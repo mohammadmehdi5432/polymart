@@ -232,7 +232,9 @@ export default function CurrencyApp() {
   const jobPaused = job?.status === 'paused';
   const jobCompleted = job?.status === 'completed';
   const progress = job?.progress_pct ?? 0;
-  const apiKeyPlaceholder = apiKeySet ? 'کلید ذخیره شده — برای تغییر، کلید جدید وارد کنید' : 'اختیاری — پیش‌فرض: 123';
+  const apiKeyPlaceholder = apiKeySet
+    ? 'کلید ذخیره شده — برای تغییر، کلید جدید وارد کنید'
+    : 'کلید API از BrsApi.ir';
 
   return (
     <Layout title="نرخ ارز" subtitle="دریافت نرخ دلار و تبدیل دسته‌ای قیمت محصولات برای مشتریان انگلیسی و عربی">
@@ -250,6 +252,41 @@ export default function CurrencyApp() {
         </div>
       ) : (
         <div className="space-y-6">
+          <section className="rounded-xl border border-pmai-border bg-white p-5 shadow-sm">
+            <h2 className="mb-1 text-base font-semibold text-gray-900">کلید API (BrsApi.ir)</h2>
+            <p className="mb-4 text-sm text-pmai-muted">
+              برای دریافت نرخ دلار از{' '}
+              <a href="https://brsapi.ir" target="_blank" rel="noopener noreferrer" className="text-pmai-primary hover:underline">
+                BrsApi.ir
+              </a>{' '}
+              کلید API را وارد و ذخیره کنید.
+            </p>
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder={apiKeyPlaceholder}
+                className={inputClassName}
+                dir="ltr"
+              />
+              <button
+                type="button"
+                onClick={handleSaveApiKey}
+                disabled={saving || !isDirty}
+                className="shrink-0 rounded-lg border border-pmai-primary px-5 py-2.5 text-sm font-medium text-pmai-primary disabled:opacity-50"
+              >
+                {saving ? 'ذخیره…' : 'ذخیره کلید'}
+              </button>
+            </div>
+            {!apiKeySet && (
+              <p className="mt-3 flex items-center gap-2 text-xs text-amber-700">
+                <HiExclamationTriangle className="h-4 w-4 shrink-0" />
+                بدون کلید API امکان دریافت نرخ دلار وجود ندارد.
+              </p>
+            )}
+          </section>
+
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard label="نرخ دلار (تومان)" value={hasRate ? status.rate_formatted : '—'} color={hasRate ? 'text-pmai-primary' : 'text-amber-700'} icon={<HiCurrencyDollar />} />
             <StatCard label="محصولات تبدیل‌شده" value={`${syncStats?.synced_products ?? 0} / ${syncStats?.total_products ?? 0}`} color="text-green-700" icon={<HiCheckCircle />} />
@@ -283,10 +320,17 @@ export default function CurrencyApp() {
                 </p>
               )}
 
+              {!apiKeySet && (
+                <p className="mb-4 flex items-center gap-2 text-xs text-amber-700">
+                  <HiExclamationTriangle className="h-4 w-4 shrink-0" />
+                  ابتدا کلید API را در بالا ذخیره کنید.
+                </p>
+              )}
+
               <button
                 type="button"
                 onClick={handleRefreshRate}
-                disabled={refreshingRate}
+                disabled={refreshingRate || !apiKeySet}
                 className="flex w-full items-center justify-center gap-2 rounded-lg bg-pmai-primary px-4 py-3 text-sm font-semibold text-white hover:bg-pmai-primary-dark disabled:opacity-60"
               >
                 <HiCloudArrowDown className={`h-5 w-5 ${refreshingRate ? 'animate-pulse' : ''}`} />
@@ -396,29 +440,6 @@ export default function CurrencyApp() {
             </div>
           </section>
 
-          <details className="rounded-xl border border-pmai-border bg-white shadow-sm">
-            <summary className="cursor-pointer px-5 py-4 text-sm font-semibold text-gray-900">تنظیمات پیشرفته — کلید API (اختیاری)</summary>
-            <div className="border-t border-gray-100 px-5 py-4">
-              <div className="flex flex-col gap-3 sm:flex-row">
-                <input
-                  type="password"
-                  value={apiKeyInput}
-                  onChange={(e) => setApiKeyInput(e.target.value)}
-                  placeholder={apiKeyPlaceholder}
-                  className={inputClassName}
-                  dir="ltr"
-                />
-                <button
-                  type="button"
-                  onClick={handleSaveApiKey}
-                  disabled={saving || !isDirty}
-                  className="shrink-0 rounded-lg border border-pmai-primary px-5 py-2.5 text-sm font-medium text-pmai-primary disabled:opacity-50"
-                >
-                  {saving ? 'ذخیره…' : 'ذخیره کلید'}
-                </button>
-              </div>
-            </div>
-          </details>
         </div>
       )}
     </Layout>

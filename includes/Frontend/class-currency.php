@@ -3,7 +3,7 @@
  * Smart currency conversion for non-Persian storefront languages.
  *
  * Persian (default) prices stay in Toman; English/Arabic routes display and
- * checkout in USD using a cached baha24 exchange rate.
+ * checkout in USD using a cached BrsApi.ir exchange rate.
  *
  * @package PolymartAI
  */
@@ -37,9 +37,9 @@ final class Currency {
 	const RATE_OPTION_KEY = 'polymart_ai_usd_rate_snapshot';
 
 	/**
-	 * baha24 USD endpoint.
+	 * BrsApi.ir gold & currency endpoint (USD rate is parsed from the currency list).
 	 */
-	const API_URL = 'https://baha24.com/api/v1/price/USD';
+	const API_URL = 'https://Api.BrsApi.ir/Market/Gold_Currency.php';
 
 	/**
 	 * Transient lifetime — 24 hours.
@@ -210,7 +210,7 @@ final class Currency {
 	}
 
 	/**
-	 * Read stored baha24 API key.
+	 * Read stored BrsApi.ir API key.
 	 *
 	 * @return string
 	 */
@@ -293,12 +293,7 @@ final class Currency {
 	}
 
 	/**
-	 * Default Bearer token when admin leaves API key empty (baha24 docs example).
-	 */
-	const DEFAULT_BEARER_TOKEN = '123';
-
-	/**
-	 * Force-fetch rate from baha24 and refresh caches.
+	 * Force-fetch rate from BrsApi.ir and refresh caches.
 	 *
 	 * @param bool $force When true, bypass transient and always hit the API.
 	 * @return array<string, mixed>|\WP_Error
@@ -310,15 +305,21 @@ final class Currency {
 		self::$rate_cache = null;
 
 		$api_key = self::get_api_key();
-		$token   = '' !== $api_key ? $api_key : self::DEFAULT_BEARER_TOKEN;
+
+		if ( '' === $api_key ) {
+			return new \WP_Error(
+				'polymart_ai_currency_missing_api_key',
+				__( 'کلید API BrsApi.ir در تنظیمات نرخ ارز وارد نشده است.', 'polymart-ai' ),
+				array( 'status' => 400 )
+			);
+		}
 
 		$response = wp_remote_get(
-			self::API_URL,
+			add_query_arg( 'key', $api_key, self::API_URL ),
 			array(
 				'timeout' => 20,
 				'headers' => array(
-					'Authorization' => 'Bearer ' . $token,
-					'Accept'        => 'application/json',
+					'Accept' => 'application/json',
 				),
 			)
 		);
@@ -331,10 +332,10 @@ final class Currency {
 
 		if ( $code < 200 || $code >= 300 ) {
 			$message = 429 === $code
-				? __( 'API baha24 محدودیت تعداد درخواست دارد — چند دقیقه بعد دوباره تلاش کنید.', 'polymart-ai' )
+				? __( 'API BrsApi.ir محدودیت تعداد درخواست دارد — چند دقیقه بعد دوباره تلاش کنید.', 'polymart-ai' )
 				: sprintf(
 					/* translators: %d: HTTP status code */
-					__( 'API baha24 با کد HTTP %d پاسخ داد.', 'polymart-ai' ),
+					__( 'API BrsApi.ir با کد HTTP %d پاسخ داد.', 'polymart-ai' ),
 					$code
 				);
 
@@ -353,7 +354,7 @@ final class Currency {
 			return self::handle_refresh_failure(
 				new \WP_Error(
 					'polymart_ai_currency_invalid_json',
-					__( 'پاسخ API baha24 نامعتبر است.', 'polymart-ai' ),
+					__( 'پاسخ API BrsApi.ir نامعتبر است.', 'polymart-ai' ),
 					array( 'status' => 502 )
 				)
 			);
@@ -918,63 +919,65 @@ final class Currency {
 	}
 
 	/**
-	 * Parse numeric rate from heterogeneous baha24 payloads.
+	 * Parse USD/Toman rate from BrsApi.ir currency list.
 	 *
 	 * @param array<string, mixed> $body Decoded JSON body.
 	 * @return float
 	 */
 	private static function parse_rate_from_response( array $body ) {
-		$candidates = array();
+		$usd = self::find_usd_currency_entry( $body );
 
-		if ( isset( $body['data'] ) && is_array( $body['data'] ) ) {
-			$candidates[] = $body['data']['price'] ?? null;
-			$candidates[] = $body['data']['sell'] ?? null;
-			$candidates[] = $body['data']['value'] ?? null;
+		if ( null === $usd ) {
+			return 0.0;
 		}
 
-		$candidates[] = $body['price'] ?? null;
-		$candidates[] = $body['sell'] ?? null;
-		$candidates[] = $body['value'] ?? null;
+		$price = $usd['price'] ?? null;
 
-		foreach ( $candidates as $candidate ) {
-			if ( is_numeric( $candidate ) && (float) $candidate > 0 ) {
-				return (float) $candidate;
-			}
+		if ( is_numeric( $price ) && (float) $price > 0 ) {
+			return (float) $price;
 		}
 
 		return 0.0;
 	}
 
 	/**
-	 * Parse update timestamp from API payload.
+	 * Parse update timestamp from BrsApi.ir USD entry.
 	 *
 	 * @param array<string, mixed> $body Decoded JSON body.
 	 * @return string ISO-8601 datetime in site timezone.
 	 */
 	private static function parse_updated_at_from_response( array $body ) {
-		$raw = '';
+		$usd = self::find_usd_currency_entry( $body );
 
-		if ( isset( $body['data'] ) && is_array( $body['data'] ) ) {
-			$raw = (string) ( $body['data']['updated_at'] ?? $body['data']['updatedAt'] ?? '' );
-		}
-
-		if ( '' === $raw ) {
-			$raw = (string) ( $body['updated_at'] ?? $body['updatedAt'] ?? $body['last_update'] ?? '' );
-		}
-
-		if ( isset( $body['data'] ) && is_array( $body['data'] ) && '' === $raw ) {
-			$raw = (string) ( $body['data']['last_update'] ?? '' );
-		}
-
-		if ( '' !== $raw ) {
-			$timestamp = strtotime( $raw );
-
-			if ( false !== $timestamp ) {
-				return wp_date( 'c', $timestamp );
-			}
+		if ( null !== $usd && ! empty( $usd['time_unix'] ) && is_numeric( $usd['time_unix'] ) ) {
+			return wp_date( 'c', (int) $usd['time_unix'] );
 		}
 
 		return wp_date( 'c' );
+	}
+
+	/**
+	 * Locate the USD row inside BrsApi.ir currency payload.
+	 *
+	 * @param array<string, mixed> $body Decoded JSON body.
+	 * @return array<string, mixed>|null
+	 */
+	private static function find_usd_currency_entry( array $body ) {
+		if ( empty( $body['currency'] ) || ! is_array( $body['currency'] ) ) {
+			return null;
+		}
+
+		foreach ( $body['currency'] as $item ) {
+			if ( ! is_array( $item ) ) {
+				continue;
+			}
+
+			if ( 'USD' === strtoupper( (string) ( $item['symbol'] ?? '' ) ) ) {
+				return $item;
+			}
+		}
+
+		return null;
 	}
 
 	/**

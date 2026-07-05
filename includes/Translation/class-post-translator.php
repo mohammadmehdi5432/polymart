@@ -791,6 +791,23 @@ final class Post_Translator {
 			return false;
 		}
 
+		// Partial Elementor saves (missing fields / API errors) must not replace live layout JSON.
+		$elementor_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
+
+		if ( '' !== trim( $elementor_error ) ) {
+			self::$elementor_storefront_serve_cache[ $key ] = false;
+
+			return false;
+		}
+
+		$decoded = json_decode( $stored, true );
+
+		if ( ! is_array( $decoded ) ) {
+			self::$elementor_storefront_serve_cache[ $key ] = false;
+
+			return false;
+		}
+
 		self::$elementor_storefront_serve_cache[ $key ] = self::is_elementor_translation_current( $post_id, $lang, $stored );
 
 		return self::$elementor_storefront_serve_cache[ $key ];

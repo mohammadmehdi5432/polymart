@@ -1306,7 +1306,7 @@ final class REST_API {
 	}
 
 	/**
-	 * Force refresh USD rate from baha24.
+	 * Force refresh USD rate from BrsApi.ir.
 	 *
 	 * @return \WP_REST_Response|\WP_Error
 	 */
