@@ -93,7 +93,7 @@ final class Async_Translator {
 	 * @return void
 	 */
 	public function handle_post_updated( $post_id, $post_after, $post_before ) {
-		if ( self::$is_translating ) {
+		if ( self::$is_translating || Post_Translator::should_skip_translation_invalidation() ) {
 			return;
 		}
 
@@ -116,6 +116,10 @@ final class Async_Translator {
 		}
 
 		Post_Translator::reconcile_post_translations_after_save( $post_id, $post_after, $post_before );
+
+		if ( Post_Translator::is_admin_translation_save_request() ) {
+			return;
+		}
 
 		if ( ! Post_Translator::has_persian_content( $post_id ) ) {
 			return;
@@ -422,7 +426,7 @@ final class Async_Translator {
 	 * @return mixed
 	 */
 	public function detect_custom_meta_change( $check, $post_id, $meta_key, $meta_value, $prev_value ) {
-		if ( null !== $check || self::$is_translating ) {
+		if ( null !== $check || self::$is_translating || Post_Translator::should_skip_translation_invalidation() ) {
 			return $check;
 		}
 
@@ -501,15 +505,7 @@ final class Async_Translator {
 			return $check;
 		}
 
-		Post_Translator::invalidate_field_translation( $post_id, $meta_key );
-		Post_Translator::reconcile_post_translations_after_save( $post_id, $post );
-
-		if ( ! Post_Translator::has_persian_content( $post_id ) ) {
-			return $check;
-		}
-
-		$this->schedule_translation( $post_id );
-
+		// Never auto-delete companion translations when third-party meta changes.
 		return $check;
 	}
 
@@ -525,7 +521,7 @@ final class Async_Translator {
 	public function handle_added_post_meta( $meta_id, $post_id, $meta_key, $meta_value ) {
 		unset( $meta_id );
 
-		if ( self::$is_translating ) {
+		if ( self::$is_translating || Post_Translator::should_skip_translation_invalidation() ) {
 			return;
 		}
 
@@ -588,8 +584,9 @@ final class Async_Translator {
 			return;
 		}
 
-		Post_Translator::invalidate_field_translation( $post_id, $meta_key );
-		Post_Translator::reconcile_post_translations_after_save( $post_id, $post );
+		if ( Post_Translator::is_admin_translation_save_request() ) {
+			return;
+		}
 
 		if ( ! Post_Translator::has_persian_content( $post_id ) ) {
 			return;
@@ -622,8 +619,6 @@ final class Async_Translator {
 		}
 
 		if ( ! Post_Translator::has_persian_content( $post_id ) ) {
-			Post_Translator::clear_all_post_translations( $post_id );
-
 			return;
 		}
 
@@ -1082,9 +1077,16 @@ final class Async_Translator {
 	 * @return bool
 	 */
 	private function core_text_changed( \WP_Post $before, \WP_Post $after ) {
-		return $before->post_title !== $after->post_title
-			|| $before->post_content !== $after->post_content
-			|| $before->post_excerpt !== $after->post_excerpt;
+		foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $source_key ) {
+			$before_source = Post_Translator::get_field_source_text( $before, $source_key );
+			$after_source  = Post_Translator::get_field_source_text( $after, $source_key );
+
+			if ( Post_Translator::field_source_text_meaningfully_changed( $before_source, $after_source ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

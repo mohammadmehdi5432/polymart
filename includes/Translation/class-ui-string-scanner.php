@@ -445,6 +445,37 @@ final class UI_String_Scanner {
 			$plugins = array_merge( $plugins, $theme_scan['plugins'] );
 		}
 
+		$extra_entries = apply_filters( 'polymart_ai_ui_string_scan_extra_entries', array() );
+		$extra_added   = 0;
+
+		if ( is_array( $extra_entries ) ) {
+			foreach ( $extra_entries as $entry ) {
+				if ( ! is_array( $entry ) || empty( $entry['msgid'] ) ) {
+					continue;
+				}
+
+				$domain = isset( $entry['domain'] ) ? (string) $entry['domain'] : 'polymart-ai';
+				$slug   = isset( $entry['plugin'] ) ? (string) $entry['plugin'] : 'JetCheckout';
+
+				if ( ! UI_String_Registry::is_allowed_domain( $domain ) ) {
+					continue;
+				}
+
+				$extra_added += self::merge_parsed_entries( $entries, array( $entry ), $domain, $slug );
+			}
+		}
+
+		if ( $extra_added > 0 ) {
+			$plugins['JetCheckout'] = array(
+				'catalog_file' => '',
+				'source_files' => 0,
+				'path'         => 'woocommerce-settings',
+				'domain'       => 'polymart-ai',
+				'count'        => $extra_added,
+			);
+			$debug['total_entries_added'] = (int) ( $debug['total_entries_added'] ?? 0 ) + $extra_added;
+		}
+
 		$debug['total_unique_strings'] = count( $entries );
 		$debug['files_found_count']    = count( $debug['files_found'] );
 

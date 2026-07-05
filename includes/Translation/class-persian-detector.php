@@ -89,6 +89,10 @@ final class Persian_Detector {
 			return self::contains_arabic_script( $plain ) || self::is_latin_text( $plain );
 		}
 
+		if ( 'en' === $lang ) {
+			return self::is_latin_text( $plain );
+		}
+
 		// Latin and other non-RTL targets should not keep Arabic-script storefront copy.
 		return ! self::contains_arabic_script( $plain );
 	}

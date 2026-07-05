@@ -30,6 +30,19 @@
 			.addClass(type ? 'is-' + type : '');
 	}
 
+	function setGlobalStatus(message, type) {
+		const $status = $('.polymart-ai-metabox__global-status');
+
+		if (!$status.length) {
+			return;
+		}
+
+		$status
+			.text(message || '')
+			.removeClass('is-error is-success')
+			.addClass(type ? 'is-' + type : '');
+	}
+
 	function setFieldValue(name, value) {
 		const $input = $('[name="' + name + '"]');
 
@@ -172,6 +185,49 @@
 		);
 	}
 
+	function setRetranslateLoading($btn, isLoading) {
+		const $spinner = $btn.find('.polymart-ai-retranslate-all-btn__spinner');
+		const $label = $btn.find('.polymart-ai-retranslate-all-btn__label');
+
+		$btn.prop('disabled', isLoading);
+		$('.polymart-ai-generate-btn').prop('disabled', isLoading);
+		$spinner.css('display', isLoading ? 'inline-block' : 'none');
+		$label.text(isLoading ? config.strings.retranslating : (config.strings.retranslateLabel || ''));
+	}
+
+	function initLanguageTabs() {
+		$('.polymart-ai-metabox__tab').on('click', function (event) {
+			event.preventDefault();
+
+			const lang = $(this).data('lang');
+
+			$('.polymart-ai-metabox__tab')
+				.removeClass('nav-tab-active')
+				.attr('aria-selected', 'false');
+
+			$(this).addClass('nav-tab-active').attr('aria-selected', 'true');
+
+			$('.polymart-ai-metabox__lang-panel')
+				.removeClass('is-active')
+				.attr('hidden', true);
+
+			const $panel = $('.polymart-ai-metabox__lang-panel[data-lang="' + lang + '"]');
+			$panel.addClass('is-active').removeAttr('hidden');
+		});
+	}
+
+	function syncEditorsBeforePostSave() {
+		const $form = $('#post');
+
+		if (!$form.length || typeof window.tinyMCE === 'undefined') {
+			return;
+		}
+
+		$form.on('submit', function () {
+			window.tinyMCE.triggerSave();
+		});
+	}
+
 	function initGenerateButtons() {
 		$('.polymart-ai-generate-btn[data-lang]').on('click', function (event) {
 			event.preventDefault();
@@ -230,6 +286,76 @@
 		});
 	}
 
+	function initRetranslateAllButton() {
+		$('.polymart-ai-retranslate-all-btn').on('click', function (event) {
+			event.preventDefault();
+
+			if (!window.confirm(config.strings.confirmRetranslate || 'Continue?')) {
+				return;
+			}
+
+			const $btn = $(this);
+			const postId = resolvePostId();
+
+			if (!postId) {
+				setGlobalStatus(config.strings.noPostId, 'error');
+				return;
+			}
+
+			setRetranslateLoading($btn, true);
+			setGlobalStatus('', '');
+
+			(config.languages || []).forEach(function (entry) {
+				setLangStatus(entry.code, '', '');
+			});
+
+			$.ajax({
+				url: config.ajaxUrl,
+				method: 'POST',
+				dataType: 'json',
+				data: {
+					action: 'polymart_retranslate_product',
+					nonce: config.nonce,
+					post_id: postId,
+				},
+			})
+				.done(function (response) {
+					if (!response || !response.success) {
+						const message =
+							response && response.data && response.data.message
+								? response.data.message
+								: config.strings.error;
+						setGlobalStatus(message, 'error');
+						return;
+					}
+
+					if (response.data && response.data.fields) {
+						populateFields(response.data.fields);
+					}
+
+					setGlobalStatus(
+						response.data.message || config.strings.retranslateSuccess,
+						'success'
+					);
+				})
+				.fail(function (xhr) {
+					let message = config.strings.error;
+
+					if (xhr.responseJSON && xhr.responseJSON.data && xhr.responseJSON.data.message) {
+						message = xhr.responseJSON.data.message;
+					}
+
+					setGlobalStatus(message, 'error');
+				})
+				.always(function () {
+					setRetranslateLoading($btn, false);
+				});
+		});
+	}
+
+	initLanguageTabs();
 	initThumbnailPickers();
+	syncEditorsBeforePostSave();
 	initGenerateButtons();
+	initRetranslateAllButton();
 })(jQuery);

@@ -351,7 +351,7 @@ final class UI_String_Bulk_Job {
 				continue;
 			}
 
-			if ( strlen( $msgid ) > self::MAX_MSGID_CHARS ) {
+			if ( strlen( $msgid ) > self::get_max_msgid_chars_for_entry( $entry ) ) {
 				$skipped[] = $hash;
 				continue;
 			}
@@ -371,6 +371,25 @@ final class UI_String_Bulk_Job {
 			'hash_map' => $hash_map,
 			'skipped'  => $skipped,
 		);
+	}
+
+	/**
+	 * Allow longer WooCommerce checkout config strings (shipping/payment descriptions).
+	 *
+	 * @param array<string, mixed> $entry Registry entry.
+	 * @return int
+	 */
+	private static function get_max_msgid_chars_for_entry( array $entry ) {
+		$context = isset( $entry['context'] ) ? (string) $entry['context'] : '';
+
+		if (
+			0 === strpos( $context, 'wc_shipping_desc:' )
+			|| 0 === strpos( $context, 'wc_payment_gateway:' )
+		) {
+			return 4000;
+		}
+
+		return self::MAX_MSGID_CHARS;
 	}
 
 	/**

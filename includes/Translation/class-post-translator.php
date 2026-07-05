@@ -28,6 +28,85 @@ final class Post_Translator {
 	const META_BOX_NONCE_NAME = 'polymart_ai_meta_box_nonce';
 
 	/**
+	 * While true, async invalidation hooks must not delete stored translations.
+	 *
+	 * @var bool
+	 */
+	private static $is_persisting_translations = false;
+
+	/**
+	 * Whether translation persistence is in progress (manual save or AI write).
+	 *
+	 * @return bool
+	 */
+	public static function is_persisting_translations() {
+		return self::$is_persisting_translations;
+	}
+
+	/**
+	 * Whether the current admin POST is saving the PolyMart translation meta box.
+	 *
+	 * @return bool
+	 */
+	public static function is_admin_translation_save_request() {
+		if ( ! is_admin() || wp_doing_ajax() || wp_doing_cron() ) {
+			return false;
+		}
+
+		if ( ! isset( $_POST[ self::META_BOX_NONCE_NAME ] ) ) {
+			return false;
+		}
+
+		return wp_verify_nonce(
+			sanitize_text_field( wp_unslash( $_POST[ self::META_BOX_NONCE_NAME ] ) ),
+			self::META_BOX_NONCE_ACTION
+		);
+	}
+
+	/**
+	 * Whether async invalidation/clear hooks should be skipped for this request.
+	 *
+	 * @return bool
+	 */
+	public static function should_skip_translation_invalidation() {
+		return self::$is_persisting_translations || self::is_admin_translation_save_request();
+	}
+
+	/**
+	 * Begin guarded translation persistence (blocks async invalidation).
+	 *
+	 * @return void
+	 */
+	public static function begin_persisting_translations() {
+		self::$is_persisting_translations = true;
+	}
+
+	/**
+	 * End guarded translation persistence.
+	 *
+	 * @return void
+	 */
+	public static function end_persisting_translations() {
+		self::$is_persisting_translations = false;
+	}
+
+	/**
+	 * Whether the Persian source snippet for a field actually changed.
+	 *
+	 * Ignores cosmetic HTML/whitespace churn from WooCommerce re-saves.
+	 *
+	 * @param string $before Previous source text.
+	 * @param string $after  Current source text.
+	 * @return bool
+	 */
+	public static function field_source_text_meaningfully_changed( $before, $after ) {
+		$before_norm = self::normalize_translation_plaintext( (string) $before );
+		$after_norm  = self::normalize_translation_plaintext( (string) $after );
+
+		return $before_norm !== $after_norm;
+	}
+
+	/**
 	 * Transient prefix for in-flight AI translation locks.
 	 */
 	const TRANSLATION_LOCK_PREFIX = 'polymart_ai_post_translate_';
@@ -440,6 +519,44 @@ final class Post_Translator {
 	}
 
 	/**
+	 * HTML form `name` for a stored meta key (no leading underscore).
+	 *
+	 * WordPress/WooCommerce often omit underscore-prefixed keys from $_POST on save.
+	 *
+	 * @param string $meta_key Database meta key.
+	 * @return string
+	 */
+	public static function get_form_field_name( $meta_key ) {
+		$meta_key = (string) $meta_key;
+
+		if ( '' !== $meta_key && '_' === $meta_key[0] ) {
+			return substr( $meta_key, 1 );
+		}
+
+		return $meta_key;
+	}
+
+	/**
+	 * Map database meta keys to HTML form field names for admin JS payloads.
+	 *
+	 * @param array<string, string> $fields Meta-keyed values.
+	 * @return array<string, string>
+	 */
+	public static function map_meta_keys_to_form_fields( array $fields ) {
+		$mapped = array();
+
+		foreach ( $fields as $meta_key => $value ) {
+			if ( ! is_string( $meta_key ) ) {
+				continue;
+			}
+
+			$mapped[ self::get_form_field_name( $meta_key ) ] = is_string( $value ) ? $value : (string) $value;
+		}
+
+		return $mapped;
+	}
+
+	/**
 	 * Build a custom meta key for a translated companion field.
 	 *
 	 * @param string $source_key Source meta key.
@@ -830,7 +947,10 @@ final class Post_Translator {
 	}
 
 	/**
-	 * Invalidate translations for core fields that changed and prune rows without Persian source.
+	 * Refresh source fingerprints after a save without deleting stored translations.
+	 *
+	 * Manual and AI translations are only removed via explicit retranslate/clear APIs.
+	 * Automatic invalidation on WooCommerce re-saves was wiping valid title rows.
 	 *
 	 * @param int           $post_id     Post ID.
 	 * @param \WP_Post      $post_after  Post after save.
@@ -838,40 +958,22 @@ final class Post_Translator {
 	 * @return void
 	 */
 	public static function reconcile_post_translations_after_save( $post_id, \WP_Post $post_after, $post_before = null ) {
+		unset( $post_before );
+
 		$post_id = absint( $post_id );
 
 		if ( $post_id <= 0 || ! $post_after instanceof \WP_Post ) {
 			return;
 		}
 
-		if ( $post_before instanceof \WP_Post ) {
-			if ( $post_before->post_title !== $post_after->post_title ) {
-				self::invalidate_field_translation( $post_id, 'post_title' );
+		foreach ( Language_Registry::get_translation_target_languages() as $language ) {
+			$lang = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+			if ( '' === $lang ) {
+				continue;
 			}
 
-			if ( $post_before->post_content !== $post_after->post_content ) {
-				self::invalidate_field_translation( $post_id, 'post_content' );
-			}
-
-			if ( $post_before->post_excerpt !== $post_after->post_excerpt ) {
-				self::invalidate_field_translation( $post_id, 'post_excerpt' );
-			}
-		}
-
-		foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $source_key ) {
-			if ( '' === trim( self::get_field_source_text( $post_after, $source_key ) ) ) {
-				self::invalidate_field_translation( $post_id, $source_key );
-			}
-		}
-
-		foreach ( self::CUSTOM_META_KEYS as $meta_key ) {
-			if ( '' === trim( self::get_field_source_text( $post_after, $meta_key ) ) ) {
-				self::invalidate_field_translation( $post_id, $meta_key );
-			}
-		}
-
-		if ( ! self::post_has_persian_content( $post_after ) ) {
-			self::clear_all_post_translations( $post_id );
+			self::sync_field_source_hashes_for_post( $post_id, $lang );
 		}
 	}
 
@@ -1950,6 +2052,21 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Maximum plain-text length for a derived/companion product title on the storefront.
+	 */
+	const STOREFRONT_TITLE_MAX_LENGTH = 120;
+
+	/**
+	 * Maximum plain-text length when deriving a title from translated content.
+	 */
+	const DERIVED_TITLE_MAX_LENGTH = 80;
+
+	/**
+	 * Absolute maximum plain-text length for something to be treated as title meta.
+	 */
+	const STOREFRONT_TITLE_HARD_MAX_LENGTH = 500;
+
+	/**
 	 * Resolve a stored core-field translation for storefront display.
 	 *
 	 * Serves admin-saved meta even when the source fingerprint gate fails.
@@ -1961,7 +2078,84 @@ final class Post_Translator {
 	 * @return string Translated value, or empty string when unavailable.
 	 */
 	public static function resolve_storefront_core_field( $post_id, $source_key, $lang, $post = null ) {
+		if ( 'post_title' === (string) $source_key ) {
+			return self::resolve_storefront_title( $post_id, $lang, true );
+		}
+
 		return self::resolve_storefront_field( $post_id, $source_key, $lang, $post );
+	}
+
+	/**
+	 * Resolve a translated product/post title for storefront display.
+	 *
+	 * WooCommerce cart lines and product names must never fall back to long-form
+	 * description copy — only dedicated title meta (or a very short derived heading).
+	 *
+	 * @param int    $post_id                 Post ID.
+	 * @param string $lang                    Target language code.
+	 * @param bool   $allow_content_fallback  Whether missing title meta may derive from content.
+	 * @return string
+	 */
+	public static function resolve_storefront_title( $post_id, $lang, $allow_content_fallback = false ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return '';
+		}
+
+		$meta_key = self::get_meta_key( 'title', $lang );
+		$stored   = get_post_meta( $post_id, $meta_key, true );
+
+		if ( is_string( $stored ) && self::has_meaningful_translation( $stored ) ) {
+			$formatted = self::format_storefront_title( $stored, self::STOREFRONT_TITLE_MAX_LENGTH );
+
+			if ( '' !== $formatted ) {
+				return $formatted;
+			}
+		}
+
+		if ( ! $allow_content_fallback ) {
+			return '';
+		}
+
+		return self::derive_storefront_title_fallback( $post_id, $lang );
+	}
+
+	/**
+	 * Normalize and cap a stored title translation for storefront display.
+	 *
+	 * Admin-saved title meta is always kept — only obvious description blobs are rejected.
+	 *
+	 * @param mixed $value      Raw title value.
+	 * @param int   $max_length Soft display cap (longer values are trimmed, not dropped).
+	 * @return string
+	 */
+	private static function format_storefront_title( $value, $max_length = 120 ) {
+		$plain = self::normalize_translation_plaintext( $value );
+
+		if ( '' === $plain ) {
+			return '';
+		}
+
+		$max_length = max( 40, absint( $max_length ) );
+
+		if ( mb_strlen( $plain ) > self::STOREFRONT_TITLE_HARD_MAX_LENGTH ) {
+			return '';
+		}
+
+		if ( mb_strlen( $plain ) <= $max_length ) {
+			return $plain;
+		}
+
+		$cut        = mb_substr( $plain, 0, $max_length );
+		$last_space = mb_strrpos( $cut, ' ' );
+
+		if ( false !== $last_space && $last_space > (int) ( $max_length * 0.6 ) ) {
+			$cut = mb_substr( $cut, 0, $last_space );
+		}
+
+		return trim( $cut );
 	}
 
 	/**
@@ -1990,13 +2184,12 @@ final class Post_Translator {
 
 		$stored = get_post_meta( $post_id, $meta_key, true );
 
-		if ( self::should_serve_stored_translation( $post_id, $source_key, $lang, $post ) ) {
-			if ( is_string( $stored ) && self::is_clean_target_language_translation( $stored, $lang ) ) {
-				return $stored;
-			}
+		if ( 'post_title' === $source_key ) {
+			return self::resolve_storefront_title( $post_id, $lang, true );
 		}
 
-		if ( is_string( $stored ) && self::is_clean_target_language_translation( $stored, $lang ) ) {
+		// Admin-saved meta is authoritative on the storefront, even when source hashes lag.
+		if ( is_string( $stored ) && self::has_meaningful_translation( $stored ) && self::is_clean_target_language_translation( $stored, $lang ) ) {
 			return $stored;
 		}
 
@@ -2012,11 +2205,183 @@ final class Post_Translator {
 			}
 		}
 
-		if ( 'post_title' === $source_key ) {
-			return self::derive_storefront_title_fallback_from_content( $post_id, $lang );
+		return '';
+	}
+
+	/**
+	 * Preview the product/post title that the storefront will resolve for one language.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return string
+	 */
+	public static function peek_storefront_title( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return '';
 		}
 
-		return '';
+		$resolved = self::resolve_storefront_title( $post_id, $lang, true );
+
+		if ( '' !== trim( $resolved ) ) {
+			return $resolved;
+		}
+
+		$post = get_post( $post_id );
+
+		return $post instanceof \WP_Post ? (string) $post->post_title : '';
+	}
+
+	/**
+	 * Whether the storefront title is derived from content because title meta is empty.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function storefront_title_uses_content_fallback( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$title_meta = get_post_meta( $post_id, self::get_meta_key( 'title', $lang ), true );
+
+		if ( self::has_meaningful_translation( $title_meta ) && self::is_clean_target_language_translation( $title_meta, $lang ) ) {
+			return false;
+		}
+
+		return '' !== trim( self::derive_storefront_title_fallback( $post_id, $lang ) );
+	}
+
+	/**
+	 * Clear every PolyMart translation row for one post and one target language.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return void
+	 */
+	public static function clear_post_language_translations( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		$suffix = '_' . $lang;
+
+		foreach ( array_keys( (array) get_post_meta( $post_id ) ) as $meta_key ) {
+			if ( ! is_string( $meta_key ) || '' === $meta_key ) {
+				continue;
+			}
+
+			$is_polymart = 0 === strpos( $meta_key, '_polymart_ai_' );
+			$is_langged  = strlen( $meta_key ) > strlen( $suffix ) && substr( $meta_key, -strlen( $suffix ) ) === $suffix;
+
+			if ( $is_polymart || $is_langged ) {
+				delete_post_meta( $post_id, $meta_key );
+			}
+		}
+
+		delete_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang );
+		self::flush_translation_status_cache( $post_id );
+	}
+
+	/**
+	 * Force a full AI re-translation for one post and language (clears stale rows first).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return true|\WP_Error
+	 */
+	public static function retranslate_post( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return new \WP_Error(
+				'polymart_ai_invalid_post',
+				__( 'شناسه مطلب یا زبان نامعتبر است.', 'polymart-ai' )
+			);
+		}
+
+		self::clear_post_language_translations( $post_id, $lang );
+
+		$result = self::request_ai_translation( $post_id, $lang );
+
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		return self::save_ai_translations( $post_id, $result['translations'], $lang );
+	}
+
+	/**
+	 * Resolve a missing title from stored content when it looks like a real product name.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return string
+	 */
+	private static function derive_storefront_title_fallback( $post_id, $lang ) {
+		$candidate = self::derive_storefront_title_fallback_from_content( $post_id, $lang );
+
+		if ( '' === trim( $candidate ) || self::is_unsuitable_derived_product_title( $candidate, $post_id ) ) {
+			return '';
+		}
+
+		return $candidate;
+	}
+
+	/**
+	 * Reject alert/notice snippets that must never become a product title.
+	 *
+	 * @param string $candidate Derived title candidate.
+	 * @param int    $post_id   Post ID.
+	 * @return bool
+	 */
+	private static function is_unsuitable_derived_product_title( $candidate, $post_id ) {
+		$candidate = trim( wp_strip_all_tags( html_entity_decode( (string) $candidate, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) );
+
+		if ( '' === $candidate ) {
+			return true;
+		}
+
+		$post = get_post( absint( $post_id ) );
+
+		if ( ! $post instanceof \WP_Post ) {
+			return true;
+		}
+
+		$source_title = trim( (string) $post->post_title );
+		$source_len   = mb_strlen( $source_title );
+		$candidate_len = mb_strlen( $candidate );
+
+		$notice_patterns = array(
+			'/^(attention|notice|warning|caution|important|alert)\s*[!.:,\-–—]*$/iu',
+			'/^(توجه|تنبيه|تنبيه|هشدار|اخطار|تذكير)\s*[!.:،\-–—]*$/u',
+		);
+
+		foreach ( $notice_patterns as $pattern ) {
+			if ( preg_match( $pattern, $candidate ) ) {
+				return true;
+			}
+		}
+
+		if ( $source_len >= 20 && $candidate_len <= 16 ) {
+			return true;
+		}
+
+		if ( $candidate_len > self::DERIVED_TITLE_MAX_LENGTH ) {
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -2038,7 +2403,7 @@ final class Post_Translator {
 		if ( preg_match( '/<h1[^>]*>(.*?)<\/h1>/is', $content, $matches ) ) {
 			$heading = trim( wp_strip_all_tags( html_entity_decode( $matches[1], ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) );
 
-			if ( self::has_meaningful_translation( $heading ) ) {
+			if ( self::has_meaningful_translation( $heading ) && mb_strlen( $heading ) <= self::DERIVED_TITLE_MAX_LENGTH ) {
 				return $heading;
 			}
 		}
@@ -2055,18 +2420,11 @@ final class Post_Translator {
 			return '';
 		}
 
-		if ( strlen( $first_line ) <= 250 ) {
-			return $first_line;
+		if ( mb_strlen( $first_line ) > self::DERIVED_TITLE_MAX_LENGTH ) {
+			return '';
 		}
 
-		$cut        = substr( $first_line, 0, 250 );
-		$last_comma = strrpos( $cut, ',' );
-
-		if ( false !== $last_comma && $last_comma > 40 ) {
-			return trim( substr( $cut, 0, $last_comma ) );
-		}
-
-		return trim( $cut );
+		return $first_line;
 	}
 
 	/**
@@ -2117,9 +2475,29 @@ final class Post_Translator {
 	 * Constructor.
 	 */
 	public function __construct() {
-		add_action( 'save_post', array( $this, 'save_manual_translations' ), 20, 3 );
+		add_action( 'pre_post_update', array( $this, 'maybe_begin_admin_translation_persist' ), 1, 1 );
+		add_action( 'save_post', array( $this, 'save_manual_translations' ), 99, 3 );
 		add_action( 'save_post', array( $this, 'sync_translation_index_on_save' ), 99, 1 );
 		add_action( 'updated_post_meta', array( $this, 'maybe_invalidate_elementor_on_source_change' ), 10, 4 );
+		add_action( 'shutdown', array( __CLASS__, 'end_persisting_translations' ), 999 );
+	}
+
+	/**
+	 * Block async invalidation before post_updated runs during admin saves.
+	 *
+	 * post_updated fires inside wp_update_post(), before save_post — the meta box
+	 * save handler has not run yet, so we must arm the guard here when the edit
+	 * form includes our nonce.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return void
+	 */
+	public function maybe_begin_admin_translation_persist( $post_id ) {
+		unset( $post_id );
+
+		if ( self::is_admin_translation_save_request() ) {
+			self::begin_persisting_translations();
+		}
 	}
 
 	/**
@@ -2178,9 +2556,12 @@ final class Post_Translator {
 			return;
 		}
 
+		self::begin_persisting_translations();
+
 		$languages = Language_Registry::get_translation_target_languages();
 
-		foreach ( $languages as $language ) {
+		try {
+			foreach ( $languages as $language ) {
 			$lang = sanitize_key( (string) $language['code'] );
 
 			if ( '' === $lang ) {
@@ -2229,6 +2610,9 @@ final class Post_Translator {
 		}
 
 		self::sync_translation_index_meta( $post_id );
+		} finally {
+			self::end_persisting_translations();
+		}
 	}
 
 	/**
@@ -3294,6 +3678,26 @@ final class Post_Translator {
 	public static function save_ai_translations( $post_id, array $translations, $lang = 'en' ) {
 		$lang = sanitize_key( (string) $lang );
 
+		self::begin_persisting_translations();
+
+		try {
+			return self::save_ai_translations_internal( $post_id, $translations, $lang );
+		} finally {
+			self::end_persisting_translations();
+		}
+	}
+
+	/**
+	 * Internal AI translation persistence (called within the persistence guard).
+	 *
+	 * @param int                   $post_id      Post ID.
+	 * @param array<string, string> $translations AI response keyed by source field name.
+	 * @param string                $lang         Target language code.
+	 * @return true|\WP_Error
+	 */
+	private static function save_ai_translations_internal( $post_id, array $translations, $lang = 'en' ) {
+		$lang = sanitize_key( (string) $lang );
+
 		foreach ( $translations as $source_key => $value ) {
 			if ( is_string( $value ) || is_numeric( $value ) ) {
 				$translations[ $source_key ] = self::normalize_ai_translation_value( $value );
@@ -4119,11 +4523,15 @@ final class Post_Translator {
 	 * @return void
 	 */
 	private function save_meta_field( $post_id, $meta_key, $sanitize ) {
-		if ( ! isset( $_POST[ $meta_key ] ) ) {
+		$form_key = self::get_form_field_name( $meta_key );
+
+		if ( isset( $_POST[ $form_key ] ) ) {
+			$raw = wp_unslash( $_POST[ $form_key ] );
+		} elseif ( isset( $_POST[ $meta_key ] ) ) {
+			$raw = wp_unslash( $_POST[ $meta_key ] );
+		} else {
 			return;
 		}
-
-		$raw = wp_unslash( $_POST[ $meta_key ] );
 
 		switch ( $sanitize ) {
 			case 'html':
@@ -4143,9 +4551,18 @@ final class Post_Translator {
 		if ( 'attachment_id' === $sanitize ) {
 			if ( $value > 0 && 'attachment' === get_post_type( $value ) ) {
 				update_post_meta( $post_id, $meta_key, $value );
-			} else {
-				delete_post_meta( $post_id, $meta_key );
 			}
+
+			return;
+		}
+
+		// Inactive language tabs and TinyMCE editors often submit empty strings even when
+		// translations were saved via AJAX — never wipe stored meta on blank POST values.
+		if ( 'html' === $sanitize ) {
+			if ( '' === trim( wp_strip_all_tags( (string) $value ) ) ) {
+				return;
+			}
+		} elseif ( '' === trim( (string) $value ) ) {
 			return;
 		}
 

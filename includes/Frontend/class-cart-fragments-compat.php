@@ -367,7 +367,72 @@ JS;
 			$fragments           = self::ensure_woodmart_fragments( $fragments );
 		}
 
+		return self::prefix_fragment_html_urls( $fragments );
+	}
+
+	/**
+	 * Prefix cart/checkout links embedded in cart fragment HTML.
+	 *
+	 * @param array<string, string> $fragments Fragment map.
+	 * @return array<string, string>
+	 */
+	private static function prefix_fragment_html_urls( array $fragments ) {
+		if ( ! Url_Router::is_translated_request() ) {
+			return $fragments;
+		}
+
+		foreach ( $fragments as $selector => $html ) {
+			if ( ! is_string( $html ) || '' === $html ) {
+				continue;
+			}
+
+			$fragments[ $selector ] = self::prefix_storefront_urls_in_html( $html );
+		}
+
 		return $fragments;
+	}
+
+	/**
+	 * Rewrite unprefixed WooCommerce cart/checkout page URLs inside HTML.
+	 *
+	 * @param string $html Fragment HTML.
+	 * @return string
+	 */
+	private static function prefix_storefront_urls_in_html( $html ) {
+		if ( ! function_exists( 'wc_get_page_id' ) || ! function_exists( 'get_permalink' ) ) {
+			return $html;
+		}
+
+		foreach ( array( 'cart', 'checkout' ) as $page ) {
+			$page_id = (int) wc_get_page_id( $page );
+
+			if ( $page_id <= 0 ) {
+				continue;
+			}
+
+			$default_url = get_permalink( $page_id );
+
+			if ( ! is_string( $default_url ) || '' === $default_url ) {
+				continue;
+			}
+
+			$prefixed_url = Url_Router::add_language_prefix_to_url( $default_url );
+
+			if ( $prefixed_url === $default_url ) {
+				continue;
+			}
+
+			$html = str_replace( $default_url, $prefixed_url, $html );
+
+			$trimmed_default  = untrailingslashit( $default_url );
+			$trimmed_prefixed = untrailingslashit( $prefixed_url );
+
+			if ( $trimmed_default !== $default_url ) {
+				$html = str_replace( $trimmed_default, $trimmed_prefixed, $html );
+			}
+		}
+
+		return $html;
 	}
 
 	/**

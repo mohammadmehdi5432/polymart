@@ -350,9 +350,36 @@ final class Url_Router {
 	 * @return string
 	 */
 	public static function add_language_prefix_to_url( $url ) {
-		$prefix = self::get_current_url_prefix();
+		return self::add_language_prefix_for_code( $url, self::get_current_language() );
+	}
 
-		if ( '' === $prefix || ! is_string( $url ) || '' === $url ) {
+	/**
+	 * Insert a specific language URL prefix immediately after the site home path.
+	 *
+	 * @param string $url           Permalink or home URL.
+	 * @param string $language_code Routed language code.
+	 * @return string
+	 */
+	public static function add_language_prefix_for_code( $url, $language_code ) {
+		if ( ! is_string( $url ) || '' === $url ) {
+			return is_string( $url ) ? $url : '';
+		}
+
+		$language_code = sanitize_key( (string) $language_code );
+
+		if ( '' === $language_code || $language_code === Language_Registry::get_default_language_code() ) {
+			return $url;
+		}
+
+		$language = Language_Registry::get_language( $language_code );
+
+		if ( ! $language || empty( $language['url_prefix'] ) ) {
+			return $url;
+		}
+
+		$prefix = sanitize_key( (string) $language['url_prefix'] );
+
+		if ( '' === $prefix ) {
 			return $url;
 		}
 
@@ -397,6 +424,23 @@ final class Url_Router {
 		$parsed_url['path'] = trailingslashit( $new_path );
 
 		return self::build_url_from_parts( $parsed_url );
+	}
+
+	/**
+	 * Override the cached storefront language for the current request.
+	 *
+	 * @param string $language_code Routed language code.
+	 * @return void
+	 */
+	public static function set_current_language( $language_code ) {
+		$language_code = sanitize_key( (string) $language_code );
+
+		if ( '' === $language_code || ! self::is_valid_routed_language( $language_code ) ) {
+			return;
+		}
+
+		self::$current_language_cache         = $language_code;
+		self::$is_translated_request_cache    = null;
 	}
 
 	/**

@@ -230,7 +230,11 @@ final class Runtime_String_Translator {
 		$key  = $lang . ':' . $hash;
 
 		if ( isset( self::$request_cache[ $key ] ) ) {
-			return self::$request_cache[ $key ];
+			$cached_hit = self::$request_cache[ $key ];
+
+			if ( is_string( $cached_hit ) && '' !== trim( $cached_hit ) ) {
+				return $cached_hit;
+			}
 		}
 
 		if ( self::$options_locked ) {
@@ -258,7 +262,7 @@ final class Runtime_String_Translator {
 
 		$cached = self::get_persistent_entry( $lang, $hash, $text );
 
-		if ( null !== $cached ) {
+		if ( null !== $cached && '' !== trim( (string) $cached ) ) {
 			self::$request_cache[ $key ] = $cached;
 
 			return $cached;
@@ -529,7 +533,12 @@ final class Runtime_String_Translator {
 
 		// Never persist or spawn cron during public page renders — cache-only mode
 		// may hit thousands of strings per request and exhaust memory at shutdown.
-		if ( ! is_admin() && ! wp_doing_cron() && ! self::allows_runtime_ai() ) {
+		$allow_queue = (bool) apply_filters(
+			'polymart_ai_allow_pending_string_queue',
+			is_admin() || wp_doing_cron() || self::allows_runtime_ai()
+		);
+
+		if ( ! $allow_queue ) {
 			return;
 		}
 
@@ -968,6 +977,15 @@ final class Runtime_String_Translator {
 		self::$allow_runtime_ai = (bool) apply_filters( 'polymart_ai_allow_runtime_ai_translation', $default );
 
 		return self::$allow_runtime_ai;
+	}
+
+	/**
+	 * Reset the per-request runtime AI gate (used before each JetCheckout field translation).
+	 *
+	 * @return void
+	 */
+	public static function reset_runtime_ai_gate() {
+		self::$allow_runtime_ai = null;
 	}
 
 	/**

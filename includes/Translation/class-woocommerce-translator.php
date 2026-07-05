@@ -7,6 +7,7 @@
 
 namespace PolymartAI\Translation;
 
+use PolymartAI\Language_Registry;
 use PolymartAI\Routing\Url_Router;
 
 defined( 'ABSPATH' ) || exit;
@@ -77,6 +78,9 @@ final class WooCommerce_Translator {
 
 		add_filter( 'woocommerce_product_get_permalink', array( $this, 'filter_product_permalink' ), 10, 2 );
 		add_filter( 'woocommerce_cart_item_permalink', array( $this, 'filter_cart_item_permalink' ), 20, 3 );
+		add_filter( 'woocommerce_get_cart_url', array( $this, 'filter_storefront_url' ), 20, 1 );
+		add_filter( 'woocommerce_get_checkout_url', array( $this, 'filter_storefront_url' ), 20, 1 );
+		add_filter( 'woocommerce_shipping_rate_label', array( $this, 'filter_shipping_rate_label' ), 20, 2 );
 		add_filter( 'woocommerce_page_title', array( $this, 'filter_page_title' ), 10, 1 );
 		add_filter( 'document_title_parts', array( $this, 'filter_document_title_parts' ), 25, 1 );
 		add_filter( 'single_term_title', array( $this, 'filter_term_title' ), 10, 1 );
@@ -219,6 +223,318 @@ final class WooCommerce_Translator {
 		}
 
 		return Url_Router::add_language_prefix_to_url( $permalink );
+	}
+
+	/**
+	 * Keep cart and checkout URLs on the active translated storefront.
+	 *
+	 * page_link prefixing is skipped during admin-ajax / wc-ajax fragment renders,
+	 * so WoodMart mini-cart buttons would otherwise link to the default-language cart.
+	 *
+	 * @param string $url Cart or checkout URL.
+	 * @return string
+	 */
+	public function filter_storefront_url( $url ) {
+		if ( ! Url_Router::is_translated_request() || ! is_string( $url ) || '' === $url ) {
+			return $url;
+		}
+
+		return Url_Router::add_language_prefix_to_url( $url );
+	}
+
+	/**
+	 * Translate custom shipping method titles configured in Persian.
+	 *
+	 * @param string           $label Shipping rate label.
+	 * @param \WC_Shipping_Rate $rate  Shipping rate object.
+	 * @return string
+	 */
+	public function filter_shipping_rate_label( $label, $rate ) {
+		if ( ! $this->should_intercept() ) {
+			return is_string( $label ) ? $label : '';
+		}
+
+		$rate_obj = $rate instanceof \WC_Shipping_Rate ? $rate : null;
+		$resolved = self::translate_shipping_rate_label( $label, $rate_obj );
+
+		if ( '' !== trim( $resolved ) ) {
+			return $resolved;
+		}
+
+		return is_string( $label ) ? $label : '';
+	}
+
+	/**
+	 * Translate a WooCommerce shipping rate label for the active storefront language.
+	 *
+	 * @param string                 $label Raw label from WooCommerce.
+	 * @param \WC_Shipping_Rate|null $rate  Optional shipping rate object.
+	 * @param string                 $lang  Optional language override.
+	 * @return string Never returns empty when a Persian source label exists.
+	 */
+	public static function translate_shipping_rate_label( $label, $rate = null, $lang = '' ) {
+		$source = is_string( $label ) ? trim( wp_strip_all_tags( html_entity_decode( $label, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) : '';
+
+		if ( '' === $source && $rate instanceof \WC_Shipping_Rate ) {
+			$source = self::resolve_shipping_rate_source_label( $rate );
+		}
+
+		if ( '' === $source ) {
+			return is_string( $label ) ? trim( $label ) : '';
+		}
+
+		$context = self::shipping_rate_storage_context( $rate, $source );
+
+		return self::translate_storefront_config_string( $source, $context, $lang );
+	}
+
+	/**
+	 * Translate a JetCheckout / WooCommerce shipping method description.
+	 *
+	 * @param string $description Raw description from zone instance settings.
+	 * @param string $rate_id     Shipping rate id (e.g. flat_rate:1).
+	 * @param string $lang        Optional language override.
+	 * @return string
+	 */
+	public static function translate_shipping_rate_description( $description, $rate_id = '', $lang = '' ) {
+		$source = is_string( $description ) ? trim( wp_strip_all_tags( html_entity_decode( $description, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) : '';
+
+		if ( '' === $source ) {
+			return is_string( $description ) ? trim( $description ) : '';
+		}
+
+		$rate_id = is_string( $rate_id ) ? trim( $rate_id ) : '';
+		$context = '' !== $rate_id
+			? 'wc_shipping_desc:' . sanitize_key( str_replace( ':', '_', $rate_id ) )
+			: 'wc_shipping_desc:' . sanitize_title( $source );
+
+		return self::translate_storefront_config_string( $source, $context, $lang );
+	}
+
+	/**
+	 * Translate a WooCommerce payment gateway title.
+	 *
+	 * @param string $title      Gateway title from settings.
+	 * @param string $gateway_id Gateway id (e.g. bacs, cod).
+	 * @param string $lang       Optional language override.
+	 * @return string
+	 */
+	public static function translate_payment_gateway_title( $title, $gateway_id = '', $lang = '' ) {
+		$source = is_string( $title ) ? trim( wp_strip_all_tags( html_entity_decode( $title, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) : '';
+
+		if ( '' === $source ) {
+			$source = self::resolve_payment_gateway_source_text( $gateway_id, 'title' );
+		}
+
+		if ( '' === $source ) {
+			return is_string( $title ) ? trim( $title ) : '';
+		}
+
+		$context = self::payment_gateway_storage_context( $gateway_id, 'title', $source );
+
+		return self::translate_storefront_config_string( $source, $context, $lang );
+	}
+
+	/**
+	 * Translate a WooCommerce payment gateway description/instructions.
+	 *
+	 * @param string $description Gateway description from settings.
+	 * @param string $gateway_id  Gateway id (e.g. bacs, cod).
+	 * @param string $lang        Optional language override.
+	 * @return string
+	 */
+	public static function translate_payment_gateway_description( $description, $gateway_id = '', $lang = '' ) {
+		$source = is_string( $description ) ? trim( wp_strip_all_tags( html_entity_decode( $description, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) : '';
+
+		if ( '' === $source ) {
+			$source = self::resolve_payment_gateway_source_text( $gateway_id, 'description' );
+		}
+
+		if ( '' === $source ) {
+			return is_string( $description ) ? trim( $description ) : '';
+		}
+
+		$context = self::payment_gateway_storage_context( $gateway_id, 'description', $source );
+
+		return self::translate_storefront_config_string( $source, $context, $lang );
+	}
+
+	/**
+	 * Shared lookup for Persian WooCommerce checkout configuration strings.
+	 *
+	 * @param string $source  Normalized Persian source text.
+	 * @param string $context Stable storage context.
+	 * @param string $lang    Optional language override.
+	 * @return string
+	 */
+	public static function translate_storefront_config_string( $source, $context, $lang = '' ) {
+		$source = is_string( $source ) ? trim( $source ) : '';
+
+		if ( '' === $source ) {
+			return '';
+		}
+
+		$lang = sanitize_key( (string) $lang );
+
+		if ( '' === $lang ) {
+			$lang = sanitize_key( Url_Router::get_current_language() );
+		}
+
+		if ( '' === $lang || $lang === Language_Registry::get_default_language_code() ) {
+			return $source;
+		}
+
+		$context = is_string( $context ) ? trim( $context ) : '';
+
+		$stored = UI_String_Registry::lookup( $lang, $source, '' );
+
+		if ( null !== $stored && '' !== trim( $stored ) ) {
+			return $stored;
+		}
+
+		if ( '' !== $context ) {
+			$stored = UI_String_Registry::lookup( $lang, $source, $context );
+
+			if ( null !== $stored && '' !== trim( $stored ) ) {
+				return $stored;
+			}
+		}
+
+		$strings = Runtime_String_Translator::get_theme_strings();
+
+		if ( '' !== $context && isset( $strings[ $context ] ) && is_string( $strings[ $context ] ) && '' !== trim( $strings[ $context ] ) ) {
+			return $strings[ $context ];
+		}
+
+		if ( Persian_Detector::contains_persian( $source ) ) {
+			$translated = Runtime_String_Translator::translate( $source, $lang, $context );
+
+			if ( is_string( $translated ) && '' !== trim( $translated ) ) {
+				return $translated;
+			}
+		}
+
+		return $source;
+	}
+
+	/**
+	 * Read the raw Persian payment gateway field configured in wp_options.
+	 *
+	 * @param string $gateway_id Gateway id.
+	 * @param string $field        title|description.
+	 * @return string
+	 */
+	private static function resolve_payment_gateway_source_text( $gateway_id, $field ) {
+		$gateway_id = sanitize_key( (string) $gateway_id );
+
+		if ( '' === $gateway_id ) {
+			return '';
+		}
+
+		$settings = get_option( 'woocommerce_' . $gateway_id . '_settings', array() );
+
+		if ( ! is_array( $settings ) ) {
+			return '';
+		}
+
+		$key = 'description' === $field ? 'description' : 'title';
+
+		if ( empty( $settings[ $key ] ) || ! is_string( $settings[ $key ] ) ) {
+			return '';
+		}
+
+		return trim( wp_strip_all_tags( $settings[ $key ] ) );
+	}
+
+	/**
+	 * Build a stable cache key for one payment gateway field.
+	 *
+	 * @param string $gateway_id Gateway id.
+	 * @param string $field      title|description.
+	 * @param string $source     Source text fallback slug.
+	 * @return string
+	 */
+	private static function payment_gateway_storage_context( $gateway_id, $field, $source ) {
+		$gateway_id = sanitize_key( (string) $gateway_id );
+		$field      = 'description' === $field ? 'description' : 'title';
+
+		if ( '' !== $gateway_id ) {
+			return 'wc_payment_gateway:' . $gateway_id . ':' . $field;
+		}
+
+		$slug = sanitize_title( $source );
+
+		return '' !== $slug ? 'wc_payment_gateway:' . $field . ':' . $slug : 'wc_payment_gateway:unknown';
+	}
+
+	/**
+	 * Read the raw Persian shipping method title configured in WooCommerce zones.
+	 *
+	 * @param \WC_Shipping_Rate $rate Shipping rate.
+	 * @return string
+	 */
+	private static function resolve_shipping_rate_source_label( \WC_Shipping_Rate $rate ) {
+		$method_id   = (string) $rate->get_method_id();
+		$instance_id = (int) $rate->get_instance_id();
+
+		if ( '' !== $method_id && $instance_id > 0 ) {
+			$settings = get_option( 'woocommerce_' . $method_id . '_' . $instance_id . '_settings', array() );
+
+			if ( is_array( $settings ) && ! empty( $settings['title'] ) && is_string( $settings['title'] ) ) {
+				$title = trim( wp_strip_all_tags( $settings['title'] ) );
+
+				if ( '' !== $title ) {
+					return $title;
+				}
+			}
+		}
+
+		if ( is_array( $rate->get_meta_data() ) ) {
+			foreach ( $rate->get_meta_data() as $meta ) {
+				if ( ! is_object( $meta ) || ! method_exists( $meta, 'get_key' ) ) {
+					continue;
+				}
+
+				if ( in_array( (string) $meta->get_key(), array( 'Items', 'item' ), true ) ) {
+					continue;
+				}
+
+				$value = method_exists( $meta, 'get_value' ) ? $meta->get_value() : '';
+
+				if ( is_string( $value ) && '' !== trim( $value ) && Persian_Detector::contains_persian( $value ) ) {
+					return trim( wp_strip_all_tags( $value ) );
+				}
+			}
+		}
+
+		$data = $rate->get_data();
+
+		if ( isset( $data['label'] ) && is_string( $data['label'] ) ) {
+			return trim( wp_strip_all_tags( $data['label'] ) );
+		}
+
+		return '';
+	}
+
+	/**
+	 * Build a stable cache key for one shipping rate label.
+	 *
+	 * @param \WC_Shipping_Rate|null $rate   Shipping rate.
+	 * @param string                 $source Source label text.
+	 * @return string
+	 */
+	private static function shipping_rate_storage_context( $rate, $source ) {
+		if ( $rate instanceof \WC_Shipping_Rate ) {
+			$rate_id = (string) $rate->get_id();
+
+			if ( '' !== $rate_id ) {
+				return 'wc_shipping_rate:' . sanitize_key( $rate_id );
+			}
+		}
+
+		$slug = sanitize_title( $source );
+
+		return '' !== $slug ? 'wc_shipping_rate:' . $slug : 'wc_shipping_rate:unknown';
 	}
 
 	/**
@@ -671,11 +987,7 @@ final class WooCommerce_Translator {
 			return $name;
 		}
 
-		$translated = $this->get_meta_or_original(
-			$post_id,
-			Post_Translator::get_meta_key( 'title', $this->get_active_lang() ),
-			$name
-		);
+		$translated = Post_Translator::resolve_storefront_title( $post_id, $this->get_active_lang(), false );
 
 		return '' !== trim( $translated ) ? $translated : $name;
 	}
@@ -1304,6 +1616,12 @@ final class WooCommerce_Translator {
 		$lang       = $this->get_active_lang();
 		$source_key = Post_Translator::resolve_source_key_for_translated_meta( $meta_key, $lang, $post_id );
 
+		if ( 'post_title' === $source_key ) {
+			$resolved = Post_Translator::resolve_storefront_title( $post_id, $lang, false );
+
+			return '' !== $resolved ? $resolved : $original;
+		}
+
 		if ( '' !== $source_key ) {
 			$resolved = Post_Translator::resolve_storefront_field( $post_id, $source_key, $lang );
 
@@ -1351,9 +1669,15 @@ final class WooCommerce_Translator {
 	 * @return string
 	 */
 	private function lookup_theme_string( $value, $storage ) {
+		$value = is_string( $value ) ? $value : '';
+
+		if ( '' === trim( $value ) ) {
+			return $value;
+		}
+
 		$stored = UI_String_Registry::lookup( $this->get_active_lang(), $value, '' );
 
-		if ( null !== $stored ) {
+		if ( null !== $stored && '' !== trim( $stored ) ) {
 			return $stored;
 		}
 
@@ -1364,7 +1688,11 @@ final class WooCommerce_Translator {
 		}
 
 		if ( Persian_Detector::contains_persian( $value ) ) {
-			return Runtime_String_Translator::translate( $value, $this->get_active_lang(), $storage );
+			$translated = Runtime_String_Translator::translate( $value, $this->get_active_lang(), $storage );
+
+			if ( is_string( $translated ) && '' !== trim( $translated ) ) {
+				return $translated;
+			}
 		}
 
 		return $value;
@@ -1894,7 +2222,12 @@ final class WooCommerce_Translator {
 			return $this->intercept_cache;
 		}
 
-		if ( ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_cron() ) {
+		if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
+			$this->intercept_cache = Url_Router::is_translated_request();
+			return $this->intercept_cache;
+		}
+
+		if ( wp_doing_cron() ) {
 			$this->intercept_cache = false;
 			return false;
 		}
