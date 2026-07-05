@@ -285,6 +285,7 @@ final class Activity_Logger {
 			'last_post_id'    => 0,
 			'queue'           => array(),
 			'retry_queue'     => array(),
+			'deferred_queue'  => array(),
 			'retry_attempts'  => array(),
 			'remaining'       => 0,
 			'total'           => 0,
@@ -306,6 +307,8 @@ final class Activity_Logger {
 			'partial_post_id' => null,
 			'partial_phase'   => null,
 			'partial_progress' => null,
+			'consecutive_post_id'   => 0,
+			'consecutive_post_steps' => 0,
 		);
 	}
 
@@ -513,6 +516,14 @@ final class Activity_Logger {
 				}
 			)
 		);
+		$job['deferred_queue'] = array_values(
+			array_filter(
+				self::get_deferred_queue( $job ),
+				static function ( $post_id ) use ( $lang ) {
+					return $post_id > 0 && 'translated' !== Post_Translator::get_translation_status( $post_id, $lang );
+				}
+			)
+		);
 
 		if ( $live_remaining <= 0 ) {
 			$job['stalled_ids']   = array();
@@ -623,9 +634,10 @@ final class Activity_Logger {
 		$succeeded = max( 0, (int) ( $job['succeeded'] ?? 0 ) );
 		$partial   = count( $partial_ids );
 
-		$retry_queue   = self::get_retry_queue( $job );
-		$exhausted_map = array_fill_keys( self::get_exhausted_job_post_ids( $job ), true );
-		$retry_pending = count(
+		$retry_queue     = self::get_retry_queue( $job );
+		$deferred_queue  = self::get_deferred_queue( $job );
+		$exhausted_map   = array_fill_keys( self::get_exhausted_job_post_ids( $job ), true );
+		$retry_pending   = count(
 			array_filter(
 				$retry_queue,
 				static function ( $queued_id ) use ( $exhausted_map ) {
@@ -633,7 +645,15 @@ final class Activity_Logger {
 				}
 			)
 		);
-		$run_pending = $retry_pending + $partial;
+		$deferred_pending = count(
+			array_filter(
+				$deferred_queue,
+				static function ( $queued_id ) use ( $exhausted_map ) {
+					return ! isset( $exhausted_map[ (int) $queued_id ] );
+				}
+			)
+		);
+		$run_pending = $retry_pending + $deferred_pending + $partial;
 
 		$job['partial_ids']   = $partial_ids;
 		$job['partial']       = $partial;
@@ -642,6 +662,7 @@ final class Activity_Logger {
 		$job['total']         = $total;
 		$job['run_pending']   = $run_pending;
 		$job['retry_pending'] = $retry_pending;
+		$job['deferred_pending'] = $deferred_pending;
 
 		$run_done = min( $total, $succeeded + $exhausted );
 		$job['run_done']  = $run_done;
@@ -994,6 +1015,27 @@ final class Activity_Logger {
 			)
 		);
 		$job['partial'] = count( $job['partial_ids'] );
+		self::remove_post_from_deferred_queue( $job, $post_id );
+	}
+
+	/**
+	 * Remove a post from the deferred (heavy/partial) queue.
+	 *
+	 * @param array<string, mixed> $job     Job state (by reference).
+	 * @param int                  $post_id Post ID.
+	 * @return void
+	 */
+	private static function remove_post_from_deferred_queue( array &$job, $post_id ) {
+		$post_id = absint( $post_id );
+
+		$job['deferred_queue'] = array_values(
+			array_filter(
+				self::get_deferred_queue( $job ),
+				static function ( $queued_id ) use ( $post_id ) {
+					return (int) $queued_id !== $post_id;
+				}
+			)
+		);
 	}
 
 	/**
@@ -1052,6 +1094,7 @@ final class Activity_Logger {
 			'last_post_id'       => 0,
 			'queue'              => array(),
 			'retry_queue'        => array(),
+			'deferred_queue'     => array(),
 			'retry_attempts'     => array(),
 			'remaining'          => $total,
 			'total'              => $total,
@@ -1160,7 +1203,9 @@ final class Activity_Logger {
 					}
 				)
 			);
-			$job['retry_queue']    = $remaining_ids;
+			$job['retry_queue']     = array();
+			$job['deferred_queue']  = $remaining_ids;
+			$job['last_post_id']    = 0;
 			$job['partial_ids']    = array_values(
 				array_intersect(
 					is_array( $job['partial_ids'] ?? null ) ? array_map( 'absint', $job['partial_ids'] ) : array(),
@@ -1169,7 +1214,7 @@ final class Activity_Logger {
 			);
 			self::sync_job_remaining( $job, $lang );
 
-			if ( empty( $job['retry_queue'] ) && (int) $job['remaining'] > 0 ) {
+			if ( empty( $job['deferred_queue'] ) && empty( $job['retry_queue'] ) && (int) $job['remaining'] > 0 ) {
 				$job['status']       = 'paused';
 				$job['pause_reason'] = 'stalled';
 				$job['stalled_ids']  = $remaining_ids;
@@ -1384,9 +1429,9 @@ final class Activity_Logger {
 
 					if ( ! empty( $actionable ) ) {
 						$job['last_post_id'] = 0;
-						$job['retry_queue']  = array_values(
+						$job['deferred_queue'] = array_values(
 							array_unique(
-								array_merge( self::get_retry_queue( $job ), $actionable )
+								array_merge( self::get_deferred_queue( $job ), $actionable )
 							)
 						);
 						$job['total']         = max( (int) ( $job['total'] ?? 0 ), (int) ( $job['succeeded'] ?? 0 ) + $needs_work );
@@ -1424,6 +1469,11 @@ final class Activity_Logger {
 			$post_id    = $pick['post_id'];
 			$from_retry = $pick['from_retry'];
 			$job['partial_post_id'] = $post_id;
+
+			if ( absint( $job['consecutive_post_id'] ?? 0 ) !== $post_id ) {
+				$job['consecutive_post_id']    = 0;
+				$job['consecutive_post_steps'] = 0;
+			}
 		}
 
 		$job['current_post_id'] = $post_id;
@@ -1457,6 +1507,50 @@ final class Activity_Logger {
 		}
 
 		if ( empty( $slice['done'] ) ) {
+			$consecutive_id = absint( $job['consecutive_post_id'] ?? 0 );
+
+			if ( $consecutive_id === $post_id ) {
+				$job['consecutive_post_steps'] = absint( $job['consecutive_post_steps'] ?? 0 ) + 1;
+			} else {
+				$job['consecutive_post_id']    = $post_id;
+				$job['consecutive_post_steps'] = 1;
+			}
+
+			$max_consecutive = (int) apply_filters(
+				'polymart_ai_job_max_consecutive_steps_per_post',
+				'elementor' === (string) ( $slice['phase'] ?? '' ) ? 25 : 15,
+				$job,
+				$post_id
+			);
+
+			if ( absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive ) ) {
+				Post_Translator::release_translation_lock( $post_id, $lang );
+				self::enqueue_job_defer( $job, $post_id );
+				$job['partial_post_id']         = null;
+				$job['partial_phase']           = null;
+				$job['partial_progress']        = null;
+				$job['consecutive_post_id']     = 0;
+				$job['consecutive_post_steps']  = 0;
+				$job['current_post_id']         = null;
+				$job['step_started_at']         = null;
+				self::increment_job_step( $job );
+				self::set_job_last_step(
+					$job,
+					$post_id,
+					'deferred',
+					sprintf(
+						/* translators: 1: post ID, 2: completed step count, 3: phase label */
+						__( 'مورد #%1$d موقتاً کنار گذاشته شد (%2$d مرحله) — پیشرفت Elementor/فیلد ذخیره شد.', 'polymart-ai' ),
+						$post_id,
+						$max_consecutive,
+						(string) ( $slice['phase'] ?? '' )
+					)
+				);
+				self::save_job( $job );
+
+				return self::normalize_job_for_response( $job, false );
+			}
+
 			$job['step_partial']      = true;
 			$job['partial_post_id']   = $post_id;
 			$job['partial_phase']     = (string) ( $slice['phase'] ?? '' );
@@ -1475,6 +1569,8 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
 		$job['partial_post_id']  = null;
 		$job['partial_phase']    = null;
 		$job['partial_progress'] = null;
@@ -1487,7 +1583,9 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Pick the next post to translate: retry queue first, then forward scan.
+	 * Pick the next post to translate: forward scan first, then deferred partials, then hard retries.
+	 *
+	 * Heavy Elementor pages stay in deferred_queue so the rest of the site keeps moving.
 	 *
 	 * @param array<string, mixed> $job    Current job state.
 	 * @param string               $lang   Target language code.
@@ -1496,32 +1594,10 @@ final class Activity_Logger {
 	 */
 	private static function pick_next_job_post_id( array &$job, $lang, $cursor ) {
 		$exhausted_ids = self::get_exhausted_job_post_ids( $job );
-		$retry_queue   = array_values(
-			array_filter(
-				self::get_retry_queue( $job ),
-				static function ( $queued_id ) use ( $exhausted_ids ) {
-					return ! in_array( (int) $queued_id, $exhausted_ids, true );
-				}
-			)
-		);
-
-		// Drain retry/partial posts first so the same item is not re-scanned forever
-		// via find_next while its retry counter never reaches exhaustion.
-		if ( ! empty( $retry_queue ) ) {
-			$post_id            = (int) array_shift( $retry_queue );
-			$job['retry_queue'] = $retry_queue;
-
-			return array(
-				'post_id'    => $post_id,
-				'from_retry' => true,
-			);
-		}
-
-		$exclude_ids = array_values(
+		$exclude_ids   = array_values(
 			array_unique(
 				array_merge(
 					$exhausted_ids,
-					// Never re-pick posts already counted as success in this run.
 					array_map( 'absint', is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() )
 				)
 			)
@@ -1540,12 +1616,50 @@ final class Activity_Logger {
 			);
 		}
 
+		$deferred_queue = array_values(
+			array_filter(
+				self::get_deferred_queue( $job ),
+				static function ( $queued_id ) use ( $exhausted_ids ) {
+					return ! in_array( (int) $queued_id, $exhausted_ids, true );
+				}
+			)
+		);
+
+		if ( ! empty( $deferred_queue ) ) {
+			$post_id               = (int) array_shift( $deferred_queue );
+			$job['deferred_queue'] = $deferred_queue;
+
+			return array(
+				'post_id'    => $post_id,
+				'from_retry' => true,
+			);
+		}
+
+		$retry_queue = array_values(
+			array_filter(
+				self::get_retry_queue( $job ),
+				static function ( $queued_id ) use ( $exhausted_ids ) {
+					return ! in_array( (int) $queued_id, $exhausted_ids, true );
+				}
+			)
+		);
+
+		if ( ! empty( $retry_queue ) ) {
+			$post_id            = (int) array_shift( $retry_queue );
+			$job['retry_queue'] = $retry_queue;
+
+			return array(
+				'post_id'    => $post_id,
+				'from_retry' => true,
+			);
+		}
+
 		$actionable = self::get_actionable_remaining_ids( $lang, $job, 50 );
 
 		if ( ! empty( $actionable ) ) {
-			$post_id             = (int) $actionable[0];
-			$job['retry_queue']  = array_slice( $actionable, 1 );
-			$job['last_post_id'] = 0;
+			$post_id               = (int) $actionable[0];
+			$job['deferred_queue'] = array_slice( $actionable, 1 );
+			$job['last_post_id']   = 0;
 
 			return array(
 				'post_id'    => $post_id,
@@ -1557,6 +1671,48 @@ final class Activity_Logger {
 			'post_id'    => 0,
 			'from_retry' => false,
 		);
+	}
+
+	/**
+	 * Normalize deferred queue from job state.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return int[]
+	 */
+	private static function get_deferred_queue( array $job ) {
+		$queue = $job['deferred_queue'] ?? array();
+
+		if ( ! is_array( $queue ) ) {
+			return array();
+		}
+
+		return array_values(
+			array_filter(
+				array_map( 'absint', $queue ),
+				static function ( $post_id ) {
+					return $post_id > 0;
+				}
+			)
+		);
+	}
+
+	/**
+	 * Queue a heavy or still-incomplete post for later (does not count as a hard failure).
+	 *
+	 * @param array<string, mixed> $job     Job state (by reference).
+	 * @param int                  $post_id Post ID.
+	 * @return void
+	 */
+	private static function enqueue_job_defer( array &$job, $post_id ) {
+		$post_id = absint( $post_id );
+		$queue   = self::get_deferred_queue( $job );
+
+		if ( $post_id <= 0 || in_array( $post_id, $queue, true ) ) {
+			return;
+		}
+
+		$queue[]             = $post_id;
+		$job['deferred_queue'] = $queue;
 	}
 
 	/**
@@ -1592,6 +1748,12 @@ final class Activity_Logger {
 	 */
 	private static function job_has_pending_work( $lang, $cursor, array $retry_queue, array $job = array() ) {
 		$exclude_ids = self::get_exhausted_job_post_ids( $job );
+
+		foreach ( self::get_deferred_queue( $job ) as $queued_id ) {
+			if ( ! in_array( (int) $queued_id, $exclude_ids, true ) ) {
+				return true;
+			}
+		}
 
 		foreach ( $retry_queue as $queued_id ) {
 			if ( ! in_array( (int) $queued_id, $exclude_ids, true ) ) {
@@ -1685,9 +1847,9 @@ final class Activity_Logger {
 		);
 
 		if ( ! empty( $fresh_retry ) ) {
-			$job['retry_queue'] = array_values(
+			$job['deferred_queue'] = array_values(
 				array_unique(
-					array_merge( self::get_retry_queue( $job ), $fresh_retry )
+					array_merge( self::get_deferred_queue( $job ), $fresh_retry )
 				)
 			);
 			self::save_job( $job );
@@ -1988,40 +2150,22 @@ final class Activity_Logger {
 		} else {
 			self::untrack_succeeded_post( $job, $post_id );
 			self::track_partial_post( $job, $post_id );
-			self::enqueue_job_retry( $job, $post_id );
+			self::enqueue_job_defer( $job, $post_id );
 
 			$gaps     = Post_Translator::get_translation_gaps( $post_id, $lang );
 			$attempts = (int) ( $job['retry_attempts'][ $post_id ] ?? 0 );
-			$max      = self::get_max_job_retries_for_post( $post_id, $lang );
 			$missing  = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'نامشخص', 'polymart-ai' );
 
 			self::log(
 				'warning',
 				sprintf(
-					/* translators: 1: post title, 2: attempt number, 3: max attempts, 4: missing fields */
-					__( '«%1$s» ناقص ماند (تلاش %2$d/%3$d) — باقی‌مانده: %4$s', 'polymart-ai' ),
+					/* translators: 1: post title, 2: missing fields */
+					__( '«%1$s» هنوز ناقص است — به صف بعدی منتقل شد. باقی‌مانده: %2$s', 'polymart-ai' ),
 					$title_source,
-					$attempts,
-					$max,
 					$missing
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
-
-			if ( in_array( $post_id, self::get_exhausted_job_post_ids( $job ), true ) ) {
-				$job['last_error'] = sprintf(
-					/* translators: 1: post ID, 2: retry count, 3: missing fields */
-					__( 'مورد #%1$d پس از %2$d تلاش رد شد — بقیه صف ادامه می‌یابد. باقی‌مانده: %3$s', 'polymart-ai' ),
-					$post_id,
-					$attempts,
-					$missing
-				);
-				self::log(
-					'warning',
-					$job['last_error'],
-					array( 'post_id' => $post_id, 'lang' => $lang )
-				);
-			}
 		}
 
 		self::increment_job_step( $job );

@@ -11,6 +11,47 @@ const POLL_INTERVAL_MS = 2000;
 const DEFERRED_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 12000];
 const MAX_IDLE_STEPS = 8;
 
+function jobPhaseLabel(phase) {
+  switch (phase) {
+    case 'elementor':
+      return 'Elementor';
+    case 'variations':
+      return 'تنوع‌های محصول';
+    case 'commerce':
+      return 'ویژگی‌ها و دسته‌ها';
+    case 'core':
+      return 'محتوای اصلی';
+    case 'fields':
+      return 'فیلدهای متنی';
+    default:
+      return phase || '';
+  }
+}
+
+function jobStepHeadline(lastStepStatus, displayPost, job) {
+  if (!displayPost?.title) {
+    return 'در حال آماده‌سازی مورد بعدی';
+  }
+
+  const phase = job?.partial_phase || displayPost?.partial_phase;
+  const progress = job?.partial_progress || displayPost?.partial_progress;
+
+  if (lastStepStatus === 'deferred') {
+    return 'موقتاً کنار گذاشته شد — ادامه بعداً';
+  }
+
+  if (lastStepStatus === 'partial' && phase) {
+    const label = jobPhaseLabel(phase);
+    return progress ? `ادامه ترجمه (${label} — ${progress})` : `ادامه ترجمه (${label})`;
+  }
+
+  if (lastStepStatus === 'partial') {
+    return 'تلاش مجدد برای مورد ناقص';
+  }
+
+  return 'در حال ترجمه';
+}
+
 function jobProgressMarker(job) {
   if (!job || typeof job !== 'object') {
     return '';
@@ -239,7 +280,11 @@ export default function AutoTranslateApp() {
         setJob(current);
 
         if (current.current_post?.title) {
-          setActivePost(current.current_post);
+          setActivePost({
+            ...current.current_post,
+            partial_phase: current.partial_phase ?? current.current_post.partial_phase,
+            partial_progress: current.partial_progress ?? current.current_post.partial_progress,
+          });
         } else if (current.last_step?.title || current.last_step?.post_id) {
           setActivePost({
             post_id: current.last_step.post_id,
@@ -712,12 +757,8 @@ export default function AutoTranslateApp() {
                       : 'border-blue-200 bg-blue-50 text-blue-900'
                   }`}
                 >
-                  <p className={`text-xs ${lastStepStatus === 'partial' ? 'text-amber-700' : 'text-blue-700'}`}>
-                    {displayPost?.title
-                      ? lastStepStatus === 'partial'
-                        ? 'تلاش مجدد برای مورد ناقص'
-                        : 'در حال ترجمه'
-                      : 'در حال آماده‌سازی مورد بعدی'}
+                  <p className={`text-xs ${lastStepStatus === 'partial' ? 'text-amber-700' : lastStepStatus === 'deferred' ? 'text-violet-700' : 'text-blue-700'}`}>
+                    {jobStepHeadline(lastStepStatus, displayPost, job)}
                     {stepWaitSec > 0 ? ` — ${stepWaitSec} ثانیه` : ''}
                   </p>
                   {displayPost?.title ? (
@@ -765,7 +806,7 @@ export default function AutoTranslateApp() {
                   { label: 'موفق (این اجرا)', value: job?.succeeded ?? 0, color: 'text-green-700' },
                   { label: 'ناقص (این اجرا)', value: job?.partial ?? 0, color: 'text-amber-700' },
                   { label: 'ناموفق (این اجرا)', value: job?.failed ?? 0, color: 'text-red-700' },
-                  { label: 'در صف تلاش مجدد', value: runPending, color: 'text-blue-700' },
+                  { label: 'در صف بعدی (سنگین/ناقص)', value: job?.deferred_pending ?? runPending, color: 'text-blue-700' },
                   { label: 'تلاش API', value: steps, color: 'text-gray-700' },
                   { label: 'کل محتوای قابل ترجمه', value: liveStats.total ?? '—' },
                 ].map((item) => (
