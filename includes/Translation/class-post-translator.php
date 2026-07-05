@@ -2659,12 +2659,16 @@ final class Post_Translator {
 	}
 
 	/**
-	 * Collect Persian source content for AI translation.
+	 * Collect core post fields (title, content, excerpt, meta) for AI translation.
+	 *
+	 * Excludes taxonomy terms, product attributes, and variation titles so large
+	 * variable products can be translated in separate job slices.
 	 *
 	 * @param \WP_Post $post Post object.
+	 * @param string   $lang Target language code.
 	 * @return array<string, string>
 	 */
-	public static function collect_persian_fields( \WP_Post $post, $lang = '' ) {
+	private static function collect_core_persian_fields( \WP_Post $post, $lang = '' ) {
 		$fields = array();
 		$lang   = sanitize_key( (string) $lang );
 
@@ -2717,6 +2721,20 @@ final class Post_Translator {
 			$fields[ $meta_key ] = $value;
 		}
 
+		return $fields;
+	}
+
+	/**
+	 * Collect taxonomy terms and WooCommerce attribute labels/options.
+	 *
+	 * @param \WP_Post $post Post object.
+	 * @param string   $lang Target language code.
+	 * @return array<string, string>
+	 */
+	private static function collect_commerce_persian_fields( \WP_Post $post, $lang = '' ) {
+		$fields = array();
+		$lang   = sanitize_key( (string) $lang );
+
 		foreach ( self::collect_translatable_terms( $post->ID ) as $term ) {
 			$name = Persian_Detector::only_persian_value( $term->name );
 
@@ -2735,9 +2753,55 @@ final class Post_Translator {
 			$fields[ $key ] = $value;
 		}
 
-		foreach ( self::collect_variation_title_fields( $post, $lang ) as $key => $value ) {
-			$fields[ $key ] = $value;
+		return $fields;
+	}
+
+	/**
+	 * Collect Persian source fields for one auto-translate job slice phase.
+	 *
+	 * @param \WP_Post $post  Post object.
+	 * @param string   $lang  Target language code.
+	 * @param string   $phase core|commerce|variations
+	 * @return array<string, string>
+	 */
+	public static function collect_persian_fields_for_job_phase( \WP_Post $post, $lang, $phase ) {
+		$phase = sanitize_key( (string) $phase );
+
+		switch ( $phase ) {
+			case 'commerce':
+				$fields = self::collect_commerce_persian_fields( $post, $lang );
+				break;
+			case 'variations':
+				$fields = self::collect_variation_title_fields( $post, $lang );
+				break;
+			case 'core':
+			default:
+				$fields = self::collect_core_persian_fields( $post, $lang );
+				break;
 		}
+
+		/**
+		 * Filter Persian source fields before AI translation.
+		 *
+		 * @param array<string, string> $fields Source field values.
+		 * @param \WP_Post              $post   Post object.
+		 * @param string                $phase  Job slice phase (core|commerce|variations).
+		 */
+		return apply_filters( 'polymart_ai_translatable_fields', $fields, $post, $phase );
+	}
+
+	/**
+	 * Collect Persian source content for AI translation.
+	 *
+	 * @param \WP_Post $post Post object.
+	 * @return array<string, string>
+	 */
+	public static function collect_persian_fields( \WP_Post $post, $lang = '' ) {
+		$fields = array_merge(
+			self::collect_core_persian_fields( $post, $lang ),
+			self::collect_commerce_persian_fields( $post, $lang ),
+			self::collect_variation_title_fields( $post, $lang )
+		);
 
 		/**
 		 * Filter Persian source fields before AI translation.
@@ -2911,6 +2975,180 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Ordered field phases for auto-translate job slices.
+	 *
+	 * @return string[]
+	 */
+	private static function get_job_field_phases() {
+		return array( 'core', 'commerce', 'variations' );
+	}
+
+	/**
+	 * @param string $phase Current field phase.
+	 * @return string|null Next phase or null when complete.
+	 */
+	private static function get_next_job_field_phase( $phase ) {
+		$phases = self::get_job_field_phases();
+		$index  = array_search( sanitize_key( (string) $phase ), $phases, true );
+
+		if ( false === $index || $index >= count( $phases ) - 1 ) {
+			return null;
+		}
+
+		return $phases[ $index + 1 ];
+	}
+
+	/**
+	 * Human-readable label for a job field phase progress message.
+	 *
+	 * @param string $phase Phase key.
+	 * @return string
+	 */
+	private static function get_job_field_phase_label( $phase ) {
+		switch ( sanitize_key( (string) $phase ) ) {
+			case 'commerce':
+				return __( 'ویژگی‌ها و دسته‌ها', 'polymart-ai' );
+			case 'variations':
+				return __( 'تنوع‌های محصول', 'polymart-ai' );
+			case 'core':
+			default:
+				return __( 'محتوای اصلی', 'polymart-ai' );
+		}
+	}
+
+	/**
+	 * Translate and persist the next batch(es) for one job field phase.
+	 *
+	 * Each batch is saved immediately so variable products keep progress even
+	 * when the site-wide job pauses mid-product.
+	 *
+	 * @param int                  $post_id      Post ID.
+	 * @param \WP_Post             $post         Post object.
+	 * @param string               $lang         Language code.
+	 * @param array<string, mixed> $state        Partial state (by reference).
+	 * @param string               $phase        core|commerce|variations
+	 * @param string               $api_key      API key.
+	 * @param string               $api_endpoint API endpoint.
+	 * @param string               $ai_model     Model name.
+	 * @return array{partial: bool, phase_complete: bool, phase_progress: string, message: string}|\WP_Error
+	 */
+	private static function run_job_field_phase_batch( $post_id, \WP_Post $post, $lang, array &$state, $phase, $api_key, $api_endpoint, $ai_model ) {
+		$payload = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
+		$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_ai( $payload );
+		$total   = count( $chunks );
+		$label   = self::get_job_field_phase_label( $phase );
+
+		if ( 0 === $total ) {
+			return array(
+				'partial'        => false,
+				'phase_complete' => true,
+				'phase_progress' => '0/0',
+				'message'        => '',
+			);
+		}
+
+		$index  = max( 0, (int) ( $state['field_chunk_index'] ?? 0 ) );
+		$budget = self::get_job_step_max_field_chunks();
+
+		while ( $index < $total && $budget > 0 ) {
+			$chunk_result = AI_Client::translate_fields(
+				$chunks[ $index ],
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang
+			);
+
+			if ( is_wp_error( $chunk_result ) ) {
+				return $chunk_result;
+			}
+
+			$batch = self::collapse_payload_parts( $chunk_result );
+
+			if ( ! empty( $batch ) ) {
+				$save_result = self::save_ai_translations(
+					$post_id,
+					$batch,
+					$lang,
+					array( 'skip_elementor' => true )
+				);
+
+				if ( is_wp_error( $save_result ) ) {
+					return $save_result;
+				}
+			}
+
+			++$index;
+			--$budget;
+		}
+
+		$state['field_chunk_index'] = $index;
+
+		if ( $index < $total ) {
+			return array(
+				'partial'        => true,
+				'phase_complete' => false,
+				'phase_progress' => $index . '/' . $total,
+				'message'        => sprintf(
+					/* translators: 1: phase label, 2: completed batches, 3: total batches */
+					__( '%1$s — بخش %2$d از %3$d', 'polymart-ai' ),
+					$label,
+					$index,
+					$total
+				),
+			);
+		}
+
+		return array(
+			'partial'        => false,
+			'phase_complete' => true,
+			'phase_progress' => $total . '/' . $total,
+			'message'        => sprintf(
+				/* translators: %s: phase label */
+				__( '%s — تکمیل شد', 'polymart-ai' ),
+				$label
+			),
+		);
+	}
+
+	/**
+	 * Transition job partial state from field phases to Elementor or clear it.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Partial state (by reference).
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|null Null to continue elementor in caller.
+	 */
+	private static function finalize_job_field_phases( $post_id, $lang, array &$state ) {
+		unset( $state['field_translations'] );
+
+		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+			$state['phase']                  = 'elementor';
+			$state['elementor_map']          = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+			$state['elementor_chunk_index']  = 0;
+			$state['elementor_chunks_total'] = 0;
+			self::save_job_partial_state( $post_id, $lang, $state );
+
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => '0/…',
+				'message'        => __( 'فیلدها ذخیره شد — ترجمه Elementor در مراحل بعدی', 'polymart-ai' ),
+			);
+		}
+
+		self::clear_job_partial_state( $post_id, $lang );
+		self::release_translation_lock( $post_id, $lang );
+
+		return array(
+			'done'           => true,
+			'phase'          => 'complete',
+			'phase_progress' => '',
+			'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
+		);
+	}
+
+	/**
 	 * Refresh the per-post translation lock TTL while a multi-step job slice runs.
 	 *
 	 * @param int    $post_id Post ID.
@@ -3017,11 +3255,10 @@ final class Post_Translator {
 
 		if ( empty( $state ) || empty( $state['phase'] ) ) {
 			$state = array(
-				'phase'               => 'fields',
-				'field_translations'  => array(),
-				'field_chunk_index'   => 0,
-				'elementor_map'       => array(),
-				'elementor_chunk_index' => 0,
+				'phase'                  => 'core',
+				'field_chunk_index'      => 0,
+				'elementor_map'          => array(),
+				'elementor_chunk_index'  => 0,
 				'elementor_chunks_total' => 0,
 			);
 		}
@@ -3040,7 +3277,6 @@ final class Post_Translator {
 				$total   = count( $chunks );
 				$index   = max( 0, (int) ( $state['field_chunk_index'] ?? 0 ) );
 				$budget  = self::get_job_step_max_field_chunks();
-				$done    = 0;
 
 				while ( $index < $total && $budget > 0 ) {
 					$chunk_result = AI_Client::translate_fields(
@@ -3055,13 +3291,23 @@ final class Post_Translator {
 						return $chunk_result;
 					}
 
-					$state['field_translations'] = array_merge(
-						(array) ( $state['field_translations'] ?? array() ),
-						self::collapse_payload_parts( $chunk_result )
-					);
+					$batch = self::collapse_payload_parts( $chunk_result );
+
+					if ( ! empty( $batch ) ) {
+						$save_result = self::save_ai_translations(
+							$post_id,
+							$batch,
+							$lang,
+							array( 'skip_elementor' => true )
+						);
+
+						if ( is_wp_error( $save_result ) ) {
+							return $save_result;
+						}
+					}
+
 					++$index;
 					--$budget;
-					++$done;
 				}
 
 				$state['field_chunk_index'] = $index;
@@ -3070,10 +3316,10 @@ final class Post_Translator {
 					self::save_job_partial_state( $post_id, $lang, $state );
 
 					return array(
-						'done'            => false,
-						'phase'           => 'fields',
-						'phase_progress'  => $index . '/' . $total,
-						'message'         => sprintf(
+						'done'           => false,
+						'phase'          => 'fields',
+						'phase_progress' => $index . '/' . $total,
+						'message'        => sprintf(
 							/* translators: 1: completed batches, 2: total batches */
 							__( 'فیلدهای متنی — بخش %1$d از %2$d', 'polymart-ai' ),
 							$index,
@@ -3082,43 +3328,50 @@ final class Post_Translator {
 					);
 				}
 
-				if ( ! empty( $state['field_translations'] ) ) {
-					$save_result = self::save_ai_translations(
+				return self::finalize_job_field_phases( $post_id, $lang, $state );
+			}
+
+			if ( in_array( (string) $state['phase'], self::get_job_field_phases(), true ) ) {
+				while ( true ) {
+					$phase = (string) $state['phase'];
+
+					$batch_result = self::run_job_field_phase_batch(
 						$post_id,
-						(array) $state['field_translations'],
+						$post,
 						$lang,
-						array( 'skip_elementor' => true )
+						$state,
+						$phase,
+						$api_key,
+						$api_endpoint,
+						$ai_model
 					);
 
-					if ( is_wp_error( $save_result ) ) {
-						return $save_result;
+					if ( is_wp_error( $batch_result ) ) {
+						return $batch_result;
 					}
+
+					if ( ! empty( $batch_result['partial'] ) ) {
+						self::save_job_partial_state( $post_id, $lang, $state );
+
+						return array(
+							'done'           => false,
+							'phase'          => $phase,
+							'phase_progress' => (string) ( $batch_result['phase_progress'] ?? '' ),
+							'message'        => (string) ( $batch_result['message'] ?? '' ),
+						);
+					}
+
+					$next_phase = self::get_next_job_field_phase( $phase );
+
+					if ( null === $next_phase ) {
+						break;
+					}
+
+					$state['phase']             = $next_phase;
+					$state['field_chunk_index'] = 0;
 				}
 
-				if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
-					$state['phase']                  = 'elementor';
-					$state['elementor_map']          = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
-					$state['elementor_chunk_index']  = 0;
-					$state['elementor_chunks_total'] = 0;
-					self::save_job_partial_state( $post_id, $lang, $state );
-
-					return array(
-						'done'           => false,
-						'phase'          => 'elementor',
-						'phase_progress' => '0/…',
-						'message'        => __( 'فیلدها ذخیره شد — ترجمه Elementor در مراحل بعدی', 'polymart-ai' ),
-					);
-				}
-
-				self::clear_job_partial_state( $post_id, $lang );
-				self::release_translation_lock( $post_id, $lang );
-
-				return array(
-					'done'           => true,
-					'phase'          => 'complete',
-					'phase_progress' => '',
-					'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
-				);
+				return self::finalize_job_field_phases( $post_id, $lang, $state );
 			}
 
 			if ( 'elementor' === (string) $state['phase'] ) {

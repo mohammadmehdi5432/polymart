@@ -767,11 +767,19 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function job_exceeded_step_budget( array $job ) {
-		$total = max( 1, (int) ( $job['total'] ?? 0 ) );
-		$steps = max( (int) ( $job['steps'] ?? 0 ), (int) ( $job['processed'] ?? 0 ) );
-		$budget = ( $total * ( self::MAX_JOB_RETRIES + 1 ) ) + 5;
+		if ( absint( $job['partial_post_id'] ?? 0 ) > 0 ) {
+			return false;
+		}
 
-		return $steps >= $budget;
+		$total  = max( 1, (int) ( $job['total'] ?? 0 ) );
+		$steps  = max( (int) ( $job['steps'] ?? 0 ), (int) ( $job['processed'] ?? 0 ) );
+		$budget = (int) apply_filters(
+			'polymart_ai_job_step_budget',
+			( $total * 8 ) + 100,
+			$job
+		);
+
+		return $steps >= max( 1, $budget );
 	}
 
 	/**
@@ -1709,10 +1717,20 @@ final class Activity_Logger {
 			$template = __( 'ترجمه متوقف شد — %1$d مورد ناقص: %2$s. «توقف کامل» و «شروع» مجدد بزنید یا فیلدها را دستی تکمیل کنید.', 'polymart-ai' );
 		}
 
+		$summary = implode( ' | ', $details );
+
+		if ( count( $remaining_ids ) > count( $details ) ) {
+			$summary .= sprintf(
+				/* translators: %d: additional incomplete post count */
+				__( ' … +%d مورد دیگر', 'polymart-ai' ),
+				count( $remaining_ids ) - count( $details )
+			);
+		}
+
 		return sprintf(
 			$template,
 			count( $remaining_ids ),
-			implode( ' | ', $details )
+			$summary
 		);
 	}
 
@@ -1733,6 +1751,20 @@ final class Activity_Logger {
 		$job['retry_attempts']      = $retry_attempts;
 
 		if ( $attempts >= self::MAX_JOB_RETRIES ) {
+			$lang    = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+			$partial = Post_Translator::get_job_partial_state( $post_id, $lang );
+			$phase   = sanitize_key( (string) ( $partial['phase'] ?? '' ) );
+
+			if ( '' !== $phase && in_array( $phase, array( 'core', 'commerce', 'variations', 'elementor', 'fields' ), true ) ) {
+				if ( ! in_array( $post_id, $retry_queue, true ) ) {
+					$retry_queue[] = $post_id;
+				}
+
+				$job['retry_queue'] = $retry_queue;
+
+				return;
+			}
+
 			$exhausted = is_array( $job['exhausted_ids'] ?? null ) ? $job['exhausted_ids'] : array();
 
 			if ( ! in_array( $post_id, $exhausted, true ) ) {
