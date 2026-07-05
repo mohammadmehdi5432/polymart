@@ -312,6 +312,26 @@ final class Post_Translator {
 	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 2500;
 
 	/**
+	 * Variation title batches — variable products may have 100+ rows.
+	 */
+	const VARIATION_AI_FIELD_CHUNK_SIZE = 3;
+
+	/**
+	 * Maximum combined characters per variation AI batch.
+	 */
+	const VARIATION_AI_MAX_CHUNK_CHARS = 1800;
+
+	/**
+	 * Commerce attribute/term batches.
+	 */
+	const COMMERCE_AI_FIELD_CHUNK_SIZE = 4;
+
+	/**
+	 * Maximum combined characters per commerce AI batch.
+	 */
+	const COMMERCE_AI_MAX_CHUNK_CHARS = 2800;
+
+	/**
 	 * Maximum characters per discovered meta value sent to AI.
 	 */
 	const MAX_META_VALUE_LENGTH = 12000;
@@ -2819,16 +2839,69 @@ final class Post_Translator {
 	 * @return array<int, array<string, string>>
 	 */
 	public static function chunk_payload_for_ai( array $payload ) {
-		$payload = self::expand_payload_for_ai( $payload );
-		$chunks  = array();
-		$current = array();
+		return self::chunk_payload_with_limits(
+			$payload,
+			self::AI_FIELD_CHUNK_SIZE,
+			self::AI_MAX_CHUNK_CHARS
+		);
+	}
+
+	/**
+	 * Split a translation payload using phase-aware batch sizes.
+	 *
+	 * @param array<string, string> $payload Field map.
+	 * @param string                $phase   core|commerce|variations.
+	 * @return array<int, array<string, string>>
+	 */
+	private static function chunk_payload_for_job_phase( array $payload, $phase ) {
+		$phase = sanitize_key( (string) $phase );
+
+		switch ( $phase ) {
+			case 'variations':
+				return self::chunk_payload_with_limits(
+					$payload,
+					self::VARIATION_AI_FIELD_CHUNK_SIZE,
+					self::VARIATION_AI_MAX_CHUNK_CHARS
+				);
+			case 'commerce':
+				return self::chunk_payload_with_limits(
+					$payload,
+					self::COMMERCE_AI_FIELD_CHUNK_SIZE,
+					self::COMMERCE_AI_MAX_CHUNK_CHARS
+				);
+			case 'core':
+			default:
+				return self::chunk_payload_for_ai( $payload );
+		}
+	}
+
+	/**
+	 * Split a translation payload into API-friendly batches with explicit limits.
+	 *
+	 * @param array<string, string> $payload    Field map.
+	 * @param int                   $max_fields Max fields per batch.
+	 * @param int                   $max_chars  Max combined characters per batch.
+	 * @return array<int, array<string, string>>
+	 */
+	private static function chunk_payload_with_limits( array $payload, $max_fields, $max_chars ) {
+		$payload       = self::expand_payload_for_ai( $payload );
+		$chunks        = array();
+		$current       = array();
 		$current_chars = 0;
+		$max_fields    = max( 1, absint( $max_fields ) );
+		$max_chars     = max( 500, absint( $max_chars ) );
 
 		foreach ( $payload as $key => $value ) {
 			$value = (string) $value;
 			$size  = strlen( (string) $key ) + strlen( $value );
 
-			if ( ! empty( $current ) && ( $current_chars + $size > self::AI_MAX_CHUNK_CHARS || count( $current ) >= self::AI_FIELD_CHUNK_SIZE ) ) {
+			if (
+				! empty( $current )
+				&& (
+					$current_chars + $size > $max_chars
+					|| count( $current ) >= $max_fields
+				)
+			) {
 				$chunks[]      = $current;
 				$current       = array();
 				$current_chars = 0;
@@ -2923,6 +2996,42 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Per-phase batch budget for one auto-translate HTTP step.
+	 *
+	 * Heavy phases (variations, Elementor) stay at 1 batch per request on production.
+	 *
+	 * @param string $phase   core|commerce|variations|elementor.
+	 * @param int    $post_id Post ID.
+	 * @return int
+	 */
+	public static function get_job_step_max_field_chunks_for_phase( $phase, $post_id = 0 ) {
+		$phase   = sanitize_key( (string) $phase );
+		$post_id = absint( $post_id );
+		$chunks  = self::get_job_step_max_field_chunks();
+
+		if ( in_array( $phase, array( 'variations', 'elementor', 'commerce' ), true ) ) {
+			$chunks = 1;
+		}
+
+		if ( 'variations' === $phase && $post_id > 0 && function_exists( 'wc_get_product' ) ) {
+			$product = wc_get_product( $post_id );
+
+			if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) && count( $product->get_children() ) > 30 ) {
+				$chunks = 1;
+			}
+		}
+
+		/**
+		 * Filter per-phase chunk budget for auto-translate job steps.
+		 *
+		 * @param int    $chunks  Batch count for this step.
+		 * @param string $phase   Phase key.
+		 * @param int    $post_id Post ID.
+		 */
+		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_field_chunks_for_phase', $chunks, $phase, $post_id ) );
+	}
+
+	/**
 	 * Max Elementor batches processed per auto-translate HTTP step.
 	 *
 	 * @return int
@@ -2934,6 +3043,106 @@ final class Post_Translator {
 		 * @param int $chunks Default 1 (keeps heavy pages under typical proxy timeouts).
 		 */
 		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_elementor_chunks', 1 ) );
+	}
+
+	/**
+	 * How many consecutive HTTP steps one post may take before rotation/defer.
+	 *
+	 * Variable products and Elementor pages need many slices — limits scale with workload.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $phase   Job slice phase.
+	 * @return array{max_consecutive: int, max_per_run: int}
+	 */
+	public static function get_job_step_limits_for_post( $post_id, $phase ) {
+		$post_id          = absint( $post_id );
+		$phase            = sanitize_key( (string) $phase );
+		$max_consecutive  = 8;
+		$max_per_run      = 24;
+
+		if ( 'elementor' === $phase ) {
+			$max_consecutive = 40;
+			$max_per_run     = 80;
+		} elseif ( 'commerce' === $phase ) {
+			$max_consecutive = 20;
+			$max_per_run     = 50;
+		} elseif ( 'variations' === $phase && $post_id > 0 && function_exists( 'wc_get_product' ) ) {
+			$product = wc_get_product( $post_id );
+
+			if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) ) {
+				$variation_count = count( $product->get_children() );
+				$estimated_steps = max( 8, (int) ceil( ( $variation_count * 2 ) / max( 1, self::VARIATION_AI_FIELD_CHUNK_SIZE ) ) );
+				$max_consecutive = min( 150, max( 30, $estimated_steps + 5 ) );
+				$max_per_run     = min( 250, $max_consecutive + 15 );
+			}
+		}
+
+		/**
+		 * Filter consecutive step limits for one post during an auto-translate job.
+		 *
+		 * @param array{max_consecutive: int, max_per_run: int} $limits  Computed limits.
+		 * @param int                                           $post_id Post ID.
+		 * @param string                                        $phase   Phase key.
+		 */
+		$limits = apply_filters(
+			'polymart_ai_job_step_limits',
+			array(
+				'max_consecutive' => $max_consecutive,
+				'max_per_run'     => $max_per_run,
+			),
+			$post_id,
+			$phase
+		);
+
+		return array(
+			'max_consecutive' => max( 1, (int) ( $limits['max_consecutive'] ?? $max_consecutive ) ),
+			'max_per_run'     => max( 1, (int) ( $limits['max_per_run'] ?? $max_per_run ) ),
+		);
+	}
+
+	/**
+	 * Build durable partial state starting at the first phase that still needs work.
+	 *
+	 * @param int           $post_id Post ID.
+	 * @param string        $lang    Target language code.
+	 * @param \WP_Post|null $post    Optional post object.
+	 * @return array<string, mixed>
+	 */
+	public static function build_initial_job_partial_state( $post_id, $lang, $post = null ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$base    = array(
+			'field_chunk_index'      => 0,
+			'elementor_map'          => array(),
+			'elementor_chunk_index'  => 0,
+			'elementor_chunks_total' => 0,
+		);
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return array_merge( $base, array( 'phase' => 'core' ) );
+		}
+
+		if ( ! $post instanceof \WP_Post ) {
+			$post = get_post( $post_id );
+		}
+
+		if ( ! $post instanceof \WP_Post ) {
+			return array_merge( $base, array( 'phase' => 'core' ) );
+		}
+
+		foreach ( self::get_job_field_phases() as $phase ) {
+			$fields = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
+
+			if ( ! empty( $fields ) ) {
+				return array_merge( $base, array( 'phase' => $phase ) );
+			}
+		}
+
+		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+			return array_merge( $base, array( 'phase' => 'elementor' ) );
+		}
+
+		return array_merge( $base, array( 'phase' => 'complete' ) );
 	}
 
 	/**
@@ -3034,9 +3243,10 @@ final class Post_Translator {
 	 */
 	private static function run_job_field_phase_batch( $post_id, \WP_Post $post, $lang, array &$state, $phase, $api_key, $api_endpoint, $ai_model ) {
 		$payload = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
-		$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_ai( $payload );
+		$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_job_phase( $payload, $phase );
 		$total   = count( $chunks );
 		$label   = self::get_job_field_phase_label( $phase );
+		$pending = count( $payload );
 
 		if ( 0 === $total ) {
 			return array(
@@ -3047,12 +3257,24 @@ final class Post_Translator {
 			);
 		}
 
+		// Remaining work is re-collected each HTTP step — always start from the first batch.
+		if ( in_array( $phase, array( 'variations', 'commerce' ), true ) ) {
+			$state['field_chunk_index'] = 0;
+		}
+
 		$index  = max( 0, (int) ( $state['field_chunk_index'] ?? 0 ) );
-		$budget = self::get_job_step_max_field_chunks();
+
+		if ( $index >= $total ) {
+			$index                      = 0;
+			$state['field_chunk_index'] = 0;
+		}
+
+		$budget = self::get_job_step_max_field_chunks_for_phase( $phase, $post->ID );
 
 		while ( $index < $total && $budget > 0 ) {
+			$chunk        = $chunks[ $index ];
 			$chunk_result = AI_Client::translate_fields(
-				$chunks[ $index ],
+				$chunk,
 				$api_key,
 				$api_endpoint,
 				$ai_model,
@@ -3060,7 +3282,20 @@ final class Post_Translator {
 			);
 
 			if ( is_wp_error( $chunk_result ) ) {
-				return $chunk_result;
+				$recovered = self::translate_job_chunk_with_single_field_fallback(
+					$chunk,
+					$api_key,
+					$api_endpoint,
+					$ai_model,
+					$lang,
+					'variations' === $phase ? 4 : 2
+				);
+
+				if ( is_wp_error( $recovered ) ) {
+					return $recovered;
+				}
+
+				$chunk_result = $recovered;
 			}
 
 			$batch = self::collapse_payload_parts( $chunk_result );
@@ -3076,6 +3311,8 @@ final class Post_Translator {
 				if ( is_wp_error( $save_result ) ) {
 					return $save_result;
 				}
+
+				self::sync_translation_index_meta( $post_id, $lang );
 			}
 
 			++$index;
@@ -3090,11 +3327,12 @@ final class Post_Translator {
 				'phase_complete' => false,
 				'phase_progress' => $index . '/' . $total,
 				'message'        => sprintf(
-					/* translators: 1: phase label, 2: completed batches, 3: total batches */
-					__( '%1$s — بخش %2$d از %3$d', 'polymart-ai' ),
+					/* translators: 1: phase label, 2: completed batches, 3: total batches, 4: pending field count */
+					__( '%1$s — بخش %2$d از %3$d (%4$d فیلد باقی‌مانده)', 'polymart-ai' ),
 					$label,
 					$index,
-					$total
+					$total,
+					$pending
 				),
 			);
 		}
@@ -3108,6 +3346,59 @@ final class Post_Translator {
 				__( '%s — تکمیل شد', 'polymart-ai' ),
 				$label
 			),
+		);
+	}
+
+	/**
+	 * Retry failed AI batches one field at a time (bounded).
+	 *
+	 * @param array<string, string> $chunk         Source fields.
+	 * @param string                $api_key       API key.
+	 * @param string                $api_endpoint  API endpoint.
+	 * @param string                $ai_model      Model name.
+	 * @param string                $lang          Target language.
+	 * @param int                   $max_fallbacks Max single-field attempts.
+	 * @return array<string, string>|\WP_Error
+	 */
+	private static function translate_job_chunk_with_single_field_fallback( array $chunk, $api_key, $api_endpoint, $ai_model, $lang, $max_fallbacks = 2 ) {
+		$merged     = array();
+		$last_error = null;
+		$attempts   = 0;
+
+		foreach ( $chunk as $key => $text ) {
+			if ( $attempts >= max( 1, absint( $max_fallbacks ) ) ) {
+				break;
+			}
+
+			++$attempts;
+
+			$single = AI_Client::translate_fields(
+				array( (string) $key => (string) $text ),
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang
+			);
+
+			if ( is_wp_error( $single ) ) {
+				$last_error = $single;
+				continue;
+			}
+
+			$merged = array_merge( $merged, $single );
+		}
+
+		if ( ! empty( $merged ) ) {
+			return $merged;
+		}
+
+		if ( $last_error instanceof \WP_Error ) {
+			return $last_error;
+		}
+
+		return new \WP_Error(
+			'polymart_ai_chunk_empty',
+			__( 'هیچ فیلدی از این بخش ترجمه نشد.', 'polymart-ai' )
 		);
 	}
 
@@ -3254,12 +3545,18 @@ final class Post_Translator {
 		$state = self::get_job_partial_state( $post_id, $lang );
 
 		if ( empty( $state ) || empty( $state['phase'] ) ) {
-			$state = array(
-				'phase'                  => 'core',
-				'field_chunk_index'      => 0,
-				'elementor_map'          => array(),
-				'elementor_chunk_index'  => 0,
-				'elementor_chunks_total' => 0,
+			$state = self::build_initial_job_partial_state( $post_id, $lang, $post );
+		}
+
+		if ( 'complete' === (string) ( $state['phase'] ?? '' ) ) {
+			self::clear_job_partial_state( $post_id, $lang );
+			self::release_translation_lock( $post_id, $lang );
+
+			return array(
+				'done'           => true,
+				'phase'          => 'complete',
+				'phase_progress' => '',
+				'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
 			);
 		}
 
@@ -3275,8 +3572,8 @@ final class Post_Translator {
 				$payload = self::collect_persian_fields( $post, $lang );
 				$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_ai( $payload );
 				$total   = count( $chunks );
-				$index   = max( 0, (int) ( $state['field_chunk_index'] ?? 0 ) );
-				$budget  = self::get_job_step_max_field_chunks();
+				$index   = 0;
+				$budget  = 1;
 
 				while ( $index < $total && $budget > 0 ) {
 					$chunk_result = AI_Client::translate_fields(
@@ -3332,43 +3629,61 @@ final class Post_Translator {
 			}
 
 			if ( in_array( (string) $state['phase'], self::get_job_field_phases(), true ) ) {
-				while ( true ) {
-					$phase = (string) $state['phase'];
+				$phase = (string) $state['phase'];
 
-					$batch_result = self::run_job_field_phase_batch(
-						$post_id,
-						$post,
-						$lang,
-						$state,
-						$phase,
-						$api_key,
-						$api_endpoint,
-						$ai_model
+				$batch_result = self::run_job_field_phase_batch(
+					$post_id,
+					$post,
+					$lang,
+					$state,
+					$phase,
+					$api_key,
+					$api_endpoint,
+					$ai_model
+				);
+
+				if ( is_wp_error( $batch_result ) ) {
+					return $batch_result;
+				}
+
+				if ( ! empty( $batch_result['partial'] ) ) {
+					self::save_job_partial_state( $post_id, $lang, $state );
+
+					return array(
+						'done'           => false,
+						'phase'          => $phase,
+						'phase_progress' => (string) ( $batch_result['phase_progress'] ?? '' ),
+						'message'        => (string) ( $batch_result['message'] ?? '' ),
 					);
+				}
 
-					if ( is_wp_error( $batch_result ) ) {
-						return $batch_result;
-					}
+				$next_phase = self::get_next_job_field_phase( $phase );
 
-					if ( ! empty( $batch_result['partial'] ) ) {
+				if ( null === $next_phase ) {
+					return self::finalize_job_field_phases( $post_id, $lang, $state );
+				}
+
+				while ( null !== $next_phase ) {
+					$next_fields = self::collect_persian_fields_for_job_phase( $post, $lang, $next_phase );
+
+					if ( ! empty( $next_fields ) ) {
+						$state['phase']             = $next_phase;
+						$state['field_chunk_index'] = 0;
 						self::save_job_partial_state( $post_id, $lang, $state );
 
 						return array(
 							'done'           => false,
-							'phase'          => $phase,
-							'phase_progress' => (string) ( $batch_result['phase_progress'] ?? '' ),
-							'message'        => (string) ( $batch_result['message'] ?? '' ),
+							'phase'          => $next_phase,
+							'phase_progress' => '0/…',
+							'message'        => sprintf(
+								/* translators: %s: next phase label */
+								__( 'ادامه در %s…', 'polymart-ai' ),
+								self::get_job_field_phase_label( $next_phase )
+							),
 						);
 					}
 
-					$next_phase = self::get_next_job_field_phase( $phase );
-
-					if ( null === $next_phase ) {
-						break;
-					}
-
-					$state['phase']             = $next_phase;
-					$state['field_chunk_index'] = 0;
+					$next_phase = self::get_next_job_field_phase( $next_phase );
 				}
 
 				return self::finalize_job_field_phases( $post_id, $lang, $state );
@@ -3482,7 +3797,20 @@ final class Post_Translator {
 			);
 
 			if ( is_wp_error( $chunk_result ) ) {
-				return $chunk_result;
+				$recovered = self::translate_job_chunk_with_single_field_fallback(
+					$aliased_payload,
+					$api_key,
+					$api_endpoint,
+					$ai_model,
+					$lang,
+					3
+				);
+
+				if ( is_wp_error( $recovered ) ) {
+					return $recovered;
+				}
+
+				$chunk_result = $recovered;
 			}
 
 			$map = array_merge(

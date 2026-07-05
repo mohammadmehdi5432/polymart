@@ -588,7 +588,13 @@ final class Activity_Logger {
 			$reconciled_at = (int) ( $job['succeeded_reconciled_steps'] ?? -1 );
 
 			if ( $reconciled_at !== $steps ) {
-				self::reconcile_succeeded_posts( $job, $lang );
+				$succeeded_count = count( is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() );
+
+				// Full per-post audit on every succeeded ID is too slow on large catalogs.
+				if ( $succeeded_count <= 50 || 0 === $steps % 10 ) {
+					self::reconcile_succeeded_posts( $job, $lang );
+				}
+
 				$job['succeeded_reconciled_steps'] = $steps;
 			}
 
@@ -730,20 +736,21 @@ final class Activity_Logger {
 	 * @param string               $lang Target language code.
 	 * @return void
 	 */
-	private static function sync_job_remaining( array &$job, $lang ) {
-		self::sync_job_live_stats( $job, $lang, true );
+	private static function sync_job_remaining( array &$job, $lang, $force = false ) {
+		self::sync_job_live_stats( $job, $lang, $force );
 		$job['remaining_synced_at'] = time();
 	}
 
 	/**
 	 * Refresh site-wide translation stats stored on the job for the admin UI.
 	 *
-	 * @param array<string, mixed> $job   Job state (by reference).
-	 * @param string               $lang  Target language code.
-	 * @param bool                 $force Skip throttling and recompute immediately.
+	 * @param array<string, mixed> $job       Job state (by reference).
+	 * @param string               $lang      Target language code.
+	 * @param bool                 $force     Skip throttling and recompute immediately.
+	 * @param bool                 $force_full Run a full per-post audit (refresh_stats only).
 	 * @return void
 	 */
-	private static function sync_job_live_stats( array &$job, $lang, $force = false ) {
+	private static function sync_job_live_stats( array &$job, $lang, $force = false, $force_full = false ) {
 		$lang = sanitize_key( (string) $lang );
 
 		if ( '' === $lang ) {
@@ -754,14 +761,16 @@ final class Activity_Logger {
 		$synced_at    = (int) ( $job['live_stats_at'] ?? 0 );
 		$synced_steps = (int) ( $job['live_stats_steps'] ?? -1 );
 
-		if ( ! $force && $synced_steps === $steps && ( time() - $synced_at ) < 2 ) {
+		if ( ! $force && $synced_steps === $steps && ( time() - $synced_at ) < 15 ) {
 			return;
 		}
 
-		Post_Translator::flush_translation_status_cache();
-		REST_API::invalidate_stats_cache();
+		if ( $force ) {
+			Post_Translator::flush_translation_status_cache();
+			REST_API::invalidate_stats_cache();
+		}
 
-		$stats = Translation_Query::compute_translation_stats( $lang );
+		$stats = Translation_Query::compute_translation_stats( $lang, $force_full );
 
 		$job['live_stats'] = array(
 			'total'        => (int) $stats['total'],
@@ -1084,16 +1093,23 @@ final class Activity_Logger {
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
-		$stats      = Translation_Query::compute_translation_stats( $lang );
+		$stats      = Translation_Query::compute_translation_stats( $lang, false );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
 
 		if ( $total <= 0 ) {
-			return new \WP_Error(
-				'polymart_ai_no_queue',
-				__( 'مورد ترجمه‌نشده‌ای برای این زبان یافت نشد.', 'polymart-ai' )
-			);
+			$probe_post = Translation_Query::find_next_untranslated_post_id( $lang, 0 );
+
+			if ( $probe_post <= 0 && $menu_needs <= 0 ) {
+				return new \WP_Error(
+					'polymart_ai_no_queue',
+					__( 'مورد ترجمه‌نشده‌ای برای این زبان یافت نشد.', 'polymart-ai' )
+				);
+			}
+
+			$needs_work = max( 1, $menu_needs );
+			$total      = $needs_work;
 		}
 
 		$language   = Language_Registry::get_language( $lang );
@@ -1151,7 +1167,7 @@ final class Activity_Logger {
 			array( 'lang' => $lang, 'total' => $total )
 		);
 
-		return self::normalize_job_for_response( $job, true );
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	/**
@@ -1170,7 +1186,7 @@ final class Activity_Logger {
 			self::log( 'warning', __( 'ترجمه خودکار متوقف موقت شد.', 'polymart-ai' ) );
 		}
 
-		return self::normalize_job_for_response( $job, true );
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	/**
@@ -1185,59 +1201,25 @@ final class Activity_Logger {
 		if ( in_array( $job['status'], array( 'paused', 'running' ), true ) ) {
 			$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
-			Post_Translator::flush_translation_status_cache();
-			self::sync_job_remaining( $job, $lang );
-
-			if ( (int) $job['remaining'] <= 0 ) {
-				return self::normalize_job_for_response( $job, true );
-			}
-
 			$job['status']          = 'running';
 			$job['last_error']      = null;
 			$job['pause_reason']    = null;
 			$job['last_post_id']    = 0;
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
-			$remaining_ids          = Translation_Query::collect_all_remaining_post_ids( $lang );
-			$retry_attempts         = is_array( $job['retry_attempts'] ?? null ) ? $job['retry_attempts'] : array();
-			$exhausted_ids          = is_array( $job['exhausted_ids'] ?? null ) ? array_map( 'absint', $job['exhausted_ids'] ) : array();
-
-			foreach ( $remaining_ids as $remaining_id ) {
-				unset( $retry_attempts[ $remaining_id ] );
-			}
-
-			$job['retry_attempts'] = $retry_attempts;
-			$job['exhausted_ids']  = array_values(
-				array_filter(
-					$exhausted_ids,
-					static function ( $post_id ) use ( $remaining_ids ) {
-						return ! in_array( (int) $post_id, $remaining_ids, true );
-					}
-				)
-			);
+			$job['retry_attempts']  = array();
+			$job['exhausted_ids']   = array();
 			$job['retry_queue']     = array();
 			$job['deferred_queue']  = array();
 			$job['parked_ids']      = array();
 			$job['defer_rounds']    = array();
 			$job['post_step_counts'] = array();
-			$job['last_post_id']    = 0;
-			$job['partial_ids']    = array_values(
-				array_intersect(
-					is_array( $job['partial_ids'] ?? null ) ? array_map( 'absint', $job['partial_ids'] ) : array(),
-					$remaining_ids
-				)
-			);
-			self::sync_job_remaining( $job, $lang );
-
-			if ( (int) $job['remaining'] > (int) ( $job['total'] ?? 0 ) ) {
-				$job['total'] = (int) $job['remaining'];
-			}
 
 			self::save_job( $job );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد.', 'polymart-ai' ) );
 		}
 
-		return self::normalize_job_for_response( $job, true );
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	/**
@@ -1291,7 +1273,7 @@ final class Activity_Logger {
 		}
 
 		Post_Translator::reconcile_all_flagged_translation_indexes( $lang );
-		self::sync_job_live_stats( $job, $lang, true );
+		self::sync_job_live_stats( $job, $lang, true, true );
 
 		if ( sanitize_key( (string) ( $job['lang'] ?? '' ) ) === $lang ) {
 			$job = self::reconcile_stale_job_state( $job, $lang );
@@ -1366,7 +1348,7 @@ final class Activity_Logger {
 			self::save_job( $job );
 			self::log( 'error', $job['last_error'] );
 
-			return self::normalize_job_for_response( $job, true );
+			return self::normalize_job_for_response( $job, false );
 		} finally {
 			self::release_step_lock();
 		}
@@ -1404,17 +1386,17 @@ final class Activity_Logger {
 
 		self::reconcile_stuck_job_queues( $job, $lang );
 
-		if ( self::job_exceeded_step_budget( $job ) && ( Translation_Query::count_untranslated_persian_posts( $lang ) > 0 || Menu_Translator::count_untranslated( $lang ) > 0 ) ) {
+		if ( self::job_exceeded_step_budget( $job ) && (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 ) > 0 ) {
 			$remaining_ids       = Translation_Query::collect_remaining_post_ids( $lang, 10 );
 			$job['status']       = 'paused';
 			$job['pause_reason'] = 'stalled';
 			$job['stalled_ids']  = $remaining_ids;
 			$job['step_started_at'] = null;
-			self::sync_job_remaining( $job, $lang );
+			self::sync_job_remaining( $job, $lang, false );
 			$job['last_error'] = self::format_stalled_job_error( $lang, $remaining_ids );
 			self::save_job( $job );
 
-			return self::normalize_job_for_response( $job, true );
+			return self::normalize_job_for_response( $job, false );
 		}
 
 		$post_id    = 0;
@@ -1501,7 +1483,7 @@ final class Activity_Logger {
 					self::log( 'warning', (string) $job['last_error'] );
 				}
 
-				return self::normalize_job_for_response( $job, true );
+				return self::normalize_job_for_response( $job, false );
 			}
 
 			$post_id    = $pick['post_id'];
@@ -1545,7 +1527,7 @@ final class Activity_Logger {
 
 			return self::normalize_job_for_response(
 				self::handle_job_translation_failure( $job, $post_id, $lang, $slice, $from_retry ),
-				true
+				false
 			);
 		}
 
@@ -1559,23 +1541,23 @@ final class Activity_Logger {
 				$job['consecutive_post_steps'] = 1;
 			}
 
-			$max_consecutive = (int) apply_filters(
-				'polymart_ai_job_max_consecutive_steps_per_post',
-				'elementor' === (string) ( $slice['phase'] ?? '' ) ? 10 : 8,
-				$job,
-				$post_id
+			$limits = Post_Translator::get_job_step_limits_for_post(
+				$post_id,
+				(string) ( $slice['phase'] ?? '' )
 			);
-			$max_steps_per_run = (int) apply_filters(
-				'polymart_ai_job_max_steps_per_post_per_run',
-				'elementor' === (string) ( $slice['phase'] ?? '' ) ? 12 : 20,
-				$job,
-				$post_id
-			);
-			$steps_on_post     = absint( $job['post_step_counts'][ $post_id ] ?? 0 );
+			$max_consecutive = (int) ( $limits['max_consecutive'] ?? 8 );
+			$max_steps_per_run = (int) ( $limits['max_per_run'] ?? 24 );
+			$steps_on_post      = absint( $job['post_step_counts'][ $post_id ] ?? 0 );
+			$previous_progress  = (string) ( $job['partial_progress'] ?? '' );
+			$current_progress   = (string) ( $slice['phase_progress'] ?? '' );
+			$made_progress      = '' !== $current_progress && $current_progress !== $previous_progress;
 
 			if (
-				absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive )
-				|| $steps_on_post >= max( 1, $max_steps_per_run )
+				! $made_progress
+				&& (
+					absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive )
+					|| $steps_on_post >= max( 1, $max_steps_per_run )
+				)
 			) {
 				Post_Translator::release_translation_lock( $post_id, $lang );
 				self::defer_job_post( $job, $post_id, $lang );
@@ -1607,6 +1589,11 @@ final class Activity_Logger {
 			$job['partial_post_id']   = $post_id;
 			$job['partial_phase']     = (string) ( $slice['phase'] ?? '' );
 			$job['partial_progress']  = (string) ( $slice['phase_progress'] ?? '' );
+
+			if ( $made_progress ) {
+				$job['consecutive_post_steps'] = 1;
+			}
+
 			$job['current_post_id']   = null;
 			$job['step_started_at']   = null;
 			self::increment_job_step( $job );
@@ -1630,7 +1617,7 @@ final class Activity_Logger {
 
 		return self::normalize_job_for_response(
 			self::handle_job_translation_success( $job, $post_id, $lang, array( 'translations' => array() ), true ),
-			true
+			false
 		);
 	}
 
@@ -1762,7 +1749,7 @@ final class Activity_Logger {
 				continue;
 			}
 
-			$max_rounds = (int) apply_filters( 'polymart_ai_job_max_defer_rounds_per_post', 3, $job, $post_id );
+			$max_rounds = (int) apply_filters( 'polymart_ai_job_max_defer_rounds_per_post', 10, $job, $post_id );
 
 			if ( (int) ( $rounds[ $post_id ] ?? 0 ) >= max( 1, $max_rounds ) ) {
 				self::park_job_post( $job, $post_id, $lang );
@@ -1863,7 +1850,7 @@ final class Activity_Logger {
 		$job['defer_rounds'] = $rounds;
 		$job['last_post_id'] = $post_id;
 
-		$max_rounds = (int) apply_filters( 'polymart_ai_job_max_defer_rounds_per_post', 3, $job, $post_id );
+		$max_rounds = (int) apply_filters( 'polymart_ai_job_max_defer_rounds_per_post', 10, $job, $post_id );
 
 		if ( $rounds[ $post_id ] >= max( 1, $max_rounds ) ) {
 			self::park_job_post( $job, $post_id, $lang );
@@ -2554,7 +2541,7 @@ final class Activity_Logger {
 				self::log( 'success', __( 'ترجمه خودکار با موفقیت به پایان رسید.', 'polymart-ai' ) );
 			}
 
-			return self::normalize_job_for_response( $job, true );
+			return self::normalize_job_for_response( $job, false );
 		}
 
 		$job['current_post_id'] = $item_id;
@@ -2577,7 +2564,7 @@ final class Activity_Logger {
 				self::save_job( $job );
 				self::log( 'error', $error_message );
 
-				return self::normalize_job_for_response( $job, true );
+				return self::normalize_job_for_response( $job, false );
 			}
 
 			if ( $attempts >= self::MAX_JOB_RETRIES ) {
@@ -2613,7 +2600,7 @@ final class Activity_Logger {
 			);
 			self::save_job( $job );
 
-			return self::normalize_job_for_response( $job, true );
+			return self::normalize_job_for_response( $job, false );
 		}
 
 		self::increment_job_step( $job );
@@ -2661,7 +2648,7 @@ final class Activity_Logger {
 		self::sync_job_remaining( $job, $lang );
 		self::save_job( $job );
 
-		return self::normalize_job_for_response( $job, true );
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	/**

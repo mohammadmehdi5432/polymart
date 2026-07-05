@@ -120,6 +120,7 @@ export default function AutoTranslateApp() {
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
+  const [actionPending, setActionPending] = useState(null);
   const [refreshingStats, setRefreshingStats] = useState(false);
   const [notice, setNotice] = useState(null);
   const [stepWaitSec, setStepWaitSec] = useState(0);
@@ -540,6 +541,19 @@ export default function AutoTranslateApp() {
     setLogs([]);
     setActivePost(null);
     autoResumedRef.current = true;
+    setActionPending('start');
+    setProcessing(true);
+    setJob((prev) => ({
+      ...(prev ?? {}),
+      status: 'running',
+      lang: targetLang,
+      lang_label: targetLabel,
+      last_error: null,
+      pause_reason: null,
+      current_post: null,
+      current_post_id: null,
+      step_started_at: null,
+    }));
     appendLog(`در حال آماده‌سازی صف ترجمه برای ${targetLabel}…`);
 
     try {
@@ -551,11 +565,27 @@ export default function AutoTranslateApp() {
       const message = error?.response?.data?.message || 'شروع ترجمه خودکار ناموفق بود.';
       setNotice({ type: 'error', message });
       appendLog(message, 'error');
+      setProcessing(false);
+      await loadJob();
+    } finally {
+      setActionPending(null);
     }
   };
 
   const handleResume = async () => {
     setNotice(null);
+    setActionPending('resume');
+    setProcessing(true);
+    setJob((prev) => ({
+      ...(prev ?? {}),
+      status: 'running',
+      last_error: null,
+      pause_reason: null,
+      current_post: null,
+      current_post_id: null,
+      step_started_at: null,
+    }));
+    appendLog('در حال از سرگیری ترجمه…');
 
     try {
       const data = await jobAction('resume');
@@ -564,16 +594,41 @@ export default function AutoTranslateApp() {
       await runSteps();
     } catch (error) {
       setNotice({ type: 'error', message: error?.response?.data?.message || 'ادامه ناموفق بود.' });
+      setProcessing(false);
+      await loadJob();
+    } finally {
+      setActionPending(null);
     }
   };
 
   const handlePause = async () => {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.removeItem(AUTO_RUN_STORAGE_KEY);
+    }
+
+    runningRef.current = false;
+    abortJobStep();
+    setProcessing(false);
+    setStepWaitSec(0);
+    setActionPending('pause');
+    setJob((prev) => ({
+      ...(prev ?? {}),
+      status: 'paused',
+      current_post: null,
+      current_post_id: null,
+      step_started_at: null,
+    }));
+    appendLog('در حال توقف موقت…');
+
     try {
       const data = await jobAction('pause');
       setJob(data);
       appendLog('ترجمه متوقف موقت شد.');
     } catch {
       setNotice({ type: 'error', message: 'توقف موقت ناموفق بود.' });
+      await loadJob();
+    } finally {
+      setActionPending(null);
     }
   };
 
@@ -587,6 +642,18 @@ export default function AutoTranslateApp() {
     setProcessing(false);
     setStepWaitSec(0);
     setActivePost(null);
+    setActionPending('stop');
+    setJob((prev) => ({
+      ...(prev ?? {}),
+      status: 'idle',
+      current_post: null,
+      current_post_id: null,
+      partial_post_id: null,
+      step_started_at: null,
+      last_error: null,
+      pause_reason: null,
+    }));
+    appendLog('در حال توقف کامل…');
 
     try {
       const data = await jobAction('stop');
@@ -596,6 +663,8 @@ export default function AutoTranslateApp() {
     } catch {
       setNotice({ type: 'error', message: 'توقف ناموفق بود — صفحه را رفرش کنید.' });
       await loadJob();
+    } finally {
+      setActionPending(null);
     }
   };
 
@@ -638,13 +707,27 @@ export default function AutoTranslateApp() {
   const isPaused = job?.status === 'paused';
   const isOutdated = Boolean(job?.outdated);
   const isOrphanedRunning = isRunning && !processing && needsWork > 0;
-  const canResume = (isPaused || isOrphanedRunning) && needsWork > 0 && !processing;
-  const canStart = !loading && !processing && !isRunning && !langsLoading;
+  const isBusy = Boolean(actionPending) || processing || refreshingStats;
+  const canResume = (isPaused || isOrphanedRunning) && needsWork > 0 && !isBusy;
+  const canStart = !loading && !isBusy && !isRunning && !langsLoading;
   const activeLangLabel = job?.lang_label || targetLabel;
   const displayPost = activePost?.title ? activePost : job?.current_post;
   const lastStepStatus = displayPost?.step_status || job?.last_step?.status;
 
-  const statusLabel = isRunning
+  const actionPendingLabel =
+    actionPending === 'start'
+      ? 'در حال شروع…'
+      : actionPending === 'resume'
+        ? 'در حال ادامه…'
+        : actionPending === 'pause'
+          ? 'در حال توقف موقت…'
+          : actionPending === 'stop'
+            ? 'در حال توقف کامل…'
+            : null;
+
+  const statusLabel = actionPendingLabel
+    ? actionPendingLabel
+    : isRunning
     ? processing
       ? stepWaitSec > 0
         ? `در حال ترجمه… (${stepWaitSec}ث)`
@@ -706,7 +789,7 @@ export default function AutoTranslateApp() {
             onChange={setTargetLang}
             options={langOptions}
             loading={langsLoading}
-            disabled={isRunning || processing}
+            disabled={isRunning || processing || Boolean(actionPending)}
             className="mb-4 w-full"
           />
 
@@ -717,37 +800,41 @@ export default function AutoTranslateApp() {
               disabled={!canStart || langOptions.length === 0}
               className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-pmai-primary px-4 py-2.5 text-sm font-medium text-white hover:bg-pmai-primary-dark disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <HiBolt className="h-4 w-4" />
-              {needsWork > 0 ? `شروع ترجمه (${needsWork} مورد)` : 'شروع ترجمه خودکار'}
+              <HiBolt className={`h-4 w-4 ${actionPending === 'start' ? 'animate-pulse' : ''}`} />
+              {actionPending === 'start'
+                ? 'در حال شروع…'
+                : needsWork > 0
+                  ? `شروع ترجمه (${needsWork} مورد)`
+                  : 'شروع ترجمه خودکار'}
             </button>
             {canResume && (
               <button
                 type="button"
                 onClick={handleResume}
-                disabled={processing}
+                disabled={isBusy}
                 className="w-full cursor-pointer rounded-lg border border-green-300 bg-green-50 px-4 py-2 text-sm font-medium text-green-800 hover:bg-green-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                ادامه ({needsWork} باقی‌مانده)
+                {actionPending === 'resume' ? 'در حال ادامه…' : `ادامه (${needsWork} باقی‌مانده)`}
               </button>
             )}
-            {isRunning && (
+            {(isRunning || actionPending === 'pause') && (
               <button
                 type="button"
                 onClick={handlePause}
-                disabled={processing}
+                disabled={isBusy && actionPending !== 'pause'}
                 className="w-full cursor-pointer rounded-lg border border-pmai-border px-4 py-2 text-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                توقف موقت
+                {actionPending === 'pause' ? 'در حال توقف موقت…' : 'توقف موقت'}
               </button>
             )}
-            {(isRunning || isPaused) && (
+            {(isRunning || isPaused || actionPending === 'stop') && (
               <button
                 type="button"
                 onClick={handleStop}
-                disabled={false}
+                disabled={actionPending === 'stop'}
                 className="w-full cursor-pointer rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {processing ? 'توقف فوری…' : 'توقف کامل'}
+                {actionPending === 'stop' ? 'در حال توقف کامل…' : processing ? 'توقف فوری…' : 'توقف کامل'}
               </button>
             )}
             <button
@@ -771,10 +858,10 @@ export default function AutoTranslateApp() {
                 {job?.lang ? ` (${job.lang})` : ''}
               </p>
             </div>
-            {(isRunning || processing) && (
+            {(isRunning || processing || actionPending) && (
               <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-xs font-medium text-blue-800">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-                در حال پردازش
+                {actionPendingLabel || 'در حال پردازش'}
               </span>
             )}
           </div>

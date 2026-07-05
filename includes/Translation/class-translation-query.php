@@ -32,13 +32,26 @@ final class Translation_Query {
 	/**
 	 * Aggregate translation stats by scanning the catalog in batches.
 	 *
-	 * @param string $lang Target language code.
+	 * Uses denormalized index meta when available (fast). Pass $force_full true
+	 * for refresh_stats / explicit admin recomputation.
+	 *
+	 * @param string $lang       Target language code.
+	 * @param bool   $force_full When true, always run a full per-post audit.
 	 * @return array{total: int, untranslated: int, partial: int, translated: int}
 	 */
-	public static function compute_translation_stats( $lang ) {
+	public static function compute_translation_stats( $lang, $force_full = false ) {
 		$lang = sanitize_key( (string) $lang );
 
 		self::maybe_backfill_translation_index( $lang );
+
+		if ( ! $force_full ) {
+			$indexed = self::compute_translation_stats_from_index( $lang );
+
+			if ( null !== $indexed ) {
+				return $indexed;
+			}
+		}
+
 		Post_Translator::reconcile_all_flagged_translation_indexes( $lang );
 		Post_Translator::flush_translation_status_cache();
 
