@@ -505,7 +505,14 @@ final class Activity_Logger {
 				}
 			)
 		);
-		$job['retry_queue']    = array_values( array_intersect( self::get_retry_queue( $job ), $job['stalled_ids'] ) );
+		$job['retry_queue']    = array_values(
+			array_filter(
+				self::get_retry_queue( $job ),
+				static function ( $post_id ) use ( $lang ) {
+					return $post_id > 0 && 'translated' !== Post_Translator::get_translation_status( $post_id, $lang );
+				}
+			)
+		);
 
 		if ( $live_remaining <= 0 ) {
 			$job['stalled_ids']   = array();
@@ -771,6 +778,12 @@ final class Activity_Logger {
 			return false;
 		}
 
+		$needs_work = (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 );
+
+		if ( $needs_work > 0 ) {
+			return false;
+		}
+
 		$total  = max( 1, (int) ( $job['total'] ?? 0 ) );
 		$steps  = max( (int) ( $job['steps'] ?? 0 ), (int) ( $job['processed'] ?? 0 ) );
 		$budget = (int) apply_filters(
@@ -780,6 +793,51 @@ final class Activity_Logger {
 		);
 
 		return $steps >= max( 1, $budget );
+	}
+
+	/**
+	 * Max retry attempts before a post is skipped for this job run.
+	 *
+	 * Variable products need many HTTP slices; give them a higher budget than pages.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return int
+	 */
+	private static function get_max_job_retries_for_post( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$max     = self::MAX_JOB_RETRIES;
+
+		if ( $post_id <= 0 ) {
+			return $max;
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post || 'product' !== $post->post_type || ! function_exists( 'wc_get_product' ) ) {
+			return (int) apply_filters( 'polymart_ai_job_max_retries', $max, $post_id, $lang );
+		}
+
+		$product = wc_get_product( $post_id );
+
+		if ( ! $product instanceof \WC_Product ) {
+			return (int) apply_filters( 'polymart_ai_job_max_retries', $max, $post_id, $lang );
+		}
+
+		if ( $product->is_type( 'variable' ) ) {
+			$variation_count = count( $product->get_children() );
+			$max             = max( $max, 3 + (int) ceil( $variation_count / 4 ) );
+		}
+
+		/**
+		 * Filter per-post retry budget for auto-translate jobs.
+		 *
+		 * @param int    $max     Computed retry cap.
+		 * @param int    $post_id Post ID.
+		 * @param string $lang    Target language code.
+		 */
+		return (int) apply_filters( 'polymart_ai_job_max_retries', $max, $post_id, $lang );
 	}
 
 	/**
@@ -1085,7 +1143,7 @@ final class Activity_Logger {
 			$job['last_post_id']    = 0;
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
-			$remaining_ids          = Translation_Query::collect_remaining_post_ids( $lang, 100 );
+			$remaining_ids          = Translation_Query::collect_all_remaining_post_ids( $lang );
 			$retry_attempts         = is_array( $job['retry_attempts'] ?? null ) ? $job['retry_attempts'] : array();
 			$exhausted_ids          = is_array( $job['exhausted_ids'] ?? null ) ? array_map( 'absint', $job['exhausted_ids'] ) : array();
 
@@ -1463,7 +1521,6 @@ final class Activity_Logger {
 			array_unique(
 				array_merge(
 					$exhausted_ids,
-					array_map( 'absint', is_array( $job['partial_ids'] ?? null ) ? $job['partial_ids'] : array() ),
 					// Never re-pick posts already counted as success in this run.
 					array_map( 'absint', is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() )
 				)
@@ -1566,14 +1623,7 @@ final class Activity_Logger {
 	 * @return int[]
 	 */
 	private static function get_exhausted_job_post_ids( array $job ) {
-		$retry_attempts = is_array( $job['retry_attempts'] ?? null ) ? $job['retry_attempts'] : array();
-		$exhausted      = is_array( $job['exhausted_ids'] ?? null ) ? array_map( 'absint', $job['exhausted_ids'] ) : array();
-
-		foreach ( $retry_attempts as $post_id => $attempts ) {
-			if ( (int) $attempts >= self::MAX_JOB_RETRIES ) {
-				$exhausted[] = (int) $post_id;
-			}
-		}
+		$exhausted = is_array( $job['exhausted_ids'] ?? null ) ? array_map( 'absint', $job['exhausted_ids'] ) : array();
 
 		return array_values( array_unique( array_filter( $exhausted ) ) );
 	}
@@ -1623,8 +1673,29 @@ final class Activity_Logger {
 			return;
 		}
 
-		$remaining_ids = Translation_Query::collect_remaining_post_ids( $lang, 100 );
-		$skipped_ids   = array_values(
+		$remaining_ids = Translation_Query::collect_all_remaining_post_ids( $lang );
+		$exhausted     = self::get_exhausted_job_post_ids( $job );
+		$fresh_retry   = array_values(
+			array_filter(
+				array_map( 'absint', $remaining_ids ),
+				static function ( $post_id ) use ( $exhausted ) {
+					return $post_id > 0 && ! in_array( $post_id, $exhausted, true );
+				}
+			)
+		);
+
+		if ( ! empty( $fresh_retry ) ) {
+			$job['retry_queue'] = array_values(
+				array_unique(
+					array_merge( self::get_retry_queue( $job ), $fresh_retry )
+				)
+			);
+			self::save_job( $job );
+
+			return;
+		}
+
+		$skipped_ids = array_values(
 			array_intersect(
 				array_map( 'absint', $remaining_ids ),
 				self::get_exhausted_job_post_ids( $job )
@@ -1727,9 +1798,14 @@ final class Activity_Logger {
 			);
 		}
 
+		$total_incomplete = max(
+			count( $remaining_ids ),
+			Translation_Query::count_untranslated_persian_posts( $lang )
+		);
+
 		return sprintf(
 			$template,
-			count( $remaining_ids ),
+			$total_incomplete,
 			$summary
 		);
 	}
@@ -1743,19 +1819,37 @@ final class Activity_Logger {
 	 */
 	private static function enqueue_job_retry( array &$job, $post_id ) {
 		$post_id        = absint( $post_id );
+		$lang           = sanitize_key( (string) ( $job['lang'] ?? '' ) );
 		$retry_queue    = self::get_retry_queue( $job );
 		$retry_attempts = is_array( $job['retry_attempts'] ?? null ) ? $job['retry_attempts'] : array();
 		$attempts       = (int) ( $retry_attempts[ $post_id ] ?? 0 ) + 1;
+		$max_attempts   = self::get_max_job_retries_for_post( $post_id, $lang );
 
 		$retry_attempts[ $post_id ] = $attempts;
 		$job['retry_attempts']      = $retry_attempts;
 
-		if ( $attempts >= self::MAX_JOB_RETRIES ) {
-			$lang    = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+		if ( $attempts >= $max_attempts ) {
 			$partial = Post_Translator::get_job_partial_state( $post_id, $lang );
 			$phase   = sanitize_key( (string) ( $partial['phase'] ?? '' ) );
 
 			if ( '' !== $phase && in_array( $phase, array( 'core', 'commerce', 'variations', 'elementor', 'fields' ), true ) ) {
+				if ( ! in_array( $post_id, $retry_queue, true ) ) {
+					$retry_queue[] = $post_id;
+				}
+
+				$job['retry_queue'] = $retry_queue;
+
+				return;
+			}
+
+			$pending = array();
+			$post    = get_post( $post_id );
+
+			if ( $post instanceof \WP_Post ) {
+				$pending = Post_Translator::collect_persian_fields( $post, $lang );
+			}
+
+			if ( ! empty( $pending ) ) {
 				if ( ! in_array( $post_id, $retry_queue, true ) ) {
 					$retry_queue[] = $post_id;
 				}
@@ -1842,9 +1936,7 @@ final class Activity_Logger {
 
 		self::enqueue_job_retry( $job, $post_id );
 
-		$attempts = (int) ( $job['retry_attempts'][ $post_id ] ?? 0 );
-
-		if ( $attempts >= self::MAX_JOB_RETRIES ) {
+		if ( in_array( $post_id, self::get_exhausted_job_post_ids( $job ), true ) ) {
 			$job['failed']++;
 		}
 
@@ -1900,27 +1992,28 @@ final class Activity_Logger {
 
 			$gaps     = Post_Translator::get_translation_gaps( $post_id, $lang );
 			$attempts = (int) ( $job['retry_attempts'][ $post_id ] ?? 0 );
+			$max      = self::get_max_job_retries_for_post( $post_id, $lang );
 			$missing  = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'نامشخص', 'polymart-ai' );
 
 			self::log(
 				'warning',
 				sprintf(
-					/* translators: 1: post title, 2: attempt number, 3: missing fields */
+					/* translators: 1: post title, 2: attempt number, 3: max attempts, 4: missing fields */
 					__( '«%1$s» ناقص ماند (تلاش %2$d/%3$d) — باقی‌مانده: %4$s', 'polymart-ai' ),
 					$title_source,
 					$attempts,
-					self::MAX_JOB_RETRIES,
+					$max,
 					$missing
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
 
-			if ( $attempts >= self::MAX_JOB_RETRIES ) {
+			if ( in_array( $post_id, self::get_exhausted_job_post_ids( $job ), true ) ) {
 				$job['last_error'] = sprintf(
 					/* translators: 1: post ID, 2: retry count, 3: missing fields */
 					__( 'مورد #%1$d پس از %2$d تلاش رد شد — بقیه صف ادامه می‌یابد. باقی‌مانده: %3$s', 'polymart-ai' ),
 					$post_id,
-					self::MAX_JOB_RETRIES,
+					$attempts,
 					$missing
 				);
 				self::log(

@@ -278,6 +278,16 @@ final class Translation_Query {
 	}
 
 	/**
+	 * Collect every post ID that still needs translation (no sample cap).
+	 *
+	 * @param string $lang Target language code.
+	 * @return int[]
+	 */
+	public static function collect_all_remaining_post_ids( $lang ) {
+		return self::collect_remaining_post_ids( $lang, 50000 );
+	}
+
+	/**
 	 * Find the next untranslated Persian post ID after a cursor (for resumable jobs).
 	 *
 	 * @param string $lang        Target language code.
