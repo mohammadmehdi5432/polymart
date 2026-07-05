@@ -1229,17 +1229,6 @@ final class Activity_Logger {
 			);
 			self::sync_job_remaining( $job, $lang );
 
-			if ( empty( $job['deferred_queue'] ) && empty( $job['retry_queue'] ) && (int) $job['remaining'] > 0 ) {
-				$job['status']       = 'paused';
-				$job['pause_reason'] = 'stalled';
-				$job['stalled_ids']  = $remaining_ids;
-				$job['last_error']   = self::format_stalled_job_error( $lang, $remaining_ids );
-				self::save_job( $job );
-				self::log( 'warning', $job['last_error'] );
-
-				return self::normalize_job_for_response( $job, true );
-			}
-
 			if ( (int) $job['remaining'] > (int) ( $job['total'] ?? 0 ) ) {
 				$job['total'] = (int) $job['remaining'];
 			}
@@ -1260,16 +1249,21 @@ final class Activity_Logger {
 		$job = self::get_job_raw();
 
 		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
-			$partial_id = absint( $job['partial_post_id'] ?? 0 );
 			$lang       = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+			$partial_id = absint( $job['partial_post_id'] ?? 0 );
+			$current_id = absint( $job['current_post_id'] ?? 0 );
 
-			if ( $partial_id > 0 && '' !== $lang ) {
-				Post_Translator::clear_job_partial_state( $partial_id, $lang );
-				Post_Translator::release_translation_lock( $partial_id, $lang );
+			foreach ( array_unique( array_filter( array( $partial_id, $current_id ) ) ) as $post_id ) {
+				if ( $post_id > 0 && '' !== $lang ) {
+					Post_Translator::clear_job_partial_state( $post_id, $lang );
+					Post_Translator::release_translation_lock( $post_id, $lang );
+				}
 			}
 
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
 		}
+
+		self::release_step_lock();
 
 		return self::save_job( self::empty_job() );
 	}
@@ -1408,6 +1402,8 @@ final class Activity_Logger {
 
 		$cursor = (int) ( $job['last_post_id'] ?? 0 );
 
+		self::reconcile_stuck_job_queues( $job, $lang );
+
 		if ( self::job_exceeded_step_budget( $job ) && ( Translation_Query::count_untranslated_persian_posts( $lang ) > 0 || Menu_Translator::count_untranslated( $lang ) > 0 ) ) {
 			$remaining_ids       = Translation_Query::collect_remaining_post_ids( $lang, 10 );
 			$job['status']       = 'paused';
@@ -1424,6 +1420,14 @@ final class Activity_Logger {
 		$post_id    = 0;
 		$from_retry = false;
 		$partial_id = absint( $job['partial_post_id'] ?? 0 );
+
+		if ( $partial_id > 0 ) {
+			if ( in_array( $partial_id, self::get_parked_ids( $job ), true ) ) {
+				Post_Translator::release_translation_lock( $partial_id, $lang );
+				$job['partial_post_id'] = null;
+				$partial_id             = 0;
+			}
+		}
 
 		if ( $partial_id > 0 ) {
 			$post_id    = $partial_id;
@@ -1459,6 +1463,16 @@ final class Activity_Logger {
 			}
 
 			if ( ! $pick['post_id'] ) {
+				self::reconcile_stuck_job_queues( $job, $lang );
+				$pick = self::pick_next_job_post_id( $job, $lang, $cursor );
+
+				if ( ! $pick['post_id'] && $cursor > 0 ) {
+					$job['last_post_id'] = 0;
+					$pick                = self::pick_next_job_post_id( $job, $lang, 0 );
+				}
+			}
+
+			if ( ! $pick['post_id'] ) {
 				if ( Menu_Translator::count_untranslated( $lang ) > 0 ) {
 					$job['phase']        = 'menus';
 					$job['last_menu_id'] = 0;
@@ -1470,6 +1484,15 @@ final class Activity_Logger {
 				$job['step_started_at'] = null;
 				$job['current_post_id'] = null;
 				self::finalize_job_if_queue_exhausted( $job, $lang );
+				self::sync_job_remaining( $job, $lang );
+
+				if ( 'running' === ( $job['status'] ?? '' ) && (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 ) > 0 ) {
+					$job['status']       = 'paused';
+					$job['pause_reason'] = 'pick_stalled';
+					$job['last_error']   = __( 'صف ترجمه گیر کرد — «ادامه» را بزنید یا «توقف کامل» و دوباره «شروع».', 'polymart-ai' );
+					self::set_job_last_step( $job, 0, 'failed', $job['last_error'] );
+				}
+
 				self::save_job( $job );
 
 				if ( 'completed' === ( $job['status'] ?? '' ) ) {
@@ -1713,11 +1736,60 @@ final class Activity_Logger {
 				array_merge(
 					self::get_exhausted_job_post_ids( $job ),
 					self::get_parked_ids( $job ),
-					self::get_deferred_queue( $job ),
 					array_map( 'absint', is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() )
 				)
 			)
 		);
+	}
+
+	/**
+	 * Heal queue deadlocks (orphaned deferred/parked state) before picking the next post.
+	 *
+	 * @param array<string, mixed> $job  Job state (by reference).
+	 * @param string               $lang Language code.
+	 * @return void
+	 */
+	private static function reconcile_stuck_job_queues( array &$job, $lang ) {
+		$lang = sanitize_key( (string) $lang );
+
+		$deferred = self::get_deferred_queue( $job );
+		$rounds   = is_array( $job['defer_rounds'] ?? null ) ? $job['defer_rounds'] : array();
+
+		foreach ( $deferred as $post_id ) {
+			$post_id = absint( $post_id );
+
+			if ( $post_id <= 0 ) {
+				continue;
+			}
+
+			$max_rounds = (int) apply_filters( 'polymart_ai_job_max_defer_rounds_per_post', 3, $job, $post_id );
+
+			if ( (int) ( $rounds[ $post_id ] ?? 0 ) >= max( 1, $max_rounds ) ) {
+				self::park_job_post( $job, $post_id, $lang );
+			}
+		}
+
+		// Drop translated IDs from auxiliary queues.
+		foreach ( array( 'deferred_queue', 'retry_queue', 'parked_ids' ) as $queue_key ) {
+			$ids = is_array( $job[ $queue_key ] ?? null ) ? $job[ $queue_key ] : array();
+
+			if ( 'deferred_queue' === $queue_key ) {
+				$ids = self::get_deferred_queue( $job );
+			} elseif ( 'retry_queue' === $queue_key ) {
+				$ids = self::get_retry_queue( $job );
+			} else {
+				$ids = self::get_parked_ids( $job );
+			}
+
+			$job[ $queue_key ] = array_values(
+				array_filter(
+					array_map( 'absint', $ids ),
+					static function ( $post_id ) use ( $lang ) {
+						return $post_id > 0 && ( '' === $lang || 'translated' !== Post_Translator::get_translation_status( $post_id, $lang ) );
+					}
+				)
+			);
+		}
 	}
 
 	/**
@@ -1749,21 +1821,14 @@ final class Activity_Logger {
 	 * @return int[]
 	 */
 	private static function get_actionable_deferred_queue( array $job, $lang ) {
-		$lang        = sanitize_key( (string) $lang );
-		$parked      = self::get_parked_ids( $job );
-		$rounds      = is_array( $job['defer_rounds'] ?? null ) ? $job['defer_rounds'] : array();
-		$deferred    = array();
+		$lang     = sanitize_key( (string) $lang );
+		$parked   = self::get_parked_ids( $job );
+		$deferred = array();
 
 		foreach ( self::get_deferred_queue( $job ) as $post_id ) {
 			$post_id = absint( $post_id );
 
 			if ( $post_id <= 0 || in_array( $post_id, $parked, true ) ) {
-				continue;
-			}
-
-			$post_rounds = (int) ( $rounds[ $post_id ] ?? 0 );
-
-			if ( $post_rounds >= max( 1, (int) apply_filters( 'polymart_ai_job_max_defer_rounds_per_post', 3, $job, $post_id ) ) ) {
 				continue;
 			}
 

@@ -7,6 +7,8 @@ const JOB_FETCH_TIMEOUT_MS = 90000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
 
+let activeStepController = null;
+
 async function sleep(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
@@ -22,6 +24,10 @@ async function withRetries(fn, { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETC
     } catch (error) {
       lastError = error;
 
+      if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError') {
+        throw error;
+      }
+
       if (attempt >= retries) {
         break;
       }
@@ -33,6 +39,14 @@ async function withRetries(fn, { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETC
   throw lastError;
 }
 
+/** Abort an in-flight translation step request (e.g. when user clicks stop). */
+export function abortJobStep() {
+  if (activeStepController) {
+    activeStepController.abort();
+    activeStepController = null;
+  }
+}
+
 export async function fetchJob() {
   const { data } = await withRetries(() =>
     api.get('/translation-job', { timeout: JOB_FETCH_TIMEOUT_MS })
@@ -41,6 +55,7 @@ export async function fetchJob() {
 }
 
 export async function jobAction(action, lang = 'en') {
+  abortJobStep();
   const { data } = await withRetries(() =>
     api.post('/translation-job', { action, lang }, { timeout: JOB_FETCH_TIMEOUT_MS })
   );
@@ -48,12 +63,27 @@ export async function jobAction(action, lang = 'en') {
 }
 
 export async function jobStep() {
+  abortJobStep();
+  activeStepController = new AbortController();
+
   try {
     const { data } = await api.post('/translation-job/step', null, {
       timeout: JOB_STEP_TIMEOUT_MS,
+      signal: activeStepController.signal,
     });
     return data;
   } catch (error) {
+    const isAbort = error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError';
+
+    if (isAbort) {
+      const job = await fetchJob().catch(() => null);
+      if (job) {
+        return { ...job, step_aborted: true };
+      }
+
+      throw error;
+    }
+
     const isTimeout =
       error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
 
@@ -61,7 +91,6 @@ export async function jobStep() {
       throw error;
     }
 
-    // Step may still have completed server-side — poll lightweight job state.
     const job = await fetchJob();
 
     if (job?.status === 'running' || job?.status === 'paused') {
@@ -72,6 +101,8 @@ export async function jobStep() {
     }
 
     throw error;
+  } finally {
+    activeStepController = null;
   }
 }
 

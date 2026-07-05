@@ -3,13 +3,14 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, jobStep, refreshJobStats, JOB_STEP_TIMEOUT_MS } from './api/job';
+import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, JOB_STEP_TIMEOUT_MS } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const STEP_DELAY_MS = 250;
 const POLL_INTERVAL_MS = 2000;
 const DEFERRED_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 12000];
 const MAX_IDLE_STEPS = 8;
+const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 
 function jobPhaseLabel(phase) {
   switch (phase) {
@@ -229,6 +230,10 @@ export default function AutoTranslateApp() {
       return;
     }
 
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.setItem(AUTO_RUN_STORAGE_KEY, '1');
+    }
+
     runningRef.current = true;
 
     if (isActiveRef.current) {
@@ -248,6 +253,10 @@ export default function AutoTranslateApp() {
       let lastMarker = jobProgressMarker(current);
 
       while (current?.status === 'running' && isActiveRef.current) {
+        if (typeof window !== 'undefined' && window.sessionStorage.getItem(AUTO_RUN_STORAGE_KEY) !== '1') {
+          break;
+        }
+
         const waitStarted = Date.now();
         const waitTimer = window.setInterval(() => {
           if (!isActiveRef.current) {
@@ -275,6 +284,10 @@ export default function AutoTranslateApp() {
 
         if (!current || typeof current !== 'object' || !current.status) {
           throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
+        }
+
+        if (current.step_aborted) {
+          break;
         }
 
         setJob(current);
@@ -484,6 +497,14 @@ export default function AutoTranslateApp() {
       return;
     }
 
+    if (typeof window !== 'undefined' && window.sessionStorage.getItem(AUTO_RUN_STORAGE_KEY) !== '1') {
+      appendLog(
+        'اجرای قبلی روی سرور فعال است ولی این تب آن را ادامه نمی‌دهد — «ادامه» یا «توقف کامل» را بزنید.',
+        'warning'
+      );
+      return;
+    }
+
     autoResumedRef.current = true;
 
     const stepAge =
@@ -557,12 +578,24 @@ export default function AutoTranslateApp() {
   };
 
   const handleStop = async () => {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.removeItem(AUTO_RUN_STORAGE_KEY);
+    }
+
+    runningRef.current = false;
+    abortJobStep();
+    setProcessing(false);
+    setStepWaitSec(0);
+    setActivePost(null);
+
     try {
       const data = await jobAction('stop');
       setJob(data);
+      autoResumedRef.current = false;
       appendLog('ترجمه متوقف شد.');
     } catch {
-      setNotice({ type: 'error', message: 'توقف ناموفق بود.' });
+      setNotice({ type: 'error', message: 'توقف ناموفق بود — صفحه را رفرش کنید.' });
+      await loadJob();
     }
   };
 
@@ -711,9 +744,10 @@ export default function AutoTranslateApp() {
               <button
                 type="button"
                 onClick={handleStop}
-                className="w-full cursor-pointer rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 hover:bg-red-100"
+                disabled={false}
+                className="w-full cursor-pointer rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                توقف کامل
+                {processing ? 'توقف فوری…' : 'توقف کامل'}
               </button>
             )}
             <button
