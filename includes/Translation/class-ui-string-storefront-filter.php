@@ -108,11 +108,17 @@ final class UI_String_Storefront_Filter {
 		$patterns = array(
 			'#(^|/)(public|frontend|storefront|templates|template-parts|shortcodes|widgets|blocks)(/|$)#',
 			'#(^|/)includes/(public|frontend|storefront|templates|shortcodes|widgets|blocks)(/|$)#',
+			'#(^|/)includes/#',
+			'#(^|/)inc/#',
+			'#(^|/)src/#',
+			'#(^|/)elementor/#',
+			'#(^|/)assets/#',
 			'#(^|/)src/(public|frontend|storefront|blocks|components)(/|$)#',
 			'#(^|/)assets/(js|css)/frontend(/|$)#',
 			'#(^|/)assets/js/(?!admin)(/|$)#',
 			'#(^|/)elementor/widgets/#',
 			'#(^|/)includes/elementor/#',
+			'#(^|/)[^/]+\.php$#',
 		);
 
 		/**
@@ -138,10 +144,15 @@ final class UI_String_Storefront_Filter {
 			'shortcodes',
 			'widgets',
 			'blocks',
+			'includes',
+			'inc',
+			'src',
+			'elementor',
 			'includes/public',
 			'includes/frontend',
 			'includes/templates',
 			'includes/shortcodes',
+			'includes/elementor',
 			'src/frontend',
 			'src/public',
 			'assets/js',
@@ -208,6 +219,73 @@ final class UI_String_Storefront_Filter {
 
 					foreach ( $references as $reference ) {
 						if ( self::is_storefront_reference( (string) $reference, $slug ) ) {
+							return true;
+						}
+					}
+
+					return false;
+				}
+			)
+		);
+	}
+
+	/**
+	 * Filter gettext catalog entries for companion plugins.
+	 *
+	 * When strict storefront allowlists drop every .pot row (common for src/Elementor paths),
+	 * fall back to a relaxed pass that only removes admin/blocked references.
+	 *
+	 * @param array<int, array<string, mixed>> $entries Parsed catalog entries.
+	 * @param string                           $slug    Plugin or theme slug label.
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function filter_catalog_entries( array $entries, $slug ) {
+		$filtered = self::filter_entries( $entries, $slug );
+
+		if ( self::uses_strict_allowlist( $slug ) || ! empty( $filtered ) || empty( $entries ) ) {
+			return $filtered;
+		}
+
+		return self::filter_entries_relaxed( $entries );
+	}
+
+	/**
+	 * Relaxed storefront filter: drop admin contexts and blocked paths only.
+	 *
+	 * @param array<int, array<string, mixed>> $entries Parsed entries.
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function filter_entries_relaxed( array $entries ) {
+		return array_values(
+			array_filter(
+				$entries,
+				static function ( $entry ) {
+					if ( ! is_array( $entry ) ) {
+						return false;
+					}
+
+					$context = isset( $entry['context'] ) ? (string) $entry['context'] : '';
+
+					if ( self::is_admin_context( $context ) ) {
+						return false;
+					}
+
+					$msgid = isset( $entry['msgid'] ) ? (string) $entry['msgid'] : '';
+
+					if ( '' === trim( $msgid ) || strlen( $msgid ) > 500 ) {
+						return false;
+					}
+
+					$references = isset( $entry['references'] ) && is_array( $entry['references'] )
+						? $entry['references']
+						: array();
+
+					if ( empty( $references ) ) {
+						return true;
+					}
+
+					foreach ( $references as $reference ) {
+						if ( ! self::is_blocked_reference( strtolower( wp_normalize_path( (string) $reference ) ) ) ) {
 							return true;
 						}
 					}

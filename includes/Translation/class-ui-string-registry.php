@@ -80,6 +80,12 @@ final class UI_String_Registry {
 
 		foreach ( self::get_allowed_plugin_slugs() as $slug ) {
 			$defaults[] = strtolower( $slug );
+
+			$declared = UI_String_Scanner::read_plugin_text_domain( $slug );
+
+			if ( '' !== $declared ) {
+				$defaults[] = $declared;
+			}
 		}
 
 		/**

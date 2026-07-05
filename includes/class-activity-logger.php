@@ -303,6 +303,9 @@ final class Activity_Logger {
 			'updated_at'      => null,
 			'phase'           => 'posts',
 			'last_menu_id'    => 0,
+			'partial_post_id' => null,
+			'partial_phase'   => null,
+			'partial_progress' => null,
 		);
 	}
 
@@ -647,11 +650,20 @@ final class Activity_Logger {
 
 		$current_post_id = absint( $job['current_post_id'] ?? 0 );
 
+		if ( $current_post_id <= 0 ) {
+			$current_post_id = absint( $job['partial_post_id'] ?? 0 );
+		}
+
 		if ( $current_post_id > 0 ) {
 			$job['current_post'] = array(
 				'post_id' => $current_post_id,
 				'title'   => get_the_title( $current_post_id ),
 			);
+
+			if ( ! empty( $job['partial_phase'] ) ) {
+				$job['current_post']['partial_phase']    = (string) $job['partial_phase'];
+				$job['current_post']['partial_progress'] = (string) ( $job['partial_progress'] ?? '' );
+			}
 		} else {
 			$job['current_post'] = null;
 		}
@@ -1119,9 +1131,17 @@ final class Activity_Logger {
 	 * @return array<string, mixed>
 	 */
 	public static function stop_job() {
-		$job = self::get_job();
+		$job = self::get_job_raw();
 
-		if ( 'idle' !== $job['status'] ) {
+		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
+			$partial_id = absint( $job['partial_post_id'] ?? 0 );
+			$lang       = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+			if ( $partial_id > 0 && '' !== $lang ) {
+				Post_Translator::clear_job_partial_state( $partial_id, $lang );
+				Post_Translator::release_translation_lock( $partial_id, $lang );
+			}
+
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
 		}
 
@@ -1275,86 +1295,127 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, true );
 		}
 
-		$pick = self::pick_next_job_post_id( $job, $lang, $cursor );
+		$post_id    = 0;
+		$from_retry = false;
+		$partial_id = absint( $job['partial_post_id'] ?? 0 );
 
-		if ( ! $pick['post_id'] ) {
-			// Cursor may have walked past posts that only look done in-memory.
-			// Reset and pull a fresh actionable set while site work remains.
-			self::sync_job_live_stats( $job, $lang, true );
-			self::reconcile_succeeded_posts( $job, $lang );
+		if ( $partial_id > 0 ) {
+			$post_id    = $partial_id;
+			$from_retry = true;
+		} else {
+			$pick = self::pick_next_job_post_id( $job, $lang, $cursor );
 
-			$needs_work = (int) ( $job['needs_work'] ?? 0 );
+			if ( ! $pick['post_id'] ) {
+				// Cursor may have walked past posts that only look done in-memory.
+				// Reset and pull a fresh actionable set while site work remains.
+				self::sync_job_live_stats( $job, $lang, true );
+				self::reconcile_succeeded_posts( $job, $lang );
 
-			if ( $needs_work > 0 ) {
-				$actionable = self::get_actionable_remaining_ids( $lang, $job, min( 50, max( 1, $needs_work ) ) );
+				$needs_work = (int) ( $job['needs_work'] ?? 0 );
 
-				if ( ! empty( $actionable ) ) {
-					$job['last_post_id'] = 0;
-					$job['retry_queue']  = array_values(
-						array_unique(
-							array_merge( self::get_retry_queue( $job ), $actionable )
-						)
-					);
-					$job['total']         = max( (int) ( $job['total'] ?? 0 ), (int) ( $job['succeeded'] ?? 0 ) + $needs_work );
-					$job['initial_total'] = max( (int) ( $job['initial_total'] ?? 0 ), (int) $job['total'] );
-					self::save_job( $job );
+				if ( $needs_work > 0 ) {
+					$actionable = self::get_actionable_remaining_ids( $lang, $job, min( 50, max( 1, $needs_work ) ) );
 
-					$pick = self::pick_next_job_post_id( $job, $lang, 0 );
+					if ( ! empty( $actionable ) ) {
+						$job['last_post_id'] = 0;
+						$job['retry_queue']  = array_values(
+							array_unique(
+								array_merge( self::get_retry_queue( $job ), $actionable )
+							)
+						);
+						$job['total']         = max( (int) ( $job['total'] ?? 0 ), (int) ( $job['succeeded'] ?? 0 ) + $needs_work );
+						$job['initial_total'] = max( (int) ( $job['initial_total'] ?? 0 ), (int) $job['total'] );
+						self::save_job( $job );
+
+						$pick = self::pick_next_job_post_id( $job, $lang, 0 );
+					}
 				}
 			}
-		}
 
-		if ( ! $pick['post_id'] ) {
-			if ( Menu_Translator::count_untranslated( $lang ) > 0 ) {
-				$job['phase']        = 'menus';
-				$job['last_menu_id'] = 0;
+			if ( ! $pick['post_id'] ) {
+				if ( Menu_Translator::count_untranslated( $lang ) > 0 ) {
+					$job['phase']        = 'menus';
+					$job['last_menu_id'] = 0;
+					self::save_job( $job );
+
+					return self::run_menu_job_step( $job );
+				}
+
+				$job['step_started_at'] = null;
+				$job['current_post_id'] = null;
+				self::finalize_job_if_queue_exhausted( $job, $lang );
 				self::save_job( $job );
 
-				return self::run_menu_job_step( $job );
+				if ( 'completed' === ( $job['status'] ?? '' ) ) {
+					self::log( 'success', __( 'ترجمه خودکار با موفقیت به پایان رسید.', 'polymart-ai' ) );
+				} elseif ( ! empty( $job['last_error'] ) ) {
+					self::log( 'warning', (string) $job['last_error'] );
+				}
+
+				return self::normalize_job_for_response( $job, true );
 			}
 
-			$job['step_started_at'] = null;
-			$job['current_post_id'] = null;
-			self::finalize_job_if_queue_exhausted( $job, $lang );
-			self::save_job( $job );
-
-			if ( 'completed' === ( $job['status'] ?? '' ) ) {
-				self::log( 'success', __( 'ترجمه خودکار با موفقیت به پایان رسید.', 'polymart-ai' ) );
-			} elseif ( ! empty( $job['last_error'] ) ) {
-				self::log( 'warning', (string) $job['last_error'] );
-			}
-
-			return self::normalize_job_for_response( $job, true );
+			$post_id    = $pick['post_id'];
+			$from_retry = $pick['from_retry'];
+			$job['partial_post_id'] = $post_id;
 		}
-
-		$post_id = $pick['post_id'];
 
 		$job['current_post_id'] = $post_id;
 		$job['step_started_at'] = time();
 		self::save_job( $job );
 
-		$result = Post_Translator::request_ai_translation( $post_id, $lang );
+		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
 
-		if ( is_wp_error( $result ) && 'polymart_ai_translation_in_progress' === $result->get_error_code() ) {
+		if ( is_wp_error( $slice ) && 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
 			$job['current_post_id']       = null;
 			$job['step_started_at']       = null;
 			$job['step_deferred']         = true;
 			$job['step_deferred_reason']  = 'translation_in_progress';
-			$job['step_deferred_message'] = $result->get_error_message();
+			$job['step_deferred_message'] = $slice->get_error_message();
 			self::save_job( $job );
 
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( is_wp_error( $result ) ) {
+		if ( is_wp_error( $slice ) ) {
+			Post_Translator::clear_job_partial_state( $post_id, $lang );
+			Post_Translator::release_translation_lock( $post_id, $lang );
+			$job['partial_post_id']   = null;
+			$job['partial_phase']     = null;
+			$job['partial_progress']  = null;
+
 			return self::normalize_job_for_response(
-				self::handle_job_translation_failure( $job, $post_id, $lang, $result, $pick['from_retry'] ),
+				self::handle_job_translation_failure( $job, $post_id, $lang, $slice, $from_retry ),
 				true
 			);
 		}
 
+		if ( empty( $slice['done'] ) ) {
+			$job['step_partial']      = true;
+			$job['partial_post_id']   = $post_id;
+			$job['partial_phase']     = (string) ( $slice['phase'] ?? '' );
+			$job['partial_progress']  = (string) ( $slice['phase_progress'] ?? '' );
+			$job['current_post_id']   = null;
+			$job['step_started_at']   = null;
+			self::increment_job_step( $job );
+			self::set_job_last_step(
+				$job,
+				$post_id,
+				'partial',
+				(string) ( $slice['message'] ?? __( 'ادامه در مرحله بعد…', 'polymart-ai' ) )
+			);
+			self::save_job( $job );
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		$job['partial_post_id']  = null;
+		$job['partial_phase']    = null;
+		$job['partial_progress'] = null;
+		unset( $job['step_partial'] );
+
 		return self::normalize_job_for_response(
-			self::handle_job_translation_success( $job, $post_id, $lang, $result ),
+			self::handle_job_translation_success( $job, $post_id, $lang, array( 'translations' => array() ), true ),
 			true
 		);
 	}
@@ -1777,11 +1838,13 @@ final class Activity_Logger {
 	 * @param array{translations: array<string, string>} $result Translation result.
 	 * @return array<string, mixed>
 	 */
-	private static function handle_job_translation_success( array $job, $post_id, $lang, array $result ) {
-		$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
+	private static function handle_job_translation_success( array $job, $post_id, $lang, array $result, $already_saved = false ) {
+		if ( ! $already_saved ) {
+			$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
 
-		if ( is_wp_error( $save_result ) ) {
-			return self::handle_job_translation_failure( $job, $post_id, $lang, $save_result, false );
+			if ( is_wp_error( $save_result ) ) {
+				return self::handle_job_translation_failure( $job, $post_id, $lang, $save_result, false );
+			}
 		}
 
 		REST_API::invalidate_stats_cache();

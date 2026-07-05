@@ -963,6 +963,154 @@ final class UI_String_Source_Scanner {
 	}
 
 	/**
+	 * Scan companion plugin sources: known storefront subtrees, bootstrap PHP, then wider fallback.
+	 *
+	 * Most custom plugins keep __()/esc_html__() in includes/ or the main plugin file — not only
+	 * public/frontend/ folders. When the limited pass finds nothing, fall back to includes/inc/src.
+	 *
+	 * @param string $root_dir Absolute plugin directory.
+	 * @param string $slug     Plugin folder slug.
+	 * @return array{entries: array<int, array<string, mixed>>, files_scanned: int, files: string[], scan_mode: string}
+	 */
+	public static function scan_companion_plugin_sources( $root_dir, $slug ) {
+		$limited = self::scan_limited_directories(
+			$root_dir,
+			$slug,
+			UI_String_Storefront_Filter::companion_source_subdirs()
+		);
+
+		$bootstrap = self::scan_root_bootstrap_files( $root_dir, $slug );
+		$entries   = self::merge_source_scan_entries(
+			(array) ( $limited['entries'] ?? array() ),
+			(array) ( $bootstrap['entries'] ?? array() )
+		);
+		$files     = array_values(
+			array_unique(
+				array_merge(
+					(array) ( $limited['files'] ?? array() ),
+					(array) ( $bootstrap['files'] ?? array() )
+				)
+			)
+		);
+		$scan_mode = 'companion_subdirs';
+
+		if ( empty( $entries ) ) {
+			$fallback = self::scan_limited_directories(
+				$root_dir,
+				$slug,
+				array( 'includes', 'inc', 'src', 'elementor', 'assets' )
+			);
+			$entries  = (array) ( $fallback['entries'] ?? array() );
+			$files    = array_values(
+				array_unique(
+					array_merge(
+						$files,
+						(array) ( $fallback['files'] ?? array() )
+					)
+				)
+			);
+			$scan_mode = empty( $entries ) ? 'companion_subdirs' : 'companion_fallback';
+		}
+
+		return array(
+			'entries'       => $entries,
+			'files_scanned' => count( $files ),
+			'files'         => $files,
+			'scan_mode'     => $scan_mode,
+		);
+	}
+
+	/**
+	 * Scan top-level plugin PHP bootstrap files (main plugin file and root helpers).
+	 *
+	 * @param string $root_dir Absolute plugin directory.
+	 * @param string $slug     Plugin folder slug.
+	 * @return array{entries: array<int, array<string, mixed>>, files: string[]}
+	 */
+	public static function scan_root_bootstrap_files( $root_dir, $slug ) {
+		$root_dir = self::resolve_existing_directory( $root_dir );
+		$entries  = array();
+		$files    = array();
+		$domains  = UI_String_Registry::get_allowed_domains();
+
+		if ( '' === $root_dir || ! is_dir( $root_dir ) || empty( $domains ) ) {
+			return array(
+				'entries' => array(),
+				'files'   => array(),
+			);
+		}
+
+		$candidates = (array) glob( wp_normalize_path( $root_dir . '/*.php' ) );
+
+		foreach ( $candidates as $path ) {
+			if ( ! is_string( $path ) || ! is_readable( $path ) ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- local plugin scan.
+			$content = file_get_contents( $path );
+
+			if ( false === $content || '' === $content ) {
+				continue;
+			}
+
+			$file_entries = self::extract_strings_from_source( $content, $domains );
+
+			if ( empty( $file_entries ) ) {
+				continue;
+			}
+
+			$files[]  = $path;
+			$basename = wp_basename( $path );
+
+			foreach ( $file_entries as $entry ) {
+				$entry['references'] = array( $basename );
+				$entries[]           = $entry;
+			}
+		}
+
+		unset( $slug );
+
+		return array(
+			'entries' => $entries,
+			'files'   => $files,
+		);
+	}
+
+	/**
+	 * Merge source scan entry lists without duplicating msgid+context pairs.
+	 *
+	 * @param array<int, array<string, mixed>> $primary  Primary entries.
+	 * @param array<int, array<string, mixed>> $secondary Secondary entries.
+	 * @return array<int, array<string, mixed>>
+	 */
+	private static function merge_source_scan_entries( array $primary, array $secondary ) {
+		if ( empty( $secondary ) ) {
+			return $primary;
+		}
+
+		$seen   = array();
+		$merged = array();
+
+		foreach ( array_merge( $primary, $secondary ) as $entry ) {
+			if ( ! is_array( $entry ) || empty( $entry['msgid'] ) ) {
+				continue;
+			}
+
+			$key = md5( (string) ( $entry['context'] ?? '' ) . '|' . (string) $entry['msgid'] );
+
+			if ( isset( $seen[ $key ] ) ) {
+				continue;
+			}
+
+			$seen[ $key ] = true;
+			$merged[]     = $entry;
+		}
+
+		return $merged;
+	}
+
+	/**
 	 * Scan only selected subdirectories under a plugin/theme root.
 	 *
 	 * @param string   $root_dir  Absolute root directory.

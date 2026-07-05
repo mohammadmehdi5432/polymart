@@ -164,7 +164,11 @@ export default function AutoTranslateApp() {
 
       return data;
     } catch {
-      setNotice({ type: 'error', message: 'بارگذاری وضعیت ترجمه خودکار ناموفق بود.' });
+      setNotice({
+        type: 'warning',
+        message:
+          'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید یا «ادامه» را بزنید.',
+      });
       return null;
     }
   }, [setTargetLang]);
@@ -289,7 +293,15 @@ export default function AutoTranslateApp() {
         }
 
         const marker = jobProgressMarker(current);
-        const madeProgress = Boolean(current.last_step) || marker !== lastMarker;
+        const madeProgress =
+          Boolean(current.last_step) ||
+          current.step_partial ||
+          current.step_recovered_after_timeout ||
+          marker !== lastMarker;
+
+        if (current.step_recovered_after_timeout) {
+          appendLog('پاسخ مرحله دیر رسید — وضعیت از سرور بازیابی شد و ادامه می‌دهیم.', 'warning');
+        }
 
         if (current.step_deferred || !madeProgress) {
           idleSteps += 1;

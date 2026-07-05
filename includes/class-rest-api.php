@@ -1516,7 +1516,7 @@ final class REST_API {
 	 */
 	public function scan_ui_strings() {
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 300 );
+			@set_time_limit( 600 );
 		}
 
 		try {

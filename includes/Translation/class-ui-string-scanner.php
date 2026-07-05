@@ -54,15 +54,10 @@ final class UI_String_Scanner {
 	 * @return string[]
 	 */
 	public static function list_scannable_plugin_slugs() {
-		static $cache = null;
-
-		if ( null !== $cache ) {
-			return $cache;
-		}
-
 		$slugs = array_merge(
 			UI_String_Registry::get_allowed_plugin_slugs(),
-			self::get_core_storefront_plugin_slugs()
+			self::get_core_storefront_plugin_slugs(),
+			self::discover_installed_plugin_slugs()
 		);
 
 		/**
@@ -103,9 +98,7 @@ final class UI_String_Scanner {
 
 		sort( $slugs, SORT_STRING );
 
-		$cache = $slugs;
-
-		return $cache;
+		return $slugs;
 	}
 
 	/**
@@ -283,7 +276,7 @@ final class UI_String_Scanner {
 
 	public static function scan_catalogs() {
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 300 );
+			@set_time_limit( 600 );
 		}
 
 		$debug = self::empty_debug_info();
@@ -326,16 +319,16 @@ final class UI_String_Scanner {
 			$catalog_only                     = in_array( strtolower( $slug ), self::get_catalog_only_plugin_slugs(), true );
 			$plugin_debug['catalog_only']     = $catalog_only;
 
-			// 1) Companion plugins: scan only public/frontend/template subtrees.
+			if ( ! $catalog_only && ! $plugin_debug['languages_exists'] ) {
+				$plugin_debug['note'] = 'languages_dir_missing';
+			}
+
+			// 1) Companion plugins: scan storefront subtrees, bootstrap PHP, then wider fallback.
 			if ( ! $catalog_only ) {
-				$source_scan = UI_String_Source_Scanner::scan_limited_directories(
-					$plugin_dir,
-					$slug,
-					UI_String_Storefront_Filter::companion_source_subdirs()
-				);
+				$source_scan = UI_String_Source_Scanner::scan_companion_plugin_sources( $plugin_dir, $slug );
 				$plugin_debug['source_files_scanned'] = (int) ( $source_scan['files_scanned'] ?? 0 );
 				$plugin_debug['source_sample_files']  = array_slice( (array) ( $source_scan['files'] ?? array() ), 0, 5 );
-				$plugin_debug['source_scan_mode']     = 'companion_subdirs';
+				$plugin_debug['source_scan_mode']     = (string) ( $source_scan['scan_mode'] ?? 'companion_subdirs' );
 
 				if ( ! empty( $source_scan['entries'] ) ) {
 					$storefront_entries = UI_String_Storefront_Filter::filter_entries( $source_scan['entries'], $slug );
@@ -408,7 +401,7 @@ final class UI_String_Scanner {
 					continue;
 				}
 
-				$storefront_entries = UI_String_Storefront_Filter::filter_entries(
+				$storefront_entries = UI_String_Storefront_Filter::filter_catalog_entries(
 					$parsed['entries'],
 					$slug
 				);
@@ -424,6 +417,44 @@ final class UI_String_Scanner {
 			}
 
 			$plugin_total = (int) $plugin_debug['source_entries_added'] + (int) $plugin_debug['catalog_entries_added'];
+
+			// Production deploys often omit languages/*.pot; scan PHP/JS sources as a last resort.
+			if ( ! $catalog_only && 0 === $plugin_total && '' !== $plugin_dir ) {
+				$fallback_scan = UI_String_Source_Scanner::scan_plugin_directory( $plugin_dir, $slug );
+				$plugin_debug['source_scan_mode']     = 'full_plugin_fallback';
+				$plugin_debug['source_files_scanned'] = (int) ( $fallback_scan['files_scanned'] ?? 0 );
+
+				if ( ! empty( $fallback_scan['entries'] ) ) {
+					$storefront_entries = UI_String_Storefront_Filter::filter_entries(
+						(array) $fallback_scan['entries'],
+						$slug
+					);
+
+					if ( empty( $storefront_entries ) ) {
+						$storefront_entries = UI_String_Storefront_Filter::filter_catalog_entries(
+							(array) $fallback_scan['entries'],
+							$slug
+						);
+					}
+
+					foreach ( $storefront_entries as $entry ) {
+						$domain = isset( $entry['domain'] ) ? (string) $entry['domain'] : 'polymart-ai';
+
+						if ( ! UI_String_Registry::is_allowed_domain( $domain ) ) {
+							continue;
+						}
+
+						$added = self::merge_parsed_entries( $entries, array( $entry ), $domain, $slug );
+						$plugin_debug['source_entries_added'] += $added;
+						$debug['total_entries_added']         += $added;
+					}
+
+					$debug['total_source_entries_parsed'] = (int) ( $debug['total_source_entries_parsed'] ?? 0 )
+						+ count( $storefront_entries );
+				}
+
+				$plugin_total = (int) $plugin_debug['source_entries_added'] + (int) $plugin_debug['catalog_entries_added'];
+			}
 
 			if ( $plugin_total > 0 ) {
 				$plugins[ $slug ] = array(
@@ -562,6 +593,14 @@ final class UI_String_Scanner {
 		$plugin_dir = wp_normalize_path( (string) $plugin_dir );
 		$markers    = array();
 
+		$slug_domain = sanitize_key( wp_basename( $plugin_dir ) );
+
+		if ( '' !== $slug_domain ) {
+			$domains[] = $slug_domain;
+		}
+
+		$domains = array_values( array_unique( array_map( 'strtolower', $domains ) ) );
+
 		foreach ( $domains as $domain ) {
 			$markers[] = "Text Domain:\t\t" . $domain;
 			$markers[] = "Text Domain:\t" . $domain;
@@ -625,6 +664,62 @@ final class UI_String_Scanner {
 	}
 
 	/**
+	 * Read the Text Domain header from a plugin's bootstrap PHP file.
+	 *
+	 * @param string $slug Plugin folder slug.
+	 * @return string Sanitized text domain or empty string.
+	 */
+	public static function read_plugin_text_domain( $slug ) {
+		static $cache = array();
+
+		$slug = self::normalize_plugin_slug( $slug );
+
+		if ( '' === $slug ) {
+			return '';
+		}
+
+		if ( isset( $cache[ $slug ] ) ) {
+			return $cache[ $slug ];
+		}
+
+		$plugin_dir = self::resolve_plugin_directory( $slug );
+
+		if ( '' === $plugin_dir ) {
+			$cache[ $slug ] = '';
+
+			return '';
+		}
+
+		$candidates = (array) glob( wp_normalize_path( $plugin_dir . '/*.php' ) );
+
+		foreach ( $candidates as $file ) {
+			if ( ! is_string( $file ) || ! is_readable( $file ) ) {
+				continue;
+			}
+
+			$headers = get_file_data(
+				$file,
+				array(
+					'TextDomain' => 'Text Domain',
+				),
+				'plugin'
+			);
+
+			$domain = sanitize_key( (string) ( $headers['TextDomain'] ?? '' ) );
+
+			if ( '' !== $domain ) {
+				$cache[ $slug ] = $domain;
+
+				return $domain;
+			}
+		}
+
+		$cache[ $slug ] = '';
+
+		return '';
+	}
+
+	/**
 	 * Resolve a plugin slug to an absolute directory path.
 	 *
 	 * Preserves slug casing and falls back to a case-insensitive match on Linux hosts.
@@ -657,6 +752,28 @@ final class UI_String_Scanner {
 		foreach ( $plugin_roots as $root ) {
 			if ( strtolower( wp_basename( $root ) ) === $needle ) {
 				return UI_String_Source_Scanner::resolve_existing_directory( $root );
+			}
+		}
+
+		// GitHub / build zips often append -main, -master, or -trunk to the folder name.
+		foreach ( $plugin_roots as $root ) {
+			$basename = wp_basename( $root );
+
+			if ( preg_match( '/-(main|master|trunk)$/i', $basename ) ) {
+				$normalized = preg_replace( '/-(main|master|trunk)$/i', '', $basename );
+
+				if ( strtolower( (string) $normalized ) === $needle ) {
+					return UI_String_Source_Scanner::resolve_existing_directory( $root );
+				}
+			}
+		}
+
+		foreach ( array( '-main', '-master', '-trunk' ) as $suffix ) {
+			$variant = wp_normalize_path( untrailingslashit( WP_PLUGIN_DIR ) . '/' . $slug . $suffix );
+			$found   = UI_String_Source_Scanner::resolve_existing_directory( $variant );
+
+			if ( '' !== $found ) {
+				return $found;
 			}
 		}
 

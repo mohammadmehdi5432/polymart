@@ -2840,6 +2840,463 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Post meta prefix for in-progress auto-translate job slices (per post + language).
+	 */
+	const JOB_PARTIAL_META_PREFIX = '_polymart_ai_job_partial_';
+
+	/**
+	 * Max field batches processed per auto-translate HTTP step.
+	 *
+	 * @return int
+	 */
+	public static function get_job_step_max_field_chunks() {
+		/**
+		 * Filter how many AI field batches one auto-translate step may run.
+		 *
+		 * @param int $chunks Default 2.
+		 */
+		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_field_chunks', 2 ) );
+	}
+
+	/**
+	 * Max Elementor batches processed per auto-translate HTTP step.
+	 *
+	 * @return int
+	 */
+	public static function get_job_step_max_elementor_chunks() {
+		/**
+		 * Filter how many Elementor AI batches one auto-translate step may run.
+		 *
+		 * @param int $chunks Default 1 (keeps heavy pages under typical proxy timeouts).
+		 */
+		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_elementor_chunks', 1 ) );
+	}
+
+	/**
+	 * @param string $lang Language code.
+	 * @return string
+	 */
+	private static function get_job_partial_meta_key( $lang ) {
+		return self::JOB_PARTIAL_META_PREFIX . sanitize_key( (string) $lang );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return array<string, mixed>
+	 */
+	public static function get_job_partial_state( $post_id, $lang ) {
+		$stored = get_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ), true );
+
+		return is_array( $stored ) ? $stored : array();
+	}
+
+	/**
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Partial job state.
+	 * @return void
+	 */
+	public static function save_job_partial_state( $post_id, $lang, array $state ) {
+		update_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ), $state );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	public static function clear_job_partial_state( $post_id, $lang ) {
+		delete_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ) );
+	}
+
+	/**
+	 * Refresh the per-post translation lock TTL while a multi-step job slice runs.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function refresh_translation_lock( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$key     = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
+
+		if ( get_transient( $key ) ) {
+			set_transient( $key, time(), self::TRANSLATION_LOCK_TTL );
+
+			return true;
+		}
+
+		return self::acquire_translation_lock( $post_id, $lang );
+	}
+
+	/**
+	 * Whether Elementor JSON still needs work during an auto-translate job.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function post_needs_elementor_job_work( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! self::should_require_elementor_translation( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! self::has_elementor_persian_content( $post_id ) ) {
+			return false;
+		}
+
+		if ( self::is_elementor_translation_current( $post_id, $lang ) ) {
+			$previous_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
+
+			return '' !== trim( $previous_error );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Process one bounded slice of an auto-translate job step for a single post.
+	 *
+	 * Heavy Elementor pages are split across many HTTP steps so proxies/PHP limits
+	 * do not abort the whole site-wide run.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
+	 */
+	public static function process_job_translation_slice( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( ! $post_id || ( ! wp_doing_cron() && ! current_user_can( 'edit_post', $post_id ) ) ) {
+			return new \WP_Error(
+				'polymart_ai_forbidden',
+				__( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' )
+			);
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post || ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			return new \WP_Error(
+				'polymart_ai_invalid_post',
+				__( 'نوع مطلب برای ترجمه نامعتبر است.', 'polymart-ai' )
+			);
+		}
+
+		$settings = self::get_translation_settings();
+
+		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) ) {
+			return new \WP_Error(
+				'polymart_ai_missing_credentials',
+				__( 'اعتبارنامه API آروان‌کلاد پیکربندی نشده است.', 'polymart-ai' )
+			);
+		}
+
+		if ( ! self::refresh_translation_lock( $post_id, $lang ) ) {
+			return new \WP_Error(
+				'polymart_ai_translation_in_progress',
+				__( 'این مورد در حال ترجمه است. لطفاً چند لحظه صبر کنید.', 'polymart-ai' )
+			);
+		}
+
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 300 );
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		if ( empty( $state ) || empty( $state['phase'] ) ) {
+			$state = array(
+				'phase'               => 'fields',
+				'field_translations'  => array(),
+				'field_chunk_index'   => 0,
+				'elementor_map'       => array(),
+				'elementor_chunk_index' => 0,
+				'elementor_chunks_total' => 0,
+			);
+		}
+
+		$api_key      = (string) $settings['api_key'];
+		$api_endpoint = rtrim( (string) $settings['api_endpoint'], '/' );
+		$ai_model     = AI_Client::resolve_model(
+			(string) ( $settings['ai_model'] ?? '' ),
+			$api_endpoint
+		);
+
+		try {
+			if ( 'fields' === (string) $state['phase'] ) {
+				$payload = self::collect_persian_fields( $post, $lang );
+				$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_ai( $payload );
+				$total   = count( $chunks );
+				$index   = max( 0, (int) ( $state['field_chunk_index'] ?? 0 ) );
+				$budget  = self::get_job_step_max_field_chunks();
+				$done    = 0;
+
+				while ( $index < $total && $budget > 0 ) {
+					$chunk_result = AI_Client::translate_fields(
+						$chunks[ $index ],
+						$api_key,
+						$api_endpoint,
+						$ai_model,
+						$lang
+					);
+
+					if ( is_wp_error( $chunk_result ) ) {
+						return $chunk_result;
+					}
+
+					$state['field_translations'] = array_merge(
+						(array) ( $state['field_translations'] ?? array() ),
+						self::collapse_payload_parts( $chunk_result )
+					);
+					++$index;
+					--$budget;
+					++$done;
+				}
+
+				$state['field_chunk_index'] = $index;
+
+				if ( $index < $total ) {
+					self::save_job_partial_state( $post_id, $lang, $state );
+
+					return array(
+						'done'            => false,
+						'phase'           => 'fields',
+						'phase_progress'  => $index . '/' . $total,
+						'message'         => sprintf(
+							/* translators: 1: completed batches, 2: total batches */
+							__( 'فیلدهای متنی — بخش %1$d از %2$d', 'polymart-ai' ),
+							$index,
+							$total
+						),
+					);
+				}
+
+				if ( ! empty( $state['field_translations'] ) ) {
+					$save_result = self::save_ai_translations(
+						$post_id,
+						(array) $state['field_translations'],
+						$lang,
+						array( 'skip_elementor' => true )
+					);
+
+					if ( is_wp_error( $save_result ) ) {
+						return $save_result;
+					}
+				}
+
+				if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+					$state['phase']                  = 'elementor';
+					$state['elementor_map']          = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+					$state['elementor_chunk_index']  = 0;
+					$state['elementor_chunks_total'] = 0;
+					self::save_job_partial_state( $post_id, $lang, $state );
+
+					return array(
+						'done'           => false,
+						'phase'          => 'elementor',
+						'phase_progress' => '0/…',
+						'message'        => __( 'فیلدها ذخیره شد — ترجمه Elementor در مراحل بعدی', 'polymart-ai' ),
+					);
+				}
+
+				self::clear_job_partial_state( $post_id, $lang );
+				self::release_translation_lock( $post_id, $lang );
+
+				return array(
+					'done'           => true,
+					'phase'          => 'complete',
+					'phase_progress' => '',
+					'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
+				);
+			}
+
+			if ( 'elementor' === (string) $state['phase'] ) {
+				$elementor_slice = self::process_elementor_job_slice(
+					$post_id,
+					$lang,
+					$state,
+					$api_key,
+					$api_endpoint,
+					$ai_model
+				);
+
+				if ( is_wp_error( $elementor_slice ) ) {
+					return $elementor_slice;
+				}
+
+				if ( empty( $elementor_slice['done'] ) ) {
+					return $elementor_slice;
+				}
+
+				self::clear_job_partial_state( $post_id, $lang );
+				self::release_translation_lock( $post_id, $lang );
+
+				return array(
+					'done'           => true,
+					'phase'          => 'complete',
+					'phase_progress' => '',
+					'message'        => __( 'ترجمه Elementor این مورد تکمیل شد.', 'polymart-ai' ),
+				);
+			}
+
+			self::clear_job_partial_state( $post_id, $lang );
+			self::release_translation_lock( $post_id, $lang );
+
+			return array(
+				'done'           => true,
+				'phase'          => 'complete',
+				'phase_progress' => '',
+				'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
+			);
+		} catch ( \Throwable $e ) {
+			self::release_translation_lock( $post_id, $lang );
+
+			return new \WP_Error(
+				'polymart_ai_job_slice_failed',
+				$e->getMessage()
+			);
+		}
+	}
+
+	/**
+	 * Translate the next Elementor batch(es) for an auto-translate job slice.
+	 *
+	 * @param int                  $post_id      Post ID.
+	 * @param string               $lang         Language code.
+	 * @param array<string, mixed> $state        Partial state (by reference).
+	 * @param string               $api_key      API key.
+	 * @param string               $api_endpoint API endpoint.
+	 * @param string               $ai_model     Model name.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
+	 */
+	private static function process_elementor_job_slice( $post_id, $lang, array &$state, $api_key, $api_endpoint, $ai_model ) {
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === $raw ) {
+			return new \WP_Error(
+				'polymart_ai_elementor_source_missing',
+				__( 'داده Elementor برای این صفحه یافت نشد.', 'polymart-ai' )
+			);
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return new \WP_Error(
+				'polymart_ai_elementor_source_invalid',
+				__( 'JSON Elementor نامعتبر است.', 'polymart-ai' )
+			);
+		}
+
+		$payload = self::collect_elementor_translation_payload( $data );
+
+		if ( empty( $payload ) ) {
+			return array(
+				'done'           => true,
+				'phase'          => 'elementor',
+				'phase_progress' => '',
+				'message'        => __( 'متن فارسی Elementor برای ترجمه یافت نشد.', 'polymart-ai' ),
+			);
+		}
+
+		$chunks = self::chunk_elementor_payload_for_ai( $payload );
+		$total  = count( $chunks );
+		$index  = max( 0, (int) ( $state['elementor_chunk_index'] ?? 0 ) );
+		$budget = self::get_job_step_max_elementor_chunks();
+		$map    = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+
+		$state['elementor_chunks_total'] = $total;
+
+		while ( $index < $total && $budget > 0 ) {
+			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunks[ $index ] );
+			$chunk_result = AI_Client::translate_fields(
+				$aliased_payload,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang
+			);
+
+			if ( is_wp_error( $chunk_result ) ) {
+				return $chunk_result;
+			}
+
+			$map = array_merge(
+				$map,
+				self::unmap_elementor_aliases(
+					self::collapse_payload_parts( $chunk_result ),
+					$alias_to_path
+				)
+			);
+			++$index;
+			--$budget;
+		}
+
+		$state['elementor_chunk_index'] = $index;
+		$state['elementor_map']         = $map;
+
+		$tree = self::apply_elementor_translation_payload( $data, $map );
+		$json = wp_json_encode( $tree );
+
+		if ( false === $json || '' === $json ) {
+			return new \WP_Error(
+				'polymart_ai_elementor_save_failed',
+				__( 'ذخیره ترجمه Elementor ناموفق بود.', 'polymart-ai' )
+			);
+		}
+
+		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), $json );
+
+		if ( $index < $total ) {
+			update_post_meta(
+				$post_id,
+				'_polymart_ai_elementor_error_' . $lang,
+				sprintf(
+					/* translators: 1: completed batches, 2: total batches */
+					__( 'ترجمه Elementor در حال انجام (%1$d/%2$d)', 'polymart-ai' ),
+					$index,
+					$total
+				)
+			);
+			self::save_job_partial_state( $post_id, $lang, $state );
+
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => $index . '/' . $total,
+				'message'        => sprintf(
+					/* translators: 1: completed batches, 2: total batches */
+					__( 'Elementor — بخش %1$d از %2$d', 'polymart-ai' ),
+					$index,
+					$total
+				),
+			);
+		}
+
+		self::save_elementor_source_hash( $post_id, $lang );
+		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+		self::flush_translation_status_cache( $post_id );
+
+		return array(
+			'done'           => true,
+			'phase'          => 'elementor',
+			'phase_progress' => $total . '/' . $total,
+			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+		);
+	}
+
+	/**
 	 * Build and store a translated Elementor JSON tree for a language.
 	 *
 	 * @param int    $post_id Post ID.
@@ -3692,13 +4149,13 @@ final class Post_Translator {
 	 * @param string                $lang         Target language code.
 	 * @return true|\WP_Error
 	 */
-	public static function save_ai_translations( $post_id, array $translations, $lang = 'en' ) {
+	public static function save_ai_translations( $post_id, array $translations, $lang = 'en', array $options = array() ) {
 		$lang = sanitize_key( (string) $lang );
 
 		self::begin_persisting_translations();
 
 		try {
-			return self::save_ai_translations_internal( $post_id, $translations, $lang );
+			return self::save_ai_translations_internal( $post_id, $translations, $lang, $options );
 		} finally {
 			self::end_persisting_translations();
 		}
@@ -3710,9 +4167,10 @@ final class Post_Translator {
 	 * @param int                   $post_id      Post ID.
 	 * @param array<string, string> $translations AI response keyed by source field name.
 	 * @param string                $lang         Target language code.
+	 * @param array<string, bool>   $options      Optional flags (skip_elementor).
 	 * @return true|\WP_Error
 	 */
-	private static function save_ai_translations_internal( $post_id, array $translations, $lang = 'en' ) {
+	private static function save_ai_translations_internal( $post_id, array $translations, $lang = 'en', array $options = array() ) {
 		$lang = sanitize_key( (string) $lang );
 
 		foreach ( $translations as $source_key => $value ) {
@@ -3814,7 +4272,7 @@ final class Post_Translator {
 			self::persist_cms_block_runtime_cache( $post_id, $lang, $post );
 		}
 
-		if ( self::should_require_elementor_translation( $post_id ) ) {
+		if ( empty( $options['skip_elementor'] ) && self::should_require_elementor_translation( $post_id ) ) {
 			$elementor_result = self::persist_elementor_translation( $post_id, $lang );
 
 			if ( is_wp_error( $elementor_result ) ) {
