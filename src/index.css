@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+#polymart-ai-root {
+  @apply font-sans text-sm text-gray-800;
+  position: relative;
+  z-index: 1;
+}
+
+#polymart-ai-root *,
+#polymart-ai-root *::before,
+#polymart-ai-root *::after {
+  box-sizing: border-box;
+}
+
+/* WordPress admin often forces default cursor; restore interactive affordances. */
+#polymart-ai-root button:not(:disabled),
+#polymart-ai-root a[href],
+#polymart-ai-root [role='button']:not([aria-disabled='true']),
+#polymart-ai-root [role='tab']:not([aria-disabled='true']),
+#polymart-ai-root label,
+#polymart-ai-root select:not(:disabled),
+#polymart-ai-root summary,
+#polymart-ai-root input[type='checkbox']:not(:disabled),
+#polymart-ai-root input[type='radio']:not(:disabled),
+#polymart-ai-root input[type='submit']:not(:disabled),
+#polymart-ai-root input[type='button']:not(:disabled) {
+  cursor: pointer;
+}
+
+#polymart-ai-root button:disabled,
+#polymart-ai-root select:disabled,
+#polymart-ai-root input:disabled,
+#polymart-ai-root [aria-disabled='true'] {
+  cursor: not-allowed;
+}
+
+#polymart-ai-root button,
+#polymart-ai-root a,
+#polymart-ai-root [role='button'],
+#polymart-ai-root [role='tab'] {
+  pointer-events: auto;
+}
+
+#polymart-ai-root input[type='text'],
+#polymart-ai-root input[type='search'],
+#polymart-ai-root input[type='url'],
+#polymart-ai-root input[type='password'],
+#polymart-ai-root input[type='number'],
+#polymart-ai-root textarea {
+  cursor: text;
+}

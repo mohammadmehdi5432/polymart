@@ -1,0 +1,140 @@
+.polymart-ai-metabox__intro {
+	margin-top: 0;
+}
+
+.polymart-ai-metabox__actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px;
+	margin: 0 0 16px;
+}
+
+.polymart-ai-metabox__status {
+	font-size: 13px;
+	color: #646970;
+}
+
+.polymart-ai-metabox__status.is-success {
+	color: #008a20;
+}
+
+.polymart-ai-metabox__status.is-error {
+	color: #b32d2e;
+}
+
+.polymart-ai-metabox__table th {
+	width: 180px;
+	padding-left: 0;
+	vertical-align: top;
+}
+
+.polymart-ai-metabox__table td {
+	padding-right: 0;
+}
+
+.polymart-ai-metabox__footnote {
+	margin-bottom: 0;
+}
+
+#polymart-ai-english-translation .inside {
+	margin: 0;
+	padding: 12px;
+}
+
+.polymart-ai-metabox__empty {
+	margin: 12px 0;
+}
+
+.polymart-ai-metabox__lang-panel {
+	margin: 0 0 20px;
+	padding: 16px;
+	border: 1px solid #dcdcde;
+	border-radius: 6px;
+	background: #fff;
+}
+
+.polymart-ai-metabox__lang-panel:last-of-type {
+	margin-bottom: 12px;
+}
+
+.polymart-ai-metabox__lang-header {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 12px;
+	padding-bottom: 12px;
+	border-bottom: 1px solid #f0f0f1;
+}
+
+.polymart-ai-metabox__lang-title {
+	margin: 0;
+	font-size: 15px;
+	line-height: 1.4;
+}
+
+.polymart-ai-metabox__lang-code {
+	font-size: 12px;
+	font-weight: 500;
+	color: #646970;
+}
+
+.polymart-ai-metabox__lang-subtitle,
+.polymart-ai-metabox__lang-prefix {
+	margin: 4px 0 0;
+}
+
+.polymart-ai-metabox__status--lang {
+	display: block;
+	min-height: 18px;
+	margin: 0 0 12px;
+	font-size: 13px;
+}
+
+.polymart-ai-metabox__status--lang.is-success {
+	color: #008a20;
+}
+
+.polymart-ai-metabox__status--lang.is-error {
+	color: #b32d2e;
+}
+
+.polymart-ai-generate-btn.button-hero {
+	display: inline-flex;
+	align-items: center;
+}
+
+.polymart-ai-thumbnail-field__preview {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 280px;
+	max-width: 100%;
+	min-height: 140px;
+	margin-bottom: 10px;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	background: #f6f7f7;
+	overflow: hidden;
+}
+
+.polymart-ai-thumbnail-field__preview img {
+	display: block;
+	width: 100%;
+	height: auto;
+}
+
+.polymart-ai-thumbnail-field__placeholder {
+	color: #646970;
+	font-size: 13px;
+}
+
+.polymart-ai-thumbnail-field__actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px;
+	margin: 0 0 8px;
+}

@@ -1,0 +1,25 @@
+# Dependencies (reinstall with: npm install)
+node_modules/
+
+# Secrets & local env
+.env
+.env.*
+!.env.example
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs & caches
+*.log
+npm-debug.log*
+.npm/
+.cache/
+
+# Vite dev cache only (compiled assets in build/assets/ are committed)
+build/.vite/
