@@ -3692,6 +3692,30 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether the current request may translate a post (REST bulk job, cron, or edit_post).
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function can_translate_post( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		if ( wp_doing_cron() ) {
+			return true;
+		}
+
+		if ( defined( 'REST_REQUEST' ) && REST_REQUEST && current_user_can( REST_API::required_admin_capability() ) ) {
+			return true;
+		}
+
+		return current_user_can( 'edit_post', $post_id );
+	}
+
+	/**
 	 * Process one bounded slice of an auto-translate job step for a single post.
 	 *
 	 * Heavy Elementor pages are split across many HTTP steps so proxies/PHP limits
@@ -3705,7 +3729,7 @@ final class Post_Translator {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 
-		if ( ! $post_id || ( ! wp_doing_cron() && ! current_user_can( 'edit_post', $post_id ) ) ) {
+		if ( ! $post_id || ! self::can_translate_post( $post_id ) ) {
 			return new \WP_Error(
 				'polymart_ai_forbidden',
 				__( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' )
@@ -4002,7 +4026,8 @@ final class Post_Translator {
 
 		$payload = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
-			$map
+			$map,
+			is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array()
 		);
 
 		if ( empty( $payload ) ) {
@@ -4029,7 +4054,9 @@ final class Post_Translator {
 			$first_key = (string) array_key_first( $chunk );
 
 			if ( '' !== $first_key && absint( $failures[ $first_key ] ?? 0 ) >= 3 ) {
-				$map = array_merge( $map, self::collapse_payload_parts( array( $first_key => (string) $chunk[ $first_key ] ) ) );
+				$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+				$skipped[] = $first_key;
+				$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
 				unset( $failures[ $first_key ] );
 				++$processed;
 				continue;
@@ -4096,7 +4123,8 @@ final class Post_Translator {
 
 		$remaining = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
-			$map
+			$map,
+			is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array()
 		);
 
 		if ( ! empty( $remaining ) ) {
@@ -4208,11 +4236,17 @@ final class Post_Translator {
 	 * @param array<string, string> $map     Completed translations keyed by path.
 	 * @return array<string, string>
 	 */
-	private static function filter_remaining_elementor_payload( array $payload, array $map ) {
-		$remaining = array();
+	private static function filter_remaining_elementor_payload( array $payload, array $map, array $skipped = array() ) {
+		$remaining      = array();
+		$skipped_lookup = array_flip( array_map( 'strval', $skipped ) );
 
 		foreach ( $payload as $path => $text ) {
+			$path = (string) $path;
 			$text = (string) $text;
+
+			if ( isset( $skipped_lookup[ $path ] ) ) {
+				continue;
+			}
 
 			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
 				continue;
@@ -4893,7 +4927,12 @@ final class Post_Translator {
 		}
 
 		// Never decode multi-megabyte Elementor JSON during public page renders.
-		if ( ! is_admin() && ! wp_doing_cron() && ! ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+		if (
+			! is_admin()
+			&& ! wp_doing_cron()
+			&& ! wp_doing_ajax()
+			&& ! ( defined( 'REST_REQUEST' ) && REST_REQUEST )
+		) {
 			self::$elementor_plain_text_cache[ $post_id ] = '';
 
 			return '';
@@ -5066,7 +5105,7 @@ final class Post_Translator {
 	public static function request_ai_translation( $post_id, $lang = 'en' ) {
 		$post_id = absint( $post_id );
 
-		if ( ! $post_id || ( ! wp_doing_cron() && ! current_user_can( 'edit_post', $post_id ) ) ) {
+		if ( ! $post_id || ! self::can_translate_post( $post_id ) ) {
 			return new \WP_Error(
 				'polymart_ai_forbidden',
 				__( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' )

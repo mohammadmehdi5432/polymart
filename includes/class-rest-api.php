@@ -305,6 +305,16 @@ final class REST_API {
 
 		register_rest_route(
 			self::NAMESPACE,
+			'/rest-nonce',
+			array(
+				'methods'             => \WP_REST_Server::READABLE,
+				'callback'            => array( $this, 'get_rest_nonce' ),
+				'permission_callback' => array( $this, 'check_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
 			'/translations/(?P<id>\d+)/generate',
 			array(
 				'methods'             => \WP_REST_Server::CREATABLE,
@@ -1413,6 +1423,19 @@ final class REST_API {
 				'total' => $result['total'],
 				'page'  => $page,
 				'pages' => (int) max( 1, ceil( $result['total'] / $limit ) ),
+			)
+		);
+	}
+
+	/**
+	 * Issue a fresh wp_rest nonce for long-lived admin SPA sessions.
+	 *
+	 * @return \WP_REST_Response
+	 */
+	public function get_rest_nonce() {
+		return rest_ensure_response(
+			array(
+				'nonce' => wp_create_nonce( 'wp_rest' ),
 			)
 		);
 	}

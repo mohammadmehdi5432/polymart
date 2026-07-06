@@ -625,12 +625,38 @@ final class Async_Translator {
 		$settings = Post_Translator::get_translation_settings();
 
 		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) ) {
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: %d: post ID */
+					__( 'ترجمه پس‌زمینه مورد #%d لغو شد — کلید API یا آدرس Gateway تنظیم نشده است.', 'polymart-ai' ),
+					$post_id
+				),
+				array(
+					'post_id' => $post_id,
+					'source'  => 'async',
+				)
+			);
+
 			return;
 		}
 
 		$languages = Language_Registry::get_translation_target_languages();
 
 		if ( empty( $languages ) ) {
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: %d: post ID */
+					__( 'ترجمه پس‌زمینه مورد #%d لغو شد — زبان مقصد فعالی یافت نشد.', 'polymart-ai' ),
+					$post_id
+				),
+				array(
+					'post_id' => $post_id,
+					'source'  => 'async',
+				)
+			);
+
 			return;
 		}
 
@@ -724,12 +750,38 @@ final class Async_Translator {
 		$settings = Post_Translator::get_translation_settings();
 
 		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) ) {
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: %d: term ID */
+					__( 'ترجمه پس‌زمینه برچسب #%d لغو شد — کلید API یا آدرس Gateway تنظیم نشده است.', 'polymart-ai' ),
+					$term_id
+				),
+				array(
+					'term_id' => $term_id,
+					'source'  => 'async',
+				)
+			);
+
 			return;
 		}
 
 		$languages = Language_Registry::get_translation_target_languages();
 
 		if ( empty( $languages ) ) {
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: %d: term ID */
+					__( 'ترجمه پس‌زمینه برچسب #%d لغو شد — زبان مقصد فعالی یافت نشد.', 'polymart-ai' ),
+					$term_id
+				),
+				array(
+					'term_id' => $term_id,
+					'source'  => 'async',
+				)
+			);
+
 			return;
 		}
 

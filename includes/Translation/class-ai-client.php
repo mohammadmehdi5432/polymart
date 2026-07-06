@@ -697,7 +697,8 @@ final class AI_Client {
 					__( 'API آروان‌کلاد کد HTTP %1$d برگرداند: %2$s', 'polymart-ai' ),
 					$status_code,
 					self::truncate_error_message( $message )
-				)
+				),
+				array( 'status' => $status_code )
 			);
 		}
 

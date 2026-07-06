@@ -26,15 +26,18 @@ final class Activity_Logger {
 	const MAX_REPORT_ENTRIES   = 1000;
 	const MAX_JOB_RETRIES      = 3;
 	const STEP_LOCK_KEY        = 'polymart_ai_job_step_lock';
-	const STEP_LOCK_TTL        = 1800;
+	const STEP_LOCK_TTL        = 600;
+	const CRON_HOOK            = 'polymart_ai_translation_job_step';
+	const CRON_INTERVAL_SEC    = 8;
 
 	/**
-	 * Register admin notice display.
+	 * Register admin notice display and background job worker.
 	 *
 	 * @return void
 	 */
 	public static function init() {
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
+		add_action( self::CRON_HOOK, array( __CLASS__, 'process_background_step' ) );
 	}
 
 	/**
@@ -1243,6 +1246,22 @@ final class Activity_Logger {
 	public static function start_job( $lang ) {
 		$lang = sanitize_key( (string) $lang );
 
+		if ( ! REST_API::is_ai_configured() ) {
+			return new \WP_Error(
+				'polymart_ai_missing_credentials',
+				__( 'کلید API یا آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده است.', 'polymart-ai' )
+			);
+		}
+
+		$language = Language_Registry::get_language( $lang );
+
+		if ( ! $language || empty( $language['enabled'] ) ) {
+			return new \WP_Error(
+				'polymart_ai_invalid_language',
+				__( 'زبان مقصد انتخاب‌شده فعال نیست.', 'polymart-ai' )
+			);
+		}
+
 		$existing = self::get_job( false );
 
 		if ( 'running' === ( $existing['status'] ?? '' ) ) {
@@ -1319,6 +1338,7 @@ final class Activity_Logger {
 		);
 
 		self::save_job( $job );
+		self::schedule_background_worker();
 		self::log(
 			'info',
 			sprintf(
@@ -1346,6 +1366,7 @@ final class Activity_Logger {
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
 			self::save_job( $job );
+			self::unschedule_background_worker();
 			self::log( 'warning', __( 'ترجمه خودکار متوقف موقت شد.', 'polymart-ai' ) );
 		}
 
@@ -1362,23 +1383,14 @@ final class Activity_Logger {
 		$job = wp_parse_args( $job, self::empty_job() );
 
 		if ( in_array( $job['status'], array( 'paused', 'running' ), true ) ) {
-			$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-
 			$job['status']          = 'running';
 			$job['last_error']      = null;
 			$job['pause_reason']    = null;
-			$job['last_post_id']    = 0;
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
-			$job['retry_attempts']  = array();
-			$job['exhausted_ids']   = array();
-			$job['retry_queue']     = array();
-			$job['deferred_queue']  = array();
-			$job['parked_ids']      = array();
-			$job['defer_rounds']    = array();
-			$job['post_step_counts'] = array();
 
 			self::save_job( $job );
+			self::schedule_background_worker();
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد.', 'polymart-ai' ) );
 		}
 
@@ -1409,6 +1421,7 @@ final class Activity_Logger {
 		}
 
 		self::release_step_lock();
+		self::unschedule_background_worker();
 
 		return self::save_job( self::empty_job() );
 	}
@@ -1579,13 +1592,76 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function acquire_step_lock() {
-		if ( get_transient( self::STEP_LOCK_KEY ) ) {
-			return false;
+		$lock = get_transient( self::STEP_LOCK_KEY );
+
+		if ( $lock ) {
+			$lock_age = time() - absint( $lock );
+			$job      = self::get_job_raw();
+			$step_age = isset( $job['step_started_at'] )
+				? time() - absint( $job['step_started_at'] )
+				: PHP_INT_MAX;
+
+			if ( $lock_age < self::STEP_LOCK_TTL && $step_age <= 300 ) {
+				return false;
+			}
+
+			delete_transient( self::STEP_LOCK_KEY );
 		}
 
 		set_transient( self::STEP_LOCK_KEY, time(), self::STEP_LOCK_TTL );
 
 		return true;
+	}
+
+	/**
+	 * Schedule the next server-side job step (survives closed browser tabs).
+	 *
+	 * @return void
+	 */
+	public static function schedule_background_worker() {
+		if ( wp_next_scheduled( self::CRON_HOOK ) ) {
+			return;
+		}
+
+		wp_schedule_single_event( time() + self::CRON_INTERVAL_SEC, self::CRON_HOOK );
+
+		if ( ! wp_doing_cron() && ( ! defined( 'DISABLE_WP_CRON' ) || ! DISABLE_WP_CRON ) ) {
+			spawn_cron();
+		}
+	}
+
+	/**
+	 * Cancel pending background job steps.
+	 *
+	 * @return void
+	 */
+	public static function unschedule_background_worker() {
+		wp_clear_scheduled_hook( self::CRON_HOOK );
+	}
+
+	/**
+	 * WP-Cron callback: process one job step and re-schedule while running.
+	 *
+	 * @return void
+	 */
+	public static function process_background_step() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			self::unschedule_background_worker();
+
+			return;
+		}
+
+		self::process_job_step();
+
+		$job = self::get_job_raw();
+
+		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			self::schedule_background_worker();
+		} else {
+			self::unschedule_background_worker();
+		}
 	}
 
 	/**
@@ -2989,6 +3065,12 @@ final class Activity_Logger {
 	public static function is_critical_api_error( \WP_Error $error ) {
 		$code    = $error->get_error_code();
 		$message = strtolower( $error->get_error_message() );
+		$data    = $error->get_error_data();
+		$status  = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
+
+		if ( in_array( $status, array( 401, 403, 429 ), true ) ) {
+			return true;
+		}
 
 		$critical_codes = array(
 			'polymart_ai_missing_credentials',
@@ -3001,6 +3083,8 @@ final class Activity_Logger {
 		}
 
 		$critical_keywords = array(
+			'429',
+			'too many requests',
 			'quota',
 			'rate limit',
 			'insufficient',

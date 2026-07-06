@@ -1,11 +1,13 @@
 import api from './settings';
 
-/** Max wait for one translation step (chunked steps should finish well under this). */
-export const JOB_STEP_TIMEOUT_MS = 240000;
+/** Max wait for one translation step — aligned with server set_time_limit and AI timeouts. */
+export const JOB_STEP_TIMEOUT_MS = 360000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
+const JOB_STEP_RETRIES = 2;
+const JOB_STEP_RETRY_DELAY_MS = 2000;
 
 let activeStepController = null;
 
@@ -25,6 +27,13 @@ async function withRetries(fn, { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETC
       lastError = error;
 
       if (error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError') {
+        throw error;
+      }
+
+      const isTimeout =
+        error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
+
+      if (isTimeout) {
         throw error;
       }
 
@@ -67,10 +76,14 @@ export async function jobStep() {
   activeStepController = new AbortController();
 
   try {
-    const { data } = await api.post('/translation-job/step', null, {
-      timeout: JOB_STEP_TIMEOUT_MS,
-      signal: activeStepController.signal,
-    });
+    const { data } = await withRetries(
+      () =>
+        api.post('/translation-job/step', null, {
+          timeout: JOB_STEP_TIMEOUT_MS,
+          signal: activeStepController.signal,
+        }),
+      { retries: JOB_STEP_RETRIES, delayMs: JOB_STEP_RETRY_DELAY_MS }
+    );
     return data;
   } catch (error) {
     const isAbort = error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError';

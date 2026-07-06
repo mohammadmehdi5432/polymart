@@ -10,7 +10,37 @@ const STEP_DELAY_MS = 250;
 const POLL_INTERVAL_MS = 2000;
 const DEFERRED_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 12000];
 const MAX_IDLE_STEPS = 8;
+const STEP_IN_FLIGHT_MAX_SEC = 600;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
+const POLL_ERROR_NOTICE_THRESHOLD = 3;
+
+function stepLogSignature(step) {
+  if (!step) {
+    return '';
+  }
+
+  return `${step.post_id ?? ''}:${step.status ?? ''}:${step.time ?? ''}:${step.message ?? ''}`;
+}
+
+function readAutoRunFlag() {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  return window.localStorage.getItem(AUTO_RUN_STORAGE_KEY) === '1';
+}
+
+function writeAutoRunFlag(active) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  if (active) {
+    window.localStorage.setItem(AUTO_RUN_STORAGE_KEY, '1');
+  } else {
+    window.localStorage.removeItem(AUTO_RUN_STORAGE_KEY);
+  }
+}
 
 function jobPhaseLabel(phase) {
   switch (phase) {
@@ -95,6 +125,7 @@ function stepErrorMessage(error) {
 
 const config = window.polymartAiSettings ?? {};
 const adminUrls = config.adminUrls ?? {};
+const aiConfigured = Boolean(config.aiConfigured);
 
 function formatTime(ts) {
   if (!ts) return '—';
@@ -134,6 +165,8 @@ export default function AutoTranslateApp() {
   const [apiTestResult, setApiTestResult] = useState(null);
   const runningRef = useRef(false);
   const autoResumedRef = useRef(false);
+  const lastStepLogRef = useRef('');
+  const pollErrorCountRef = useRef(0);
   const logsRef = useRef(null);
   const isActiveRef = useRef(true);
   const pendingTimersRef = useRef(new Set());
@@ -183,6 +216,14 @@ export default function AutoTranslateApp() {
 
   const appendStepLog = useCallback(
     (step) => {
+      const signature = stepLogSignature(step);
+
+      if (!signature || signature === lastStepLogRef.current) {
+        return;
+      }
+
+      lastStepLogRef.current = signature;
+
       const message = formatStepLog(step);
 
       if (!message) {
@@ -208,6 +249,7 @@ export default function AutoTranslateApp() {
   const loadJob = useCallback(async () => {
     try {
       const data = await fetchJob();
+      pollErrorCountRef.current = 0;
       setJob(data);
 
       if (data?.lang && data.status !== 'idle') {
@@ -215,12 +257,22 @@ export default function AutoTranslateApp() {
       }
 
       return data;
-    } catch {
-      setNotice({
-        type: 'warning',
-        message:
-          'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید یا «ادامه» را بزنید.',
-      });
+    } catch (error) {
+      const status = error?.response?.status;
+
+      if (status === 403) {
+        setNotice({
+          type: 'warning',
+          message: 'نشست ادمین منقضی شده — صفحه را رفرش کنید یا دوباره وارد شوید.',
+        });
+      } else {
+        setNotice({
+          type: 'warning',
+          message:
+            'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید یا «ادامه» را بزنید.',
+        });
+      }
+
       return null;
     }
   }, [setTargetLang]);
@@ -241,7 +293,7 @@ export default function AutoTranslateApp() {
     }
 
     if (typeof window !== 'undefined') {
-      window.sessionStorage.setItem(AUTO_RUN_STORAGE_KEY, '1');
+      writeAutoRunFlag(true);
     }
 
     runningRef.current = true;
@@ -263,7 +315,7 @@ export default function AutoTranslateApp() {
       let lastMarker = jobProgressMarker(current);
 
       while (current?.status === 'running' && isActiveRef.current) {
-        if (typeof window !== 'undefined' && window.sessionStorage.getItem(AUTO_RUN_STORAGE_KEY) !== '1') {
+        if (!readAutoRunFlag()) {
           break;
         }
 
@@ -366,7 +418,6 @@ export default function AutoTranslateApp() {
 
         const marker = jobProgressMarker(current);
         const madeProgress =
-          Boolean(current.last_step) ||
           current.step_partial ||
           current.step_recovered_after_timeout ||
           marker !== lastMarker;
@@ -375,8 +426,19 @@ export default function AutoTranslateApp() {
           appendLog('پاسخ مرحله دیر رسید — وضعیت از سرور بازیابی شد و ادامه می‌دهیم.', 'warning');
         }
 
+        const stepAgeSec =
+          current.step_started_at != null
+            ? Math.floor(Date.now() / 1000) - Number(current.step_started_at)
+            : null;
+        const serverStepInFlight =
+          stepAgeSec != null && stepAgeSec >= 0 && stepAgeSec < STEP_IN_FLIGHT_MAX_SEC;
+        const lockBusyWhileServerWorking =
+          current.step_deferred && current.step_deferred_reason === 'step_lock_busy' && serverStepInFlight;
+
         if (current.step_deferred || !madeProgress) {
-          idleSteps += 1;
+          if (!lockBusyWhileServerWorking) {
+            idleSteps += 1;
+          }
 
           if (current.step_deferred_message && idleSteps === 1) {
             appendLog(current.step_deferred_message, 'warning');
@@ -401,7 +463,9 @@ export default function AutoTranslateApp() {
           }
 
           const delayMs = current.step_deferred
-            ? DEFERRED_BACKOFF_MS[Math.min(idleSteps - 1, DEFERRED_BACKOFF_MS.length - 1)]
+            ? lockBusyWhileServerWorking
+              ? Math.max(STEP_DELAY_MS, 3000)
+              : DEFERRED_BACKOFF_MS[Math.min(idleSteps - 1, DEFERRED_BACKOFF_MS.length - 1)]
             : STEP_DELAY_MS;
 
           try {
@@ -494,8 +558,19 @@ export default function AutoTranslateApp() {
             };
           });
         })
-        .catch(() => {
-          // Ignore poll errors while a step request is authoritative.
+        .catch((error) => {
+          pollErrorCountRef.current += 1;
+
+          if (pollErrorCountRef.current >= POLL_ERROR_NOTICE_THRESHOLD && isActiveRef.current) {
+            const status = error?.response?.status;
+            setNotice({
+              type: 'warning',
+              message:
+                status === 403
+                  ? 'نشست ادمین منقضی شده — صفحه را رفرش کنید.'
+                  : 'به‌روزرسانی وضعیت از سرور ناموفق بود — اتصال یا نشست را بررسی کنید.',
+            });
+          }
         });
     }, POLL_INTERVAL_MS);
 
@@ -511,9 +586,9 @@ export default function AutoTranslateApp() {
       return;
     }
 
-    if (typeof window !== 'undefined' && window.sessionStorage.getItem(AUTO_RUN_STORAGE_KEY) !== '1') {
+    if (!readAutoRunFlag()) {
       appendLog(
-        'اجرای قبلی روی سرور فعال است ولی این تب آن را ادامه نمی‌دهد — «ادامه» یا «توقف کامل» را بزنید.',
+        'اجرای قبلی روی سرور فعال است — «ادامه» را بزنید تا این تب هم ترجمه را پیش ببرد.',
         'warning'
       );
       return;
@@ -524,36 +599,65 @@ export default function AutoTranslateApp() {
     const stepAge =
       job.step_started_at != null ? Math.floor(Date.now() / 1000) - Number(job.step_started_at) : null;
 
-    // A step is already in flight on the server — pause so the UI matches server reality.
-    if (stepAge != null && stepAge >= 0 && stepAge < 30) {
-      appendLog(
-        'اجرای قبلی هنوز روی سرور فعال بود — برای جلوگیری از تداخل متوقف شد. برای ادامه «ادامه» را بزنید.',
-        'warning'
-      );
-      jobAction('pause')
-        .then((data) => setJob(data))
-        .catch(() => {});
-      return;
-    }
+    if (stepAge != null && stepAge >= 0 && stepAge < STEP_IN_FLIGHT_MAX_SEC) {
+      appendLog('اجرای قبلی روی سرور فعال است — منتظر اتمام مرحله…');
 
-    // Stale in-flight marker: previous browser tab died mid-step.
-    if (stepAge != null && stepAge >= 30) {
-      appendLog('مرحله قبلی بیش از حد طول کشید یا قطع شد. برای ادامه «ادامه» را بزنید.', 'warning');
-      jobAction('pause')
-        .then((data) => setJob(data))
-        .catch(() => {});
+      const waitForInFlightStep = async () => {
+        while (isActiveRef.current) {
+          try {
+            await delay(3000);
+          } catch {
+            return;
+          }
+
+          const latest = await fetchJob().catch(() => null);
+
+          if (!latest || !isActiveRef.current) {
+            return;
+          }
+
+          setJob(latest);
+
+          if (latest.status !== 'running') {
+            return;
+          }
+
+          const age =
+            latest.step_started_at != null
+              ? Math.floor(Date.now() / 1000) - Number(latest.step_started_at)
+              : null;
+
+          if (age == null || age < 0 || age >= STEP_IN_FLIGHT_MAX_SEC) {
+            appendLog('مرحله قبلی تمام شد — ادامه خودکار…');
+            runSteps();
+            return;
+          }
+        }
+      };
+
+      waitForInFlightStep();
       return;
     }
 
     appendLog('اجرای ناتمام پیدا شد — ادامه خودکار…');
     runSteps();
-  }, [loading, job?.status, job?.step_started_at, processing, runSteps, appendLog]);
+  }, [loading, job?.status, job?.step_started_at, processing, runSteps, appendLog, delay]);
 
   const handleStart = async () => {
+    if (!aiConfigured) {
+      setNotice({
+        type: 'error',
+        message: 'کلید API یا آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده است.',
+      });
+      return;
+    }
+
     setNotice(null);
     setLogs([]);
     setActivePost(null);
+    lastStepLogRef.current = '';
     autoResumedRef.current = true;
+    writeAutoRunFlag(true);
     setActionPending('start');
     setProcessing(true);
     setJob((prev) => ({
@@ -576,9 +680,27 @@ export default function AutoTranslateApp() {
       appendLog(`ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}).`);
       await runSteps();
     } catch (error) {
+      const code = error?.response?.data?.code;
       const message = error?.response?.data?.message || 'شروع ترجمه خودکار ناموفق بود.';
-      setNotice({ type: 'error', message });
+
+      if (code === 'polymart_ai_job_running') {
+        const existing = await loadJob();
+
+        if (existing?.status === 'running') {
+          setNotice({
+            type: 'warning',
+            message: 'یک ترجمه از قبل در حال اجراست — «ادامه» را بزنید.',
+          });
+        } else {
+          setNotice({ type: 'error', message });
+        }
+      } else {
+        setNotice({ type: 'error', message });
+      }
+
       appendLog(message, 'error');
+      autoResumedRef.current = false;
+      writeAutoRunFlag(false);
       setProcessing(false);
       await loadJob();
     } finally {
@@ -590,6 +712,7 @@ export default function AutoTranslateApp() {
     setNotice(null);
     setActionPending('resume');
     setProcessing(true);
+    writeAutoRunFlag(true);
     setJob((prev) => ({
       ...(prev ?? {}),
       status: 'running',
@@ -637,7 +760,8 @@ export default function AutoTranslateApp() {
     const shouldContinue = job?.status === 'running' || processing;
 
     try {
-      const data = await jobAction('skip', targetLang, { post_id: postId });
+      const jobLang = job?.lang || targetLang;
+      const data = await jobAction('skip', jobLang, { post_id: postId });
       setJob(data);
 
       if (data?.last_step) {
@@ -666,9 +790,7 @@ export default function AutoTranslateApp() {
   };
 
   const handlePause = async () => {
-    if (typeof window !== 'undefined') {
-      window.sessionStorage.removeItem(AUTO_RUN_STORAGE_KEY);
-    }
+    writeAutoRunFlag(false);
 
     runningRef.current = false;
     abortJobStep();
@@ -697,9 +819,7 @@ export default function AutoTranslateApp() {
   };
 
   const handleStop = async () => {
-    if (typeof window !== 'undefined') {
-      window.sessionStorage.removeItem(AUTO_RUN_STORAGE_KEY);
-    }
+    writeAutoRunFlag(false);
 
     runningRef.current = false;
     abortJobStep();
@@ -737,7 +857,8 @@ export default function AutoTranslateApp() {
     setNotice(null);
 
     try {
-      const data = await refreshJobStats(targetLang);
+      const jobLang = job?.lang || targetLang;
+      const data = await refreshJobStats(jobLang);
       setJob(data);
       const stats = data?.live_stats ?? {};
       appendLog(
@@ -800,7 +921,8 @@ export default function AutoTranslateApp() {
   const isBusy = Boolean(actionPending) || processing || refreshingStats;
   const isSkipDisabled = refreshingStats || Boolean(actionPending);
   const canResume = (isPaused || isOrphanedRunning) && needsWork > 0 && !isBusy;
-  const canStart = !loading && !isBusy && !isRunning && !langsLoading;
+  const canStart =
+    aiConfigured && !loading && !isBusy && !isRunning && !langsLoading && langOptions.length > 0;
   const activeLangLabel = job?.lang_label || targetLabel;
   const displayPost = activePost?.title ? activePost : job?.current_post;
   const lastStepStatus = displayPost?.step_status || job?.last_step?.status;
@@ -872,6 +994,24 @@ export default function AutoTranslateApp() {
       {langsError && (
         <div className="mb-4">
           <Notice type="warning" message={langsError} />
+        </div>
+      )}
+
+      {!loading && !aiConfigured && (
+        <div className="mb-4">
+          <Notice
+            type="error"
+            message="کلید API یا آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده — ابتدا از بخش تنظیمات پیکربندی کنید."
+          />
+        </div>
+      )}
+
+      {config.cronDisabled && (
+        <div className="mb-4">
+          <Notice
+            type="warning"
+            message="WP-Cron روی این سرور غیرفعال است — مطمئن شوید wp-cron.php به‌صورت زمان‌بندی‌شده اجرا می‌شود تا ترجمه بدون تب باز هم ادامه یابد."
+          />
         </div>
       )}
 
