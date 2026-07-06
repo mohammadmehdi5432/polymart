@@ -592,6 +592,10 @@ final class Frontend_Interceptor {
 
 		$block_id = absint( $block_id );
 
+		if ( $block_id <= 0 ) {
+			$block_id = $this->guess_layout_block_id_from_html( $content );
+		}
+
 		if ( $block_id > 0 ) {
 			$resolved = $this->resolve_cms_block_html( $block_id, $content );
 
@@ -680,6 +684,37 @@ final class Frontend_Interceptor {
 		);
 
 		return is_string( $cached ) && '' !== trim( $cached ) ? $cached : null;
+	}
+
+	/**
+	 * Try to recover a cms_block post ID from Woodmart wrapper markup.
+	 *
+	 * @param string $content Rendered HTML.
+	 * @return int
+	 */
+	private function guess_layout_block_id_from_html( $content ) {
+		if ( ! is_string( $content ) || '' === $content ) {
+			return 0;
+		}
+
+		$patterns = array(
+			'/data-block-id=["\'](\d+)["\']/i',
+			'/data-id=["\'](\d+)["\']/i',
+			'/class=["\'][^"\']*cms-block-(\d+)/i',
+			'/class=["\'][^"\']*html-block-(\d+)/i',
+		);
+
+		foreach ( $patterns as $pattern ) {
+			if ( preg_match( $pattern, $content, $matches ) ) {
+				$block_id = absint( $matches[1] );
+
+				if ( $block_id > 0 && 'cms_block' === get_post_type( $block_id ) ) {
+					return $block_id;
+				}
+			}
+		}
+
+		return 0;
 	}
 
 	/**

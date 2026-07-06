@@ -99,9 +99,9 @@ final class Menu_Translator {
 			return false;
 		}
 
-		$title = trim( (string) $item->post_title );
+		$source = self::get_menu_label_source( $item_id, $item );
 
-		if ( '' === $title || ! Persian_Detector::contains_persian( $title ) ) {
+		if ( '' === $source || ! Persian_Detector::contains_persian( $source ) ) {
 			return false;
 		}
 
@@ -144,7 +144,7 @@ final class Menu_Translator {
 			);
 		}
 
-		$source = trim( (string) $item->post_title );
+		$source = self::get_menu_label_source( $item_id, $item );
 
 		if ( '' === $source || ! Persian_Detector::contains_persian( $source ) ) {
 			return new \WP_Error(
@@ -226,6 +226,154 @@ final class Menu_Translator {
 			'menu:' . $item_id,
 			$translated
 		);
+	}
+
+	/**
+	 * Resolve the storefront label for a menu item on translated URLs.
+	 *
+	 * Handles Home/front-page links whose nav label is English while the linked
+	 * page title (or site front page) is still Persian.
+	 *
+	 * @param \WP_Post $menu_item Menu item object.
+	 * @param string   $lang      Target language code.
+	 * @param string   $title     Title WordPress passed to the filter.
+	 * @return string
+	 */
+	public static function resolve_storefront_menu_title( \WP_Post $menu_item, $lang, $title ) {
+		$lang = sanitize_key( (string) $lang );
+
+		if ( ! $menu_item instanceof \WP_Post || '' === $lang ) {
+			return is_string( $title ) ? $title : '';
+		}
+
+		$stored = get_post_meta( $menu_item->ID, Post_Translator::get_menu_title_meta_key( $lang ), true );
+
+		if ( Post_Translator::is_usable_storefront_translation( $stored, $lang ) ) {
+			return (string) $stored;
+		}
+
+		if ( self::menu_item_targets_front_page( $menu_item->ID ) ) {
+			$front_id = absint( get_option( 'page_on_front' ) );
+
+			if ( $front_id > 0 ) {
+				$translated = get_post_meta( $front_id, Post_Translator::get_meta_key( 'title', $lang ), true );
+
+				if ( Post_Translator::is_usable_storefront_translation( $translated, $lang ) ) {
+					return (string) $translated;
+				}
+			}
+		}
+
+		return is_string( $title ) ? $title : '';
+	}
+
+	/**
+	 * Best Persian source string for translating a menu item label.
+	 *
+	 * @param int           $item_id Menu item post ID.
+	 * @param \WP_Post|null $item    Optional menu item object.
+	 * @return string
+	 */
+	public static function get_menu_label_source( $item_id, $item = null ) {
+		$item_id = absint( $item_id );
+
+		if ( ! $item instanceof \WP_Post ) {
+			$item = get_post( $item_id );
+		}
+
+		if ( ! $item instanceof \WP_Post || self::POST_TYPE !== $item->post_type ) {
+			return '';
+		}
+
+		$title = trim( (string) $item->post_title );
+
+		if ( '' !== $title && Persian_Detector::contains_persian( $title ) ) {
+			return $title;
+		}
+
+		$type      = (string) get_post_meta( $item_id, '_menu_item_type', true );
+		$object    = (string) get_post_meta( $item_id, '_menu_item_object', true );
+		$object_id = absint( get_post_meta( $item_id, '_menu_item_object_id', true ) );
+
+		if ( 'post_type' === $type && $object_id > 0 ) {
+			$linked = get_post( $object_id );
+
+			if ( $linked instanceof \WP_Post ) {
+				$linked_title = trim( (string) $linked->post_title );
+
+				if ( '' !== $linked_title && Persian_Detector::contains_persian( $linked_title ) ) {
+					return $linked_title;
+				}
+			}
+		}
+
+		if ( self::menu_item_targets_front_page( $item_id ) ) {
+			$front_id = absint( get_option( 'page_on_front' ) );
+
+			if ( $front_id > 0 ) {
+				$page = get_post( $front_id );
+
+				if ( $page instanceof \WP_Post ) {
+					$page_title = trim( (string) $page->post_title );
+
+					if ( '' !== $page_title && Persian_Detector::contains_persian( $page_title ) ) {
+						return $page_title;
+					}
+				}
+			}
+		}
+
+		return $title;
+	}
+
+	/**
+	 * Whether a nav menu item points at the site front page.
+	 *
+	 * @param int $item_id Menu item post ID.
+	 * @return bool
+	 */
+	public static function menu_item_targets_front_page( $item_id ) {
+		$item_id = absint( $item_id );
+
+		if ( $item_id <= 0 ) {
+			return false;
+		}
+
+		$front_id = absint( get_option( 'page_on_front' ) );
+		$type     = (string) get_post_meta( $item_id, '_menu_item_type', true );
+
+		if ( 'post_type' === $type && $front_id > 0 ) {
+			$object    = (string) get_post_meta( $item_id, '_menu_item_object', true );
+			$object_id = absint( get_post_meta( $item_id, '_menu_item_object_id', true ) );
+
+			return 'page' === $object && $object_id === $front_id;
+		}
+
+		if ( 'custom' !== $type ) {
+			return false;
+		}
+
+		$url = trim( (string) get_post_meta( $item_id, '_menu_item_url', true ) );
+
+		if ( '' === $url || '/' === $url || '#' === $url ) {
+			return true;
+		}
+
+		$home      = untrailingslashit( (string) home_url() );
+		$candidate = untrailingslashit( (string) wp_parse_url( $url, PHP_URL_PATH ) );
+
+		if ( '' === $candidate || '/' === $candidate ) {
+			return true;
+		}
+
+		$home_path = (string) wp_parse_url( home_url( '/' ), PHP_URL_PATH );
+		$home_path = untrailingslashit( is_string( $home_path ) ? $home_path : '' );
+
+		if ( '' !== $home_path && $candidate === $home_path ) {
+			return true;
+		}
+
+		return untrailingslashit( $url ) === $home;
 	}
 
 	/**

@@ -399,7 +399,6 @@ final class Language_Switcher {
 			'html[dir="ltr"], html.polymart-lang-' . esc_attr( $language['code'] ) . ' { direction: ltr; }
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ', body.ltr {
 				direction: ltr;
-				text-align: left;
 			}
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .website-wrapper,
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .wd-page-wrapper,
@@ -409,7 +408,6 @@ final class Language_Switcher {
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .entry-content,
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .woocommerce {
 				direction: ltr;
-				text-align: left;
 			}
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .wd-header-main-nav > *,
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .wd-nav,

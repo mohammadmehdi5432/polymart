@@ -9,6 +9,7 @@ namespace PolymartAI\Frontend;
 
 use PolymartAI\Routing\Url_Router;
 use PolymartAI\Translation\Layout_Guard;
+use PolymartAI\Translation\Menu_Translator;
 use PolymartAI\Translation\Persian_Detector;
 use PolymartAI\Translation\Post_Translator;
 use PolymartAI\Translation\Runtime_String_Translator;
@@ -164,7 +165,15 @@ final class Woodmart_Translator {
 			return $title;
 		}
 
-		$stored = get_post_meta( $menu_item->ID, Post_Translator::get_menu_title_meta_key( $this->get_active_lang() ), true );
+		$lang = $this->get_active_lang();
+
+		$resolved = Menu_Translator::resolve_storefront_menu_title( $menu_item, $lang, $title );
+
+		if ( $resolved !== $title && '' !== trim( $resolved ) ) {
+			return $resolved;
+		}
+
+		$stored = get_post_meta( $menu_item->ID, Post_Translator::get_menu_title_meta_key( $lang ), true );
 
 		if ( is_string( $stored ) && '' !== trim( $stored ) ) {
 			return $stored;

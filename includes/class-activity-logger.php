@@ -720,14 +720,82 @@ final class Activity_Logger {
 	 */
 	private static function set_job_last_step( array &$job, $post_id, $status, $message = '' ) {
 		$post_id = absint( $post_id );
+		$status  = sanitize_key( (string) $status );
+		$message = sanitize_text_field( (string) $message );
+
+		if ( 'partial' === $status && $post_id > 0 && '' !== (string) ( $job['lang'] ?? '' ) ) {
+			$message = self::enrich_partial_step_message( $post_id, (string) $job['lang'], $message );
+		}
 
 		$job['last_step'] = array(
 			'post_id' => $post_id,
 			'title'   => $post_id > 0 ? get_the_title( $post_id ) : '',
-			'status'  => sanitize_key( (string) $status ),
-			'message' => sanitize_text_field( (string) $message ),
+			'status'  => $status,
+			'message' => $message,
 			'time'    => time(),
 		);
+	}
+
+	/**
+	 * Append gap details to partial auto-translate step messages.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @param string $message Base message.
+	 * @return string
+	 */
+	private static function enrich_partial_step_message( $post_id, $lang, $message ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$message = trim( (string) $message );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return $message;
+		}
+
+		$partial = Post_Translator::get_job_partial_state( $post_id, $lang );
+		$phase   = sanitize_key( (string) ( $partial['phase'] ?? '' ) );
+
+		if ( '' !== $phase && 'complete' !== $phase ) {
+			$phase_label = $phase;
+
+			if ( 'elementor' === $phase ) {
+				$phase_label = 'Elementor';
+			}
+
+			$progress = self::format_job_partial_progress( $partial );
+
+			if ( '' !== $progress ) {
+				$message = trim( $message . ' [' . $phase_label . ' ' . $progress . ']' );
+			}
+		}
+
+		$gaps    = Post_Translator::get_translation_gaps( $post_id, $lang );
+		$missing = array();
+
+		foreach ( $gaps['fields'] ?? array() as $field ) {
+			if ( empty( $field['translated'] ) ) {
+				$missing[] = (string) ( $field['label'] ?? '' );
+			}
+		}
+
+		if ( empty( $missing ) && ! empty( $gaps['missing'] ) ) {
+			$missing = array_map( 'strval', (array) $gaps['missing'] );
+		}
+
+		$missing = array_values( array_filter( array_unique( $missing ) ) );
+
+		if ( ! empty( $missing ) ) {
+			$message = trim(
+				$message . ' — ' . sprintf(
+					/* translators: %s: comma-separated missing field labels */
+					__( 'باقی‌مانده: %s', 'polymart-ai' ),
+					implode( ', ', array_slice( $missing, 0, 4 ) )
+				)
+			);
+		}
+
+		return $message;
 	}
 
 	/**
@@ -2447,7 +2515,13 @@ final class Activity_Logger {
 	 * @return array<string, mixed>
 	 */
 	private static function handle_job_translation_failure( array $job, $post_id, $lang, \WP_Error $result, $from_retry ) {
-		$error_message          = $result->get_error_message();
+		$error_message = $result->get_error_message();
+		$error_code    = sanitize_key( (string) $result->get_error_code() );
+
+		if ( '' !== $error_code && false === stripos( $error_message, $error_code ) ) {
+			$error_message = sprintf( '[%s] %s', $error_code, $error_message );
+		}
+
 		$job['last_error']      = $error_message;
 		self::increment_job_step( $job );
 		$job['current_post_id'] = null;

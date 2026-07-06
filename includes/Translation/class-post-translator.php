@@ -828,10 +828,10 @@ final class Post_Translator {
 			return false;
 		}
 
-		// Partial Elementor saves (missing fields / API errors) must not replace live layout JSON.
+		// Partial Elementor saves must not block serving a usable companion JSON.
 		$elementor_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
 
-		if ( '' !== trim( $elementor_error ) ) {
+		if ( '' !== trim( $elementor_error ) && ! self::is_elementor_progress_message( $elementor_error ) ) {
 			self::$elementor_storefront_serve_cache[ $key ] = false;
 
 			return false;
@@ -3598,6 +3598,12 @@ final class Post_Translator {
 			return false;
 		}
 
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
 		if ( ! self::should_require_elementor_translation( $post_id ) ) {
 			return false;
 		}
@@ -3609,7 +3615,18 @@ final class Post_Translator {
 		if ( self::is_elementor_translation_current( $post_id, $lang ) ) {
 			$previous_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
 
-			return '' !== trim( $previous_error );
+			if ( self::is_elementor_progress_message( $previous_error ) ) {
+				delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+				delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+
+				return false;
+			}
+
+			if ( '' !== trim( $previous_error ) ) {
+				return true;
+			}
+
+			return false;
 		}
 
 		return true;
@@ -3821,6 +3838,30 @@ final class Post_Translator {
 					$api_endpoint,
 					$ai_model
 				);
+
+				if (
+					is_wp_error( $elementor_slice )
+					&& in_array(
+						$elementor_slice->get_error_code(),
+						array(
+							'polymart_ai_elementor_source_missing',
+							'polymart_ai_elementor_source_invalid',
+						),
+						true
+					)
+				) {
+					delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+					delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+					self::clear_job_partial_state( $post_id, $lang );
+					self::release_translation_lock( $post_id, $lang );
+
+					return array(
+						'done'           => true,
+						'phase'          => 'complete',
+						'phase_progress' => '',
+						'message'        => __( 'داده Elementor یافت نشد — این مورد از فیلدهای متنی/محتوا بسنده شد.', 'polymart-ai' ),
+					);
+				}
 
 				if ( is_wp_error( $elementor_slice ) ) {
 					return $elementor_slice;
@@ -4264,24 +4305,51 @@ final class Post_Translator {
 		if ( $complete ) {
 			self::save_elementor_source_hash( $post_id, $lang );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 			self::flush_translation_status_cache( $post_id );
 
 			return true;
 		}
 
-		update_post_meta(
-			$post_id,
-			'_polymart_ai_elementor_error_' . $lang,
-			sprintf(
-				/* translators: 1: completed batches, 2: total batches */
-				__( 'ترجمه Elementor در حال انجام (%1$d/%2$d)', 'polymart-ai' ),
-				min( $total_chunks, $done_count ),
-				$total_chunks
-			)
+		$progress_message = sprintf(
+			/* translators: 1: completed batches, 2: total batches */
+			__( 'ترجمه Elementor در حال انجام (%1$d/%2$d)', 'polymart-ai' ),
+			min( $total_chunks, $done_count ),
+			$total_chunks
 		);
+
+		update_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), $progress_message );
+		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		self::flush_translation_status_cache( $post_id );
 
 		return true;
+	}
+
+	/**
+	 * Meta key for in-progress Elementor job slices (not a hard failure).
+	 *
+	 * @param string $lang Language code.
+	 * @return string
+	 */
+	private static function get_elementor_progress_meta_key( $lang ) {
+		return '_polymart_ai_elementor_progress_' . sanitize_key( (string) $lang );
+	}
+
+	/**
+	 * Whether an Elementor error meta value is only a legacy progress marker.
+	 *
+	 * @param string $message Stored meta value.
+	 * @return bool
+	 */
+	private static function is_elementor_progress_message( $message ) {
+		$message = trim( (string) $message );
+
+		if ( '' === $message ) {
+			return false;
+		}
+
+		return false !== strpos( $message, 'ترجمه Elementor در حال انجام' )
+			|| false !== strpos( $message, 'Elementor —' );
 	}
 
 	/**
