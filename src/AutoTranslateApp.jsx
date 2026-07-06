@@ -47,6 +47,10 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
   }
 
   if (lastStepStatus === 'partial') {
+    const gapHint = job?.last_step?.message || displayPost?.step_message || '';
+    if (gapHint) {
+      return 'ادامه فیلدهای باقی‌مانده';
+    }
     return 'تلاش مجدد برای مورد ناقص';
   }
 
@@ -563,6 +567,7 @@ export default function AutoTranslateApp() {
     try {
       const data = await jobAction('start', targetLang);
       setJob(data);
+      setActionPending(null);
       appendLog(`ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}).`);
       await runSteps();
     } catch (error) {
@@ -594,6 +599,7 @@ export default function AutoTranslateApp() {
     try {
       const data = await jobAction('resume');
       setJob(data);
+      setActionPending(null);
       appendLog('ترجمه از سر گرفته شد.');
       await runSteps();
     } catch (error) {
@@ -729,14 +735,19 @@ export default function AutoTranslateApp() {
             ? 'در حال توقف کامل…'
             : null;
 
-  const statusLabel = actionPendingLabel
-    ? actionPendingLabel
-    : isRunning
-    ? processing
+  const statusLabel =
+    processing && isRunning && !actionPendingLabel
       ? stepWaitSec > 0
         ? `در حال ترجمه… (${stepWaitSec}ث)`
         : 'در حال ترجمه…'
-      : 'نیاز به ادامه (اجرا ناتمام)'
+      : actionPendingLabel
+        ? actionPendingLabel
+        : isRunning
+          ? processing
+            ? stepWaitSec > 0
+              ? `در حال ترجمه… (${stepWaitSec}ث)`
+              : 'در حال ترجمه…'
+            : 'نیاز به ادامه (اجرا ناتمام)'
     : isPaused
       ? isOutdated
         ? 'نیاز به اجرای مجدد'
@@ -753,8 +764,8 @@ export default function AutoTranslateApp() {
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
         <p className="font-medium">روش پیشنهادی برای ترجمه انبوه</p>
         <p className="mt-1">
-          «پیشرفت این اجرا» فقط همین run را نشان می‌دهد. «کل سایت» بعد از هر ترجمه موفق به‌روز می‌شود —
-          اگر مورد ناقص بماند یا فقط بخشی از فیلدها پر شود، عدد کل سایت کمتر از پیشرفت این اجرا جلو نمی‌رود.
+          «پیشرفت این اجرا» فقط پست‌هایی را می‌شمارد که در همین run کاملاً تمام شده‌اند (۰/۷۷۷ یعنی هنوز هیچ‌کدام ۱۰۰٪ نشده، نه اینکه کار نمی‌کند).
+          «کل سایت» بعد از هر بهبود واقعی به‌روز می‌شود — مثلاً −۷ یعنی ۷ مورد در کل سایت جلو رفته‌اند، حتی اگر هنوز ناقص باشند.
         </p>
       </div>
 

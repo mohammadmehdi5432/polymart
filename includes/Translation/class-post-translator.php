@@ -365,6 +365,8 @@ final class Post_Translator {
 			'_oembed_',
 			'_wc_',
 			'_woocommerce_',
+			'saswp_',
+			'_saswp_',
 		);
 
 		/**
