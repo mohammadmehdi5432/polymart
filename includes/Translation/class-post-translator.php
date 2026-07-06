@@ -324,7 +324,19 @@ final class Post_Translator {
 	/**
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
 	 */
-	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 70;
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 120;
+
+	/**
+	 * Minimum HTTP timeout (seconds) for auto-translate job AI calls.
+	 *
+	 * Must stay below the admin SPA step timeout (180s) including PHP overhead.
+	 */
+	const JOB_REQUEST_MIN_TIMEOUT = 120;
+
+	/**
+	 * Maximum HTTP timeout (seconds) for a single auto-translate job AI call.
+	 */
+	const JOB_REQUEST_MAX_TIMEOUT = 165;
 
 	/**
 	 * Variation title batches — variable products may have 100+ rows.
@@ -2870,26 +2882,68 @@ final class Post_Translator {
 	 * @param string                $phase   core|commerce|variations.
 	 * @return array<int, array<string, string>>
 	 */
-	private static function chunk_payload_for_job_phase( array $payload, $phase ) {
-		$phase = sanitize_key( (string) $phase );
+	private static function chunk_payload_for_job_phase( array $payload, $phase, $post_id = 0 ) {
+		$phase   = sanitize_key( (string) $phase );
+		$post_id = absint( $post_id );
 
 		switch ( $phase ) {
 			case 'variations':
 				return self::chunk_payload_with_limits(
 					$payload,
-					self::VARIATION_AI_FIELD_CHUNK_SIZE,
-					self::VARIATION_AI_MAX_CHUNK_CHARS
+					1,
+					1200
 				);
 			case 'commerce':
+				$max_fields = 2;
+				$max_chars  = 2000;
+
+				if ( $post_id > 0 && function_exists( 'wc_get_product' ) ) {
+					$product = wc_get_product( $post_id );
+
+					if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) ) {
+						$max_fields = 1;
+						$max_chars  = 1500;
+					}
+				}
+
 				return self::chunk_payload_with_limits(
 					$payload,
-					self::COMMERCE_AI_FIELD_CHUNK_SIZE,
-					self::COMMERCE_AI_MAX_CHUNK_CHARS
+					$max_fields,
+					$max_chars
 				);
 			case 'core':
 			default:
-				return self::chunk_payload_for_ai( $payload );
+				return self::chunk_payload_with_limits(
+					$payload,
+					2,
+					2500
+				);
 		}
+	}
+
+	/**
+	 * HTTP options for AI calls made during auto-translate job slices.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $phase   Job phase key.
+	 * @return array<string, int>
+	 */
+	public static function get_job_ai_request_options( $post_id = 0, $phase = '' ) {
+		unset( $post_id, $phase );
+
+		$options = array(
+			'min_timeout' => self::JOB_REQUEST_MIN_TIMEOUT,
+			'max_timeout' => self::JOB_REQUEST_MAX_TIMEOUT,
+		);
+
+		/**
+		 * Filter HTTP timeout bounds for auto-translate job AI requests.
+		 *
+		 * @param array<string, int> $options min_timeout / max_timeout in seconds.
+		 * @param int                $post_id Post ID.
+		 * @param string             $phase   Job phase key.
+		 */
+		return apply_filters( 'polymart_ai_job_ai_request_options', $options, absint( $post_id ), sanitize_key( (string) $phase ) );
 	}
 
 	/**
@@ -3364,11 +3418,12 @@ final class Post_Translator {
 	 * @return array{partial: bool, phase_complete: bool, phase_progress: string, message: string}|\WP_Error
 	 */
 	private static function run_job_field_phase_batch( $post_id, \WP_Post $post, $lang, array &$state, $phase, $api_key, $api_endpoint, $ai_model ) {
-		$payload = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
-		$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_job_phase( $payload, $phase );
-		$total   = count( $chunks );
-		$label   = self::get_job_field_phase_label( $phase );
-		$pending = count( $payload );
+		$payload     = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
+		$chunks      = empty( $payload ) ? array() : self::chunk_payload_for_job_phase( $payload, $phase, $post->ID );
+		$total       = count( $chunks );
+		$label       = self::get_job_field_phase_label( $phase );
+		$pending     = count( $payload );
+		$ai_options  = self::get_job_ai_request_options( $post->ID, $phase );
 
 		if ( 0 === $total ) {
 			return array(
@@ -3400,17 +3455,21 @@ final class Post_Translator {
 				$api_key,
 				$api_endpoint,
 				$ai_model,
-				$lang
+				$lang,
+				$ai_options
 			);
 
 			if ( is_wp_error( $chunk_result ) ) {
+				$fallback_limit = max( 1, count( $chunk ) );
+
 				$recovered = self::translate_job_chunk_with_single_field_fallback(
 					$chunk,
 					$api_key,
 					$api_endpoint,
 					$ai_model,
 					$lang,
-					'variations' === $phase ? 4 : 2
+					$fallback_limit,
+					$ai_options
 				);
 
 				if ( is_wp_error( $recovered ) ) {
@@ -3709,11 +3768,12 @@ final class Post_Translator {
 
 		try {
 			if ( 'fields' === (string) $state['phase'] ) {
-				$payload = self::collect_persian_fields( $post, $lang );
-				$chunks  = empty( $payload ) ? array() : self::chunk_payload_for_ai( $payload );
-				$total   = count( $chunks );
-				$index   = 0;
-				$budget  = 1;
+				$payload    = self::collect_persian_fields( $post, $lang );
+				$chunks     = empty( $payload ) ? array() : self::chunk_payload_for_job_phase( $payload, 'core', $post_id );
+				$total      = count( $chunks );
+				$index      = 0;
+				$budget     = 1;
+				$ai_options = self::get_job_ai_request_options( $post_id, 'fields' );
 
 				while ( $index < $total && $budget > 0 ) {
 					$chunk_result = AI_Client::translate_fields(
@@ -3721,7 +3781,8 @@ final class Post_Translator {
 						$api_key,
 						$api_endpoint,
 						$ai_model,
-						$lang
+						$lang,
+						$ai_options
 					);
 
 					if ( is_wp_error( $chunk_result ) ) {
@@ -3992,7 +4053,7 @@ final class Post_Translator {
 					$api_endpoint,
 					$ai_model,
 					$lang,
-					3,
+					1,
 					$ai_options
 				);
 

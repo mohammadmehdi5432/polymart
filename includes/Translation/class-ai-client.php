@@ -36,18 +36,20 @@ final class AI_Client {
 
 	/**
 	 * Minimum HTTP timeout for a translation request (seconds).
+	 *
+	 * ArvanCloud inference often exceeds 30s even for modest payloads.
 	 */
-	const REQUEST_TIMEOUT_MIN = 45;
+	const REQUEST_TIMEOUT_MIN = 90;
 
 	/**
 	 * Maximum HTTP timeout for a translation request (seconds).
 	 */
-	const REQUEST_TIMEOUT_MAX = 180;
+	const REQUEST_TIMEOUT_MAX = 240;
 
 	/**
 	 * Maximum automatic retries after transport failures.
 	 */
-	const MAX_TRANSPORT_RETRIES = 2;
+	const MAX_TRANSPORT_RETRIES = 3;
 
 	/**
 	 * Verify API credentials with a minimal chat completion request.
@@ -249,8 +251,12 @@ final class AI_Client {
 
 		$timeout = self::request_timeout_for_payload( $payload );
 
+		if ( ! empty( $options['min_timeout'] ) ) {
+			$timeout = max( $timeout, max( 30, absint( $options['min_timeout'] ) ) );
+		}
+
 		if ( ! empty( $options['max_timeout'] ) ) {
-			$timeout = min( $timeout, max( 20, absint( $options['max_timeout'] ) ) );
+			$timeout = min( $timeout, max( 30, absint( $options['max_timeout'] ) ) );
 		}
 
 		/**
@@ -276,9 +282,15 @@ final class AI_Client {
 			$error_message = $response->get_error_message();
 
 			if ( 'http_request_failed' === $error_code && $attempt < self::MAX_TRANSPORT_RETRIES ) {
-				sleep( min( 4, $attempt * 2 ) );
+				$retry_options            = $options;
+				$retry_options['min_timeout'] = max(
+					(int) ( $retry_options['min_timeout'] ?? 0 ),
+					min( self::REQUEST_TIMEOUT_MAX, $timeout + ( 30 * $attempt ) )
+				);
 
-				return self::post_chat_completion( $endpoint, $api_key, $payload, $attempt + 1, $options );
+				sleep( min( 6, $attempt * 2 ) );
+
+				return self::post_chat_completion( $endpoint, $api_key, $payload, $attempt + 1, $retry_options );
 			}
 
 			if ( 'http_request_failed' === $error_code ) {
@@ -316,7 +328,7 @@ final class AI_Client {
 
 		return (int) min(
 			self::REQUEST_TIMEOUT_MAX,
-			max( self::REQUEST_TIMEOUT_MIN, (int) ceil( $chars / 40 ) + 30 )
+			max( self::REQUEST_TIMEOUT_MIN, (int) ceil( $chars / 20 ) + 60 )
 		);
 	}
 

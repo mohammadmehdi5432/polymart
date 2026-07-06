@@ -1,7 +1,7 @@
 import api from './settings';
 
 /** Max wait for one translation step (chunked steps should finish well under this). */
-export const JOB_STEP_TIMEOUT_MS = 180000;
+export const JOB_STEP_TIMEOUT_MS = 240000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
 const JOB_FETCH_RETRIES = 4;
