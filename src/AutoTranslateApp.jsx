@@ -191,6 +191,8 @@ export default function AutoTranslateApp() {
           ? 'success'
           : step.status === 'failed'
             ? 'error'
+            : step.status === 'skipped'
+              ? 'warning'
             : step.status === 'partial'
               ? 'warning'
               : 'info';
@@ -611,6 +613,55 @@ export default function AutoTranslateApp() {
     }
   };
 
+  const handleSkip = async () => {
+    const postId =
+      Number(job?.partial_post_id) ||
+      Number(activePost?.post_id) ||
+      Number(job?.current_post?.post_id) ||
+      Number(job?.last_step?.post_id) ||
+      0;
+
+    if (!postId || actionPending) {
+      return;
+    }
+
+    setNotice(null);
+    setActionPending('skip');
+    abortJobStep();
+    runningRef.current = false;
+    setStepWaitSec(0);
+
+    const shouldContinue = job?.status === 'running' || processing;
+
+    try {
+      const data = await jobAction('skip', targetLang, { post_id: postId });
+      setJob(data);
+
+      if (data?.last_step) {
+        appendStepLog(data.last_step);
+      } else {
+        appendLog(`#${postId} رد شد — رفتن به مورد بعدی.`, 'warning');
+      }
+
+      setActivePost(null);
+
+      if (shouldContinue && data?.status === 'running') {
+        setActionPending(null);
+        setProcessing(true);
+        await runSteps();
+        return;
+      }
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error?.response?.data?.message || 'رد کردن مورد ناموفق بود.',
+      });
+      await loadJob();
+    } finally {
+      setActionPending(null);
+    }
+  };
+
   const handlePause = async () => {
     if (typeof window !== 'undefined') {
       window.sessionStorage.removeItem(AUTO_RUN_STORAGE_KEY);
@@ -723,6 +774,17 @@ export default function AutoTranslateApp() {
   const activeLangLabel = job?.lang_label || targetLabel;
   const displayPost = activePost?.title ? activePost : job?.current_post;
   const lastStepStatus = displayPost?.step_status || job?.last_step?.status;
+  const skipTargetId =
+    Number(job?.partial_post_id) ||
+    Number(displayPost?.post_id) ||
+    Number(job?.current_post?.post_id) ||
+    Number(job?.last_step?.post_id) ||
+    0;
+  const canSkip =
+    skipTargetId > 0 &&
+    !loading &&
+    (isRunning || isPaused || processing || isOrphanedRunning) &&
+    actionPending !== 'stop';
 
   const actionPendingLabel =
     actionPending === 'start'
@@ -733,7 +795,9 @@ export default function AutoTranslateApp() {
           ? 'در حال توقف موقت…'
           : actionPending === 'stop'
             ? 'در حال توقف کامل…'
-            : null;
+            : actionPending === 'skip'
+              ? 'در حال رد کردن…'
+              : null;
 
   const statusLabel =
     processing && isRunning && !actionPendingLabel
@@ -842,6 +906,18 @@ export default function AutoTranslateApp() {
                 {actionPending === 'pause' ? 'در حال توقف موقت…' : 'توقف موقت'}
               </button>
             )}
+            {canSkip && (
+              <button
+                type="button"
+                onClick={handleSkip}
+                disabled={isBusy && actionPending !== 'skip'}
+                className="w-full cursor-pointer rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {actionPending === 'skip'
+                  ? 'در حال رد کردن…'
+                  : `رد کردن #${skipTargetId} → بعدی`}
+              </button>
+            )}
             {(isRunning || isPaused || actionPending === 'stop') && (
               <button
                 type="button"
@@ -911,9 +987,19 @@ export default function AutoTranslateApp() {
                   )}
                   {stepWaitSec >= 45 ? (
                     <p className="mt-2 text-xs opacity-80">
-                      این مورد طولانی شده (Elementor یا API کند). اگر خطا باشد اینجا نمایش داده می‌شود.
+                      این مورد طولانی شده (Elementor یا API کند). می‌توانید «رد کردن» را بزنید تا به مورد بعدی برود.
                     </p>
                   ) : null}
+                  {canSkip && (
+                    <button
+                      type="button"
+                      onClick={handleSkip}
+                      disabled={isBusy && actionPending !== 'skip'}
+                      className="mt-3 rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-50 disabled:opacity-50"
+                    >
+                      {actionPending === 'skip' ? 'در حال رد کردن…' : `رد کردن #${skipTargetId} و رفتن به بعدی`}
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -942,6 +1028,7 @@ export default function AutoTranslateApp() {
                   { label: 'موفق (این اجرا)', value: job?.succeeded ?? 0, color: 'text-green-700' },
                   { label: 'ناقص (این اجرا)', value: job?.partial ?? 0, color: 'text-amber-700' },
                   { label: 'ناموفق (این اجرا)', value: job?.failed ?? 0, color: 'text-red-700' },
+                  { label: 'رد شده (این اجرا)', value: job?.skipped ?? 0, color: 'text-amber-800' },
                   { label: 'در صف بعدی (سنگین/ناقص)', value: job?.deferred_pending ?? runPending, color: 'text-blue-700' },
                   { label: 'تلاش API', value: steps, color: 'text-gray-700' },
                   { label: 'کل محتوای قابل ترجمه', value: liveStats.total ?? '—' },
@@ -985,9 +1072,23 @@ export default function AutoTranslateApp() {
               </p>
 
               {job?.last_error && (
-                <p className="mt-2 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
-                  آخرین خطا: {job.last_error}
-                </p>
+                <div className="mt-2 space-y-2">
+                  <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+                    آخرین خطا: {job.last_error}
+                  </p>
+                  {canSkip && (
+                    <button
+                      type="button"
+                      onClick={handleSkip}
+                      disabled={isBusy && actionPending !== 'skip'}
+                      className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                    >
+                      {actionPending === 'skip'
+                        ? 'در حال رد کردن…'
+                        : `رد کردن #${skipTargetId} و ادامه با مورد بعدی`}
+                    </button>
+                  )}
+                </div>
               )}
 
               {Array.isArray(job?.stalled_details) && job.stalled_details.length > 0 && (

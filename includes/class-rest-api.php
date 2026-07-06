@@ -1444,6 +1444,10 @@ final class REST_API {
 			case 'refresh_stats':
 				$result = Activity_Logger::refresh_job_stats( $lang );
 				break;
+			case 'skip':
+				$post_id = absint( $request->get_param( 'post_id' ) );
+				$result  = Activity_Logger::skip_current_job_post( $post_id );
+				break;
 			default:
 				return new \WP_Error(
 					'polymart_ai_invalid_action',

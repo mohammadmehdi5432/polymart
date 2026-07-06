@@ -52,6 +52,39 @@ final class AI_Client {
 	const MAX_TRANSPORT_RETRIES = 3;
 
 	/**
+	 * cURL timeout (seconds) for the in-flight translation HTTP request.
+	 *
+	 * @var int|null
+	 */
+	private static $active_curl_timeout = null;
+
+	/**
+	 * Register transport hooks.
+	 *
+	 * @return void
+	 */
+	public static function init() {
+		add_action( 'http_api_curl', array( __CLASS__, 'enforce_active_curl_timeout' ), 10, 1 );
+	}
+
+	/**
+	 * Force cURL to honor the computed translation timeout (some hosts default to 30s).
+	 *
+	 * @param resource|\CurlHandle $handle cURL handle.
+	 * @return void
+	 */
+	public static function enforce_active_curl_timeout( $handle ) {
+		if ( null === self::$active_curl_timeout ) {
+			return;
+		}
+
+		$timeout = (int) self::$active_curl_timeout;
+
+		curl_setopt( $handle, CURLOPT_TIMEOUT, $timeout );
+		curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, min( 45, $timeout ) );
+	}
+
+	/**
 	 * Verify API credentials with a minimal chat completion request.
 	 *
 	 * @param string $api_key  ArvanCloud API key.
@@ -266,6 +299,9 @@ final class AI_Client {
 		 * @param array<string, mixed>  $payload Outbound request body.
 		 */
 		$timeout = (int) apply_filters( 'polymart_ai_request_timeout', $timeout, $payload );
+		$timeout = max( self::REQUEST_TIMEOUT_MIN, min( self::REQUEST_TIMEOUT_MAX, $timeout ) );
+
+		self::$active_curl_timeout = $timeout;
 
 		$response = wp_remote_post(
 			self::resolve_chat_completions_url( $endpoint ),
@@ -276,6 +312,8 @@ final class AI_Client {
 				'body'        => $encoded_body,
 			)
 		);
+
+		self::$active_curl_timeout = null;
 
 		if ( is_wp_error( $response ) ) {
 			$error_code    = $response->get_error_code();
@@ -371,7 +409,7 @@ final class AI_Client {
 		$result = self::send_translation_request( $data_array, $api_key, $endpoint, $model, $target_lang, $options );
 
 		if ( ! is_wp_error( $result ) ) {
-			return self::merge_partial_translations( $data_array, $result, $api_key, $endpoint, $model, $target_lang );
+			return self::merge_partial_translations( $data_array, $result, $api_key, $endpoint, $model, $target_lang, $options );
 		}
 
 		if ( count( $data_array ) <= 1 ) {
@@ -440,7 +478,7 @@ final class AI_Client {
 	 * @param string                $target_lang  Target language.
 	 * @return array<string, string>|\WP_Error
 	 */
-	private static function merge_partial_translations( array $source, array $translations, $api_key = '', $endpoint = '', $model = '', $target_lang = 'en' ) {
+	private static function merge_partial_translations( array $source, array $translations, $api_key = '', $endpoint = '', $model = '', $target_lang = 'en', array $options = array() ) {
 		$validated = self::validate_keys( $source, $translations, true );
 
 		if ( is_wp_error( $validated ) ) {
@@ -472,7 +510,8 @@ final class AI_Client {
 				$api_key,
 				$endpoint,
 				$model,
-				$target_lang
+				$target_lang,
+				$options
 			);
 
 			if ( is_wp_error( $single ) ) {

@@ -54,10 +54,10 @@ export async function fetchJob() {
   return data;
 }
 
-export async function jobAction(action, lang = 'en') {
+export async function jobAction(action, lang = 'en', extra = {}) {
   abortJobStep();
   const { data } = await withRetries(() =>
-    api.post('/translation-job', { action, lang }, { timeout: JOB_FETCH_TIMEOUT_MS })
+    api.post('/translation-job', { action, lang, ...extra }, { timeout: JOB_FETCH_TIMEOUT_MS })
   );
   return data;
 }

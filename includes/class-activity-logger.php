@@ -300,6 +300,7 @@ final class Activity_Logger {
 			'partial_ids'     => array(),
 			'exhausted_ids'   => array(),
 			'failed'          => 0,
+			'skipped'         => 0,
 			'current_post_id' => null,
 			'step_started_at' => null,
 			'last_error'      => null,
@@ -1307,6 +1308,7 @@ final class Activity_Logger {
 			'partial_ids'     => array(),
 			'exhausted_ids'   => array(),
 			'failed'          => 0,
+			'skipped'         => 0,
 			'current_post_id' => null,
 			'last_error'      => null,
 			'started_at'      => time(),
@@ -1409,6 +1411,132 @@ final class Activity_Logger {
 		self::release_step_lock();
 
 		return self::save_job( self::empty_job() );
+	}
+
+	/**
+	 * Skip the current (or specified) post and continue with the next queue item.
+	 *
+	 * @param int $post_id Optional post ID; falls back to partial/current/last step.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public static function skip_current_job_post( $post_id = 0 ) {
+		$job  = self::get_job_raw();
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( '' === $lang ) {
+			$lang = 'en';
+		}
+
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['partial_post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['current_post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 && is_array( $job['last_step'] ?? null ) ) {
+			$post_id = absint( $job['last_step']['post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 ) {
+			return new \WP_Error(
+				'polymart_ai_no_skip_target',
+				__( 'موردی برای رد کردن مشخص نیست.', 'polymart-ai' )
+			);
+		}
+
+		Post_Translator::clear_job_partial_state( $post_id, $lang );
+		Post_Translator::release_translation_lock( $post_id, $lang );
+		self::release_step_lock();
+
+		$exhausted = self::get_exhausted_job_post_ids( $job );
+
+		if ( ! in_array( $post_id, $exhausted, true ) ) {
+			$exhausted[] = $post_id;
+		}
+
+		$job['exhausted_ids'] = array_values( array_unique( array_map( 'absint', $exhausted ) ) );
+
+		self::remove_post_from_deferred_queue( $job, $post_id );
+
+		$job['retry_queue'] = array_values(
+			array_filter(
+				self::get_retry_queue( $job ),
+				static function ( $queued_id ) use ( $post_id ) {
+					return (int) $queued_id !== $post_id;
+				}
+			)
+		);
+
+		$job['parked_ids'] = array_values(
+			array_filter(
+				self::get_parked_ids( $job ),
+				static function ( $queued_id ) use ( $post_id ) {
+					return (int) $queued_id !== $post_id;
+				}
+			)
+		);
+
+		$job['partial_ids'] = array_values(
+			array_filter(
+				is_array( $job['partial_ids'] ?? null ) ? $job['partial_ids'] : array(),
+				static function ( $queued_id ) use ( $post_id ) {
+					return (int) $queued_id !== $post_id;
+				}
+			)
+		);
+		$job['partial'] = count( $job['partial_ids'] );
+
+		if ( isset( $job['retry_attempts'][ $post_id ] ) ) {
+			unset( $job['retry_attempts'][ $post_id ] );
+		}
+
+		if ( isset( $job['post_step_counts'][ $post_id ] ) ) {
+			unset( $job['post_step_counts'][ $post_id ] );
+		}
+
+		$job['last_post_id']           = $post_id;
+		$job['partial_post_id']        = null;
+		$job['partial_phase']          = null;
+		$job['partial_progress']       = null;
+		$job['current_post_id']        = null;
+		$job['step_started_at']        = null;
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['last_error']             = null;
+		$job['pause_reason']           = null;
+		$job['skipped']                = absint( $job['skipped'] ?? 0 ) + 1;
+
+		if ( in_array( $job['status'] ?? '', array( 'paused' ), true ) ) {
+			$job['status'] = 'running';
+		}
+
+		self::set_job_last_step(
+			$job,
+			$post_id,
+			'skipped',
+			__( 'این مورد رد شد — ادامه با مورد بعدی.', 'polymart-ai' )
+		);
+
+		self::sync_job_remaining( $job, $lang );
+		self::save_job( $job );
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: post title */
+				__( 'مورد #%1$d «%2$s» رد شد — ادامه با مورد بعدی.', 'polymart-ai' ),
+				$post_id,
+				get_the_title( $post_id ) ?: '#' . $post_id
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang )
+		);
+
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	/**

@@ -23,6 +23,7 @@ use PolymartAI\Integration\Knd_Integration;
 use PolymartAI\Integration\Kndpi_Integration;
 use PolymartAI\Integration\Wve_Integration;
 use PolymartAI\Routing\Url_Router;
+use PolymartAI\Translation\AI_Client;
 use PolymartAI\Translation\Async_Translator;
 use PolymartAI\Translation\Comment_Translator;
 use PolymartAI\Translation\Frontend_Interceptor;
@@ -200,6 +201,7 @@ final class Plugin {
 	private function init_hooks() {
 		Language_Registry::maybe_seed_defaults();
 		Activity_Logger::init();
+		AI_Client::init();
 		Cpc_Integration::init();
 		Customer_Portal_Integration::init();
 		Jet_Checkout_Integration::init();
