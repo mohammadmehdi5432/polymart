@@ -112,3 +112,13 @@ export async function refreshJobStats(lang = 'en') {
   );
   return data;
 }
+
+/** Quick ArvanCloud translation smoke test (same code path as bulk jobs). */
+export async function testTranslationApi({ text = 'سلام دنیا', lang = 'en' } = {}) {
+  const { data } = await api.post(
+    '/translation-job/test-api',
+    { text, lang },
+    { timeout: 150000 }
+  );
+  return data;
+}

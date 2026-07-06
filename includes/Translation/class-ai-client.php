@@ -191,6 +191,63 @@ final class AI_Client {
 	}
 
 	/**
+	 * Send a short sample through the same translation path as bulk jobs (for diagnostics).
+	 *
+	 * @param string $text        Source text (Persian).
+	 * @param string $target_lang Target language code.
+	 * @param string $api_key     ArvanCloud API key.
+	 * @param string $endpoint    Gateway base URL.
+	 * @param string $model       Model identifier.
+	 * @return array<string, mixed>
+	 */
+	public static function test_sample_translation( $text, $target_lang, $api_key, $endpoint, $model ) {
+		$text        = sanitize_text_field( (string) $text );
+		$target_lang = sanitize_key( (string) $target_lang );
+
+		if ( '' === $text ) {
+			$text = 'سلام دنیا';
+		}
+
+		if ( '' === $target_lang ) {
+			$target_lang = 'en';
+		}
+
+		$started      = microtime( true );
+		$translations = self::send_translation_request(
+			array( 'test_line' => $text ),
+			(string) $api_key,
+			(string) $endpoint,
+			(string) $model,
+			$target_lang,
+			array(
+				'min_timeout' => 60,
+				'max_timeout' => 120,
+			)
+		);
+		$elapsed_ms = (int) round( ( microtime( true ) - $started ) * 1000 );
+
+		if ( is_wp_error( $translations ) ) {
+			return array(
+				'success'    => false,
+				'elapsed_ms' => $elapsed_ms,
+				'source'     => $text,
+				'target_lang' => $target_lang,
+				'error'      => $translations->get_error_message(),
+				'error_code' => $translations->get_error_code(),
+			);
+		}
+
+		return array(
+			'success'     => true,
+			'elapsed_ms'  => $elapsed_ms,
+			'source'      => $text,
+			'target_lang' => $target_lang,
+			'model'       => self::resolve_model( (string) $model, (string) $endpoint ),
+			'translated'  => (string) ( $translations['test_line'] ?? '' ),
+		);
+	}
+
+	/**
 	 * Send a batch translation request to ArvanCloud AI.
 	 *
 	 * @param array<string, string> $data_array Field key => source text.

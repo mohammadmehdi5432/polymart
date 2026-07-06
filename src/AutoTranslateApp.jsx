@@ -3,7 +3,7 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, JOB_STEP_TIMEOUT_MS } from './api/job';
+import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, testTranslationApi, JOB_STEP_TIMEOUT_MS } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const STEP_DELAY_MS = 250;
@@ -129,6 +129,9 @@ export default function AutoTranslateApp() {
   const [notice, setNotice] = useState(null);
   const [stepWaitSec, setStepWaitSec] = useState(0);
   const [activePost, setActivePost] = useState(null);
+  const [apiTestText, setApiTestText] = useState('سلام دنیا');
+  const [apiTestLoading, setApiTestLoading] = useState(false);
+  const [apiTestResult, setApiTestResult] = useState(null);
   const runningRef = useRef(false);
   const autoResumedRef = useRef(false);
   const logsRef = useRef(null);
@@ -621,7 +624,7 @@ export default function AutoTranslateApp() {
       Number(job?.last_step?.post_id) ||
       0;
 
-    if (!postId || actionPending) {
+    if (!postId || Boolean(actionPending)) {
       return;
     }
 
@@ -747,6 +750,32 @@ export default function AutoTranslateApp() {
       });
     } finally {
       setRefreshingStats(false);
+    }
+  };
+
+  const handleApiTest = async () => {
+    setApiTestLoading(true);
+    setApiTestResult(null);
+    setNotice(null);
+
+    try {
+      const data = await testTranslationApi({ text: apiTestText.trim() || 'سلام دنیا', lang: targetLang });
+      setApiTestResult(data);
+
+      if (data?.success) {
+        appendLog(
+          `تست آروان موفق (${data.elapsed_ms}ms): «${data.source}» → «${data.translated}»`,
+          'success'
+        );
+      } else {
+        appendLog(`تست آروان ناموفق (${data?.elapsed_ms ?? '?'}ms): ${data?.error || 'خطای نامشخص'}`, 'error');
+      }
+    } catch (error) {
+      const message = error?.response?.data?.message || error?.message || 'تست API ناموفق بود.';
+      setApiTestResult({ success: false, error: message });
+      appendLog(`تست آروان ناموفق: ${message}`, 'error');
+    } finally {
+      setApiTestLoading(false);
     }
   };
 
@@ -910,7 +939,7 @@ export default function AutoTranslateApp() {
               <button
                 type="button"
                 onClick={handleSkip}
-                disabled={isBusy && actionPending !== 'skip'}
+                disabled={isSkipDisabled}
                 className="w-full cursor-pointer rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {actionPending === 'skip'
@@ -937,6 +966,57 @@ export default function AutoTranslateApp() {
               <HiArrowPath className={`h-4 w-4 ${refreshingStats ? 'animate-spin' : ''}`} />
               {refreshingStats ? 'در حال به‌روزرسانی آمار…' : 'به‌روزرسانی آمار کل سایت'}
             </button>
+          </div>
+
+          <div className="mt-5 rounded-lg border border-dashed border-gray-300 bg-gray-50 p-4">
+            <p className="text-xs font-medium text-gray-800">تست سریع آروان‌کلاد</p>
+            <p className="mt-1 text-xs text-gray-600">
+              همان مسیر ترجمه واقعی — اگر اینجا timeout بخورد، مشکل از API است نه از محصول.
+            </p>
+            <input
+              type="text"
+              value={apiTestText}
+              onChange={(event) => setApiTestText(event.target.value)}
+              disabled={apiTestLoading}
+              className="mt-3 w-full rounded border border-pmai-border bg-white px-3 py-2 text-sm disabled:opacity-50"
+              placeholder="متن تستی فارسی"
+            />
+            <button
+              type="button"
+              onClick={handleApiTest}
+              disabled={apiTestLoading}
+              className="mt-2 w-full cursor-pointer rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium text-blue-900 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {apiTestLoading ? 'در حال ارسال به آروان… (تا ۲ دقیقه)' : `تست ترجمه به ${targetLabel}`}
+            </button>
+            {apiTestResult && (
+              <div
+                className={`mt-3 rounded border px-3 py-2 text-xs ${
+                  apiTestResult.success
+                    ? 'border-green-200 bg-green-50 text-green-900'
+                    : 'border-red-200 bg-red-50 text-red-800'
+                }`}
+              >
+                {apiTestResult.success ? (
+                  <>
+                    <p className="font-medium">موفق — {apiTestResult.elapsed_ms}ms</p>
+                    <p className="mt-1">«{apiTestResult.source}» → «{apiTestResult.translated}»</p>
+                    {apiTestResult.model ? <p className="mt-1 opacity-80">مدل: {apiTestResult.model}</p> : null}
+                  </>
+                ) : (
+                  <>
+                    <p className="font-medium">
+                      ناموفق
+                      {apiTestResult.elapsed_ms != null ? ` — ${apiTestResult.elapsed_ms}ms` : ''}
+                    </p>
+                    <p className="mt-1 break-words">{apiTestResult.error}</p>
+                    {apiTestResult.error_code ? (
+                      <p className="mt-1 opacity-80">[{apiTestResult.error_code}]</p>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -994,7 +1074,7 @@ export default function AutoTranslateApp() {
                     <button
                       type="button"
                       onClick={handleSkip}
-                      disabled={isBusy && actionPending !== 'skip'}
+                      disabled={isSkipDisabled}
                       className="mt-3 rounded-lg border border-amber-400 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-50 disabled:opacity-50"
                     >
                       {actionPending === 'skip' ? 'در حال رد کردن…' : `رد کردن #${skipTargetId} و رفتن به بعدی`}
@@ -1080,7 +1160,7 @@ export default function AutoTranslateApp() {
                     <button
                       type="button"
                       onClick={handleSkip}
-                      disabled={isBusy && actionPending !== 'skip'}
+                      disabled={isSkipDisabled}
                       className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
                     >
                       {actionPending === 'skip'

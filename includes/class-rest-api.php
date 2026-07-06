@@ -295,6 +295,16 @@ final class REST_API {
 
 		register_rest_route(
 			self::NAMESPACE,
+			'/translation-job/test-api',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'test_translation_api' ),
+				'permission_callback' => array( $this, 'check_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
 			'/translations/(?P<id>\d+)/generate',
 			array(
 				'methods'             => \WP_REST_Server::CREATABLE,
@@ -1463,6 +1473,54 @@ final class REST_API {
 				array( 'status' => 400 )
 			);
 		}
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Run a short sample translation through ArvanCloud (same path as bulk jobs).
+	 *
+	 * @param \WP_REST_Request $request REST request.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function test_translation_api( $request ) {
+		$incoming = $request->get_json_params();
+
+		if ( ! is_array( $incoming ) ) {
+			$incoming = array();
+		}
+
+		$text = sanitize_text_field( (string) ( $incoming['text'] ?? 'سلام دنیا' ) );
+		$lang = sanitize_key( (string) ( $incoming['lang'] ?? 'en' ) );
+
+		if ( '' === $lang ) {
+			$lang = 'en';
+		}
+
+		$current     = wp_parse_args( get_option( self::OPTION_KEY, array() ), self::get_default_settings() );
+		$translation = self::normalize_translation_settings( $current['translation'] );
+
+		$api_key  = trim( (string) ( $translation['api_key'] ?? '' ) );
+		$endpoint = trim( (string) ( $translation['api_endpoint'] ?? '' ) );
+		$model    = trim( (string) ( $translation['ai_model'] ?? '' ) );
+
+		if ( '' === $api_key ) {
+			return new \WP_Error(
+				'polymart_ai_missing_api_key',
+				__( 'کلید API در تنظیمات ترجمه تنظیم نشده است.', 'polymart-ai' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		if ( '' === $endpoint ) {
+			return new \WP_Error(
+				'polymart_ai_missing_endpoint',
+				__( 'آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده است.', 'polymart-ai' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		$result = AI_Client::test_sample_translation( $text, $lang, $api_key, $endpoint, $model );
 
 		return rest_ensure_response( $result );
 	}
