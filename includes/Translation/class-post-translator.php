@@ -3132,6 +3132,7 @@ final class Post_Translator {
 			'field_chunk_index'      => 0,
 			'elementor_map'          => array(),
 			'elementor_chunk_index'  => 0,
+			'elementor_failures'     => array(),
 			'elementor_chunks_total' => 0,
 		);
 
@@ -3919,9 +3920,19 @@ final class Post_Translator {
 		$budget       = self::get_job_step_max_elementor_chunks();
 		$ai_options   = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
 		$processed    = 0;
+		$failures     = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
 			$chunk = array_shift( $chunks );
+			$first_key = (string) array_key_first( $chunk );
+
+			if ( '' !== $first_key && absint( $failures[ $first_key ] ?? 0 ) >= 3 ) {
+				$map = array_merge( $map, self::collapse_payload_parts( array( $first_key => (string) $chunk[ $first_key ] ) ) );
+				unset( $failures[ $first_key ] );
+				++$processed;
+				continue;
+			}
+
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 
 			$chunk_result = AI_Client::translate_fields(
@@ -3940,11 +3951,17 @@ final class Post_Translator {
 					$api_endpoint,
 					$ai_model,
 					$lang,
-					1,
+					3,
 					$ai_options
 				);
 
 				if ( is_wp_error( $recovered ) ) {
+					foreach ( array_keys( $chunk ) as $failed_key ) {
+						$failures[ (string) $failed_key ] = absint( $failures[ (string) $failed_key ] ?? 0 ) + 1;
+					}
+
+					$state['elementor_failures'] = $failures;
+
 					return self::handle_elementor_job_slice_failure(
 						$post_id,
 						$lang,
@@ -3952,7 +3969,8 @@ final class Post_Translator {
 						$state,
 						$map,
 						$source_total,
-						$recovered
+						$recovered,
+						array_keys( $chunk )
 					);
 				}
 
@@ -3972,6 +3990,7 @@ final class Post_Translator {
 		$state['elementor_map']          = $map;
 		$state['elementor_chunk_index']  = count( $map );
 		$state['elementor_chunks_total'] = max( 1, $source_total );
+		$state['elementor_failures']     = $failures;
 
 		$remaining = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
@@ -4024,13 +4043,27 @@ final class Post_Translator {
 	 * @param array<string, string> $map         Translated path map so far.
 	 * @param int                   $source_total Total translatable widgets.
 	 * @param \WP_Error             $error       API error.
+	 * @param string[]              $failed_keys Optional field keys that failed in this chunk.
 	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}|\WP_Error
 	 */
-	private static function handle_elementor_job_slice_failure( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, \WP_Error $error ) {
+	private static function handle_elementor_job_slice_failure( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, \WP_Error $error, array $failed_keys = array() ) {
 		$state['elementor_map']          = $map;
 		$state['elementor_chunk_index']  = count( $map );
 		$state['elementor_chunks_total'] = max( 1, $source_total );
 		$progress                        = count( $map ) . '/' . max( 1, $source_total );
+		$failures                        = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+
+		foreach ( $failed_keys as $failed_key ) {
+			$failed_key = (string) $failed_key;
+
+			if ( '' === $failed_key ) {
+				continue;
+			}
+
+			$failures[ $failed_key ] = absint( $failures[ $failed_key ] ?? 0 ) + 1;
+		}
+
+		$state['elementor_failures'] = $failures;
 
 		if ( ! empty( $map ) ) {
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, count( $map ), max( 1, $source_total ) );
@@ -4077,7 +4110,9 @@ final class Post_Translator {
 		$remaining = array();
 
 		foreach ( $payload as $path => $text ) {
-			if ( isset( $map[ $path ] ) && '' !== trim( (string) $map[ $path ] ) ) {
+			$text = (string) $text;
+
+			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
 				continue;
 			}
 
@@ -4085,6 +4120,31 @@ final class Post_Translator {
 		}
 
 		return $remaining;
+	}
+
+	/**
+	 * Whether an Elementor field (including oversized multi-part values) is fully translated.
+	 *
+	 * @param string               $path Field path.
+	 * @param string               $text Source text.
+	 * @param array<string, string> $map Completed translations keyed by path.
+	 * @return bool
+	 */
+	private static function elementor_field_translation_complete( $path, $text, array $map ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( strlen( $text ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
+			return isset( $map[ $path ] ) && '' !== trim( (string) $map[ $path ] );
+		}
+
+		if ( ! isset( $map[ $path ] ) || '' === trim( (string) $map[ $path ] ) ) {
+			return false;
+		}
+
+		$translated = (string) $map[ $path ];
+
+		return strlen( $translated ) >= (int) floor( strlen( $text ) * 0.85 );
 	}
 
 	/**

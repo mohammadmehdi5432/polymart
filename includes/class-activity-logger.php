@@ -310,8 +310,9 @@ final class Activity_Logger {
 			'partial_post_id' => null,
 			'partial_phase'   => null,
 			'partial_progress' => null,
-			'consecutive_post_id'   => 0,
+			'consecutive_post_id'    => 0,
 			'consecutive_post_steps' => 0,
+			'stuck_progress_steps'   => 0,
 		);
 	}
 
@@ -748,6 +749,77 @@ final class Activity_Logger {
 		$index = absint( $state['field_chunk_index'] ?? 0 );
 
 		return $index > 0 ? (string) $index : '';
+	}
+
+	/**
+	 * Whether a slice advanced durable progress for the current post.
+	 *
+	 * @param array<string, mixed> $job              Job state.
+	 * @param string               $current_progress Progress marker from the slice.
+	 * @return bool
+	 */
+	private static function job_slice_made_progress( array $job, $current_progress ) {
+		$previous = (string) ( $job['partial_progress'] ?? '' );
+		$current  = (string) $current_progress;
+
+		return '' !== $current && $current !== $previous;
+	}
+
+	/**
+	 * Track repeated attempts at the same progress marker and decide when to defer.
+	 *
+	 * @param array<string, mixed> $job              Job state (by reference).
+	 * @param int                    $post_id          Post ID.
+	 * @param string                 $current_progress Progress marker from the slice.
+	 * @return bool True when the post should be deferred.
+	 */
+	private static function job_progress_stuck_should_defer( array &$job, $post_id, $current_progress ) {
+		if ( self::job_slice_made_progress( $job, $current_progress ) ) {
+			$job['stuck_progress_steps'] = 0;
+
+			return false;
+		}
+
+		$job['stuck_progress_steps'] = absint( $job['stuck_progress_steps'] ?? 0 ) + 1;
+
+		$limit = (int) apply_filters( 'polymart_ai_job_stuck_progress_limit', 6, $job, $post_id );
+
+		return absint( $job['stuck_progress_steps'] ?? 0 ) >= max( 3, $limit );
+	}
+
+	/**
+	 * Defer a post that keeps failing at the same partial progress.
+	 *
+	 * @param array<string, mixed> $job      Job state (by reference).
+	 * @param int                  $post_id  Post ID.
+	 * @param string               $lang     Language code.
+	 * @param string               $phase    Phase key.
+	 * @param string               $progress Progress marker.
+	 * @return void
+	 */
+	private static function defer_job_post_stuck_slice( array &$job, $post_id, $lang, $phase, $progress ) {
+		self::defer_job_post( $job, $post_id, $lang );
+		$job['partial_post_id']        = null;
+		$job['partial_phase']          = null;
+		$job['partial_progress']       = null;
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['current_post_id']        = null;
+		$job['step_started_at']        = null;
+		self::increment_job_step( $job );
+		self::set_job_last_step(
+			$job,
+			$post_id,
+			'deferred',
+			sprintf(
+				/* translators: 1: post title, 2: phase label, 3: progress marker */
+				__( '«%1$s» موقتاً کنار گذاشته شد (%2$s %3$s) — ادامه بقیه صف', 'polymart-ai' ),
+				get_the_title( $post_id ),
+				$phase,
+				$progress
+			)
+		);
 	}
 
 	/**
@@ -1514,6 +1586,7 @@ final class Activity_Logger {
 			if ( absint( $job['consecutive_post_id'] ?? 0 ) !== $post_id ) {
 				$job['consecutive_post_id']    = 0;
 				$job['consecutive_post_steps'] = 0;
+				$job['stuck_progress_steps']   = 0;
 			}
 		}
 
@@ -1546,10 +1619,21 @@ final class Activity_Logger {
 				Post_Translator::is_recoverable_job_slice_error( $slice )
 				&& Post_Translator::job_partial_state_has_progress( $post_id, $lang, $partial_state )
 			) {
+				$partial_progress = self::format_job_partial_progress( $partial_state );
+				$phase            = (string) ( $partial_state['phase'] ?? 'elementor' );
+
+				if ( self::job_progress_stuck_should_defer( $job, $post_id, $partial_progress ) ) {
+					Post_Translator::release_translation_lock( $post_id, $lang );
+					self::defer_job_post_stuck_slice( $job, $post_id, $lang, $phase, $partial_progress );
+					self::save_job( $job );
+
+					return self::normalize_job_for_response( $job, false );
+				}
+
 				Post_Translator::release_translation_lock( $post_id, $lang );
 				$job['partial_post_id']   = $post_id;
-				$job['partial_phase']     = (string) ( $partial_state['phase'] ?? 'elementor' );
-				$job['partial_progress']  = self::format_job_partial_progress( $partial_state );
+				$job['partial_phase']     = $phase;
+				$job['partial_progress']  = $partial_progress;
 				$job['current_post_id']   = null;
 				$job['step_started_at']   = null;
 				$job['last_error']        = $slice->get_error_message();
@@ -1587,48 +1671,34 @@ final class Activity_Logger {
 				$job['consecutive_post_steps'] = 1;
 			}
 
-			if ( ! empty( $slice['recoverable'] ) ) {
-				$job['consecutive_post_steps'] = 1;
-			}
-
 			$limits = Post_Translator::get_job_step_limits_for_post(
 				$post_id,
 				(string) ( $slice['phase'] ?? '' )
 			);
-			$max_consecutive = (int) ( $limits['max_consecutive'] ?? 8 );
+			$max_consecutive   = (int) ( $limits['max_consecutive'] ?? 8 );
 			$max_steps_per_run = (int) ( $limits['max_per_run'] ?? 24 );
-			$steps_on_post      = absint( $job['post_step_counts'][ $post_id ] ?? 0 );
-			$previous_progress  = (string) ( $job['partial_progress'] ?? '' );
-			$current_progress   = (string) ( $slice['phase_progress'] ?? '' );
-			$made_progress      = '' !== $current_progress && $current_progress !== $previous_progress;
+			$steps_on_post     = absint( $job['post_step_counts'][ $post_id ] ?? 0 );
+			$current_progress  = (string) ( $slice['phase_progress'] ?? '' );
+			$made_progress     = self::job_slice_made_progress( $job, $current_progress );
+			$stuck_should_defer = ! $made_progress && self::job_progress_stuck_should_defer( $job, $post_id, $current_progress );
 
 			if (
-				! $made_progress
-				&& (
-					absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive )
-					|| $steps_on_post >= max( 1, $max_steps_per_run )
+				$stuck_should_defer
+				|| (
+					! $made_progress
+					&& (
+						absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive )
+						|| $steps_on_post >= max( 1, $max_steps_per_run )
+					)
 				)
 			) {
 				Post_Translator::release_translation_lock( $post_id, $lang );
-				self::defer_job_post( $job, $post_id, $lang );
-				$job['partial_post_id']        = null;
-				$job['partial_phase']          = null;
-				$job['partial_progress']       = null;
-				$job['consecutive_post_id']    = 0;
-				$job['consecutive_post_steps'] = 0;
-				$job['current_post_id']        = null;
-				$job['step_started_at']        = null;
-				self::increment_job_step( $job );
-				self::set_job_last_step(
+				self::defer_job_post_stuck_slice(
 					$job,
 					$post_id,
-					'deferred',
-					sprintf(
-						/* translators: 1: post ID, 2: phase label */
-						__( 'مورد #%1$d کنار گذاشته شد — ادامه بقیه صف. (%2$s)', 'polymart-ai' ),
-						$post_id,
-						(string) ( $slice['phase'] ?? '' )
-					)
+					$lang,
+					(string) ( $slice['phase'] ?? '' ),
+					$current_progress
 				);
 				self::save_job( $job );
 
@@ -1648,6 +1718,7 @@ final class Activity_Logger {
 
 			if ( $made_progress ) {
 				$job['consecutive_post_steps'] = 1;
+				$job['stuck_progress_steps']   = 0;
 			}
 
 			$job['current_post_id']   = null;
