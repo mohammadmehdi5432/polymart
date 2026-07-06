@@ -798,6 +798,7 @@ export default function AutoTranslateApp() {
   const isOutdated = Boolean(job?.outdated);
   const isOrphanedRunning = isRunning && !processing && needsWork > 0;
   const isBusy = Boolean(actionPending) || processing || refreshingStats;
+  const isSkipDisabled = refreshingStats || Boolean(actionPending);
   const canResume = (isPaused || isOrphanedRunning) && needsWork > 0 && !isBusy;
   const canStart = !loading && !isBusy && !isRunning && !langsLoading;
   const activeLangLabel = job?.lang_label || targetLabel;
