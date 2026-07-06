@@ -312,6 +312,21 @@ final class Post_Translator {
 	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 2500;
 
 	/**
+	 * One widget/field per job step — avoids ArvanCloud gateway timeouts on heavy pages.
+	 */
+	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 1;
+
+	/**
+	 * Maximum characters per Elementor job-step API call.
+	 */
+	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1000;
+
+	/**
+	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
+	 */
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 70;
+
+	/**
 	 * Variation title batches — variable products may have 100+ rows.
 	 */
 	const VARIATION_AI_FIELD_CHUNK_SIZE = 3;
@@ -3139,10 +3154,114 @@ final class Post_Translator {
 		}
 
 		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
-			return array_merge( $base, array( 'phase' => 'elementor' ) );
+			$state = array_merge( $base, array( 'phase' => 'elementor' ) );
+			$raw   = get_post_meta( $post_id, '_elementor_data', true );
+
+			if ( is_string( $raw ) && '' !== $raw ) {
+				$source_data = json_decode( $raw, true );
+
+				if ( is_array( $source_data ) ) {
+					$restored_map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
+
+					if ( ! empty( $restored_map ) ) {
+						$state['elementor_map'] = $restored_map;
+					}
+				}
+			}
+
+			return $state;
 		}
 
 		return array_merge( $base, array( 'phase' => 'complete' ) );
+	}
+
+	/**
+	 * Whether a job slice error should preserve partial progress and retry later.
+	 *
+	 * @param \WP_Error $error Error object.
+	 * @return bool
+	 */
+	public static function is_recoverable_job_slice_error( $error ) {
+		if ( ! $error instanceof \WP_Error ) {
+			return false;
+		}
+
+		$recoverable_codes = array(
+			'polymart_ai_timeout',
+			'polymart_ai_http_error',
+			'polymart_ai_api_error',
+			'polymart_ai_invalid_json',
+			'polymart_ai_invalid_response',
+			'polymart_ai_missing_choices',
+			'polymart_ai_empty_response',
+			'polymart_ai_no_translations',
+			'polymart_ai_chunk_empty',
+			'polymart_ai_job_slice_failed',
+		);
+
+		if ( in_array( $error->get_error_code(), $recoverable_codes, true ) ) {
+			return true;
+		}
+
+		$message = strtolower( $error->get_error_message() );
+
+		return false !== strpos( $message, 'timeout' )
+			|| false !== strpos( $message, 'timed out' )
+			|| false !== strpos( $message, 'منقضی' )
+			|| false !== strpos( $message, 'gateway' );
+	}
+
+	/**
+	 * Whether durable partial state exists for a resumable job slice.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Partial state.
+	 * @return bool
+	 */
+	public static function job_partial_state_has_progress( $post_id, $lang, array $state = array() ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( empty( $state ) ) {
+			$state = self::get_job_partial_state( $post_id, $lang );
+		}
+
+		if ( empty( $state ) || ! is_array( $state ) ) {
+			return (bool) get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
+		}
+
+		$phase = sanitize_key( (string) ( $state['phase'] ?? '' ) );
+
+		if ( 'elementor' === $phase ) {
+			$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+
+			return ! empty( $map ) || absint( $state['elementor_chunk_index'] ?? 0 ) > 0;
+		}
+
+		if ( in_array( $phase, array( 'core', 'commerce', 'variations', 'fields' ), true ) ) {
+			return absint( $state['field_chunk_index'] ?? 0 ) > 0;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Build a resumable partial slice response after a recoverable API failure.
+	 *
+	 * @param string               $phase    Phase key.
+	 * @param string               $progress Progress label.
+	 * @param string               $message  Human-readable message.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}
+	 */
+	public static function make_recoverable_partial_slice_response( $phase, $progress, $message ) {
+		return array(
+			'done'           => false,
+			'phase'          => sanitize_key( (string) $phase ),
+			'phase_progress' => (string) $progress,
+			'message'        => (string) $message,
+			'recoverable'    => true,
+		);
 	}
 
 	/**
@@ -3360,7 +3479,7 @@ final class Post_Translator {
 	 * @param int                   $max_fallbacks Max single-field attempts.
 	 * @return array<string, string>|\WP_Error
 	 */
-	private static function translate_job_chunk_with_single_field_fallback( array $chunk, $api_key, $api_endpoint, $ai_model, $lang, $max_fallbacks = 2 ) {
+	private static function translate_job_chunk_with_single_field_fallback( array $chunk, $api_key, $api_endpoint, $ai_model, $lang, $max_fallbacks = 2, array $options = array() ) {
 		$merged     = array();
 		$last_error = null;
 		$attempts   = 0;
@@ -3377,7 +3496,8 @@ final class Post_Translator {
 				$api_key,
 				$api_endpoint,
 				$ai_model,
-				$lang
+				$lang,
+				$options
 			);
 
 			if ( is_wp_error( $single ) ) {
@@ -3749,7 +3869,9 @@ final class Post_Translator {
 	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
 	 */
 	private static function process_elementor_job_slice( $post_id, $lang, array &$state, $api_key, $api_endpoint, $ai_model ) {
-		$raw = get_post_meta( $post_id, '_elementor_data', true );
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$raw     = get_post_meta( $post_id, '_elementor_data', true );
 
 		if ( ! is_string( $raw ) || '' === $raw ) {
 			return new \WP_Error(
@@ -3767,33 +3889,46 @@ final class Post_Translator {
 			);
 		}
 
-		$payload = self::collect_elementor_translation_payload( $data );
+		$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+
+		if ( empty( $map ) ) {
+			$map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
+		}
+
+		$payload = self::filter_remaining_elementor_payload(
+			self::collect_elementor_translation_payload( $data ),
+			$map
+		);
 
 		if ( empty( $payload ) ) {
+			self::save_elementor_source_hash( $post_id, $lang );
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+
 			return array(
 				'done'           => true,
 				'phase'          => 'elementor',
 				'phase_progress' => '',
-				'message'        => __( 'متن فارسی Elementor برای ترجمه یافت نشد.', 'polymart-ai' ),
+				'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
 			);
 		}
 
-		$chunks = self::chunk_elementor_payload_for_ai( $payload );
-		$total  = count( $chunks );
-		$index  = max( 0, (int) ( $state['elementor_chunk_index'] ?? 0 ) );
-		$budget = self::get_job_step_max_elementor_chunks();
-		$map    = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$source_total = count( self::collect_elementor_translation_payload( $data ) );
+		$chunks       = self::chunk_elementor_payload_for_job( $payload );
+		$budget       = self::get_job_step_max_elementor_chunks();
+		$ai_options   = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
+		$processed    = 0;
 
-		$state['elementor_chunks_total'] = $total;
+		while ( $processed < $budget && ! empty( $chunks ) ) {
+			$chunk = array_shift( $chunks );
+			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 
-		while ( $index < $total && $budget > 0 ) {
-			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunks[ $index ] );
 			$chunk_result = AI_Client::translate_fields(
 				$aliased_payload,
 				$api_key,
 				$api_endpoint,
 				$ai_model,
-				$lang
+				$lang,
+				$ai_options
 			);
 
 			if ( is_wp_error( $chunk_result ) ) {
@@ -3803,11 +3938,20 @@ final class Post_Translator {
 					$api_endpoint,
 					$ai_model,
 					$lang,
-					3
+					1,
+					$ai_options
 				);
 
 				if ( is_wp_error( $recovered ) ) {
-					return $recovered;
+					return self::handle_elementor_job_slice_failure(
+						$post_id,
+						$lang,
+						$data,
+						$state,
+						$map,
+						$source_total,
+						$recovered
+					);
 				}
 
 				$chunk_result = $recovered;
@@ -3820,14 +3964,230 @@ final class Post_Translator {
 					$alias_to_path
 				)
 			);
-			++$index;
-			--$budget;
+			++$processed;
 		}
 
-		$state['elementor_chunk_index'] = $index;
-		$state['elementor_map']         = $map;
+		$state['elementor_map']          = $map;
+		$state['elementor_chunk_index']  = count( $map );
+		$state['elementor_chunks_total'] = max( 1, $source_total );
 
-		$tree = self::apply_elementor_translation_payload( $data, $map );
+		$remaining = self::filter_remaining_elementor_payload(
+			self::collect_elementor_translation_payload( $data ),
+			$map
+		);
+
+		if ( ! empty( $remaining ) ) {
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), max( 1, $source_total ) );
+
+			if ( is_wp_error( $persisted ) ) {
+				return $persisted;
+			}
+
+			self::save_job_partial_state( $post_id, $lang, $state );
+
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => count( $map ) . '/' . max( 1, $source_total ),
+				'message'        => sprintf(
+					/* translators: 1: completed widgets, 2: total widgets */
+					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+					count( $map ),
+					max( 1, $source_total )
+				),
+			);
+		}
+
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), max( 1, $source_total ), true );
+
+		if ( is_wp_error( $persisted ) ) {
+			return $persisted;
+		}
+
+		return array(
+			'done'           => true,
+			'phase'          => 'elementor',
+			'phase_progress' => count( $map ) . '/' . max( 1, $source_total ),
+			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+		);
+	}
+
+	/**
+	 * Keep Elementor job progress after a recoverable API failure.
+	 *
+	 * @param int                   $post_id     Post ID.
+	 * @param string                $lang        Language code.
+	 * @param array<string, mixed>  $source_data Source Elementor tree.
+	 * @param array<string, mixed>  $state       Partial state (by reference).
+	 * @param array<string, string> $map         Translated path map so far.
+	 * @param int                   $source_total Total translatable widgets.
+	 * @param \WP_Error             $error       API error.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}|\WP_Error
+	 */
+	private static function handle_elementor_job_slice_failure( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, \WP_Error $error ) {
+		$state['elementor_map']          = $map;
+		$state['elementor_chunk_index']  = count( $map );
+		$state['elementor_chunks_total'] = max( 1, $source_total );
+		$progress                        = count( $map ) . '/' . max( 1, $source_total );
+
+		if ( ! empty( $map ) ) {
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, count( $map ), max( 1, $source_total ) );
+
+			if ( ! is_wp_error( $persisted ) ) {
+				self::save_job_partial_state( $post_id, $lang, $state );
+
+				return self::make_recoverable_partial_slice_response(
+					'elementor',
+					$progress,
+					sprintf(
+						/* translators: 1: saved widget count, 2: error message */
+						__( 'Elementor — %1$d بخش ذخیره شد. API موقتاً قطع شد: %2$s', 'polymart-ai' ),
+						count( $map ),
+						$error->get_error_message()
+					)
+				);
+			}
+		}
+
+		if ( self::is_recoverable_job_slice_error( $error ) ) {
+			self::save_job_partial_state( $post_id, $lang, $state );
+
+			return self::make_recoverable_partial_slice_response(
+				'elementor',
+				$progress,
+				sprintf(
+					/* translators: %s: error message */
+					__( 'Elementor — API موقتاً قطع شد (ادامه در مرحله بعد): %s', 'polymart-ai' ),
+					$error->get_error_message()
+				)
+			);
+		}
+
+		return $error;
+	}
+
+	/**
+	 * @param array<string, string> $payload Source Elementor field map.
+	 * @param array<string, string> $map     Completed translations keyed by path.
+	 * @return array<string, string>
+	 */
+	private static function filter_remaining_elementor_payload( array $payload, array $map ) {
+		$remaining = array();
+
+		foreach ( $payload as $path => $text ) {
+			if ( isset( $map[ $path ] ) && '' !== trim( (string) $map[ $path ] ) ) {
+				continue;
+			}
+
+			$remaining[ $path ] = $text;
+		}
+
+		return $remaining;
+	}
+
+	/**
+	 * Smaller Elementor batches for auto-translate job steps.
+	 *
+	 * @param array<string, string> $payload Field map.
+	 * @return array<int, array<string, string>>
+	 */
+	private static function chunk_elementor_payload_for_job( array $payload ) {
+		return self::chunk_payload_with_limits(
+			$payload,
+			self::ELEMENTOR_JOB_FIELD_CHUNK_SIZE,
+			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
+		);
+	}
+
+	/**
+	 * Rebuild a path map from partially saved Elementor JSON.
+	 *
+	 * @param int                  $post_id     Post ID.
+	 * @param string               $lang        Language code.
+	 * @param array<string, mixed> $source_data Source Elementor tree.
+	 * @return array<string, string>
+	 */
+	private static function rebuild_elementor_map_from_saved_translation( $post_id, $lang, array $source_data ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$raw     = get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
+
+		if ( ! is_string( $raw ) || '' === $raw ) {
+			return array();
+		}
+
+		$saved = json_decode( $raw, true );
+
+		if ( ! is_array( $saved ) ) {
+			return array();
+		}
+
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$map            = array();
+
+		foreach ( $source_payload as $path => $source_text ) {
+			$translated = self::get_elementor_value_at_path( $saved, $path );
+
+			if ( ! is_string( $translated ) || '' === trim( $translated ) ) {
+				continue;
+			}
+
+			if ( Persian_Detector::contains_persian( $translated ) ) {
+				continue;
+			}
+
+			$map[ $path ] = $translated;
+		}
+
+		return $map;
+	}
+
+	/**
+	 * @param array<string, mixed> $node Elementor JSON root.
+	 * @param string               $path Dotted path (root.0.settings.title).
+	 * @return string|null
+	 */
+	private static function get_elementor_value_at_path( array $node, $path ) {
+		$parts = explode( '.', (string) $path );
+		array_shift( $parts );
+
+		$current = $node;
+
+		foreach ( $parts as $part ) {
+			if ( ! is_array( $current ) ) {
+				return null;
+			}
+
+			if ( array_key_exists( $part, $current ) ) {
+				$current = $current[ $part ];
+				continue;
+			}
+
+			if ( ctype_digit( (string) $part ) && array_key_exists( (int) $part, $current ) ) {
+				$current = $current[ (int) $part ];
+				continue;
+			}
+
+			return null;
+		}
+
+		return is_string( $current ) ? $current : null;
+	}
+
+	/**
+	 * Persist partial or complete Elementor JSON for a job slice.
+	 *
+	 * @param int                   $post_id      Post ID.
+	 * @param string                $lang         Language code.
+	 * @param array<string, mixed>  $source_data  Source tree.
+	 * @param array<string, string> $map          Translated path map.
+	 * @param int                   $done_count   Completed chunks/widgets.
+	 * @param int                   $total_chunks Total chunks/widgets.
+	 * @param bool                  $complete     Whether translation finished.
+	 * @return true|\WP_Error
+	 */
+	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false ) {
+		$tree = self::apply_elementor_translation_payload( $source_data, $map );
 		$json = wp_json_encode( $tree );
 
 		if ( false === $json || '' === $json ) {
@@ -3839,42 +4199,27 @@ final class Post_Translator {
 
 		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), $json );
 
-		if ( $index < $total ) {
-			update_post_meta(
-				$post_id,
-				'_polymart_ai_elementor_error_' . $lang,
-				sprintf(
-					/* translators: 1: completed batches, 2: total batches */
-					__( 'ترجمه Elementor در حال انجام (%1$d/%2$d)', 'polymart-ai' ),
-					$index,
-					$total
-				)
-			);
-			self::save_job_partial_state( $post_id, $lang, $state );
+		if ( $complete ) {
+			self::save_elementor_source_hash( $post_id, $lang );
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+			self::flush_translation_status_cache( $post_id );
 
-			return array(
-				'done'           => false,
-				'phase'          => 'elementor',
-				'phase_progress' => $index . '/' . $total,
-				'message'        => sprintf(
-					/* translators: 1: completed batches, 2: total batches */
-					__( 'Elementor — بخش %1$d از %2$d', 'polymart-ai' ),
-					$index,
-					$total
-				),
-			);
+			return true;
 		}
 
-		self::save_elementor_source_hash( $post_id, $lang );
-		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+		update_post_meta(
+			$post_id,
+			'_polymart_ai_elementor_error_' . $lang,
+			sprintf(
+				/* translators: 1: completed batches, 2: total batches */
+				__( 'ترجمه Elementor در حال انجام (%1$d/%2$d)', 'polymart-ai' ),
+				min( $total_chunks, $done_count ),
+				$total_chunks
+			)
+		);
 		self::flush_translation_status_cache( $post_id );
 
-		return array(
-			'done'           => true,
-			'phase'          => 'elementor',
-			'phase_progress' => $total . '/' . $total,
-			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
-		);
+		return true;
 	}
 
 	/**

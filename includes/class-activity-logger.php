@@ -730,6 +730,27 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Human-readable progress string from durable post partial state.
+	 *
+	 * @param array<string, mixed> $state Partial state.
+	 * @return string
+	 */
+	private static function format_job_partial_progress( array $state ) {
+		$phase = sanitize_key( (string) ( $state['phase'] ?? '' ) );
+
+		if ( 'elementor' === $phase ) {
+			$done  = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+			$total = max( $done, absint( $state['elementor_chunks_total'] ?? 0 ) );
+
+			return $done . '/' . max( 1, $total );
+		}
+
+		$index = absint( $state['field_chunk_index'] ?? 0 );
+
+		return $index > 0 ? (string) $index : '';
+	}
+
+	/**
 	 * Sync remaining count from the database after a step.
 	 *
 	 * @param array<string, mixed> $job  Job state (by reference).
@@ -1519,6 +1540,31 @@ final class Activity_Logger {
 		}
 
 		if ( is_wp_error( $slice ) ) {
+			$partial_state = Post_Translator::get_job_partial_state( $post_id, $lang );
+
+			if (
+				Post_Translator::is_recoverable_job_slice_error( $slice )
+				&& Post_Translator::job_partial_state_has_progress( $post_id, $lang, $partial_state )
+			) {
+				Post_Translator::release_translation_lock( $post_id, $lang );
+				$job['partial_post_id']   = $post_id;
+				$job['partial_phase']     = (string) ( $partial_state['phase'] ?? 'elementor' );
+				$job['partial_progress']  = self::format_job_partial_progress( $partial_state );
+				$job['current_post_id']   = null;
+				$job['step_started_at']   = null;
+				$job['last_error']        = $slice->get_error_message();
+				self::increment_job_step( $job );
+				self::set_job_last_step(
+					$job,
+					$post_id,
+					'partial',
+					$slice->get_error_message()
+				);
+				self::save_job( $job );
+
+				return self::normalize_job_for_response( $job, false );
+			}
+
 			Post_Translator::clear_job_partial_state( $post_id, $lang );
 			Post_Translator::release_translation_lock( $post_id, $lang );
 			$job['partial_post_id']   = null;
@@ -1538,6 +1584,10 @@ final class Activity_Logger {
 				$job['consecutive_post_steps'] = absint( $job['consecutive_post_steps'] ?? 0 ) + 1;
 			} else {
 				$job['consecutive_post_id']    = $post_id;
+				$job['consecutive_post_steps'] = 1;
+			}
+
+			if ( ! empty( $slice['recoverable'] ) ) {
 				$job['consecutive_post_steps'] = 1;
 			}
 
@@ -1589,6 +1639,12 @@ final class Activity_Logger {
 			$job['partial_post_id']   = $post_id;
 			$job['partial_phase']     = (string) ( $slice['phase'] ?? '' );
 			$job['partial_progress']  = (string) ( $slice['phase_progress'] ?? '' );
+
+			if ( ! empty( $slice['recoverable'] ) ) {
+				$job['recoverable'] = true;
+			} else {
+				unset( $job['recoverable'] );
+			}
 
 			if ( $made_progress ) {
 				$job['consecutive_post_steps'] = 1;

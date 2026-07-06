@@ -164,7 +164,7 @@ final class AI_Client {
 	 * @param string                $model      Model identifier.
 	 * @return array<string, string>|\WP_Error Decoded translations keyed like the input.
 	 */
-	public static function send_translation_request( array $data_array, $api_key, $endpoint, $model, $target_lang = 'en' ) {
+	public static function send_translation_request( array $data_array, $api_key, $endpoint, $model, $target_lang = 'en', array $options = array() ) {
 		$endpoint = rtrim( (string) $endpoint, '/' );
 		$api_key  = (string) $api_key;
 		$model    = (string) $model;
@@ -208,7 +208,7 @@ final class AI_Client {
 		 */
 		$payload = apply_filters( 'polymart_ai_arvan_request_payload', $payload, $data_array );
 
-		$response = self::post_chat_completion( $endpoint, $api_key, $payload );
+		$response = self::post_chat_completion( $endpoint, $api_key, $payload, 1, $options );
 
 		if ( is_wp_error( $response ) ) {
 			return $response;
@@ -218,7 +218,7 @@ final class AI_Client {
 
 		if ( $status_code >= 400 && isset( $payload['response_format'] ) ) {
 			unset( $payload['response_format'] );
-			$response = self::post_chat_completion( $endpoint, $api_key, $payload );
+			$response = self::post_chat_completion( $endpoint, $api_key, $payload, 1, $options );
 		}
 
 		if ( is_wp_error( $response ) ) {
@@ -234,9 +234,10 @@ final class AI_Client {
 	 * @param string               $endpoint API base URL.
 	 * @param string               $api_key  API key.
 	 * @param array<string, mixed> $payload  Request body.
+	 * @param array<string, mixed> $options  Optional request options (max_timeout).
 	 * @return array|\WP_Error
 	 */
-	private static function post_chat_completion( $endpoint, $api_key, array $payload, $attempt = 1 ) {
+	private static function post_chat_completion( $endpoint, $api_key, array $payload, $attempt = 1, array $options = array() ) {
 		$encoded_body = wp_json_encode( $payload );
 
 		if ( false === $encoded_body ) {
@@ -247,6 +248,10 @@ final class AI_Client {
 		}
 
 		$timeout = self::request_timeout_for_payload( $payload );
+
+		if ( ! empty( $options['max_timeout'] ) ) {
+			$timeout = min( $timeout, max( 20, absint( $options['max_timeout'] ) ) );
+		}
 
 		/**
 		 * Filter the HTTP timeout used for ArvanCloud translation requests.
@@ -273,7 +278,7 @@ final class AI_Client {
 			if ( 'http_request_failed' === $error_code && $attempt < self::MAX_TRANSPORT_RETRIES ) {
 				sleep( min( 4, $attempt * 2 ) );
 
-				return self::post_chat_completion( $endpoint, $api_key, $payload, $attempt + 1 );
+				return self::post_chat_completion( $endpoint, $api_key, $payload, $attempt + 1, $options );
 			}
 
 			if ( 'http_request_failed' === $error_code ) {
@@ -338,10 +343,12 @@ final class AI_Client {
 	 * @param string                $api_key    ArvanCloud API key.
 	 * @param string                $endpoint   Base URL.
 	 * @param string                $model      Model identifier.
+	 * @param string                $model      Model identifier.
 	 * @param string                $target_lang Target language code.
+	 * @param array<string, mixed>  $options    Optional: max_timeout (int seconds).
 	 * @return array<string, string>|\WP_Error
 	 */
-	public static function translate_fields( array $data_array, $api_key, $endpoint, $model, $target_lang = 'en' ) {
+	public static function translate_fields( array $data_array, $api_key, $endpoint, $model, $target_lang = 'en', array $options = array() ) {
 		if ( empty( $data_array ) ) {
 			return new \WP_Error(
 				'polymart_ai_empty_payload',
@@ -349,7 +356,7 @@ final class AI_Client {
 			);
 		}
 
-		$result = self::send_translation_request( $data_array, $api_key, $endpoint, $model, $target_lang );
+		$result = self::send_translation_request( $data_array, $api_key, $endpoint, $model, $target_lang, $options );
 
 		if ( ! is_wp_error( $result ) ) {
 			return self::merge_partial_translations( $data_array, $result, $api_key, $endpoint, $model, $target_lang );
@@ -371,7 +378,7 @@ final class AI_Client {
 				continue;
 			}
 
-			$half_result = self::translate_fields( $half, $api_key, $endpoint, $model, $target_lang );
+			$half_result = self::translate_fields( $half, $api_key, $endpoint, $model, $target_lang, $options );
 
 			if ( is_wp_error( $half_result ) ) {
 				return $half_result;

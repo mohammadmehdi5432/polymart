@@ -313,7 +313,11 @@ export default function AutoTranslateApp() {
         }
 
         if (current.last_error && current.status !== 'paused') {
-          appendLog(current.last_error, 'error');
+          appendLog(current.last_error, current.last_step?.status === 'partial' ? 'warning' : 'error');
+        }
+
+        if (current.recoverable) {
+          appendLog('پیشرفت Elementor ذخیره شد — از همان بخش بعدی ادامه می‌دهیم.', 'warning');
         }
 
         if (current.status === 'paused') {
