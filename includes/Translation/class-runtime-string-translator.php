@@ -632,6 +632,9 @@ final class Runtime_String_Translator {
 	 * @return void
 	 */
 	public static function process_pending_queue() {
+		// Increase timeout for pending queue processing
+		set_time_limit( 240 );
+
 		$queue = get_option( self::PENDING_OPTION, array() );
 
 		if ( ! is_array( $queue ) || empty( $queue ) ) {

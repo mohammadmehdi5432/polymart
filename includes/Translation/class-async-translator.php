@@ -660,6 +660,9 @@ final class Async_Translator {
 			return;
 		}
 
+		// Increase timeout for background cron jobs
+		set_time_limit( 300 );
+
 		self::$is_translating = true;
 
 		try {
@@ -784,6 +787,9 @@ final class Async_Translator {
 
 			return;
 		}
+
+		// Increase timeout for background cron jobs
+		set_time_limit( 300 );
 
 		self::$is_translating = true;
 

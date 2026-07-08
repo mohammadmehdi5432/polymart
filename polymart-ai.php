@@ -92,6 +92,11 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	);
 }
 
+// Load production debug tool in admin
+if ( is_admin() ) {
+	require_once POLYMART_AI_PLUGIN_DIR . 'tools/production-debug.php';
+}
+
 register_activation_hook( __FILE__, array( 'PolymartAI\Routing\Url_Router', 'activate' ) );
 register_deactivation_hook( __FILE__, array( 'PolymartAI\Routing\Url_Router', 'deactivate' ) );
 register_activation_hook( __FILE__, array( 'PolymartAI\Frontend\Currency', 'maybe_schedule_cron' ) );

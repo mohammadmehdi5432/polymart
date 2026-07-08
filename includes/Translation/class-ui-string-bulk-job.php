@@ -17,7 +17,7 @@ final class UI_String_Bulk_Job {
 	/**
 	 * Strings per AI request.
 	 */
-	const BATCH_SIZE = 5;
+	const BATCH_SIZE = 3;
 
 	/**
 	 * Skip msgids longer than this in bulk (runtime gettext handles them).
@@ -27,7 +27,7 @@ final class UI_String_Bulk_Job {
 	/**
 	 * Maximum combined msgid length per batch.
 	 */
-	const MAX_BATCH_CHARS = 2000;
+	const MAX_BATCH_CHARS = 1500;
 
 	/**
 	 * Load persisted job state.
@@ -176,6 +176,9 @@ final class UI_String_Bulk_Job {
 	 * @return array<string, mixed>|\WP_Error
 	 */
 	public static function process_step() {
+		// Increase timeout for bulk translation steps
+		set_time_limit( 180 );
+
 		$job = self::ensure_running_job();
 
 		if ( is_wp_error( $job ) ) {

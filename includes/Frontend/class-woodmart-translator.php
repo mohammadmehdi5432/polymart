@@ -57,6 +57,17 @@ final class Woodmart_Translator {
 		'popup_html_block',
 		'header_banner_text',
 		'sticky_navigation_area',
+		'info_box_text',
+		'info_box_title',
+		'sticky_header_text',
+		'categories_menu_title',
+		'mobile_menu_label',
+		'burger_menu_label',
+		'header_contact_text',
+		'header_additional_text',
+		'footer_text',
+		'footer_copyright',
+		'footer_additional_text',
 	);
 
 	/**
