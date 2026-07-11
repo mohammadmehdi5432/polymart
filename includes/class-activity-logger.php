@@ -66,6 +66,13 @@ final class Activity_Logger {
 	const LOOPBACK_GATE_SEC    = 1;
 
 	/**
+	 * True while a token-authenticated loopback tick is executing.
+	 *
+	 * @var bool
+	 */
+	private static $trusted_loopback_tick = false;
+
+	/**
 	 * Register admin notice display and background job worker.
 	 *
 	 * @return void
@@ -173,10 +180,38 @@ final class Activity_Logger {
 			exit( 'busy' );
 		}
 
-		self::process_background_step();
+		self::$trusted_loopback_tick = true;
+
+		try {
+			self::process_background_step();
+		} finally {
+			self::$trusted_loopback_tick = false;
+		}
 
 		status_header( 200 );
 		exit( 'ok' );
+	}
+
+	/**
+	 * Whether the current request is a trusted auto-translate worker
+	 * (WP-Cron or token-authenticated AJAX loopback).
+	 *
+	 * @return bool
+	 */
+	public static function is_trusted_job_worker() {
+		if ( wp_doing_cron() || self::$trusted_loopback_tick ) {
+			return true;
+		}
+
+		if (
+			wp_doing_ajax()
+			&& isset( $_REQUEST['action'] ) // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			&& self::LOOPBACK_ACTION === sanitize_key( wp_unslash( (string) $_REQUEST['action'] ) )
+		) {
+			return true;
+		}
+
+		return false;
 	}
 
 	/**

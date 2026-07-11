@@ -3774,7 +3774,7 @@ final class Post_Translator {
 	}
 
 	/**
-	 * Whether the current request may translate a post (REST bulk job, cron, or edit_post).
+	 * Whether the current request may translate a post (REST bulk job, cron, loopback, or edit_post).
 	 *
 	 * @param int $post_id Post ID.
 	 * @return bool
@@ -3786,11 +3786,21 @@ final class Post_Translator {
 			return false;
 		}
 
-		if ( wp_doing_cron() ) {
+		// Cron + token-authenticated AJAX loopback have no interactive user.
+		if ( \PolymartAI\Activity_Logger::is_trusted_job_worker() ) {
 			return true;
 		}
 
 		if ( defined( 'REST_REQUEST' ) && REST_REQUEST && current_user_can( REST_API::required_admin_capability() ) ) {
+			return true;
+		}
+
+		// Site admins running the bulk job may translate any queued post,
+		// even when they lack per-post edit caps (custom types / other authors).
+		if (
+			current_user_can( REST_API::required_admin_capability() )
+			&& \PolymartAI\Activity_Logger::is_bulk_job_running()
+		) {
 			return true;
 		}
 

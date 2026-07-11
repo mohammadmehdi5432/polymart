@@ -128,7 +128,11 @@ final class Menu_Translator {
 			);
 		}
 
-		if ( ! wp_doing_cron() && ! current_user_can( 'edit_theme_options' ) && ! current_user_can( 'manage_options' ) ) {
+		if (
+			! \PolymartAI\Activity_Logger::is_trusted_job_worker()
+			&& ! current_user_can( 'edit_theme_options' )
+			&& ! current_user_can( 'manage_options' )
+		) {
 			return new \WP_Error(
 				'polymart_ai_forbidden',
 				__( 'شما اجازه ترجمه منو را ندارید.', 'polymart-ai' )
