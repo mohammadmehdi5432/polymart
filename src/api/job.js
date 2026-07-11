@@ -1,12 +1,12 @@
 import api from './settings';
 
-/** Max wait for one translation step — aligned with server set_time_limit and AI timeouts. */
-export const JOB_STEP_TIMEOUT_MS = 360000;
+/** Max wait for one worker tick (multi-step cron budget + buffer). */
+export const JOB_STEP_TIMEOUT_MS = 180000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
-const JOB_STEP_RETRIES = 2;
+const JOB_STEP_RETRIES = 1;
 const JOB_STEP_RETRY_DELAY_MS = 2000;
 
 let activeStepController = null;
@@ -48,7 +48,7 @@ async function withRetries(fn, { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETC
   throw lastError;
 }
 
-/** Abort an in-flight translation step request (e.g. when user clicks stop). */
+/** Abort an in-flight worker tick (e.g. when user clicks stop). */
 export function abortJobStep() {
   if (activeStepController) {
     activeStepController.abort();
@@ -71,6 +71,10 @@ export async function jobAction(action, lang = 'en', extra = {}) {
   return data;
 }
 
+/**
+ * Run the same multi-step worker tick as WP-Cron.
+ * Browser and cron share one pipeline + lock.
+ */
 export async function jobStep() {
   abortJobStep();
   activeStepController = new AbortController();
@@ -78,10 +82,14 @@ export async function jobStep() {
   try {
     const { data } = await withRetries(
       () =>
-        api.post('/translation-job/step', null, {
-          timeout: JOB_STEP_TIMEOUT_MS,
-          signal: activeStepController.signal,
-        }),
+        api.post(
+          '/translation-job',
+          { action: 'kick' },
+          {
+            timeout: JOB_STEP_TIMEOUT_MS,
+            signal: activeStepController.signal,
+          }
+        ),
       { retries: JOB_STEP_RETRIES, delayMs: JOB_STEP_RETRY_DELAY_MS }
     );
     return data;

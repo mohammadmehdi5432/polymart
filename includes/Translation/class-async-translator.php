@@ -871,6 +871,11 @@ final class Async_Translator {
 			return;
 		}
 
+		// Bulk auto-translate owns the queue — avoid racing the same product.
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			return;
+		}
+
 		if ( ! wp_next_scheduled( self::CRON_HOOK, array( $post_id ) ) ) {
 			wp_schedule_single_event( time(), self::CRON_HOOK, array( $post_id ) );
 		}

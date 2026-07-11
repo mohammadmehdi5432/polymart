@@ -3,16 +3,12 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, testTranslationApi, JOB_STEP_TIMEOUT_MS } from './api/job';
+import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
-const STEP_DELAY_MS = 250;
-const POLL_INTERVAL_MS = 2000;
-const DEFERRED_BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 12000];
-const MAX_IDLE_STEPS = 8;
-const STEP_IN_FLIGHT_MAX_SEC = 600;
-/** If cron ticked within this window, the SPA only monitors (does not fight for the step lock). */
-const CRON_HEALTHY_SEC = 600;
+const POLL_INTERVAL_MS = 2500;
+/** If cron has not ticked for this long, nudge the server worker (no heavy kick). */
+const CRON_STALE_SEC = 60;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -30,7 +26,7 @@ function isCronHealthy(job) {
   }
 
   const age = Math.floor(Date.now() / 1000) - Number(job.last_cron_at);
-  return age >= 0 && age < CRON_HEALTHY_SEC;
+  return age >= 0 && age < CRON_STALE_SEC;
 }
 
 function resolveDisplayPost(job, stickyPost = null) {
@@ -76,14 +72,6 @@ function mergeJobSnapshot(prev, data) {
   return merged;
 }
 
-function readAutoRunFlag() {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-
-  return window.localStorage.getItem(AUTO_RUN_STORAGE_KEY) === '1';
-}
-
 function writeAutoRunFlag(active) {
   if (typeof window === 'undefined') {
     return;
@@ -115,17 +103,15 @@ function jobPhaseLabel(phase) {
 
 function jobStepHeadline(lastStepStatus, displayPost, job) {
   if (job?.worker_lock && !displayPost?.title) {
-    return 'کارگر سرور در حال ترجمه است';
+    return 'کارگر مشترک در حال ترجمه است';
   }
 
   if (displayPost?.from_last_step) {
-    return 'آخرین مورد پردازش‌شده (بین مراحل)';
+    return 'آخرین مورد پردازش‌شده';
   }
 
   if (!displayPost?.title) {
-    return isCronHealthy(job)
-      ? 'مانیتورینگ کارگر پس‌زمینه…'
-      : 'در حال آماده‌سازی مورد بعدی';
+    return 'در حال آماده‌سازی مورد بعدی';
   }
 
   const phase = job?.partial_phase || displayPost?.partial_phase;
@@ -149,42 +135,6 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
   }
 
   return 'در حال ترجمه';
-}
-
-function jobProgressMarker(job) {
-  if (!job || typeof job !== 'object') {
-    return '';
-  }
-
-  const done = job.run_done ?? job.succeeded ?? 0;
-  const steps = job.steps ?? job.processed ?? 0;
-  const postId = job.last_step?.post_id ?? job.current_post?.post_id ?? '';
-
-  return `${done}:${steps}:${postId}`;
-}
-
-function stepErrorMessage(error) {
-  const status = error?.response?.status;
-  const apiMessage = error?.response?.data?.message;
-  const code = error?.code;
-
-  if (code === 'ECONNABORTED' || /timeout/i.test(error?.message || '')) {
-    return `پاسخ سرور بیش از ${Math.round(JOB_STEP_TIMEOUT_MS / 60000)} دقیقه طول کشید (صفحات Elementor سنگین یا API کند). وضعیت ذخیره شد — «ادامه» را بزنید.`;
-  }
-
-  if (apiMessage) {
-    return apiMessage;
-  }
-
-  if (status >= 500) {
-    return 'خطای سرور هنگام ترجمه. وضعیت ذخیره شد — «ادامه» را بزنید.';
-  }
-
-  if (!error?.response) {
-    return 'اتصال قطع شد. وضعیت ذخیره شد — «ادامه» را بزنید.';
-  }
-
-  return 'مرحله ترجمه ناموفق بود. وضعیت ذخیره شد — «ادامه» را بزنید.';
 }
 
 const config = window.polymartAiSettings ?? {};
@@ -218,59 +168,27 @@ export default function AutoTranslateApp() {
   const [job, setJob] = useState(null);
   const [logs, setLogs] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [processing, setProcessing] = useState(false);
   const [actionPending, setActionPending] = useState(null);
   const [refreshingStats, setRefreshingStats] = useState(false);
   const [notice, setNotice] = useState(null);
-  const [stepWaitSec, setStepWaitSec] = useState(0);
   const [activePost, setActivePost] = useState(null);
   const [apiTestText, setApiTestText] = useState('سلام دنیا');
   const [apiTestLoading, setApiTestLoading] = useState(false);
   const [apiTestResult, setApiTestResult] = useState(null);
-  const [monitoring, setMonitoring] = useState(false);
-  const runningRef = useRef(false);
   const autoResumedRef = useRef(false);
   const lastStepLogRef = useRef('');
   const pollErrorCountRef = useRef(0);
   const logsRef = useRef(null);
   const isActiveRef = useRef(true);
-  const pendingTimersRef = useRef(new Set());
   const activePostRef = useRef(null);
-
-  const clearPendingTimers = useCallback(() => {
-    pendingTimersRef.current.forEach((timerId) => {
-      window.clearTimeout(timerId);
-      window.clearInterval(timerId);
-    });
-    pendingTimersRef.current.clear();
-  }, []);
-
-  const delay = useCallback((ms) => {
-    return new Promise((resolve, reject) => {
-      const timerId = window.setTimeout(() => {
-        pendingTimersRef.current.delete(timerId);
-
-        if (!isActiveRef.current) {
-          reject(new Error('unmounted'));
-          return;
-        }
-
-        resolve();
-      }, ms);
-
-      pendingTimersRef.current.add(timerId);
-    });
-  }, []);
 
   useEffect(() => {
     isActiveRef.current = true;
 
     return () => {
       isActiveRef.current = false;
-      runningRef.current = false;
-      clearPendingTimers();
     };
-  }, [clearPendingTimers]);
+  }, []);
 
   const appendLog = useCallback((message, type = 'info') => {
     if (!message) {
@@ -343,7 +261,7 @@ export default function AutoTranslateApp() {
         setNotice({
           type: 'warning',
           message:
-            'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید یا «ادامه» را بزنید.',
+            'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید؛ کارگر روی سرور ادامه می‌دهد.',
         });
       }
 
@@ -385,392 +303,97 @@ export default function AutoTranslateApp() {
     return merged;
   }, [appendStepLog]);
 
-  const runMonitor = useCallback(async () => {
-    if (runningRef.current || !isActiveRef.current) {
-      return;
-    }
-
-    if (typeof window !== 'undefined') {
-      writeAutoRunFlag(true);
-    }
-
-    runningRef.current = true;
-    setMonitoring(true);
-    setProcessing(false);
-    setStepWaitSec(0);
-    appendLog('حالت مانیتور: کارگر سرور (کرون) ترجمه را پیش می‌برد — این تب فقط وضعیت را نشان می‌دهد.', 'info');
-
+  /**
+   * Light server nudge: schedule/ping cron only — never run translation in the browser.
+   */
+  const ensureServerWorker = useCallback(async () => {
     try {
-      while (isActiveRef.current && readAutoRunFlag()) {
-        const data = await fetchJob();
-
-        if (!isActiveRef.current) {
-          return;
-        }
-
-        applyJobUpdate(data);
-
-        if (data?.status !== 'running') {
-          appendLog(
-            data?.status === 'completed'
-              ? 'ترجمه خودکار با موفقیت به پایان رسید.'
-              : 'اجرای سرور متوقف شد.',
-            data?.status === 'completed' ? 'success' : 'warning'
-          );
-          break;
-        }
-
-        // Cron went silent — fall back to SPA-assisted stepping.
-        if (!isCronHealthy(data) && !data?.worker_lock) {
-          appendLog('تیک کرون تازه نیست — این تب هم به پیشبرد مراحل کمک می‌کند.', 'warning');
-          runningRef.current = false;
-          setMonitoring(false);
-          await runStepsAssistRef.current();
-          return;
-        }
-
-        const age = data.last_cron_at
-          ? Math.max(0, Math.floor(Date.now() / 1000) - Number(data.last_cron_at))
-          : data.worker_lock_age != null
-            ? Number(data.worker_lock_age)
-            : 0;
-        setStepWaitSec(age);
-
-        try {
-          await delay(POLL_INTERVAL_MS);
-        } catch {
-          return;
-        }
-      }
-    } catch (error) {
-      if (!isActiveRef.current || error?.message === 'unmounted') {
-        return;
-      }
-
-      appendLog(stepErrorMessage(error), 'warning');
-    } finally {
-      runningRef.current = false;
-      setMonitoring(false);
-      setStepWaitSec(0);
-
+      const data = await jobAction('ensure');
       if (isActiveRef.current) {
-        await loadJob();
+        applyJobUpdate(data);
       }
+      return data;
+    } catch {
+      return null;
     }
-  }, [appendLog, applyJobUpdate, delay, loadJob]);
-
-  // Forward declaration: filled after runSteps is defined.
-  const runStepsAssistRef = useRef(async () => {});
-
-  const runSteps = useCallback(async () => {
-    if (runningRef.current || !isActiveRef.current) {
-      return;
-    }
-
-    // Prefer monitor-only when background cron is healthy — avoids lock fights and stale UI.
-    const snapshot = await fetchJob().catch(() => null);
-    if (snapshot && isCronHealthy(snapshot)) {
-      applyJobUpdate(snapshot);
-      await runMonitor();
-      return;
-    }
-
-    if (typeof window !== 'undefined') {
-      writeAutoRunFlag(true);
-    }
-
-    runningRef.current = true;
-    setMonitoring(false);
-
-    if (isActiveRef.current) {
-      setProcessing(true);
-      setStepWaitSec(0);
-    }
-
-    try {
-      let current = snapshot || (await fetchJob());
-
-      if (!isActiveRef.current) {
-        return;
-      }
-
-      applyJobUpdate(current);
-      let idleSteps = 0;
-      let lastMarker = jobProgressMarker(current);
-
-      while (current?.status === 'running' && isActiveRef.current) {
-        if (!readAutoRunFlag()) {
-          break;
-        }
-
-        // Switch to monitor mid-run if cron takes over.
-        if (isCronHealthy(current)) {
-          appendLog('کارگر کرون فعال شد — تغییر به حالت مانیتور.', 'info');
-          runningRef.current = false;
-          setProcessing(false);
-          await runMonitor();
-          return;
-        }
-
-        const waitStarted = Date.now();
-        const waitTimer = window.setInterval(() => {
-          if (!isActiveRef.current) {
-            return;
-          }
-
-          setStepWaitSec(Math.floor((Date.now() - waitStarted) / 1000));
-        }, 1000);
-        pendingTimersRef.current.add(waitTimer);
-
-        try {
-          current = await jobStep();
-        } finally {
-          window.clearInterval(waitTimer);
-          pendingTimersRef.current.delete(waitTimer);
-
-          if (isActiveRef.current) {
-            setStepWaitSec(0);
-          }
-        }
-
-        if (!isActiveRef.current) {
-          return;
-        }
-
-        if (!current || typeof current !== 'object' || !current.status) {
-          throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
-        }
-
-        applyJobUpdate(current);
-
-        if (current.step_aborted) {
-          break;
-        }
-
-        if (current.status === 'paused') {
-          if (current.pause_reason === 'critical') {
-            appendLog(current.last_error || 'به‌خاطر خطای API متوقف شد.', 'error');
-            setNotice({
-              type: 'error',
-              message: current.last_error || 'ترجمه به‌خاطر خطای API متوقف شد.',
-            });
-          } else if (current.pause_reason === 'stalled' || current.pause_reason === 'pick_stalled') {
-            appendLog(current.last_error || 'صف ترجمه گیر کرد.', 'warning');
-            setNotice({
-              type: 'warning',
-              message: current.last_error || 'صف ترجمه گیر کرد — «ادامه» را بزنید.',
-            });
-
-            (current.stalled_details || []).forEach((item) => {
-              if (item.fields?.length) {
-                item.fields.forEach((field) => {
-                  if (field.translated) {
-                    return;
-                  }
-                  appendLog(
-                    `#${item.post_id} ${item.title ?? ''} — ${field.label || field.key}`,
-                    'warning'
-                  );
-                });
-              } else {
-                appendLog(
-                  `#${item.post_id} ${item.title ?? ''} — ${(item.missing ?? []).join('، ') || (item.notes ?? []).join('، ') || 'نامشخص'}`,
-                  'warning'
-                );
-              }
-            });
-          }
-          break;
-        }
-
-        if (current.status === 'completed') {
-          appendLog('ترجمه خودکار با موفقیت به پایان رسید.', 'success');
-          break;
-        }
-
-        const marker = jobProgressMarker(current);
-        const madeProgress =
-          current.step_partial ||
-          current.step_recovered_after_timeout ||
-          marker !== lastMarker;
-
-        if (current.step_recovered_after_timeout) {
-          appendLog('پاسخ مرحله دیر رسید — وضعیت از سرور بازیابی شد و ادامه می‌دهیم.', 'warning');
-        }
-
-        const stepAgeSec =
-          current.step_started_at != null
-            ? Math.floor(Date.now() / 1000) - Number(current.step_started_at)
-            : null;
-        const serverStepInFlight =
-          stepAgeSec != null && stepAgeSec >= 0 && stepAgeSec < STEP_IN_FLIGHT_MAX_SEC;
-        const lockBusyWhileServerWorking =
-          current.step_deferred && current.step_deferred_reason === 'step_lock_busy' && serverStepInFlight;
-
-        if (current.step_deferred || !madeProgress) {
-          const isLockBusy = current.step_deferred_reason === 'step_lock_busy';
-          const isFairnessRotation = current.step_deferred_reason === 'fairness_rotation';
-
-          if (!isLockBusy && !isFairnessRotation && !lockBusyWhileServerWorking) {
-            idleSteps += 1;
-          } else if (isLockBusy || lockBusyWhileServerWorking) {
-            idleSteps = 0;
-          }
-
-          if (current.step_deferred_message && (idleSteps === 1 || isLockBusy || isFairnessRotation)) {
-            appendLog(current.step_deferred_message, 'warning');
-          }
-
-          if (idleSteps >= MAX_IDLE_STEPS && !isLockBusy && !lockBusyWhileServerWorking) {
-            const stallMessage =
-              'چند تلاش پشت‌سرهم بدون پیشرفت — برای جلوگیری از فشار به سرور متوقف شد. «ادامه» را بزنید.';
-
-            appendLog(stallMessage, 'warning');
-            setNotice({ type: 'warning', message: stallMessage });
-
-            try {
-              const paused = await jobAction('pause');
-              applyJobUpdate(paused);
-            } catch {
-              // Server state remains authoritative.
-            }
-            break;
-          }
-
-          const delayMs = current.step_deferred
-            ? isLockBusy || lockBusyWhileServerWorking
-              ? Math.max(STEP_DELAY_MS, 3000)
-              : isFairnessRotation
-                ? Math.max(STEP_DELAY_MS, 800)
-                : DEFERRED_BACKOFF_MS[Math.min(Math.max(idleSteps, 1) - 1, DEFERRED_BACKOFF_MS.length - 1)]
-            : STEP_DELAY_MS;
-
-          try {
-            await delay(delayMs);
-          } catch {
-            return;
-          }
-          continue;
-        }
-
-        idleSteps = 0;
-        lastMarker = marker;
-
-        try {
-          await delay(STEP_DELAY_MS);
-        } catch {
-          return;
-        }
-      }
-    } catch (error) {
-      if (!isActiveRef.current || error?.message === 'unmounted') {
-        return;
-      }
-
-      const message = stepErrorMessage(error);
-      appendLog(message, 'warning');
-
-      const isTimeout =
-        error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
-      const isNetwork =
-        error?.code === 'ERR_NETWORK' || /network/i.test(error?.message || '');
-
-      if (isTimeout || isNetwork) {
-        setNotice({
-          type: 'warning',
-          message: `${message} — کارگر سرور ادامه می‌دهد؛ چند لحظه صبر کنید.`,
-        });
-
-        try {
-          await delay(DEFERRED_BACKOFF_MS[2] || 2000);
-        } catch {
-          return;
-        }
-
-        const latest = await loadJob().catch(() => null);
-
-        if (latest?.status === 'running' && readAutoRunFlag() && isActiveRef.current) {
-          runningRef.current = false;
-          setProcessing(false);
-          window.setTimeout(() => {
-            if (isActiveRef.current && readAutoRunFlag()) {
-              runSteps();
-            }
-          }, 500);
-          return;
-        }
-
-        return;
-      }
-
-      setNotice({ type: 'warning', message });
-
-      try {
-        const paused = await jobAction('pause');
-
-        if (isActiveRef.current) {
-          applyJobUpdate(paused);
-        }
-      } catch {
-        // Job state remains on the server; user can still resume/stop.
-      }
-    } finally {
-      runningRef.current = false;
-
-      if (!isActiveRef.current) {
-        return;
-      }
-
-      setProcessing(false);
-      setStepWaitSec(0);
-      await loadJob();
-    }
-  }, [appendLog, applyJobUpdate, delay, loadJob, runMonitor]);
-
-  // Keep assist fallback wired for monitor → SPA handoff.
-  runStepsAssistRef.current = runSteps;
+  }, [applyJobUpdate]);
 
   useEffect(() => {
     if (!job || job.status !== 'running') {
       return undefined;
     }
 
-    const timer = window.setInterval(() => {
+    writeAutoRunFlag(true);
+
+    let ensureInFlight = false;
+
+    const tick = async () => {
       if (!isActiveRef.current) {
         return;
       }
 
-      fetchJob()
-        .then((data) => {
-          if (!data || !isActiveRef.current) {
-            return;
-          }
+      try {
+        const data = await fetchJob();
+        if (!data || !isActiveRef.current) {
+          return;
+        }
 
-          pollErrorCountRef.current = 0;
-          // Always take the server snapshot so cron progress is visible even while SPA assists.
-          applyJobUpdate(data);
-        })
-        .catch((error) => {
-          pollErrorCountRef.current += 1;
+        pollErrorCountRef.current = 0;
+        applyJobUpdate(data);
 
-          if (pollErrorCountRef.current >= POLL_ERROR_NOTICE_THRESHOLD && isActiveRef.current) {
-            const status = error?.response?.status;
+        if (data.status === 'completed') {
+          appendLog('ترجمه خودکار با موفقیت به پایان رسید.', 'success');
+          writeAutoRunFlag(false);
+          return;
+        }
+
+        if (data.status === 'paused') {
+          if (data.pause_reason === 'critical') {
+            appendLog(data.last_error || 'به‌خاطر خطای API متوقف شد.', 'error');
+            setNotice({
+              type: 'error',
+              message: data.last_error || 'ترجمه به‌خاطر خطای API متوقف شد.',
+            });
+          } else if (data.pause_reason === 'stalled' || data.pause_reason === 'pick_stalled') {
+            appendLog(data.last_error || 'صف ترجمه گیر کرد.', 'warning');
             setNotice({
               type: 'warning',
-              message:
-                status === 403
-                  ? 'نشست ادمین منقضی شده — صفحه را رفرش کنید.'
-                  : 'به‌روزرسانی وضعیت از سرور ناموفق بود — اتصال یا نشست را بررسی کنید.',
+              message: data.last_error || 'صف ترجمه گیر کرد — «ادامه» یا رد کردن مورد فعلی را بزنید.',
             });
           }
-        });
-    }, POLL_INTERVAL_MS);
+          writeAutoRunFlag(false);
+          return;
+        }
+
+        if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight) {
+          ensureInFlight = true;
+          await ensureServerWorker();
+          ensureInFlight = false;
+        }
+      } catch (error) {
+        pollErrorCountRef.current += 1;
+
+        if (pollErrorCountRef.current >= POLL_ERROR_NOTICE_THRESHOLD && isActiveRef.current) {
+          const status = error?.response?.status;
+          setNotice({
+            type: 'warning',
+            message:
+              status === 403
+                ? 'نشست ادمین منقضی شده — صفحه را رفرش کنید.'
+                : 'به‌روزرسانی مانیتور ناموفق بود — کارگر کرون روی سرور مستقل از این تب ادامه می‌دهد.',
+          });
+        }
+      }
+    };
+
+    tick();
+    const timer = window.setInterval(tick, POLL_INTERVAL_MS);
 
     return () => window.clearInterval(timer);
-  }, [job?.status, applyJobUpdate]);
+  }, [job?.status, applyJobUpdate, ensureServerWorker, appendLog]);
 
   useEffect(() => {
-    if (loading || autoResumedRef.current || processing || monitoring) {
+    if (loading || autoResumedRef.current) {
       return;
     }
 
@@ -778,76 +401,10 @@ export default function AutoTranslateApp() {
       return;
     }
 
-    if (!readAutoRunFlag()) {
-      appendLog(
-        isCronHealthy(job)
-          ? 'کارگر سرور در حال ترجمه است — «ادامه» را بزنید تا مانیتورینگ این تب هم فعال شود.'
-          : 'اجرای قبلی روی سرور فعال است — «ادامه» را بزنید تا این تب هم ترجمه را پیش ببرد.',
-        'warning'
-      );
-      return;
-    }
-
     autoResumedRef.current = true;
-
-    if (isCronHealthy(job) || job.worker_lock) {
-      appendLog('کارگر پس‌زمینه فعال است — شروع مانیتورینگ…');
-      runSteps();
-      return;
-    }
-
-    const stepAge =
-      job.step_started_at != null ? Math.floor(Date.now() / 1000) - Number(job.step_started_at) : null;
-
-    if (stepAge != null && stepAge >= 0 && stepAge < STEP_IN_FLIGHT_MAX_SEC) {
-      appendLog('اجرای قبلی روی سرور فعال است — منتظر اتمام مرحله…');
-
-      const waitForInFlightStep = async () => {
-        while (isActiveRef.current) {
-          try {
-            await delay(3000);
-          } catch {
-            return;
-          }
-
-          const latest = await fetchJob().catch(() => null);
-
-          if (!latest || !isActiveRef.current) {
-            return;
-          }
-
-          applyJobUpdate(latest);
-
-          if (latest.status !== 'running') {
-            return;
-          }
-
-          if (isCronHealthy(latest) || latest.worker_lock) {
-            appendLog('کارگر سرور فعال شد — مانیتورینگ…');
-            runSteps();
-            return;
-          }
-
-          const age =
-            latest.step_started_at != null
-              ? Math.floor(Date.now() / 1000) - Number(latest.step_started_at)
-              : null;
-
-          if (age == null || age < 0 || age >= STEP_IN_FLIGHT_MAX_SEC) {
-            appendLog('مرحله قبلی تمام شد — ادامه خودکار…');
-            runSteps();
-            return;
-          }
-        }
-      };
-
-      waitForInFlightStep();
-      return;
-    }
-
-    appendLog('اجرای ناتمام پیدا شد — ادامه خودکار…');
-    runSteps();
-  }, [loading, job?.status, job?.step_started_at, job?.last_cron_at, job?.worker_lock, processing, monitoring, runSteps, appendLog, delay, applyJobUpdate]);
+    appendLog('اجرای ناتمام پیدا شد — مانیتور به کارگر کرون سرور وصل شد.', 'info');
+    ensureServerWorker();
+  }, [loading, job?.status, ensureServerWorker, appendLog]);
 
   const handleStart = async () => {
     if (!aiConfigured) {
@@ -865,7 +422,6 @@ export default function AutoTranslateApp() {
     autoResumedRef.current = true;
     writeAutoRunFlag(true);
     setActionPending('start');
-    setProcessing(true);
     setJob((prev) => ({
       ...(prev ?? {}),
       status: 'running',
@@ -883,8 +439,11 @@ export default function AutoTranslateApp() {
       const data = await jobAction('start', targetLang);
       setJob(data);
       setActionPending(null);
-      appendLog(`ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}).`);
-      await runSteps();
+      appendLog(
+        `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود؛ بستن تب اشکالی ندارد.`,
+        'success'
+      );
+      await ensureServerWorker();
     } catch (error) {
       const code = error?.response?.data?.code;
       const message = error?.response?.data?.message || 'شروع ترجمه خودکار ناموفق بود.';
@@ -894,9 +453,10 @@ export default function AutoTranslateApp() {
 
         if (existing?.status === 'running') {
           setNotice({
-            type: 'warning',
-            message: 'یک ترجمه از قبل در حال اجراست — «ادامه» را بزنید.',
+            type: 'info',
+            message: 'یک ترجمه از قبل در حال اجراست — مانیتور همین اجرا را نشان می‌دهد.',
           });
+          await ensureServerWorker();
         } else {
           setNotice({ type: 'error', message });
         }
@@ -907,7 +467,6 @@ export default function AutoTranslateApp() {
       appendLog(message, 'error');
       autoResumedRef.current = false;
       writeAutoRunFlag(false);
-      setProcessing(false);
       await loadJob();
     } finally {
       setActionPending(null);
@@ -917,7 +476,6 @@ export default function AutoTranslateApp() {
   const handleResume = async () => {
     setNotice(null);
     setActionPending('resume');
-    setProcessing(true);
     writeAutoRunFlag(true);
     setJob((prev) => ({
       ...(prev ?? {}),
@@ -928,17 +486,16 @@ export default function AutoTranslateApp() {
       current_post_id: null,
       step_started_at: null,
     }));
-    appendLog('در حال از سرگیری ترجمه…');
+    appendLog('در حال از سرگیری ترجمه روی کارگر کرون…');
 
     try {
       const data = await jobAction('resume');
       setJob(data);
       setActionPending(null);
-      appendLog('ترجمه از سر گرفته شد.');
-      await runSteps();
+      appendLog('ترجمه از سر گرفته شد — کارگر کرون ادامه می‌دهد.', 'success');
+      await ensureServerWorker();
     } catch (error) {
       setNotice({ type: 'error', message: error?.response?.data?.message || 'ادامه ناموفق بود.' });
-      setProcessing(false);
       await loadJob();
     } finally {
       setActionPending(null);
@@ -960,10 +517,6 @@ export default function AutoTranslateApp() {
     setNotice(null);
     setActionPending('skip');
     abortJobStep();
-    runningRef.current = false;
-    setStepWaitSec(0);
-
-    const shouldContinue = job?.status === 'running' || processing;
 
     try {
       const jobLang = job?.lang || targetLang;
@@ -973,16 +526,13 @@ export default function AutoTranslateApp() {
       if (data?.last_step) {
         appendStepLog(data.last_step);
       } else {
-        appendLog(`#${postId} رد شد — رفتن به مورد بعدی.`, 'warning');
+        appendLog(`#${postId} رد شد — کارگر کرون مورد بعدی را می‌گیرد.`, 'warning');
       }
 
       setActivePost(null);
 
-      if (shouldContinue && data?.status === 'running') {
-        setActionPending(null);
-        setProcessing(true);
-        await runSteps();
-        return;
+      if (data?.status === 'running') {
+        await ensureServerWorker();
       }
     } catch (error) {
       setNotice({
@@ -997,12 +547,7 @@ export default function AutoTranslateApp() {
 
   const handlePause = async () => {
     writeAutoRunFlag(false);
-
-    runningRef.current = false;
     abortJobStep();
-    setProcessing(false);
-    setMonitoring(false);
-    setStepWaitSec(0);
     setActionPending('pause');
     setJob((prev) => ({
       ...(prev ?? {}),
@@ -1027,12 +572,7 @@ export default function AutoTranslateApp() {
 
   const handleStop = async () => {
     writeAutoRunFlag(false);
-
-    runningRef.current = false;
     abortJobStep();
-    setProcessing(false);
-    setMonitoring(false);
-    setStepWaitSec(0);
     setActivePost(null);
     setActionPending('stop');
     setJob((prev) => ({
@@ -1122,15 +662,16 @@ export default function AutoTranslateApp() {
       : job?.remaining ?? 0);
   const initialNeedsWork = job?.initial_needs_work ?? 0;
   const siteResolved = job?.site_resolved ?? (initialNeedsWork > 0 ? Math.max(0, initialNeedsWork - needsWork) : 0);
+  const siteProgress =
+    job?.site_progress_pct ??
+    (initialNeedsWork > 0 ? Math.min(100, Math.round((siteResolved / initialNeedsWork) * 100)) : 0);
+  const queueBacklog = job?.queue_backlog ?? job?.deferred_pending ?? runPending;
   const isRunning = job?.status === 'running';
   const isPaused = job?.status === 'paused';
   const isOutdated = Boolean(job?.outdated);
-  const cronHealthy = isCronHealthy(job);
-  const isLive = processing || monitoring;
-  const isOrphanedRunning = isRunning && !isLive && needsWork > 0;
-  const isBusy = Boolean(actionPending) || isLive || refreshingStats;
+  const isBusy = Boolean(actionPending) || refreshingStats;
   const isSkipDisabled = refreshingStats || Boolean(actionPending);
-  const canResume = (isPaused || isOrphanedRunning) && needsWork > 0 && !isBusy;
+  const canResume = isPaused && needsWork > 0 && !isBusy;
   const canStart =
     aiConfigured && !loading && !isBusy && !isRunning && !langsLoading && langOptions.length > 0;
   const activeLangLabel = job?.lang_label || targetLabel;
@@ -1145,7 +686,7 @@ export default function AutoTranslateApp() {
   const canSkip =
     skipTargetId > 0 &&
     !loading &&
-    (isRunning || isPaused || isLive || isOrphanedRunning) &&
+    (isRunning || isPaused) &&
     actionPending !== 'stop';
 
   const actionPendingLabel =
@@ -1165,39 +706,37 @@ export default function AutoTranslateApp() {
     ? Math.max(0, Math.floor(Date.now() / 1000) - Number(job.last_cron_at))
     : null;
 
+  const workerLabel =
+    job?.last_worker === 'cron' ? 'کرون' : job?.last_worker === 'admin' ? 'سرور' : null;
+
   const statusLabel = actionPendingLabel
     ? actionPendingLabel
-    : monitoring && isRunning
-      ? cronAgeSec != null
-        ? `مانیتور کرون (${cronAgeSec}ث از آخرین تیک)`
-        : 'مانیتور کارگر سرور…'
-      : processing && isRunning
-        ? stepWaitSec > 0
-          ? `کمک تب — ترجمه… (${stepWaitSec}ث)`
-          : 'کمک تب — در حال ترجمه…'
-        : isRunning
-          ? cronHealthy || job?.worker_lock
-            ? 'کارگر سرور فعال (تب فقط مانیتور کند)'
-            : 'نیاز به ادامه (اجرا ناتمام)'
-          : isPaused
-            ? isOutdated
-              ? 'نیاز به اجرای مجدد'
-              : 'متوقف'
-            : job?.status === 'completed'
-              ? 'تمام شد'
-              : 'آماده';
+    : isRunning
+      ? job?.worker_lock
+        ? `کرون در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
+        : cronAgeSec != null
+          ? cronAgeSec < CRON_STALE_SEC
+            ? `در حال اجرا روی سرور — آخرین تیک ${cronAgeSec}ث پیش`
+            : `در حال اجرا — منتظر تیک کرون (${cronAgeSec}ث)`
+          : 'در حال اجرا روی سرور (کارگر کرون)'
+      : isPaused
+        ? isOutdated
+          ? 'نیاز به اجرای مجدد'
+          : 'متوقف'
+        : job?.status === 'completed'
+          ? 'تمام شد'
+          : 'آماده';
 
   return (
     <Layout
       title="ترجمه خودکار"
-      subtitle={`ترجمه مرحله‌به‌مرحله محتوای فارسی به ${targetLabel} — با قابلیت توقف و ادامه`}
+      subtitle={`ترجمه خودکار محتوای فارسی به ${targetLabel} — اجرا روی سرور با کرون، مانیتور در این صفحه`}
     >
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
-        <p className="font-medium">روش پیشنهادی برای ترجمه انبوه</p>
+        <p className="font-medium">کارگر کرون سرور (بدون وابستگی به مرورگر)</p>
         <p className="mt-1">
-          کار واقعی را کرون سرور انجام می‌دهد؛ این صفحه باید مانیتور باشد نه رقیب قفل.
-          «تلاش API» تعداد stepهاست؛ «موفق این اجرا» فقط موارد ۱۰۰٪ تمام‌شده را می‌شمارد.
-          اگر کرون فعال باشد تب خودش به حالت مانیتور می‌رود و آمار را هر ۲ ثانیه از سرور می‌گیرد.
+          ترجمه فقط روی سرور با WP-Cron اجرا می‌شود. بستن یا قطع شدن تب هیچ اثری روی صف ندارد — این صفحه فقط مانیتور و کنترل
+          (شروع / توقف / رد) است. آمار «کل سایت» منبع حقیقت پیشرفت است.
         </p>
       </div>
 
@@ -1226,14 +765,14 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message="حالت سرور فعال است (DISABLE_WP_CRON): مطمئن شوید crontab هر ۱ تا ۵ دقیقه wp-cron.php را اجرا می‌کند — ترجمه بدون تب باز هم ادامه می‌یابد."
+            message="حالت سرور فعال است (DISABLE_WP_CRON): crontab باید هر ۱ تا ۲ دقیقه wp-cron.php را اجرا کند — ترجمه بدون تب باز ادامه می‌یابد."
           />
         </div>
       ) : !config.devMode ? (
         <div className="mb-4">
           <Notice
             type="warning"
-            message="پیشنهاد پروداکشن: در wp-config مقدار define('DISABLE_WP_CRON', true) بگذارید و در cPanel هر ۱–۵ دقیقه /usr/local/bin/php …/wp-cron.php را زمان‌بندی کنید. الان WP-Cron وابسته به ترافیک/تب باز است."
+            message="پیشنهاد پروداکشن: در wp-config مقدار define('DISABLE_WP_CRON', true) بگذارید و در cPanel هر ۱–۲ دقیقه /usr/local/bin/php …/wp-cron.php را زمان‌بندی کنید تا ترجمه مستقل از ترافیک سایت پیش برود."
           />
         </div>
       ) : null}
@@ -1242,9 +781,16 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message={`کارگر پس‌زمینه فعال است — آخرین تیک کرون: ${formatTime(job.last_cron_at)}${
-              job.last_cron_steps ? ` (${job.last_cron_steps} مرحله در آخرین اجرا)` : ''
-            }. می‌توانید تب را ببندید.`}
+            message={`کارگر کرون زنده است — آخرین تیک: ${formatTime(job.last_cron_at)}${
+              job.last_cron_steps ? ` (${job.last_cron_steps} مرحله)` : ''
+            }. بستن تب اشکالی ندارد.`}
+          />
+        </div>
+      ) : !loading && job?.status === 'running' && !job?.last_cron_at ? (
+        <div className="mb-4">
+          <Notice
+            type="warning"
+            message="کارگر هنوز اولین تیک را نزده — اگر crontab تنظیم شده چند ثانیه صبر کنید، یا مطمئن شوید DISABLE_WP_CRON + crontab فعال است."
           />
         </div>
       ) : null}
@@ -1272,7 +818,7 @@ export default function AutoTranslateApp() {
             onChange={setTargetLang}
             options={langOptions}
             loading={langsLoading}
-            disabled={isRunning || processing || Boolean(actionPending)}
+            disabled={isRunning || Boolean(actionPending)}
             className="mb-4 w-full"
           />
 
@@ -1304,7 +850,7 @@ export default function AutoTranslateApp() {
               <button
                 type="button"
                 onClick={handlePause}
-                disabled={isBusy && actionPending !== 'pause'}
+                disabled={Boolean(actionPending) && actionPending !== 'pause'}
                 className="w-full cursor-pointer rounded-lg border border-pmai-border px-4 py-2 text-sm hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {actionPending === 'pause' ? 'در حال توقف موقت…' : 'توقف موقت'}
@@ -1329,7 +875,7 @@ export default function AutoTranslateApp() {
                 disabled={actionPending === 'stop'}
                 className="w-full cursor-pointer rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {actionPending === 'stop' ? 'در حال توقف کامل…' : processing ? 'توقف فوری…' : 'توقف کامل'}
+                {actionPending === 'stop' ? 'در حال توقف کامل…' : 'توقف کامل'}
               </button>
             )}
             <button
@@ -1404,10 +950,10 @@ export default function AutoTranslateApp() {
                 {job?.lang ? ` (${job.lang})` : ''}
               </p>
             </div>
-            {(isRunning || isLive || actionPending) && (
+            {(isRunning || actionPending) && (
               <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-xs font-medium text-blue-800">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-                {actionPendingLabel || (monitoring ? 'مانیتور سرور' : 'در حال پردازش')}
+                {actionPendingLabel || 'مانیتور کرون'}
               </span>
             )}
           </div>
@@ -1416,19 +962,16 @@ export default function AutoTranslateApp() {
             <p className="text-pmai-muted">در حال بارگذاری…</p>
           ) : (
             <>
-              {(isLive || (isRunning && (displayPost?.title || job?.worker_lock))) && (
+              {(isRunning && (displayPost?.title || job?.worker_lock || job?.last_step)) && (
                 <div
                   className={`mb-4 rounded-lg border px-4 py-3 text-sm ${
                     lastStepStatus === 'partial'
                       ? 'border-amber-200 bg-amber-50 text-amber-950'
-                      : monitoring
-                        ? 'border-violet-200 bg-violet-50 text-violet-950'
-                        : 'border-blue-200 bg-blue-50 text-blue-900'
+                      : 'border-blue-200 bg-blue-50 text-blue-900'
                   }`}
                 >
-                  <p className={`text-xs ${lastStepStatus === 'partial' ? 'text-amber-700' : lastStepStatus === 'deferred' ? 'text-violet-700' : monitoring ? 'text-violet-700' : 'text-blue-700'}`}>
+                  <p className={`text-xs ${lastStepStatus === 'partial' ? 'text-amber-700' : lastStepStatus === 'deferred' ? 'text-violet-700' : 'text-blue-700'}`}>
                     {jobStepHeadline(lastStepStatus, displayPost, job)}
-                    {stepWaitSec > 0 ? ` — ${stepWaitSec} ثانیه` : ''}
                   </p>
                   {displayPost?.title ? (
                     <>
@@ -1448,15 +991,10 @@ export default function AutoTranslateApp() {
                   )}
                   {job?.last_cron_at ? (
                     <p className="mt-2 text-xs opacity-80">
-                      آخرین تیک کرون: {formatTime(job.last_cron_at)}
-                      {job.last_cron_steps ? ` · ${job.last_cron_steps} مرحله در آن تیک` : ''}
+                      آخرین تیک کارگر: {formatTime(job.last_cron_at)}
+                      {job.last_cron_steps ? ` · ${job.last_cron_steps} مرحله` : ''}
                       {job.worker_lock ? ' · قفل فعال' : ''}
                       {job.cron_scheduled ? ' · event بعدی زمان‌بندی شده' : ''}
-                    </p>
-                  ) : null}
-                  {!monitoring && stepWaitSec >= 45 ? (
-                    <p className="mt-2 text-xs opacity-80">
-                      این مورد طولانی شده (Elementor یا API کند). می‌توانید «رد کردن» را بزنید تا به مورد بعدی برود.
                     </p>
                   ) : null}
                   {canSkip && (
@@ -1476,31 +1014,52 @@ export default function AutoTranslateApp() {
                 {[
                   { label: 'وضعیت', value: statusLabel },
                   {
-                    label: 'پیشرفت این اجرا',
-                    value: queueTotal > 0 ? `${runDone} / ${queueTotal}` : '—',
+                    label: 'پیشرفت کل سایت',
+                    value:
+                      initialNeedsWork > 0
+                        ? `${siteResolved} / ${initialNeedsWork}`
+                        : liveStats.translated != null
+                          ? `${liveStats.translated} ترجمه‌شده`
+                          : '—',
+                    hint:
+                      needsWork > 0
+                        ? `${needsWork} باقی‌مانده · ${liveStats.partial ?? 0} ناقص · ${liveStats.untranslated ?? 0} ترجمه‌نشده`
+                        : 'همه موارد انجام شده',
                     color: 'text-pmai-primary',
-                  },
-                  {
-                    label: 'باقی این اجرا',
-                    value: runRemaining,
-                    color: runRemaining > 0 ? 'text-blue-700' : 'text-green-700',
                   },
                   {
                     label: 'نیاز به کار (کل سایت)',
                     value: needsWork,
                     hint:
                       initialNeedsWork > 0
-                        ? `شروع: ${initialNeedsWork}${siteResolved > 0 ? ` · −${siteResolved} انجام شد` : ''}`
+                        ? `شروع این اجرا: ${initialNeedsWork}`
                         : null,
                     color: needsWork > 0 ? 'text-amber-700' : 'text-green-700',
                   },
+                  {
+                    label: 'ترجمه‌شده / ناقص / خام',
+                    value: `${liveStats.translated ?? '—'} / ${liveStats.partial ?? '—'} / ${liveStats.untranslated ?? '—'}`,
+                    hint: liveStats.total != null ? `از ${liveStats.total} محتوای قابل ترجمه` : null,
+                    color: 'text-gray-800',
+                  },
                   { label: 'موفق (این اجرا)', value: job?.succeeded ?? 0, color: 'text-green-700' },
-                  { label: 'ناقص (این اجرا)', value: job?.partial ?? 0, color: 'text-amber-700' },
+                  { label: 'ناقص در صف اجرا', value: job?.partial ?? 0, color: 'text-amber-700' },
                   { label: 'ناموفق (این اجرا)', value: job?.failed ?? 0, color: 'text-red-700' },
                   { label: 'رد شده (این اجرا)', value: job?.skipped ?? 0, color: 'text-amber-800' },
-                  { label: 'در صف بعدی (سنگین/ناقص)', value: job?.deferred_pending ?? runPending, color: 'text-blue-700' },
-                  { label: 'تلاش API', value: steps, color: 'text-gray-700' },
-                  { label: 'کل محتوای قابل ترجمه', value: liveStats.total ?? '—' },
+                  {
+                    label: 'صف سنگین / معوق',
+                    value: queueBacklog,
+                    hint: 'محصولات با تنوع زیاد یا ناقص که بعداً دوباره گرفته می‌شوند',
+                    color: 'text-blue-700',
+                  },
+                  { label: 'تلاش API (slice)', value: steps, color: 'text-gray-700' },
+                  {
+                    label: 'پیشرفت این اجرا',
+                    value: queueTotal > 0 ? `${runDone} / ${queueTotal}` : '—',
+                    hint: 'فقط موارد ۱۰۰٪ تمام‌شده در این اجرا',
+                    color: 'text-pmai-primary',
+                  },
+                  { label: 'باقی بودجه این اجرا', value: runRemaining, color: runRemaining > 0 ? 'text-blue-700' : 'text-green-700' },
                 ].map((item) => (
                   <div key={item.label} className="rounded-lg bg-gray-50 px-3 py-2">
                     <p className="text-xs text-pmai-muted">{item.label}</p>
@@ -1510,7 +1069,33 @@ export default function AutoTranslateApp() {
                 ))}
               </div>
 
-              {queueTotal > 0 && (
+              {initialNeedsWork > 0 && (
+                <div className="mb-3">
+                  <div className="mb-1 flex justify-between text-xs text-pmai-muted">
+                    <span>پیشرفت کل سایت (از شروع این اجرا)</span>
+                    <span>
+                      {siteResolved} / {initialNeedsWork} ({siteProgress}%)
+                    </span>
+                  </div>
+                  <div className="h-3 overflow-hidden rounded-full bg-gray-200">
+                    <div
+                      className={`h-full rounded-full transition-all duration-300 ${
+                        isRunning ? 'bg-pmai-primary animate-pulse' : 'bg-pmai-primary'
+                      }`}
+                      style={{ width: `${Math.min(100, siteProgress)}%` }}
+                    />
+                  </div>
+                  <p className="mt-2 text-xs text-pmai-muted">
+                    کل سایت الان: {liveStats.translated ?? 0} ترجمه‌شده، {liveStats.partial ?? 0} ناقص،{' '}
+                    {liveStats.untranslated ?? 0} ترجمه‌نشده
+                    {queueTotal > 0
+                      ? ` — این اجرا (۱۰۰٪ تمام‌شده): ${runDone}/${queueTotal} (${progress}%)`
+                      : ''}
+                  </p>
+                </div>
+              )}
+
+              {!initialNeedsWork && queueTotal > 0 && (
                 <div className="mb-3">
                   <div className="mb-1 flex justify-between text-xs text-pmai-muted">
                     <span>پیشرفت این اجرا</span>
@@ -1521,18 +1106,11 @@ export default function AutoTranslateApp() {
                   <div className="h-3 overflow-hidden rounded-full bg-gray-200">
                     <div
                       className={`h-full rounded-full transition-all duration-300 ${
-                        isRunning || processing ? 'bg-pmai-primary animate-pulse' : 'bg-pmai-primary'
+                        isRunning ? 'bg-pmai-primary animate-pulse' : 'bg-pmai-primary'
                       }`}
                       style={{ width: `${Math.min(100, progress)}%` }}
                     />
                   </div>
-                  {liveStats.translated != null && (
-                    <p className="mt-2 text-xs text-pmai-muted">
-                      کل سایت: {liveStats.translated ?? 0} ترجمه‌شده، {liveStats.partial ?? 0} ناقص،{' '}
-                      {liveStats.untranslated ?? 0} ترجمه‌نشده
-                      {siteResolved > 0 ? ` — ${siteResolved} مورد از شروع این اجرا تکمیل شد` : ''}
-                    </p>
-                  )}
                 </div>
               )}
 
@@ -1636,9 +1214,9 @@ export default function AutoTranslateApp() {
       <aside className="mt-6 rounded-lg border border-blue-200 bg-blue-50 p-5 text-sm text-blue-950">
         <h3 className="font-semibold text-blue-900">نکات مهم</h3>
         <ul className="mt-2 list-inside list-disc space-y-1">
-          <li>هر مورد جداگانه ترجمه می‌شود تا از فشار به سرور جلوگیری شود.</li>
-          <li>اگر API موفق باشد ولی ترجمه ناقص بماند، همان مورد دوباره در صف قرار می‌گیرد.</li>
-          <li>اگر شبکه قطع شود، وضعیت ذخیره می‌شود و با «ادامه» از همانجا ادامه می‌یابد.</li>
+          <li>کار ترجمه فقط با کرون سرور انجام می‌شود — بستن مرورگر یا قطع اینترنت مانیتور، صف را متوقف نمی‌کند.</li>
+          <li>محصولات با تنوع زیاد ممکن است چند ده مرحله طول بکشند؛ نوار «پیشرفت کل سایت» منبع حقیقت است نه فقط «موفق این اجرا».</li>
+          <li>اگر یک مورد گیر کرد، «رد کردن» را بزنید تا کرون به مورد بعدی برود.</li>
           <li>
             برای ترجمه ساده‌تر بدون resume، از{' '}
             <a href={`${adminUrls.settings}#bulk`} className="font-semibold underline">

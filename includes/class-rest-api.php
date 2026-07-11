@@ -1481,6 +1481,14 @@ final class REST_API {
 				$post_id = absint( $request->get_param( 'post_id' ) );
 				$result  = Activity_Logger::skip_current_job_post( $post_id );
 				break;
+			case 'kick':
+				// Heavy tick — prefer ensure from the SPA; kick is recovery/debug.
+				$result = Activity_Logger::kick_worker();
+				break;
+			case 'ensure':
+				// Schedule + nudge cron only — browser never owns translation work.
+				$result = Activity_Logger::ensure_background_worker();
+				break;
 			default:
 				return new \WP_Error(
 					'polymart_ai_invalid_action',
@@ -1549,13 +1557,14 @@ final class REST_API {
 	}
 
 	/**
-	 * Process one step of the auto-translation job.
+	 * Process the auto-translation job worker tick (same path as WP-Cron).
 	 *
 	 * @return \WP_REST_Response|\WP_Error
 	 */
 	public function process_translation_job_step() {
 		try {
-			$job = Activity_Logger::process_job_step();
+			// Unified with cron: multi-step budget, not a separate single-step driver.
+			$job = Activity_Logger::kick_worker();
 		} catch ( \Throwable $e ) {
 			return new \WP_Error(
 				'polymart_ai_step_crashed',

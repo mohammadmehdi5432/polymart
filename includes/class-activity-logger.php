@@ -28,11 +28,12 @@ final class Activity_Logger {
 	const STEP_LOCK_KEY        = 'polymart_ai_job_step_lock';
 	const STEP_LOCK_TTL        = 600;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
-	const CRON_INTERVAL_SEC    = 8;
+	/** Seconds between self-chained cron ticks while a job is running. */
+	const CRON_INTERVAL_SEC    = 3;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
-	const CRON_STEP_BUDGET_SEC = 75;
+	const CRON_STEP_BUDGET_SEC = 90;
 	/** Max steps inside one cron tick (safety cap). */
-	const CRON_MAX_STEPS_PER_TICK = 12;
+	const CRON_MAX_STEPS_PER_TICK = 16;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -58,10 +59,12 @@ final class Activity_Logger {
 		}
 
 		if ( wp_next_scheduled( self::CRON_HOOK ) ) {
+			self::ping_wp_cron();
+
 			return;
 		}
 
-		self::schedule_background_worker();
+		self::schedule_background_worker( 1 );
 	}
 
 	/**
@@ -343,6 +346,7 @@ final class Activity_Logger {
 			'stuck_progress_steps'   => 0,
 			'last_cron_at'           => null,
 			'last_cron_steps'        => 0,
+			'last_worker'            => null,
 		);
 	}
 
@@ -719,6 +723,21 @@ final class Activity_Logger {
 		}
 
 		$job['run_remaining'] = max( 0, $total - $run_done );
+
+		// Site-wide progress (canonical monitor numbers).
+		$initial_needs = max( 0, (int) ( $job['initial_needs_work'] ?? $total ) );
+		$needs_work_now = max( 0, (int) ( $job['needs_work'] ?? $remaining ) );
+		$site_resolved  = max( 0, (int) ( $job['site_resolved'] ?? max( 0, $initial_needs - $needs_work_now ) ) );
+		$job['initial_needs_work'] = $initial_needs;
+		$job['site_resolved']      = $site_resolved;
+		$job['site_progress_pct']  = $initial_needs > 0
+			? min( 100, (int) round( ( $site_resolved / $initial_needs ) * 100 ) )
+			: ( $needs_work_now > 0 ? 0 : 100 );
+
+		$parked_pending = count( self::get_parked_ids( $job ) );
+		$pinned_partial = absint( $job['partial_post_id'] ?? 0 ) > 0 ? 1 : 0;
+		$job['queue_backlog'] = $deferred_pending + $parked_pending + $retry_pending + $pinned_partial;
+		$job['parked_pending'] = $parked_pending;
 
 		$current_post_id = absint( $job['current_post_id'] ?? 0 );
 
@@ -1392,12 +1411,13 @@ final class Activity_Logger {
 		);
 
 		self::save_job( $job );
-		self::schedule_background_worker();
+		self::schedule_background_worker( 1 );
+		self::ping_wp_cron();
 		self::log(
 			'info',
 			sprintf(
 				/* translators: 1: language name, 2: count */
-				__( 'ترجمه خودکار به %1$s شروع شد — %2$d مورد در صف.', 'polymart-ai' ),
+				__( 'ترجمه خودکار به %1$s شروع شد — %2$d مورد در صف (کارگر کرون).', 'polymart-ai' ),
 				$lang_label,
 				$total
 			),
@@ -1444,8 +1464,9 @@ final class Activity_Logger {
 			$job['step_started_at'] = null;
 
 			self::save_job( $job );
-			self::schedule_background_worker();
-			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد.', 'polymart-ai' ) );
+			self::schedule_background_worker( 1 );
+			self::ping_wp_cron();
+			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (کارگر کرون).', 'polymart-ai' ) );
 		}
 
 		return self::normalize_job_for_response( $job, false );
@@ -1680,16 +1701,90 @@ final class Activity_Logger {
 	 */
 	public static function schedule_background_worker( $delay_sec = null ) {
 		if ( wp_next_scheduled( self::CRON_HOOK ) ) {
+			self::ping_wp_cron();
+
 			return;
 		}
 
 		$delay = null === $delay_sec ? self::CRON_INTERVAL_SEC : max( 1, absint( $delay_sec ) );
 
 		wp_schedule_single_event( time() + $delay, self::CRON_HOOK );
+		self::ping_wp_cron();
+	}
 
-		if ( ! wp_doing_cron() && ( ! defined( 'DISABLE_WP_CRON' ) || ! DISABLE_WP_CRON ) ) {
-			spawn_cron();
+	/**
+	 * Nudge WP-Cron so the job worker starts without waiting for page traffic.
+	 *
+	 * Works for both traffic-based WP-Cron and DISABLE_WP_CRON + real crontab setups
+	 * (loopback still helps immediately after Start/Resume).
+	 *
+	 * @return void
+	 */
+	public static function ping_wp_cron() {
+		if ( wp_doing_cron() ) {
+			return;
 		}
+
+		if ( ! defined( 'DISABLE_WP_CRON' ) || ! DISABLE_WP_CRON ) {
+			spawn_cron();
+
+			return;
+		}
+
+		/**
+		 * Allow hosts to disable the loopback cron nudge.
+		 *
+		 * @param bool $enabled Default true.
+		 */
+		if ( ! apply_filters( 'polymart_ai_job_cron_loopback', true ) ) {
+			return;
+		}
+
+		$cron_url = add_query_arg(
+			'doing_wp_cron',
+			sprintf( '%.22F', microtime( true ) ),
+			site_url( 'wp-cron.php' )
+		);
+
+		wp_remote_post(
+			$cron_url,
+			array(
+				'timeout'   => 0.01,
+				'blocking'  => false,
+				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+			)
+		);
+	}
+
+	/**
+	 * Ensure the background worker is scheduled (and nudged) without running a heavy tick.
+	 * Used by the admin monitor so the browser never owns translation work.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function ensure_background_worker() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		$next = wp_next_scheduled( self::CRON_HOOK );
+		$last = absint( $job['last_cron_at'] ?? 0 );
+		$stale = $last <= 0 || ( time() - $last ) > 45;
+
+		if ( ! $next || $stale ) {
+			self::unschedule_background_worker();
+			self::schedule_background_worker( 1 );
+		} else {
+			self::ping_wp_cron();
+		}
+
+		$job = self::get_job_raw();
+		$job['cron_scheduled'] = (bool) wp_next_scheduled( self::CRON_HOOK );
+		$job['worker_ensured'] = true;
+
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	/**
@@ -1699,6 +1794,17 @@ final class Activity_Logger {
 	 */
 	public static function unschedule_background_worker() {
 		wp_clear_scheduled_hook( self::CRON_HOOK );
+	}
+
+	/**
+	 * Whether a bulk auto-translate job is currently running.
+	 *
+	 * @return bool
+	 */
+	public static function is_bulk_job_running() {
+		$job = get_option( self::JOB_OPTION, array() );
+
+		return is_array( $job ) && 'running' === ( $job['status'] ?? '' );
 	}
 
 	/**
@@ -1716,12 +1822,12 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * WP-Cron callback: process multiple job steps within a time budget.
+	 * Shared worker tick used by WP-Cron AND the admin UI kick.
 	 *
+	 * One code path for both drivers so browser and cron stay on the same job state.
 	 * Schedules the next event BEFORE work so fatals/timeouts do not orphan the chain.
-	 * Multi-step ticks matter when system crontab only hits wp-cron.php every few minutes.
 	 *
-	 * @return void
+	 * @return array<string, mixed> Normalized job after the tick.
 	 */
 	public static function process_background_step() {
 		$job = self::get_job_raw();
@@ -1729,7 +1835,7 @@ final class Activity_Logger {
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
 			self::unschedule_background_worker();
 
-			return;
+			return self::normalize_job_for_response( $job, false );
 		}
 
 		// Ensure a follow-up tick exists even if this request fatals mid-step.
@@ -1741,6 +1847,7 @@ final class Activity_Logger {
 		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
 		$max_steps = max( 1, min( 30, $max_steps ) );
 		$steps_run = 0;
+		$last_result = null;
 
 		if ( function_exists( 'set_time_limit' ) ) {
 			@set_time_limit( max( 120, $budget + 60 ) );
@@ -1752,22 +1859,26 @@ final class Activity_Logger {
 			}
 
 			$result = self::process_job_step();
+			$last_result = $result;
 
 			++$steps_run;
 
 			$job = self::get_job_raw();
-			$job['last_cron_at']    = time();
-			$job['last_cron_steps'] = $steps_run;
+			$job['last_cron_at']     = time();
+			$job['last_cron_steps']  = $steps_run;
+			$job['last_worker']      = wp_doing_cron() ? 'cron' : 'admin';
 			self::save_job( $job );
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
 				self::unschedule_background_worker();
 
-				return;
+				return is_array( $result )
+					? $result
+					: self::normalize_job_for_response( $job, false );
 			}
 
 			if ( is_array( $result ) && ! empty( $result['step_deferred'] ) ) {
-				// Lock contention or in-progress translation — wait for next cron tick.
+				// Lock contention or in-progress translation — wait for next tick.
 				break;
 			}
 
@@ -1775,6 +1886,36 @@ final class Activity_Logger {
 				break;
 			}
 		}
+
+		if ( is_array( $last_result ) ) {
+			$last_result['last_cron_at']    = time();
+			$last_result['last_cron_steps'] = $steps_run;
+			$last_result['last_worker']     = wp_doing_cron() ? 'cron' : 'admin';
+
+			return $last_result;
+		}
+
+		return self::normalize_job_for_response( self::get_job_raw(), false );
+	}
+
+	/**
+	 * Admin/UI entry: run the same worker tick as cron (unified pipeline).
+	 *
+	 * Prefer ensure_background_worker() from the SPA — kick is kept for recovery/debug.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function kick_worker() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		self::schedule_background_worker( 1 );
+		self::ping_wp_cron();
+
+		return self::process_background_step();
 	}
 
 	/**
@@ -1949,7 +2090,7 @@ final class Activity_Logger {
 				if ( 'running' === ( $job['status'] ?? '' ) && (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 ) > 0 ) {
 					$job['status']       = 'paused';
 					$job['pause_reason'] = 'pick_stalled';
-					$job['last_error']   = __( 'صف ترجمه گیر کرد — «ادامه» را بزنید یا «توقف کامل» و دوباره «شروع».', 'polymart-ai' );
+					$job['last_error']   = __( 'صف ترجمه گیر کرد — مورد فعلی را رد کنید یا «ادامه» / شروع مجدد بزنید.', 'polymart-ai' );
 					self::set_job_last_step( $job, 0, 'failed', $job['last_error'] );
 				}
 
@@ -2265,12 +2406,19 @@ final class Activity_Logger {
 	 * @return int[]
 	 */
 	private static function get_forward_scan_exclude_ids( array $job ) {
+		$deferred = array_map( 'absint', self::get_deferred_queue( $job ) );
+		$partial  = absint( $job['partial_post_id'] ?? 0 );
+
 		return array_values(
 			array_unique(
-				array_merge(
-					self::get_exhausted_job_post_ids( $job ),
-					self::get_parked_ids( $job ),
-					array_map( 'absint', is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() )
+				array_filter(
+					array_merge(
+						self::get_exhausted_job_post_ids( $job ),
+						self::get_parked_ids( $job ),
+						$deferred,
+						$partial > 0 ? array( $partial ) : array(),
+						array_map( 'absint', is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() )
+					)
 				)
 			)
 		);
