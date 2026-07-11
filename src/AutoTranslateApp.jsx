@@ -51,6 +51,11 @@ function isCronHealthy(job) {
     return false;
   }
 
+  // Between batches without an active lock — nudge ensure after ~45s idle.
+  if (job?.status === 'running' && !job?.worker_lock && activityAge > 45) {
+    return false;
+  }
+
   if (job?.worker_lock) {
     // Actively translating a known post — trust the lock for one AI-call window.
     if (hasActivePost && lockAge >= 0 && lockAge < LOCK_HEALTHY_SEC) {
@@ -903,11 +908,13 @@ export default function AutoTranslateApp() {
       ? job?.worker_lock && cronAgeSec != null && cronAgeSec < LOCK_HEALTHY_SEC
         ? `در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
         : cronAgeSec != null
-          ? cronAgeSec < CRON_STALE_SEC
-            ? `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
-            : cronAgeSec < 20
-              ? `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`
-              : `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`
+          ? job?.as_pending && cronAgeSec >= 15 && cronAgeSec < CRON_STALE_SEC
+            ? `در صف Action Scheduler — تیک بعدی تا ${Math.max(0, 60 - cronAgeSec)}ث`
+            : cronAgeSec < CRON_STALE_SEC
+              ? `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
+              : cronAgeSec < 20
+                ? `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`
+                : `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`
           : job?.cron_scheduled
             ? 'زمان‌بندی شده — شروع زنجیره پس‌زمینه'
             : 'در حال اجرا روی سرور'

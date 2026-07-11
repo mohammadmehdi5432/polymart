@@ -149,6 +149,41 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Record that the next AS slice was queued (between-batch gap is normal here).
+	 *
+	 * @param int $action_id Enqueued Action Scheduler action ID.
+	 * @return void
+	 */
+	public static function on_as_chain_enqueued( $action_id ) {
+		$action_id = absint( $action_id );
+
+		if ( $action_id <= 0 || ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		$job = self::get_job_raw();
+		$job['chain_enqueued_at']   = time();
+		$job['chain_action_id']     = $action_id;
+		$job['worker_heartbeat_at'] = time();
+		$job['last_worker']         = 'as';
+		$job['updated_at']          = time();
+		update_option( self::JOB_OPTION, $job, false );
+	}
+
+	/**
+	 * Wake WP-Cron / AS queue when inline chaining could not run the pending slice.
+	 *
+	 * @return void
+	 */
+	public static function nudge_as_queue_runner() {
+		if ( ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		self::ping_wp_cron( true );
+	}
+
+	/**
 	 * Whether the bulk worker is actively translating (lock/heartbeat recently touched).
 	 *
 	 * AS uses action "modified" which does not tick during long batches — use this

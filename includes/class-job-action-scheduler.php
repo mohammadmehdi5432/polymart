@@ -176,13 +176,22 @@ final class Job_Action_Scheduler {
 			'n' => sprintf( '%.6F', microtime( true ) ),
 		);
 
-		if ( 0 === $delay_sec && function_exists( 'as_enqueue_async_action' ) ) {
-			$action_id = as_enqueue_async_action( self::HOOK, $args, self::GROUP, false );
+		if ( 0 === $delay_sec && function_exists( 'as_schedule_single_action' ) ) {
+			// Scheduled-now is more reliable than async when AS HTTP runner is disabled.
+			$action_id = as_schedule_single_action( time(), self::HOOK, $args, self::GROUP );
 		} elseif ( function_exists( 'as_schedule_single_action' ) ) {
 			$action_id = as_schedule_single_action( time() + $delay_sec, self::HOOK, $args, self::GROUP );
-		} else {
+		} elseif ( function_exists( 'as_enqueue_async_action' ) ) {
 			$action_id = as_enqueue_async_action( self::HOOK, $args, self::GROUP, false );
+		} else {
+			$action_id = 0;
 		}
+
+		if ( $action_id <= 0 ) {
+			return 0;
+		}
+
+		Activity_Logger::on_as_chain_enqueued( absint( $action_id ) );
 
 		Activity_Logger::log(
 			'info',
@@ -516,12 +525,24 @@ final class Job_Action_Scheduler {
 			return;
 		}
 
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 120 );
+		}
+
 		if ( self::$inline_chain_depth >= self::MAX_INLINE_CHAIN_DEPTH ) {
-			self::enqueue_next( true, 0 );
+			$action_id = self::enqueue_next( true, 0 );
+			if ( $action_id > 0 ) {
+				Activity_Logger::nudge_as_queue_runner();
+			}
+
 			return;
 		}
 
-		self::enqueue_next( true, 0 );
+		$action_id = self::enqueue_next( true, 0 );
+
+		if ( $action_id <= 0 ) {
+			return;
+		}
 
 		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) <= 0 ) {
 			return;
@@ -529,7 +550,10 @@ final class Job_Action_Scheduler {
 
 		++self::$inline_chain_depth;
 		try {
-			self::run_queue_inline( true );
+			$processed = self::run_queue_inline( true );
+			if ( $processed <= 0 ) {
+				Activity_Logger::nudge_as_queue_runner();
+			}
 		} finally {
 			--self::$inline_chain_depth;
 		}
