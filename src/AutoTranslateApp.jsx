@@ -8,7 +8,7 @@ import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
 /** AS keep-alive is ~60s; treat worker stale only after a missed pulse. */
-const CRON_STALE_SEC = 70;
+const CRON_STALE_SEC = 150;
 /**
  * Lock alone is trusted this long without a completed tick.
  * Must stay above max AI HTTP timeout (~165s) so the monitor does not steal a living worker.

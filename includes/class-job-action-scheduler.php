@@ -21,8 +21,11 @@ final class Job_Action_Scheduler {
 	const HOOK  = 'polymart_ai_as_translate_slice';
 	const GROUP = 'polymart_ai_translation';
 
-	/** Seconds after which an In-progress AS action is treated as dead. */
-	const STALE_RUNNING_SEC = 60;
+	/**
+	 * Seconds after which an In-progress AS action is treated as dead.
+	 * Must exceed one full AS batch (multi-slice + Elementor partials + retries).
+	 */
+	const STALE_RUNNING_SEC = 150;
 
 	/**
 	 * Action ID currently executing (for fatal shutdown recovery).
@@ -105,10 +108,11 @@ final class Job_Action_Scheduler {
 	/**
 	 * Enqueue the next async slice-batch action.
 	 *
-	 * @param bool $force Recover stale In-progress actions first when true.
+	 * @param bool $force              Recover stale In-progress actions first when true.
+	 * @param bool $allow_while_running Allow enqueue while another action is In-progress (chain tail only).
 	 * @return int Action ID or 0.
 	 */
-	public static function enqueue_next( $force = false ) {
+	public static function enqueue_next( $force = false, $allow_while_running = false ) {
 		if ( ! Activity_Logger::is_bulk_job_running() ) {
 			return 0;
 		}
@@ -117,13 +121,17 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
-		if ( $force ) {
+		if ( $force && ! Activity_Logger::is_bulk_worker_lively( self::STALE_RUNNING_SEC ) ) {
 			self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
 		}
 
 		// Prefer a pending follow-up over stacking duplicates — but never block
 		// while the *current* callback is still STATUS_RUNNING (unique would jam).
 		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+			return 0;
+		}
+
+		if ( ! $allow_while_running && self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0 ) {
 			return 0;
 		}
 
@@ -168,8 +176,12 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
-		$recovered = self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
-		Activity_Logger::release_stale_locks_for_as( self::STALE_RUNNING_SEC );
+		$recovered = 0;
+
+		if ( ! Activity_Logger::is_bulk_worker_lively( self::STALE_RUNNING_SEC ) ) {
+			$recovered = self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
+			Activity_Logger::release_stale_locks_for_as( self::STALE_RUNNING_SEC );
+		}
 
 		if ( $recovered > 0 ) {
 			Activity_Logger::log(
@@ -277,9 +289,6 @@ final class Job_Action_Scheduler {
 			)
 		);
 
-		self::recover_stale_running_actions( self::STALE_RUNNING_SEC, self::$current_action_id );
-		Activity_Logger::release_stale_locks_for_as( self::STALE_RUNNING_SEC );
-
 		try {
 			Activity_Logger::run_action_scheduler_batch();
 		} catch ( \Throwable $e ) {
@@ -309,8 +318,9 @@ final class Job_Action_Scheduler {
 			);
 		}
 
-		$job_after = Activity_Logger::get_job_for_as_debug();
+		$job_after  = Activity_Logger::get_job_for_as_debug();
 		$post_after = absint( $job_after['current_post_id'] ?? 0 ) ?: absint( $job_after['partial_post_id'] ?? 0 );
+		$log_post   = $post_after > 0 ? $post_after : absint( $job_after['last_post_id'] ?? 0 );
 
 		Activity_Logger::log(
 			'info',
@@ -318,12 +328,12 @@ final class Job_Action_Scheduler {
 				/* translators: 1: AS action ID, 2: post ID, 3: job status */
 				__( 'AS #%1$d: پایان batch (پست: #%2$d، وضعیت جاب: %3$s).', 'polymart-ai' ),
 				self::$current_action_id,
-				$post_after,
+				$log_post,
 				(string) ( $job_after['status'] ?? '' )
 			),
 			array(
 				'as_action_id' => self::$current_action_id,
-				'post_id'      => $post_after,
+				'post_id'      => $log_post,
 			)
 		);
 
@@ -332,7 +342,7 @@ final class Job_Action_Scheduler {
 			sprintf(
 				'[PolyMartAI AS] end action=%d post=%d status=%s mem=%s',
 				self::$current_action_id,
-				$post_after,
+				$log_post,
 				(string) ( $job_after['status'] ?? '' ),
 				size_format( memory_get_usage( true ) )
 			)
@@ -341,7 +351,7 @@ final class Job_Action_Scheduler {
 		self::$handler_clean_exit = true;
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
-			self::enqueue_next( true );
+			self::enqueue_next( true, true );
 		}
 	}
 
@@ -397,7 +407,7 @@ final class Job_Action_Scheduler {
 
 			if ( Activity_Logger::is_bulk_job_running() ) {
 				// Unique enqueue may still see this action as running — force-fail first done above.
-				self::enqueue_next( true );
+				self::enqueue_next( true, true );
 			}
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
@@ -450,6 +460,11 @@ final class Job_Action_Scheduler {
 		$older_than_sec = max( 30, absint( $older_than_sec ) );
 		$except_id      = absint( $except_id );
 		$recovered      = 0;
+
+		// AS "modified" does not tick during long batches — trust the job heartbeat instead.
+		if ( Activity_Logger::is_bulk_worker_lively( $older_than_sec ) ) {
+			return 0;
+		}
 
 		try {
 			$store = \ActionScheduler::store();

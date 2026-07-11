@@ -146,6 +146,42 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Whether the bulk worker is actively translating (lock/heartbeat recently touched).
+	 *
+	 * AS uses action "modified" which does not tick during long batches — use this
+	 * before failing In-progress actions or force-releasing locks.
+	 *
+	 * @param int|null $max_silent_sec Max seconds without lock/heartbeat refresh.
+	 * @return bool
+	 */
+	public static function is_bulk_worker_lively( $max_silent_sec = null ) {
+		if ( ! self::is_bulk_job_running() ) {
+			return false;
+		}
+
+		$max_silent_sec = null === $max_silent_sec
+			? Job_Action_Scheduler::STALE_RUNNING_SEC
+			: max( 30, absint( $max_silent_sec ) );
+
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
+
+		if ( $stamp > 0 && ( time() - $stamp ) < $max_silent_sec ) {
+			return true;
+		}
+
+		$job  = self::get_job_raw();
+		$last = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 ),
+			absint( $job['step_started_at'] ?? 0 )
+		);
+
+		return $last > 0 && ( time() - $last ) < $max_silent_sec;
+	}
+
+	/**
 	 * Shared secret for the async job loopback endpoint.
 	 *
 	 * @return string
@@ -1523,8 +1559,13 @@ final class Activity_Logger {
 	 */
 	public static function release_stale_locks_for_as( $idle_sec = 60 ) {
 		$idle_sec = max( 30, absint( $idle_sec ) );
-		$job      = self::get_job_raw();
-		$last     = max(
+
+		if ( self::is_bulk_worker_lively( $idle_sec ) ) {
+			return false;
+		}
+
+		$job  = self::get_job_raw();
+		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 ),
 			absint( $job['step_started_at'] ?? 0 )
@@ -2396,6 +2437,7 @@ final class Activity_Logger {
 		);
 
 		self::save_job( $job );
+		Job_Action_Scheduler::cancel_all();
 		self::bootstrap_background_worker();
 		self::log(
 			'info',
@@ -2826,8 +2868,8 @@ final class Activity_Logger {
 	/**
 	 * Mark the job as scheduled and enqueue Action Scheduler work.
 	 *
-	 * Runs one short batch inline so Start is never a silent no-op, then relies
-	 * on the 1-minute cron keep-alive to drain the AS queue.
+	 * Enqueues one AS action and runs the queue inline in this request so Start
+	 * shows immediate progress without stacking a parallel inline batch.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2843,7 +2885,13 @@ final class Activity_Logger {
 		self::ensure_recurring_pulse();
 
 		$as_ok = Job_Action_Scheduler::is_available();
-		Job_Action_Scheduler::enqueue_next( true );
+
+		if ( $as_ok ) {
+			Job_Action_Scheduler::enqueue_next( true );
+			Job_Action_Scheduler::run_queue_inline();
+		} else {
+			self::run_action_scheduler_batch( 2 );
+		}
 
 		$job = self::get_job_raw();
 		$job['worker_scheduled_at'] = time();
@@ -2852,21 +2900,12 @@ final class Activity_Logger {
 		$job['worker_mode']         = $as_ok ? 'as' : 'cron';
 		self::save_job( $job );
 
-		// Immediate progress in the Start request (bounded) — cron/AS continues.
-		$result = self::run_action_scheduler_batch( 2 );
-		if ( ! is_array( $result ) ) {
-			$result = self::normalize_job_for_response( self::get_job_raw(), false );
-		}
-
+		$result = self::normalize_job_for_response( self::get_job_raw(), false );
 		$result['worker_bootstrapped'] = true;
 		$result['as_enqueued']         = $as_ok;
 		$result['worker_mode']         = $as_ok ? 'as' : 'cron';
 		$result['cli_spawned']         = false;
 		$result['loopback_spawned']    = false;
-
-		if ( $as_ok && self::is_bulk_job_running() ) {
-			Job_Action_Scheduler::enqueue_next( true );
-		}
 
 		return $result;
 	}
@@ -2895,9 +2934,9 @@ final class Activity_Logger {
 		);
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 		$busy = self::is_step_lock_held_fresh();
-		$inline_idle = self::get_ensure_inline_idle_sec();
+		$stale_sec = Job_Action_Scheduler::STALE_RUNNING_SEC;
 
-		if ( $busy && $age >= self::LOCK_FORCE_IDLE_SEC ) {
+		if ( $busy && $age >= self::LOCK_FORCE_IDLE_SEC && ! self::is_bulk_worker_lively( $stale_sec ) ) {
 			self::release_step_lock();
 			$busy                = false;
 			$released_stale_lock = true;
@@ -2905,12 +2944,10 @@ final class Activity_Logger {
 
 		Job_Action_Scheduler::ensure_scheduled();
 
-		if ( ! $busy && $age >= min( $inline_idle, Job_Action_Scheduler::STALE_RUNNING_SEC ) ) {
-			Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
-			self::release_stale_locks_for_as( Job_Action_Scheduler::STALE_RUNNING_SEC );
+		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
 
+		if ( $worker_dead && ! $busy && $age >= $stale_sec ) {
 			if ( Job_Action_Scheduler::is_available() ) {
-				Job_Action_Scheduler::enqueue_next( true );
 				Job_Action_Scheduler::run_queue_inline();
 			} else {
 				self::run_action_scheduler_batch( 2 );
