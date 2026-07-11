@@ -329,7 +329,7 @@ final class Activity_Logger {
 
 		if ( Job_Action_Scheduler::is_available() ) {
 			Job_Action_Scheduler::ensure_scheduled();
-			$processed = Job_Action_Scheduler::run_queue_inline();
+			$processed = Job_Action_Scheduler::run_queue_inline( true );
 
 			$out = self::normalize_job_for_response( self::get_job_raw(), false );
 			$out['as_processed'] = $processed;
@@ -2939,8 +2939,9 @@ final class Activity_Logger {
 		$as_ok = Job_Action_Scheduler::is_available();
 
 		if ( $as_ok ) {
-			Job_Action_Scheduler::enqueue_next( true );
-			Job_Action_Scheduler::run_queue_inline();
+			Job_Action_Scheduler::clear_slice_mutex();
+			Job_Action_Scheduler::enqueue_next( true, 0 );
+			Job_Action_Scheduler::run_queue_inline( true );
 		} else {
 			self::run_action_scheduler_batch( 2 );
 		}
@@ -2996,14 +2997,19 @@ final class Activity_Logger {
 
 		Job_Action_Scheduler::ensure_scheduled();
 
+		$as_pending = Job_Action_Scheduler::has_pending_or_running();
 		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
+		$should_tick = $worker_dead || $as_pending || $age >= 30;
 
-		if ( $worker_dead && ! $busy && $age >= $stale_sec ) {
-			if ( Job_Action_Scheduler::is_available() ) {
-				Job_Action_Scheduler::run_queue_inline();
-			} else {
-				self::run_action_scheduler_batch( 2 );
+		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
+			$processed = Job_Action_Scheduler::run_queue_inline( true );
+			if ( $processed > 0 ) {
+				$job = self::get_job_raw();
+				$job['worker_inline_tick'] = true;
+				self::save_job( $job );
 			}
+		} elseif ( $should_tick && ! Job_Action_Scheduler::is_available() ) {
+			self::run_action_scheduler_batch( 2 );
 		}
 
 		$next = self::get_next_worker_cron();
@@ -3234,7 +3240,8 @@ final class Activity_Logger {
 
 		self::force_release_step_lock_if_idle();
 		self::ensure_recurring_pulse();
-		Job_Action_Scheduler::enqueue_next( true );
+		Job_Action_Scheduler::clear_slice_mutex_if_stale();
+		Job_Action_Scheduler::enqueue_next( true, 0 );
 
 		$result = self::keep_alive_as_worker();
 

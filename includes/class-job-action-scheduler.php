@@ -118,13 +118,13 @@ final class Job_Action_Scheduler {
 	}
 
 	/**
-	 * Enqueue the next async slice-batch action.
+	 * Enqueue the next slice-batch action.
 	 *
-	 * @param bool $force              Recover stale In-progress actions first when true.
-	 * @param bool $allow_while_running Allow enqueue while another action is In-progress (chain tail only).
+	 * @param bool     $force     Recover stale In-progress actions first when true.
+	 * @param int|null $delay_sec Seconds before the action is due (0 = run ASAP).
 	 * @return int Action ID or 0.
 	 */
-	public static function enqueue_next( $force = false, $allow_while_running = false ) {
+	public static function enqueue_next( $force = false, $delay_sec = null ) {
 		if ( ! Activity_Logger::is_bulk_job_running() ) {
 			return 0;
 		}
@@ -137,32 +137,33 @@ final class Job_Action_Scheduler {
 			self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
 		}
 
-		// Prefer a pending follow-up over stacking duplicates.
 		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
 			return 0;
 		}
 
-		/**
-		 * Fires before a translation AS action is enqueued.
-		 */
+		if ( null === $delay_sec ) {
+			$delay_sec = self::CHAIN_DELAY_SEC;
+		}
+
+		$delay_sec = max( 0, min( 30, absint( $delay_sec ) ) );
+
+		if ( $delay_sec <= 1 && self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0 ) {
+			return 0;
+		}
+
 		do_action( 'polymart_ai_before_enqueue_as_slice' );
 
 		$args = array(
 			'n' => sprintf( '%.6F', microtime( true ) ),
 		);
 
-		$delay = (int) apply_filters( 'polymart_ai_as_chain_delay_sec', self::CHAIN_DELAY_SEC );
-		$delay = max( 2, min( 30, $delay ) );
-		$when  = time() + $delay;
-
-		// Future-dated actions are safe while another slice is still finishing.
-		if ( $delay <= 1 && self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0 ) {
-			return 0;
+		if ( 0 === $delay_sec && function_exists( 'as_enqueue_async_action' ) ) {
+			$action_id = as_enqueue_async_action( self::HOOK, $args, self::GROUP, false );
+		} elseif ( function_exists( 'as_schedule_single_action' ) ) {
+			$action_id = as_schedule_single_action( time() + $delay_sec, self::HOOK, $args, self::GROUP );
+		} else {
+			$action_id = as_enqueue_async_action( self::HOOK, $args, self::GROUP, false );
 		}
-
-		$action_id = function_exists( 'as_schedule_single_action' )
-			? as_schedule_single_action( $when, self::HOOK, $args, self::GROUP )
-			: as_enqueue_async_action( self::HOOK, $args, self::GROUP, false );
 
 		Activity_Logger::log(
 			'info',
@@ -222,7 +223,7 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
-		return self::enqueue_next( false );
+		return self::enqueue_next( false, 0 );
 	}
 
 	/**
@@ -253,10 +254,12 @@ final class Job_Action_Scheduler {
 	 */
 	public static function cancel_all() {
 		if ( ! self::is_available() ) {
+			self::clear_slice_mutex();
 			return;
 		}
 
 		self::fail_all_running_actions();
+		self::clear_slice_mutex();
 
 		as_unschedule_all_actions( self::HOOK, array(), self::GROUP );
 		as_unschedule_all_actions( self::HOOK, null, self::GROUP );
@@ -280,6 +283,8 @@ final class Job_Action_Scheduler {
 		self::$handler_clean_exit = false;
 		self::$current_action_id  = self::resolve_current_action_id();
 		self::register_handler_shutdown();
+
+		self::clear_slice_mutex_if_stale();
 
 		if ( ! self::try_claim_slice_mutex( self::$current_action_id ) ) {
 			self::defer_slice_action( self::$current_action_id );
@@ -388,7 +393,7 @@ final class Job_Action_Scheduler {
 
 		if ( self::$handler_clean_exit ) {
 			if ( Activity_Logger::is_bulk_job_running() ) {
-				self::enqueue_next( true );
+				self::enqueue_next( true, self::CHAIN_DELAY_SEC );
 			}
 
 			return;
@@ -433,7 +438,7 @@ final class Job_Action_Scheduler {
 			);
 
 			if ( Activity_Logger::is_bulk_job_running() ) {
-				self::enqueue_next( true );
+				self::enqueue_next( true, 0 );
 			}
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
@@ -642,6 +647,10 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function defer_slice_action( $action_id ) {
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+			return;
+		}
+
 		$delay = (int) apply_filters( 'polymart_ai_as_concurrency_defer_sec', self::CONCURRENCY_DEFER_SEC );
 		$delay = max( 15, min( 120, $delay ) );
 
@@ -695,11 +704,32 @@ final class Job_Action_Scheduler {
 	}
 
 	/**
-	 * Run due Action Scheduler actions in this PHP request (cron keep-alive path).
+	 * Clear the single-flight mutex (bootstrap / stop / stale recovery).
 	 *
-	 * @return int Number of actions processed, or 0.
+	 * @return void
 	 */
-	public static function run_queue_inline() {
+	public static function clear_slice_mutex() {
+		delete_transient( self::SLICE_MUTEX_KEY );
+	}
+
+	/**
+	 * Drop a mutex left by a dead PHP worker.
+	 *
+	 * @return void
+	 */
+	public static function clear_slice_mutex_if_stale() {
+		if ( ! Activity_Logger::is_bulk_worker_lively( self::SLICE_BUDGET_SEC ) ) {
+			self::clear_slice_mutex();
+		}
+	}
+
+	/**
+	 * Run due actions, or force one inline slice when the AS queue is idle.
+	 *
+	 * @param bool $force_inline When true, run a batch directly if the runner processed nothing.
+	 * @return int Actions processed by the AS runner, or 1 when inline fallback ran.
+	 */
+	public static function run_queue_inline( $force_inline = false ) {
 		if ( ! self::is_available() ) {
 			return 0;
 		}
@@ -741,6 +771,13 @@ final class Job_Action_Scheduler {
 
 		remove_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
 		remove_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
+
+		if ( $done <= 0 && $force_inline && Activity_Logger::is_bulk_job_running() ) {
+			self::clear_slice_mutex_if_stale();
+			Activity_Logger::run_action_scheduler_batch( 1, self::SLICE_BUDGET_SEC );
+
+			return 1;
+		}
 
 		return $done;
 	}
