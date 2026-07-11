@@ -26,11 +26,18 @@ final class Activity_Logger {
 	const MAX_REPORT_ENTRIES   = 1000;
 	const MAX_JOB_RETRIES      = 3;
 	const STEP_LOCK_KEY        = 'polymart_ai_job_step_lock';
+	/** Atomic claim option paired with the step-lock transient. */
+	const STEP_LOCK_CLAIM_KEY  = 'polymart_ai_job_step_lock_claim';
 	/**
-	 * Absolute orphan ceiling. Living ticks call touch_step_lock() during work.
-	 * Keep this only slightly above one AI call — not 5+ minutes of idle queue.
+	 * Absolute orphan ceiling. Living ticks refresh the lock before/during AI HTTP.
+	 * Must stay above Post_Translator::JOB_REQUEST_MAX_TIMEOUT (165s).
 	 */
-	const STEP_LOCK_TTL        = 180;
+	const STEP_LOCK_TTL        = 210;
+	/**
+	 * ensure/kick must not force-unlock during a normal long AI call.
+	 * Keep above JOB_REQUEST_MAX_TIMEOUT so monitors cannot start a second worker.
+	 */
+	const LOCK_FORCE_IDLE_SEC  = 200;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	/**
 	 * Recurring pulse — survives closed admin tabs. Crontab every minute fires this
@@ -39,12 +46,12 @@ final class Activity_Logger {
 	const CRON_PULSE_HOOK      = 'polymart_ai_translation_job_pulse';
 	const CRON_PULSE_SCHEDULE  = 'polymart_ai_every_minute';
 	/** Seconds before the next self-chained tick after work finishes. */
-	const CRON_INTERVAL_SEC    = 5;
+	const CRON_INTERVAL_SEC    = 3;
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
-	const CRON_SAFETY_SEC      = 90;
-	const CRON_INTERVAL_SERVER_SEC = 5;
+	const CRON_SAFETY_SEC      = 120;
+	const CRON_INTERVAL_SERVER_SEC = 3;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
-	const CRON_STEP_BUDGET_SEC = 90;
+	const CRON_STEP_BUDGET_SEC = 120;
 	/** Max steps inside one cron tick (safety cap). */
 	const CRON_MAX_STEPS_PER_TICK = 20;
 	/**
@@ -64,6 +71,7 @@ final class Activity_Logger {
 		add_action( self::CRON_HOOK, array( __CLASS__, 'process_background_step' ) );
 		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'process_background_step' ) );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
+		add_action( 'polymart_ai_during_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		// Heal ONLY inside cron/REST — never on storefront/admin HTML loads
 		// (pinging cron on every page was spawning heavy AI work and freezing the site).
 		if ( wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_ajax() ) {
@@ -888,9 +896,11 @@ final class Activity_Logger {
 			$job['current_post'] = null;
 		}
 
-		$lock = get_transient( self::STEP_LOCK_KEY );
-		$job['worker_lock']     = (bool) $lock;
-		$job['worker_lock_age'] = $lock ? max( 0, time() - absint( $lock ) ) : null;
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$stamp = $lock ? absint( $lock ) : $claim;
+		$job['worker_lock']     = $stamp > 0;
+		$job['worker_lock_age'] = $stamp > 0 ? max( 0, time() - $stamp ) : null;
 
 		$next_cron = self::get_next_worker_cron();
 		$job['cron_scheduled'] = (bool) $next_cron;
@@ -955,26 +965,29 @@ final class Activity_Logger {
 	/**
 	 * Drop an orphaned step lock left by a killed/timed-out PHP process.
 	 *
-	 * IMPORTANT: Do NOT use heartbeat silence alone while a post is actively
-	 * being translated — a single AI call can exceed 60s. But a lock with no
-	 * current_post_id after a completed item is a between-tick deadlock and
+	 * IMPORTANT: Do NOT treat heartbeat silence alone as death while a post is
+	 * actively translating — a single AI call can take up to ~165s. A lock with
+	 * no current_post_id after a completed item is a between-tick deadlock and
 	 * must be cleared sooner so cron/ensure can continue.
 	 *
 	 * @return bool True when a stale lock was cleared.
 	 */
 	private static function maybe_release_stale_step_lock() {
-		$lock = get_transient( self::STEP_LOCK_KEY );
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
 
-		if ( ! $lock ) {
+		if ( ! $lock && $claim <= 0 ) {
 			return false;
 		}
 
-		$lock_age = time() - absint( $lock );
-		$job      = self::get_job_raw();
-		$current  = absint( $job['current_post_id'] ?? 0 );
-		$last     = max(
+		$lock_stamp = $lock ? absint( $lock ) : $claim;
+		$lock_age   = time() - $lock_stamp;
+		$job        = self::get_job_raw();
+		$current    = absint( $job['current_post_id'] ?? 0 );
+		$last       = max(
 			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 )
+			absint( $job['worker_heartbeat_at'] ?? 0 ),
+			$lock_stamp
 		);
 		$idle_for = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
@@ -994,7 +1007,7 @@ final class Activity_Logger {
 			return false;
 		}
 
-		delete_transient( self::STEP_LOCK_KEY );
+		self::release_step_lock();
 
 		$job['step_started_at'] = null;
 		$job['current_post_id'] = null;
@@ -1007,21 +1020,32 @@ final class Activity_Logger {
 	 * Force-clear the step lock when the job has been silent too long.
 	 *
 	 * Used by ensure/kick recovery so a stuck object-cache lock cannot block
-	 * the queue for many minutes.
+	 * the queue for many minutes. Threshold stays above one max AI call so a
+	 * healthy long translation is never stolen by the monitor.
 	 *
-	 * @param int $idle_sec Seconds of silence before forcing unlock.
+	 * @param int|null $idle_sec Seconds of silence before forcing unlock.
 	 * @return bool
 	 */
-	private static function force_release_step_lock_if_idle( $idle_sec = 90 ) {
-		$idle_sec = max( 30, absint( $idle_sec ) );
-		$job      = self::get_job_raw();
-		$last     = max(
+	private static function force_release_step_lock_if_idle( $idle_sec = null ) {
+		$idle_sec = null === $idle_sec
+			? self::LOCK_FORCE_IDLE_SEC
+			: max( self::LOCK_FORCE_IDLE_SEC, absint( $idle_sec ) );
+
+		$job     = self::get_job_raw();
+		$current = absint( $job['current_post_id'] ?? 0 );
+
+		// Actively translating a known post — never force-unlock before full TTL.
+		if ( $current > 0 ) {
+			$idle_sec = max( $idle_sec, self::STEP_LOCK_TTL );
+		}
+
+		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 )
 		);
 		$idle_for = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		if ( $idle_for < $idle_sec && get_transient( self::STEP_LOCK_KEY ) ) {
+		if ( $idle_for < $idle_sec && ( get_transient( self::STEP_LOCK_KEY ) || get_option( self::STEP_LOCK_CLAIM_KEY ) ) ) {
 			// Still recent activity — only use normal stale logic.
 			return self::maybe_release_stale_step_lock();
 		}
@@ -1030,10 +1054,10 @@ final class Activity_Logger {
 			return false;
 		}
 
-		$had_lock = (bool) get_transient( self::STEP_LOCK_KEY );
-		delete_transient( self::STEP_LOCK_KEY );
+		$had_lock = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
+		self::release_step_lock();
 
-		if ( $had_lock || absint( $job['current_post_id'] ?? 0 ) > 0 ) {
+		if ( $had_lock || $current > 0 ) {
 			$job['step_started_at'] = null;
 			$job['current_post_id'] = null;
 			self::save_job( $job );
@@ -1050,11 +1074,14 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	private static function touch_step_lock() {
-		if ( ! get_transient( self::STEP_LOCK_KEY ) ) {
+		$now = time();
+
+		if ( ! get_transient( self::STEP_LOCK_KEY ) && ! get_option( self::STEP_LOCK_CLAIM_KEY ) ) {
 			return;
 		}
 
-		set_transient( self::STEP_LOCK_KEY, time(), self::STEP_LOCK_TTL );
+		update_option( self::STEP_LOCK_CLAIM_KEY, (string) $now, false );
+		set_transient( self::STEP_LOCK_KEY, $now, self::STEP_LOCK_TTL );
 	}
 
 	/**
@@ -1084,11 +1111,12 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function is_worker_heartbeat_fresh( array $job ) {
-		if ( get_transient( self::STEP_LOCK_KEY ) ) {
-			$lock = absint( get_transient( self::STEP_LOCK_KEY ) );
-			$age  = $lock > 0 ? ( time() - $lock ) : PHP_INT_MAX;
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
 
-			return $age < self::STEP_LOCK_TTL;
+		if ( $stamp > 0 ) {
+			return ( time() - $stamp ) < self::STEP_LOCK_TTL;
 		}
 
 		$last = max(
@@ -1101,7 +1129,7 @@ final class Activity_Logger {
 			return false;
 		}
 
-		return ( time() - $last ) < 45;
+		return ( time() - $last ) < self::LOCK_IDLE_ORPHAN_SEC;
 	}
 
 	/**
@@ -1708,7 +1736,7 @@ final class Activity_Logger {
 	public static function save_job( array $job ) {
 		$fresh = get_option( self::JOB_OPTION, array() );
 
-		// Same run: merge durable success IDs so concurrent ticks cannot wipe each other.
+		// Same run: merge durable progress so concurrent ticks cannot wipe each other.
 		if (
 			is_array( $fresh )
 			&& ! empty( $fresh )
@@ -1729,6 +1757,62 @@ final class Activity_Logger {
 			$job['succeeded']     = count( $merged );
 			$job['steps']         = max( (int) ( $job['steps'] ?? 0 ), (int) ( $fresh['steps'] ?? 0 ) );
 			$job['processed']     = max( (int) ( $job['processed'] ?? 0 ), (int) ( $fresh['processed'] ?? 0 ), (int) $job['steps'] );
+
+			foreach ( array( 'exhausted_ids', 'partial_ids' ) as $list_key ) {
+				$job_list   = is_array( $job[ $list_key ] ?? null ) ? $job[ $list_key ] : array();
+				$fresh_list = is_array( $fresh[ $list_key ] ?? null ) ? $fresh[ $list_key ] : array();
+				$job[ $list_key ] = array_values(
+					array_unique(
+						array_filter(
+							array_map( 'absint', array_merge( $fresh_list, $job_list ) )
+						)
+					)
+				);
+			}
+
+			// Prefer the more advanced writer's queues so removals are not resurrected.
+			$job_steps   = (int) ( $job['steps'] ?? 0 );
+			$fresh_steps = (int) ( $fresh['steps'] ?? 0 );
+
+			if ( $fresh_steps > $job_steps ) {
+				foreach ( array( 'deferred_queue', 'retry_queue' ) as $queue_key ) {
+					if ( is_array( $fresh[ $queue_key ] ?? null ) ) {
+						$job[ $queue_key ] = array_values(
+							array_unique(
+								array_filter( array_map( 'absint', $fresh[ $queue_key ] ) )
+							)
+						);
+					}
+				}
+
+				if ( empty( $job['partial_post_id'] ) && absint( $fresh['partial_post_id'] ?? 0 ) > 0 ) {
+					$job['partial_post_id'] = absint( $fresh['partial_post_id'] );
+				}
+			} else {
+				foreach ( array( 'deferred_queue', 'retry_queue' ) as $queue_key ) {
+					if ( is_array( $job[ $queue_key ] ?? null ) ) {
+						$job[ $queue_key ] = array_values(
+							array_unique(
+								array_filter( array_map( 'absint', $job[ $queue_key ] ) )
+							)
+						);
+					}
+				}
+			}
+
+			$job_attempts   = is_array( $job['retry_attempts'] ?? null ) ? $job['retry_attempts'] : array();
+			$fresh_attempts = is_array( $fresh['retry_attempts'] ?? null ) ? $fresh['retry_attempts'] : array();
+			$merged_attempts = $fresh_attempts;
+
+			foreach ( $job_attempts as $post_key => $attempts ) {
+				$post_key = (string) absint( $post_key );
+				$merged_attempts[ $post_key ] = max(
+					absint( $merged_attempts[ $post_key ] ?? 0 ),
+					absint( $attempts )
+				);
+			}
+
+			$job['retry_attempts'] = $merged_attempts;
 		}
 
 		$job['updated_at'] = time();
@@ -1770,6 +1854,9 @@ final class Activity_Logger {
 				__( 'یک فرآیند ترجمه خودکار در حال اجراست. ابتدا آن را متوقف یا از سرگیری کنید.', 'polymart-ai' )
 			);
 		}
+
+		// Drop leftover locks / partial meta from a previous paused/completed run.
+		self::cleanup_job_translation_locks( $existing );
 
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
@@ -1862,10 +1949,23 @@ final class Activity_Logger {
 		$job = self::get_job_raw();
 
 		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			$lang       = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+			$partial_id = absint( $job['partial_post_id'] ?? 0 );
+			$current_id = absint( $job['current_post_id'] ?? 0 );
+
+			// Release locks so manual translate / next resume is not blocked,
+			// but keep partial meta so resume can continue mid-slice.
+			foreach ( array_unique( array_filter( array( $partial_id, $current_id ) ) ) as $post_id ) {
+				if ( $post_id > 0 && '' !== $lang ) {
+					Post_Translator::release_translation_lock( $post_id, $lang );
+				}
+			}
+
 			$job['status']          = 'paused';
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
 			self::save_job( $job );
+			self::release_step_lock();
 			self::unschedule_background_worker();
 			self::log( 'warning', __( 'ترجمه خودکار متوقف موقت شد.', 'polymart-ai' ) );
 		}
@@ -1906,21 +2006,12 @@ final class Activity_Logger {
 		$job = self::get_job_raw();
 
 		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
-			$lang       = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-			$partial_id = absint( $job['partial_post_id'] ?? 0 );
-			$current_id = absint( $job['current_post_id'] ?? 0 );
-
-			foreach ( array_unique( array_filter( array( $partial_id, $current_id ) ) ) as $post_id ) {
-				if ( $post_id > 0 && '' !== $lang ) {
-					Post_Translator::clear_job_partial_state( $post_id, $lang );
-					Post_Translator::release_translation_lock( $post_id, $lang );
-				}
-			}
-
+			self::cleanup_job_translation_locks( $job, true );
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
+		} else {
+			self::release_step_lock();
 		}
 
-		self::release_step_lock();
 		self::unschedule_background_worker();
 
 		return self::save_job( self::empty_job() );
@@ -2091,27 +2182,68 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Release per-post locks and optional partial meta for a job snapshot.
+	 *
+	 * @param array<string, mixed> $job          Job state.
+	 * @param bool                 $clear_partial Whether to clear resume meta.
+	 * @return void
+	 */
+	private static function cleanup_job_translation_locks( array $job, $clear_partial = true ) {
+		$lang       = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+		$partial_id = absint( $job['partial_post_id'] ?? 0 );
+		$current_id = absint( $job['current_post_id'] ?? 0 );
+
+		foreach ( array_unique( array_filter( array( $partial_id, $current_id ) ) ) as $post_id ) {
+			if ( $post_id <= 0 || '' === $lang ) {
+				continue;
+			}
+
+			if ( $clear_partial ) {
+				Post_Translator::clear_job_partial_state( $post_id, $lang );
+			}
+
+			Post_Translator::release_translation_lock( $post_id, $lang );
+		}
+
+		self::release_step_lock();
+	}
+
+	/**
 	 * Acquire a global lock so only one job step runs at a time.
+	 *
+	 * Uses an atomic add_option claim so two cron/REST workers cannot both win
+	 * under load or object-cache replication lag.
 	 *
 	 * @return bool
 	 */
 	private static function acquire_step_lock() {
 		self::maybe_release_stale_step_lock();
 
-		$lock = get_transient( self::STEP_LOCK_KEY );
+		$now    = time();
+		$claim  = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$lock   = get_transient( self::STEP_LOCK_KEY );
+		$stamp  = max( $claim, $lock ? absint( $lock ) : 0 );
 
-		if ( $lock ) {
-			$lock_age = time() - absint( $lock );
-
-			// Another worker is alive and still refreshing the lock.
-			if ( $lock_age < self::STEP_LOCK_TTL ) {
-				return false;
+		if ( $stamp > 0 && ( $now - $stamp ) < self::STEP_LOCK_TTL ) {
+			// Mirror transient for UI if claim exists alone.
+			if ( ! $lock && $claim > 0 ) {
+				set_transient( self::STEP_LOCK_KEY, $claim, self::STEP_LOCK_TTL );
 			}
 
+			return false;
+		}
+
+		if ( $stamp > 0 ) {
+			delete_option( self::STEP_LOCK_CLAIM_KEY );
 			delete_transient( self::STEP_LOCK_KEY );
 		}
 
-		set_transient( self::STEP_LOCK_KEY, time(), self::STEP_LOCK_TTL );
+		// add_option is atomic in MySQL — only one worker wins.
+		if ( ! add_option( self::STEP_LOCK_CLAIM_KEY, (string) $now, '', 'no' ) ) {
+			return false;
+		}
+
+		set_transient( self::STEP_LOCK_KEY, $now, self::STEP_LOCK_TTL );
 
 		return true;
 	}
@@ -2247,7 +2379,24 @@ final class Activity_Logger {
 		// Prefer real server crontab when DISABLE_WP_CRON is on — loopback from
 		// PHP often blocks or races with page traffic on production hosts.
 		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
-			if ( ! apply_filters( 'polymart_ai_job_cron_loopback', false ) ) {
+			$allow_loopback = (bool) apply_filters( 'polymart_ai_job_cron_loopback', false );
+
+			// Safety net: if the worker looks dead, try a one-shot loopback so a
+			// misconfigured crontab cannot stall the queue forever.
+			if ( ! $allow_loopback ) {
+				$job  = self::get_job_raw();
+				$last = max(
+					absint( $job['last_cron_at'] ?? 0 ),
+					absint( $job['worker_heartbeat_at'] ?? 0 )
+				);
+				$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+				if ( 'running' === ( $job['status'] ?? '' ) && $age >= self::LOCK_FORCE_IDLE_SEC ) {
+					$allow_loopback = true;
+				}
+			}
+
+			if ( ! $allow_loopback ) {
 				return;
 			}
 
@@ -2292,7 +2441,7 @@ final class Activity_Logger {
 			ignore_user_abort( true );
 		}
 
-		self::force_release_step_lock_if_idle( 90 );
+		self::force_release_step_lock_if_idle();
 		self::clear_chain_events();
 		self::schedule_background_worker( 0 );
 		self::ping_wp_cron( true );
@@ -2328,23 +2477,8 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		$last = max(
-			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 )
-		);
-		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
-
-		$released_stale_lock = self::force_release_step_lock_if_idle( 90 );
+		$released_stale_lock = self::force_release_step_lock_if_idle();
 		$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
-
-		if ( $age >= 90 && get_transient( self::STEP_LOCK_KEY ) ) {
-			delete_transient( self::STEP_LOCK_KEY );
-			$released_stale_lock    = true;
-			$job                    = self::get_job_raw();
-			$job['step_started_at'] = null;
-			$job['current_post_id'] = null;
-			self::save_job( $job );
-		}
 
 		self::ensure_recurring_pulse();
 
@@ -2360,7 +2494,7 @@ final class Activity_Logger {
 		$job['next_cron_at']        = $next ? (int) $next : null;
 		$job['cron_scheduled']      = (bool) $next;
 		$job['worker_ensured']      = true;
-		$job['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY );
+		$job['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
 
 		if ( $released_stale_lock ) {
 			$job['lock_recovered'] = true;
@@ -2448,7 +2582,8 @@ final class Activity_Logger {
 		$last_result = null;
 
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( max( 120, $budget + 60 ) );
+			// One tick may include a full AI call (up to ~165s) plus several slices.
+			@set_time_limit( max( 300, $budget + 180 ) );
 		}
 
 		while ( $steps_run < $max_steps ) {
@@ -2548,7 +2683,7 @@ final class Activity_Logger {
 			ignore_user_abort( true );
 		}
 
-		self::force_release_step_lock_if_idle( 90 );
+		self::force_release_step_lock_if_idle();
 		self::schedule_background_worker( 1 );
 		self::ping_wp_cron( true );
 
@@ -2562,6 +2697,7 @@ final class Activity_Logger {
 	 */
 	private static function release_step_lock() {
 		delete_transient( self::STEP_LOCK_KEY );
+		delete_option( self::STEP_LOCK_CLAIM_KEY );
 	}
 
 	/**

@@ -8,13 +8,16 @@ import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
 /** If cron has not ticked for this long, nudge/ensure the server worker. */
-const CRON_STALE_SEC = 20;
-/** Lock alone is only trusted this long without a completed tick. */
-const LOCK_HEALTHY_SEC = 90;
+const CRON_STALE_SEC = 30;
+/**
+ * Lock alone is trusted this long without a completed tick.
+ * Must stay above max AI HTTP timeout (~165s) so the monitor does not steal a living worker.
+ */
+const LOCK_HEALTHY_SEC = 200;
 /** Between-item lock with no progress — force ensure. */
-const LOCK_IDLE_STALE_SEC = 45;
+const LOCK_IDLE_STALE_SEC = 60;
 /** Do not hammer ensure more than once per this interval. */
-const ENSURE_MIN_INTERVAL_MS = 30000;
+const ENSURE_MIN_INTERVAL_MS = 45000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -136,7 +139,7 @@ function jobPhaseLabel(phase) {
 }
 
 function jobStepHeadline(lastStepStatus, displayPost, job) {
-  if (job?.worker_lock && Number(job?.worker_lock_age || 0) > 120) {
+  if (job?.worker_lock && Number(job?.worker_lock_age || 0) > LOCK_HEALTHY_SEC) {
     return 'قفل مرحله گیر کرده — در حال بازیابی…';
   }
 

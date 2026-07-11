@@ -608,6 +608,15 @@ final class Async_Translator {
 			return;
 		}
 
+		// Auto-translate job owns posts — reschedule async work until it finishes.
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			if ( ! wp_next_scheduled( self::CRON_HOOK, array( $post_id ) ) ) {
+				wp_schedule_single_event( time() + MINUTE_IN_SECONDS, self::CRON_HOOK, array( $post_id ) );
+			}
+
+			return;
+		}
+
 		$post = get_post( $post_id );
 
 		if ( ! $post instanceof \WP_Post || ! in_array( $post->post_type, Post_Translator::get_supported_post_types(), true ) ) {
@@ -741,6 +750,15 @@ final class Async_Translator {
 		$term_id = absint( $term_id );
 
 		if ( ! $term_id || self::$is_translating ) {
+			return;
+		}
+
+		// Defer while auto-translate owns the AI budget; reschedule shortly after.
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			if ( ! wp_next_scheduled( self::TERM_CRON_HOOK, array( $term_id ) ) ) {
+				wp_schedule_single_event( time() + MINUTE_IN_SECONDS, self::TERM_CRON_HOOK, array( $term_id ) );
+			}
+
 			return;
 		}
 
@@ -943,6 +961,11 @@ final class Async_Translator {
 		$term_id = absint( $term_id );
 
 		if ( ! $term_id || self::$is_translating ) {
+			return;
+		}
+
+		// Bulk auto-translate owns the AI budget — defer term work until it finishes.
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			return;
 		}
 

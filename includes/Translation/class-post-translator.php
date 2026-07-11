@@ -3711,9 +3711,12 @@ final class Post_Translator {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$key     = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
+		$claim   = $key . '_claim';
+		$now     = time();
 
-		if ( get_transient( $key ) ) {
-			set_transient( $key, time(), self::TRANSLATION_LOCK_TTL );
+		if ( get_transient( $key ) || get_option( $claim ) ) {
+			update_option( $claim, (string) $now, false );
+			set_transient( $key, $now, self::TRANSLATION_LOCK_TTL );
 
 			return true;
 		}
@@ -3874,9 +3877,13 @@ final class Post_Translator {
 				$payload    = self::collect_persian_fields( $post, $lang );
 				$chunks     = empty( $payload ) ? array() : self::chunk_payload_for_job_phase( $payload, 'core', $post_id );
 				$total      = count( $chunks );
-				$index      = 0;
+				$index      = max( 0, (int) ( $state['field_chunk_index'] ?? 0 ) );
 				$budget     = 1;
 				$ai_options = self::get_job_ai_request_options( $post_id, 'fields' );
+
+				if ( $total <= 0 || $index >= $total ) {
+					return self::finalize_job_field_phases( $post_id, $lang, $state );
+				}
 
 				while ( $index < $total && $budget > 0 ) {
 					$chunk_result = AI_Client::translate_fields(
@@ -5341,13 +5348,32 @@ final class Post_Translator {
 			return false;
 		}
 
-		$key = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
+		$key   = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
+		$claim = $key . '_claim';
+		$now   = time();
 
-		if ( get_transient( $key ) ) {
+		$existing_claim = absint( get_option( $claim, 0 ) );
+		$existing_lock  = get_transient( $key );
+		$stamp          = max( $existing_claim, $existing_lock ? absint( $existing_lock ) : 0 );
+
+		if ( $stamp > 0 && ( $now - $stamp ) < self::TRANSLATION_LOCK_TTL ) {
+			if ( ! $existing_lock && $existing_claim > 0 ) {
+				set_transient( $key, $existing_claim, self::TRANSLATION_LOCK_TTL );
+			}
+
 			return false;
 		}
 
-		set_transient( $key, time(), self::TRANSLATION_LOCK_TTL );
+		if ( $stamp > 0 ) {
+			delete_option( $claim );
+			delete_transient( $key );
+		}
+
+		if ( ! add_option( $claim, (string) $now, '', 'no' ) ) {
+			return false;
+		}
+
+		set_transient( $key, $now, self::TRANSLATION_LOCK_TTL );
 
 		return true;
 	}
@@ -5367,7 +5393,9 @@ final class Post_Translator {
 			return;
 		}
 
-		delete_transient( self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang );
+		$key = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
+		delete_transient( $key );
+		delete_option( $key . '_claim' );
 	}
 
 	/**

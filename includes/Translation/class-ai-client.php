@@ -74,6 +74,7 @@ final class AI_Client {
 
 	/**
 	 * Force cURL to honor the computed translation timeout (some hosts default to 30s).
+	 * Also emits mid-request heartbeats so the bulk job lock stays fresh during long AI calls.
 	 *
 	 * @param resource|\CurlHandle $handle cURL handle.
 	 * @return void
@@ -87,6 +88,30 @@ final class AI_Client {
 
 		curl_setopt( $handle, CURLOPT_TIMEOUT, $timeout );
 		curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, min( 45, $timeout ) );
+
+		// Keep the auto-translate worker heartbeat alive while Arvan is thinking.
+		if ( $timeout >= 60 && function_exists( 'curl_setopt' ) ) {
+			curl_setopt( $handle, CURLOPT_NOPROGRESS, false );
+			curl_setopt(
+				$handle,
+				CURLOPT_PROGRESSFUNCTION,
+				static function () {
+					static $last_beat = 0;
+
+					$now = time();
+
+					if ( $now - $last_beat >= 15 ) {
+						$last_beat = $now;
+						/**
+						 * Fires periodically during a long ArvanCloud HTTP request.
+						 */
+						do_action( 'polymart_ai_during_ai_http' );
+					}
+
+					return 0;
+				}
+			);
+		}
 	}
 
 	/**
