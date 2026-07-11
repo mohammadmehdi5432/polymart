@@ -353,15 +353,16 @@ final class Activity_Logger {
 	 * Bounded multi-slice batch used by Action Scheduler callbacks and cron fallback.
 	 *
 	 * @param int|null $max_steps_override Optional step cap.
+	 * @param int|null $budget_override    Optional wall-clock budget in seconds.
 	 * @return array<string, mixed>
 	 */
-	public static function run_action_scheduler_batch( $max_steps_override = null ) {
+	public static function run_action_scheduler_batch( $max_steps_override = null, $budget_override = null ) {
 		self::$trusted_as_tick        = true;
 		self::$trusted_job_tick       = true;
 		self::$skip_chain_after_tick  = true;
 
 		try {
-			return self::process_background_step( $max_steps_override );
+			return self::process_background_step( $max_steps_override, $budget_override );
 		} finally {
 			self::$skip_chain_after_tick = false;
 			self::$trusted_as_tick       = false;
@@ -414,7 +415,11 @@ final class Activity_Logger {
 			$post_id = absint( $job['last_step']['post_id'] ?? 0 );
 		}
 
-		$title = $post_id > 0 ? (string) ( get_the_title( $post_id ) ?: '' ) : '';
+		if ( $post_id <= 0 ) {
+			return self::recover_worker_infrastructure_failure( $message, $context );
+		}
+
+		$title = (string) ( get_the_title( $post_id ) ?: '' );
 
 		self::log(
 			'error',
@@ -482,6 +487,40 @@ final class Activity_Logger {
 		$job['last_worker']            = self::$trusted_as_tick ? 'as' : self::resolve_last_worker_label();
 
 		self::save_job( $job );
+
+		return self::normalize_job_for_response( $job, false );
+	}
+
+	/**
+	 * Recover from worker/AS infrastructure failures (no specific post to blame).
+	 *
+	 * @param string               $message Error message.
+	 * @param array<string, mixed> $context Extra log context.
+	 * @return array<string, mixed>
+	 */
+	public static function recover_worker_infrastructure_failure( $message, array $context = array() ) {
+		$message = is_string( $message ) ? $message : wp_json_encode( $message );
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: %s: error message */
+				__( 'خطای زیرساخت کارگر ترجمه — صف ادامه می‌یابد. خطا: %s', 'polymart-ai' ),
+				$message
+			),
+			$context
+		);
+
+		self::force_unlock_step_now();
+
+		$job = self::get_job_raw();
+
+		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			$job['worker_heartbeat_at'] = time();
+			$job['last_cron_at']        = time();
+			$job['last_worker']         = self::$trusted_as_tick ? 'as' : self::resolve_last_worker_label();
+			self::save_job( $job );
+		}
 
 		return self::normalize_job_for_response( $job, false );
 	}
@@ -3051,9 +3090,10 @@ final class Activity_Logger {
 	 * Schedules the next event BEFORE work so fatals/timeouts do not orphan the chain.
 	 *
 	 * @param int|null $max_steps_override Optional bounded step count for REST recovery.
+	 * @param int|null $budget_override    Optional wall-clock budget override (AS slices).
 	 * @return array<string, mixed> Normalized job after the tick.
 	 */
-	public static function process_background_step( $max_steps_override = null ) {
+	public static function process_background_step( $max_steps_override = null, $budget_override = null ) {
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -3083,7 +3123,9 @@ final class Activity_Logger {
 		wp_schedule_single_event( time() + self::CRON_SAFETY_SEC, self::CRON_HOOK );
 
 		$started   = time();
-		$budget    = self::get_cron_step_budget_sec();
+		$budget    = null !== $budget_override
+			? max( 20, min( 120, absint( $budget_override ) ) )
+			: self::get_cron_step_budget_sec();
 		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
 		$max_steps = max( 1, min( 40, $max_steps ) );
 		if ( null !== $max_steps_override ) {
@@ -3093,8 +3135,8 @@ final class Activity_Logger {
 		$last_result = null;
 
 		if ( function_exists( 'set_time_limit' ) ) {
-			// One tick may include a full AI call (up to ~165s) plus several slices.
-			@set_time_limit( max( 300, $budget + 180 ) );
+			$limit = self::$trusted_as_tick ? min( 120, $budget + 15 ) : max( 300, $budget + 180 );
+			@set_time_limit( $limit );
 		}
 
 		while ( $steps_run < $max_steps ) {
@@ -3228,7 +3270,8 @@ final class Activity_Logger {
 	 */
 	public static function process_job_step() {
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 1200 );
+			$limit = self::$trusted_as_tick ? 120 : 1200;
+			@set_time_limit( $limit );
 		}
 
 		$job = self::get_job_raw();

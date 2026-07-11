@@ -294,6 +294,11 @@ final class Post_Translator {
 	const AI_FIELD_CHUNK_SIZE = 6;
 
 	/**
+	 * Core field batches per auto-translate job slice (smaller than manual translate).
+	 */
+	const JOB_CORE_FIELD_CHUNK_SIZE = 3;
+
+	/**
 	 * Maximum combined characters per AI request batch.
 	 */
 	const AI_MAX_CHUNK_CHARS = 3500;
@@ -342,7 +347,7 @@ final class Post_Translator {
 	/**
 	 * Variation title batches — variable products may have 100+ rows.
 	 */
-	const VARIATION_AI_FIELD_CHUNK_SIZE = 3;
+	const VARIATION_AI_FIELD_CHUNK_SIZE = 2;
 
 	/**
 	 * Maximum combined characters per variation AI batch.
@@ -352,7 +357,7 @@ final class Post_Translator {
 	/**
 	 * Commerce attribute/term batches.
 	 */
-	const COMMERCE_AI_FIELD_CHUNK_SIZE = 4;
+	const COMMERCE_AI_FIELD_CHUNK_SIZE = 2;
 
 	/**
 	 * Maximum combined characters per commerce AI batch.
@@ -2940,11 +2945,11 @@ final class Post_Translator {
 						$variation_count = count( $product->get_children() );
 
 						if ( $variation_count > 80 ) {
-							$max_fields = 5;
-							$max_chars  = 2500;
+							$max_fields = 3;
+							$max_chars  = 1800;
 						} elseif ( $variation_count > 30 ) {
-							$max_fields = 4;
-							$max_chars  = 2200;
+							$max_fields = 2;
+							$max_chars  = 1500;
 						}
 					}
 				}
@@ -2978,7 +2983,7 @@ final class Post_Translator {
 			default:
 				return self::chunk_payload_with_limits(
 					$payload,
-					self::AI_FIELD_CHUNK_SIZE,
+					self::JOB_CORE_FIELD_CHUNK_SIZE,
 					self::AI_MAX_CHUNK_CHARS
 				);
 		}
@@ -3126,7 +3131,7 @@ final class Post_Translator {
 		 *
 		 * @param int $chunks Default 2.
 		 */
-		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_field_chunks', 2 ) );
+		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_field_chunks', 1 ) );
 	}
 
 	/**
@@ -3146,7 +3151,7 @@ final class Post_Translator {
 		} elseif ( 'commerce' === $phase ) {
 			$chunks = 1;
 		} elseif ( 'variations' === $phase ) {
-			$chunks = 2;
+			$chunks = 1;
 
 			if ( $post_id > 0 && function_exists( 'wc_get_product' ) ) {
 				$product = wc_get_product( $post_id );
@@ -3155,8 +3160,6 @@ final class Post_Translator {
 					$variation_count = count( $product->get_children() );
 
 					if ( $variation_count > 80 ) {
-						$chunks = 3;
-					} elseif ( $variation_count > 30 ) {
 						$chunks = 2;
 					}
 				}
