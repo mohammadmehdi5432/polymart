@@ -3,7 +3,7 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
+import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi, jobStep } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
@@ -92,12 +92,12 @@ function mergeJobSnapshot(prev, data) {
 
   const merged = { ...data };
 
+  // Never keep a previous "active" post as if the worker still owns it — that
+  // made isCronHealthy trust a dead lock and skip recovery for minutes.
   if (!merged.current_post?.title) {
-    const fromLast = resolveDisplayPost(merged, prev?.current_post);
+    const fromLast = resolveDisplayPost(merged, null);
     if (fromLast?.title) {
       merged.current_post = fromLast;
-    } else if (prev?.current_post?.title) {
-      merged.current_post = prev.current_post;
     }
   }
 
@@ -400,11 +400,11 @@ export default function AutoTranslateApp() {
   }, [appendStepLog, syncServerLogs]);
 
   /**
-   * Light server nudge: schedule/ping cron only — never run translation in the browser.
+   * Recover a stalled server worker. Soft ensure first; hard kick if silent too long.
    */
-  const ensureServerWorker = useCallback(async () => {
+  const ensureServerWorker = useCallback(async (forceKick = false) => {
     try {
-      const data = await jobAction('ensure');
+      const data = forceKick ? await jobStep() : await jobAction('ensure');
       if (isActiveRef.current) {
         applyJobUpdate(data);
       }
@@ -461,25 +461,30 @@ export default function AutoTranslateApp() {
           return;
         }
 
-        if (
-          data.status === 'running' &&
-          !isCronHealthy(data) &&
-          !ensureInFlight
-        ) {
+        if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight) {
+          const now = Math.floor(Date.now() / 1000);
+          const activityAge = Math.max(
+            0,
+            now - Number(data.last_cron_at || data.worker_heartbeat_at || 0)
+          );
           const lockAge = Number(data.worker_lock_age || 0);
           const hasActivePost = Boolean(
             data.current_post?.title && !data.current_post?.from_last_step
           );
-          // Only block ensure while a real in-flight post translation owns the lock.
           const lockBlocks =
             Boolean(data.worker_lock) &&
             hasActivePost &&
             lockAge >= 0 &&
-            lockAge < LOCK_HEALTHY_SEC;
+            lockAge < LOCK_HEALTHY_SEC &&
+            activityAge < LOCK_HEALTHY_SEC;
 
           if (!lockBlocks) {
             ensureInFlight = true;
-            await ensureServerWorker();
+            // After 45s silence, force a real kick — ensure alone was getting stuck on locks.
+            const recovered = await ensureServerWorker(activityAge >= 45);
+            if (recovered?.lock_recovered && isActiveRef.current) {
+              appendLog('قفل گیرکرده آزاد شد — کارگر از نو شروع شد.', 'warning');
+            }
             ensureInFlight = false;
           }
         }
@@ -829,12 +834,14 @@ export default function AutoTranslateApp() {
   const statusLabel = actionPendingLabel
     ? actionPendingLabel
     : isRunning
-      ? job?.worker_lock
+      ? job?.worker_lock && cronAgeSec != null && cronAgeSec < LOCK_HEALTHY_SEC
         ? `کرون در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
         : cronAgeSec != null
           ? cronAgeSec < CRON_STALE_SEC
             ? `در حال اجرا روی سرور — آخرین تیک ${cronAgeSec}ث پیش`
-            : `در حال اجرا — آخرین فعالیت ${cronAgeSec}ث پیش`
+            : cronAgeSec >= 45
+              ? `کارگر خوابیده (${cronAgeSec}ث) — در حال بازیابی اجباری…`
+              : `در حال اجرا — آخرین فعالیت ${cronAgeSec}ث پیش`
           : job?.cron_scheduled
             ? 'زمان‌بندی شده — منتظر اجرای crontab'
             : 'در حال اجرا روی سرور (کارگر کرون)'

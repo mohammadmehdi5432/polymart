@@ -952,6 +952,10 @@ final class Activity_Logger {
 		);
 		$idle_for = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
+		// Hard stop: no heartbeat/tick for a full lock TTL means the worker is dead,
+		// even if current_post_id is still set (killed mid-request).
+		$worker_dead = $idle_for >= self::STEP_LOCK_TTL;
+
 		// Between items: lock held, no active post, and no completed tick recently.
 		$idle_orphan = ( 0 === $current )
 			&& $idle_for >= self::LOCK_IDLE_ORPHAN_SEC
@@ -960,7 +964,7 @@ final class Activity_Logger {
 		// Living worker stopped touching the lock for the full TTL.
 		$ttl_expired = $lock_age >= self::STEP_LOCK_TTL;
 
-		if ( ! $idle_orphan && ! $ttl_expired ) {
+		if ( ! $worker_dead && ! $idle_orphan && ! $ttl_expired ) {
 			return false;
 		}
 
@@ -971,6 +975,47 @@ final class Activity_Logger {
 		self::save_job( $job );
 
 		return true;
+	}
+
+	/**
+	 * Force-clear the step lock when the job has been silent too long.
+	 *
+	 * Used by ensure/kick recovery so a stuck object-cache lock cannot block
+	 * the queue for many minutes.
+	 *
+	 * @param int $idle_sec Seconds of silence before forcing unlock.
+	 * @return bool
+	 */
+	private static function force_release_step_lock_if_idle( $idle_sec = 90 ) {
+		$idle_sec = max( 30, absint( $idle_sec ) );
+		$job      = self::get_job_raw();
+		$last     = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 )
+		);
+		$idle_for = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+		if ( $idle_for < $idle_sec && get_transient( self::STEP_LOCK_KEY ) ) {
+			// Still recent activity — only use normal stale logic.
+			return self::maybe_release_stale_step_lock();
+		}
+
+		if ( $idle_for < $idle_sec ) {
+			return false;
+		}
+
+		$had_lock = (bool) get_transient( self::STEP_LOCK_KEY );
+		delete_transient( self::STEP_LOCK_KEY );
+
+		if ( $had_lock || absint( $job['current_post_id'] ?? 0 ) > 0 ) {
+			$job['step_started_at'] = null;
+			$job['current_post_id'] = null;
+			self::save_job( $job );
+
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -2237,18 +2282,25 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		$released_stale_lock = self::maybe_release_stale_step_lock();
-		$lock_held           = (bool) get_transient( self::STEP_LOCK_KEY );
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
+		}
 
-		$next = self::get_next_worker_cron();
 		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 )
 		);
 		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		// Living tick with an active post — only nudge cron, do not start a second worker.
-		if ( $lock_held && absint( $job['current_post_id'] ?? 0 ) > 0 && $age < self::STEP_LOCK_TTL ) {
+		// After ~90s of silence the previous worker is dead — never block on its lock.
+		$released_stale_lock = self::force_release_step_lock_if_idle( 90 );
+		$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
+		$lock_held           = (bool) get_transient( self::STEP_LOCK_KEY );
+
+		$next = self::get_next_worker_cron();
+
+		// Only trust a lock when activity is still fresh.
+		if ( $lock_held && $age < 90 && absint( $job['current_post_id'] ?? 0 ) > 0 ) {
 			self::ensure_recurring_pulse();
 			self::ping_wp_cron();
 			$job = self::get_job_raw();
@@ -2259,10 +2311,14 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		// Lock without current post (between-item stall) — clear and continue.
-		if ( $lock_held ) {
-			$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
-			$lock_held           = (bool) get_transient( self::STEP_LOCK_KEY );
+		if ( $lock_held && $age >= 90 ) {
+			delete_transient( self::STEP_LOCK_KEY );
+			$released_stale_lock = true;
+			$lock_held           = false;
+			$job                 = self::get_job_raw();
+			$job['step_started_at'] = null;
+			$job['current_post_id'] = null;
+			self::save_job( $job );
 		}
 
 		if ( $lock_held ) {
@@ -2279,19 +2335,14 @@ final class Activity_Logger {
 		$due_and_idle = $next && $next <= time();
 
 		self::ensure_recurring_pulse();
-
-		if ( ! wp_next_scheduled( self::CRON_HOOK ) || $due_and_idle ) {
-			self::clear_chain_events();
-			self::schedule_background_worker( 0 );
-			$next = self::get_next_worker_cron();
-		} else {
-			self::ping_wp_cron();
-		}
+		self::clear_chain_events();
+		self::schedule_background_worker( 0 );
+		$next = self::get_next_worker_cron();
 
 		$job = self::get_job_raw();
-		$job['worker_scheduled_at'] = absint( $job['worker_scheduled_at'] ?? 0 ) ?: time();
-		$job['next_cron_at']        = $next ? (int) $next : ( self::get_next_worker_cron() ?: null );
-		$job['cron_scheduled']      = (bool) ( $job['next_cron_at'] ?? false );
+		$job['worker_scheduled_at'] = time();
+		$job['next_cron_at']        = $next ? (int) $next : null;
+		$job['cron_scheduled']      = (bool) $next;
 		$job['worker_ensured']      = true;
 
 		if ( $released_stale_lock ) {
@@ -2301,11 +2352,12 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 
-		$stale_limit = 15;
-
-		if ( $age > $stale_limit || $due_and_idle || $released_stale_lock ) {
+		// Stale job: run a tick inline. Cron alone is not reliable on many hosts.
+		if ( $age > 15 || $due_and_idle || $released_stale_lock ) {
 			return self::process_background_step();
 		}
+
+		self::ping_wp_cron();
 
 		return self::normalize_job_for_response( $job, false );
 	}
@@ -2360,6 +2412,10 @@ final class Activity_Logger {
 			self::unschedule_background_worker();
 
 			return self::normalize_job_for_response( $job, false );
+		}
+
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
 		}
 
 		// Heartbeat BEFORE work so the monitor knows the worker is alive during long AI calls.
@@ -2477,6 +2533,11 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
+		}
+
+		self::force_release_step_lock_if_idle( 90 );
 		self::schedule_background_worker( 1 );
 		self::ping_wp_cron();
 
