@@ -6,9 +6,9 @@ import { useTargetLanguages } from './hooks/useTargetLanguages';
 import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
-const POLL_INTERVAL_MS = 2500;
-/** If cron has not ticked for this long, nudge the server worker (no heavy kick). */
-const CRON_STALE_SEC = 60;
+const POLL_INTERVAL_MS = 2000;
+/** If cron has not ticked for this long, nudge/ensure the server worker. */
+const CRON_STALE_SEC = 20;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -21,6 +21,12 @@ function stepLogSignature(step) {
 }
 
 function isCronHealthy(job) {
+  if (job?.worker_lock) {
+    // A living tick owns the queue — do not spam ensure.
+    const lockAge = Number(job.worker_lock_age || 0);
+    return lockAge >= 0 && lockAge < 180;
+  }
+
   if (job?.worker_alive) {
     return true;
   }
@@ -32,9 +38,7 @@ function isCronHealthy(job) {
   }
 
   const age = Math.floor(Date.now() / 1000) - stamp;
-  const windowSec = job?.cron_disabled ? 180 : 90;
-
-  return age >= 0 && age < windowSec;
+  return age >= 0 && age < CRON_STALE_SEC;
 }
 
 function resolveDisplayPost(job, stickyPost = null) {

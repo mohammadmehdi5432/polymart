@@ -445,6 +445,12 @@ final class AI_Client {
 
 		self::$active_curl_timeout = $timeout;
 
+		/**
+		 * Fires immediately before an ArvanCloud HTTP request.
+		 * Used by the bulk job worker to refresh locks during long calls.
+		 */
+		do_action( 'polymart_ai_before_ai_http' );
+
 		$response = wp_remote_post(
 			self::resolve_chat_completions_url( $endpoint ),
 			array(

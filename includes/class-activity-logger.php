@@ -27,22 +27,20 @@ final class Activity_Logger {
 	const MAX_JOB_RETRIES      = 3;
 	const STEP_LOCK_KEY        = 'polymart_ai_job_step_lock';
 	/**
-	 * Absolute orphan ceiling for the step lock.
-	 * Living workers must call touch_step_lock() so this only trips on dead PHP processes.
+	 * Absolute orphan ceiling. Living ticks call touch_step_lock() during work.
+	 * Keep this only slightly above one AI call — not 5+ minutes of idle queue.
 	 */
-	const STEP_LOCK_TTL        = 300;
+	const STEP_LOCK_TTL        = 180;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
-	/** Seconds between self-chained cron ticks while a job is running (traffic WP-Cron). */
-	const CRON_INTERVAL_SEC    = 3;
-	/**
-	 * When DISABLE_WP_CRON + real crontab (~60s), chain farther out so a long tick
-	 * and the next crontab invocation do not overlap.
-	 */
-	const CRON_INTERVAL_SERVER_SEC = 55;
+	/** Seconds before the next self-chained tick after work finishes. */
+	const CRON_INTERVAL_SEC    = 5;
+	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
+	const CRON_SAFETY_SEC      = 120;
+	const CRON_INTERVAL_SERVER_SEC = 5;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
 	const CRON_STEP_BUDGET_SEC = 90;
 	/** Max steps inside one cron tick (safety cap). */
-	const CRON_MAX_STEPS_PER_TICK = 16;
+	const CRON_MAX_STEPS_PER_TICK = 20;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -52,7 +50,21 @@ final class Activity_Logger {
 	public static function init() {
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
 		add_action( self::CRON_HOOK, array( __CLASS__, 'process_background_step' ) );
+		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		self::maybe_heal_background_worker();
+	}
+
+	/**
+	 * Keep the step lock / heartbeat fresh during long Arvan HTTP calls.
+	 *
+	 * @return void
+	 */
+	public static function on_ai_http_heartbeat() {
+		if ( ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		self::touch_worker_heartbeat();
 	}
 
 	/**
@@ -870,20 +882,13 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Chain delay before the next worker event.
+	 * Chain delay before the next worker event after a tick finishes.
+	 * Keep this short — the step lock prevents overlap, not a long delay.
 	 *
 	 * @return int
 	 */
 	private static function get_cron_chain_delay_sec() {
-		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
-			// Keep the next event outside the current tick budget to avoid overlap.
-			return max(
-				self::CRON_INTERVAL_SERVER_SEC,
-				self::get_cron_step_budget_sec() + 5
-			);
-		}
-
-		return self::CRON_INTERVAL_SEC;
+		return max( 2, min( 15, (int) apply_filters( 'polymart_ai_job_cron_chain_delay_sec', self::CRON_INTERVAL_SEC ) ) );
 	}
 
 	/**
@@ -959,6 +964,13 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function is_worker_heartbeat_fresh( array $job ) {
+		if ( get_transient( self::STEP_LOCK_KEY ) ) {
+			$lock = absint( get_transient( self::STEP_LOCK_KEY ) );
+			$age  = $lock > 0 ? ( time() - $lock ) : PHP_INT_MAX;
+
+			return $age < self::STEP_LOCK_TTL;
+		}
+
 		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 ),
@@ -969,10 +981,7 @@ final class Activity_Logger {
 			return false;
 		}
 
-		// With real crontab (often every 60s), allow a wider window before alarming.
-		$window = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 180 : 90;
-
-		return ( time() - $last ) < $window;
+		return ( time() - $last ) < 45;
 	}
 
 	/**
@@ -2144,7 +2153,7 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 
-		$stale_limit = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 90 : 60;
+		$stale_limit = 15;
 
 		if ( $age > $stale_limit || $due_and_idle || $released_stale_lock ) {
 			return self::process_background_step();
@@ -2209,10 +2218,10 @@ final class Activity_Logger {
 		$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
 		self::save_job( $job );
 
-		// Ensure a follow-up tick exists even if this request fatals mid-step.
-		// With server crontab, chain outside the current budget to prevent overlap.
+		// Fatal-recovery event only — real chain is scheduled AFTER work so we do not
+		// sit idle for ~budget seconds when crontab is every minute.
 		self::unschedule_background_worker();
-		self::schedule_background_worker( self::get_cron_chain_delay_sec() );
+		self::schedule_background_worker( self::CRON_SAFETY_SEC );
 
 		$started   = time();
 		$budget    = self::get_cron_step_budget_sec();
@@ -2233,6 +2242,16 @@ final class Activity_Logger {
 			self::touch_worker_heartbeat();
 			$result = self::process_job_step();
 			$last_result = $result;
+
+			// Never clear another worker's lock on contention; only clear after our own step.
+			$deferred_busy = is_array( $result )
+				&& ! empty( $result['step_deferred'] )
+				&& 'step_lock_busy' === (string) ( $result['step_deferred_reason'] ?? '' );
+
+			if ( ! $deferred_busy ) {
+				self::release_step_lock();
+			}
+
 			self::touch_worker_heartbeat();
 
 			++$steps_run;
@@ -2243,7 +2262,6 @@ final class Activity_Logger {
 			$job['last_cron_steps']     = $steps_run;
 			$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
 			self::save_job( $job );
-			self::touch_step_lock();
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
 				self::unschedule_background_worker();
@@ -2263,11 +2281,29 @@ final class Activity_Logger {
 			}
 		}
 
+		// Immediate follow-up so crontab / loopback can continue within seconds.
+		self::unschedule_background_worker();
+		if ( 'running' === ( self::get_job_raw()['status'] ?? '' ) ) {
+			self::schedule_background_worker( self::get_cron_chain_delay_sec() );
+			self::ping_wp_cron();
+		}
+
+		$end_deferred_busy = is_array( $last_result )
+			&& ! empty( $last_result['step_deferred'] )
+			&& 'step_lock_busy' === (string) ( $last_result['step_deferred_reason'] ?? '' );
+
+		if ( ! $end_deferred_busy ) {
+			self::release_step_lock();
+		}
+
 		if ( is_array( $last_result ) ) {
 			$last_result['last_cron_at']        = time();
 			$last_result['worker_heartbeat_at'] = time();
 			$last_result['last_cron_steps']     = $steps_run;
 			$last_result['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+			$last_result['cron_scheduled']      = (bool) wp_next_scheduled( self::CRON_HOOK );
+			$last_result['next_cron_at']        = wp_next_scheduled( self::CRON_HOOK ) ?: null;
+			$last_result['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY );
 
 			return $last_result;
 		}
