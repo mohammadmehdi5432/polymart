@@ -436,19 +436,24 @@ export default function AutoTranslateApp() {
           current.step_deferred && current.step_deferred_reason === 'step_lock_busy' && serverStepInFlight;
 
         if (current.step_deferred || !madeProgress) {
-          if (!lockBusyWhileServerWorking) {
+          const isLockBusy = current.step_deferred_reason === 'step_lock_busy';
+          const isFairnessRotation = current.step_deferred_reason === 'fairness_rotation';
+
+          // Cron (or another tab) owns the step — never auto-pause on lock contention.
+          if (!isLockBusy && !isFairnessRotation && !lockBusyWhileServerWorking) {
             idleSteps += 1;
+          } else if (isLockBusy || lockBusyWhileServerWorking) {
+            // Reset idle so SPA keeps monitoring while the server worker runs.
+            idleSteps = 0;
           }
 
-          if (current.step_deferred_message && idleSteps === 1) {
+          if (current.step_deferred_message && (idleSteps === 1 || isLockBusy || isFairnessRotation)) {
             appendLog(current.step_deferred_message, 'warning');
           }
 
-          if (idleSteps >= MAX_IDLE_STEPS) {
+          if (idleSteps >= MAX_IDLE_STEPS && !isLockBusy && !lockBusyWhileServerWorking) {
             const stallMessage =
-              current.step_deferred_reason === 'step_lock_busy'
-                ? 'ترجمه در تب یا فرآیند دیگری در حال اجراست — برای جلوگیری از فشار به سرور متوقف شد. «ادامه» را بزنید.'
-                : 'چند تلاش پشت‌سرهم بدون پیشرفت — برای جلوگیری از فشار به سرور متوقف شد. «ادامه» را بزنید.';
+              'چند تلاش پشت‌سرهم بدون پیشرفت — برای جلوگیری از فشار به سرور متوقف شد. «ادامه» را بزنید.';
 
             appendLog(stallMessage, 'warning');
             setNotice({ type: 'warning', message: stallMessage });
@@ -463,9 +468,11 @@ export default function AutoTranslateApp() {
           }
 
           const delayMs = current.step_deferred
-            ? lockBusyWhileServerWorking
+            ? isLockBusy || lockBusyWhileServerWorking
               ? Math.max(STEP_DELAY_MS, 3000)
-              : DEFERRED_BACKOFF_MS[Math.min(idleSteps - 1, DEFERRED_BACKOFF_MS.length - 1)]
+              : isFairnessRotation
+                ? Math.max(STEP_DELAY_MS, 800)
+                : DEFERRED_BACKOFF_MS[Math.min(Math.max(idleSteps, 1) - 1, DEFERRED_BACKOFF_MS.length - 1)]
             : STEP_DELAY_MS;
 
           try {
@@ -492,6 +499,42 @@ export default function AutoTranslateApp() {
 
       const message = stepErrorMessage(error);
       appendLog(message, 'warning');
+
+      const isTimeout =
+        error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
+      const isNetwork =
+        error?.code === 'ERR_NETWORK' || /network/i.test(error?.message || '');
+
+      // Transient browser/network errors must not kill the server worker.
+      if (isTimeout || isNetwork) {
+        setNotice({
+          type: 'warning',
+          message: `${message} — کارگر سرور ادامه می‌دهد؛ چند لحظه صبر کنید.`,
+        });
+
+        try {
+          await delay(DEFERRED_BACKOFF_MS[2] || 2000);
+        } catch {
+          return;
+        }
+
+        const latest = await loadJob().catch(() => null);
+
+        if (latest?.status === 'running' && readAutoRunFlag() && isActiveRef.current) {
+          // Keep looping — do not pause.
+          runningRef.current = false;
+          setProcessing(false);
+          window.setTimeout(() => {
+            if (isActiveRef.current && readAutoRunFlag()) {
+              runSteps();
+            }
+          }, 500);
+          return;
+        }
+
+        return;
+      }
+
       setNotice({ type: 'warning', message });
 
       try {
@@ -1006,14 +1049,32 @@ export default function AutoTranslateApp() {
         </div>
       )}
 
-      {config.cronDisabled && (
+      {config.cronDisabled ? (
+        <div className="mb-4">
+          <Notice
+            type="info"
+            message="حالت سرور فعال است (DISABLE_WP_CRON): مطمئن شوید crontab هر ۱ تا ۵ دقیقه wp-cron.php را اجرا می‌کند — ترجمه بدون تب باز هم ادامه می‌یابد."
+          />
+        </div>
+      ) : !config.devMode ? (
         <div className="mb-4">
           <Notice
             type="warning"
-            message="WP-Cron روی این سرور غیرفعال است — مطمئن شوید wp-cron.php به‌صورت زمان‌بندی‌شده اجرا می‌شود تا ترجمه بدون تب باز هم ادامه یابد."
+            message="پیشنهاد پروداکشن: در wp-config مقدار define('DISABLE_WP_CRON', true) بگذارید و در cPanel هر ۱–۵ دقیقه /usr/local/bin/php …/wp-cron.php را زمان‌بندی کنید. الان WP-Cron وابسته به ترافیک/تب باز است."
           />
         </div>
-      )}
+      ) : null}
+
+      {!loading && job?.status === 'running' && job?.last_cron_at ? (
+        <div className="mb-4">
+          <Notice
+            type="info"
+            message={`کارگر پس‌زمینه فعال است — آخرین تیک کرون: ${formatTime(job.last_cron_at)}${
+              job.last_cron_steps ? ` (${job.last_cron_steps} مرحله در آخرین اجرا)` : ''
+            }. می‌توانید تب را ببندید.`}
+          />
+        </div>
+      ) : null}
 
       {!loading && isOutdated && (
         <div className="mb-4">

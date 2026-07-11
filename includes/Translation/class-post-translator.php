@@ -2538,6 +2538,41 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Copy the source featured image for languages that do not need a separate media asset.
+	 *
+	 * Auto-translate cannot AI-translate image binaries; without this fallback, slides
+	 * that only (or also) need a thumbnail stay permanently incomplete in the job queue.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return int Attachment ID stored (0 on failure).
+	 */
+	public static function ensure_translated_thumbnail_fallback( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return 0;
+		}
+
+		$existing = self::get_translated_thumbnail_id( $post_id, $lang );
+
+		if ( $existing > 0 ) {
+			return $existing;
+		}
+
+		$source_id = (int) get_post_thumbnail_id( $post_id );
+
+		if ( $source_id <= 0 || 'attachment' !== get_post_type( $source_id ) ) {
+			return 0;
+		}
+
+		update_post_meta( $post_id, self::get_thumbnail_meta_key( $lang ), $source_id );
+
+		return $source_id;
+	}
+
+	/**
 	 * Constructor.
 	 */
 	public function __construct() {
@@ -2888,10 +2923,29 @@ final class Post_Translator {
 
 		switch ( $phase ) {
 			case 'variations':
+				$max_fields = self::VARIATION_AI_FIELD_CHUNK_SIZE;
+				$max_chars  = self::VARIATION_AI_MAX_CHUNK_CHARS;
+
+				if ( $post_id > 0 && function_exists( 'wc_get_product' ) ) {
+					$product = wc_get_product( $post_id );
+
+					if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) ) {
+						$variation_count = count( $product->get_children() );
+
+						if ( $variation_count > 80 ) {
+							$max_fields = 5;
+							$max_chars  = 2500;
+						} elseif ( $variation_count > 30 ) {
+							$max_fields = 4;
+							$max_chars  = 2200;
+						}
+					}
+				}
+
 				return self::chunk_payload_with_limits(
 					$payload,
-					1,
-					1200
+					$max_fields,
+					$max_chars
 				);
 			case 'commerce':
 				$max_fields = 2;
@@ -3069,8 +3123,6 @@ final class Post_Translator {
 	/**
 	 * Per-phase batch budget for one auto-translate HTTP step.
 	 *
-	 * Heavy phases (variations, Elementor) stay at 1 batch per request on production.
-	 *
 	 * @param string $phase   core|commerce|variations|elementor.
 	 * @param int    $post_id Post ID.
 	 * @return int
@@ -3080,15 +3132,25 @@ final class Post_Translator {
 		$post_id = absint( $post_id );
 		$chunks  = self::get_job_step_max_field_chunks();
 
-		if ( in_array( $phase, array( 'variations', 'elementor', 'commerce' ), true ) ) {
+		if ( 'elementor' === $phase ) {
 			$chunks = 1;
-		}
+		} elseif ( 'commerce' === $phase ) {
+			$chunks = 1;
+		} elseif ( 'variations' === $phase ) {
+			$chunks = 2;
 
-		if ( 'variations' === $phase && $post_id > 0 && function_exists( 'wc_get_product' ) ) {
-			$product = wc_get_product( $post_id );
+			if ( $post_id > 0 && function_exists( 'wc_get_product' ) ) {
+				$product = wc_get_product( $post_id );
 
-			if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) && count( $product->get_children() ) > 30 ) {
-				$chunks = 1;
+				if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) ) {
+					$variation_count = count( $product->get_children() );
+
+					if ( $variation_count > 80 ) {
+						$chunks = 3;
+					} elseif ( $variation_count > 30 ) {
+						$chunks = 2;
+					}
+				}
 			}
 		}
 
@@ -3142,9 +3204,20 @@ final class Post_Translator {
 
 			if ( $product instanceof \WC_Product && $product->is_type( 'variable' ) ) {
 				$variation_count = count( $product->get_children() );
-				$estimated_steps = max( 8, (int) ceil( ( $variation_count * 2 ) / max( 1, self::VARIATION_AI_FIELD_CHUNK_SIZE ) ) );
-				$max_consecutive = min( 150, max( 30, $estimated_steps + 5 ) );
-				$max_per_run     = min( 250, $max_consecutive + 15 );
+				$fields_per_var  = 2;
+				$chunk_fields    = self::VARIATION_AI_FIELD_CHUNK_SIZE;
+				$chunks_per_step = max( 1, self::get_job_step_max_field_chunks_for_phase( 'variations', $post_id ) );
+
+				if ( $variation_count > 80 ) {
+					$chunk_fields = 5;
+				} elseif ( $variation_count > 30 ) {
+					$chunk_fields = 4;
+				}
+
+				$fields_per_step = max( 1, $chunk_fields * $chunks_per_step );
+				$estimated_steps = max( 4, (int) ceil( ( $variation_count * $fields_per_var ) / $fields_per_step ) );
+				$max_consecutive = min( 80, max( 20, $estimated_steps + 5 ) );
+				$max_per_run     = min( 120, $max_consecutive + 20 );
 			}
 		}
 
@@ -3247,6 +3320,7 @@ final class Post_Translator {
 			'polymart_ai_timeout',
 			'polymart_ai_http_error',
 			'polymart_ai_api_error',
+			'polymart_ai_rate_limited',
 			'polymart_ai_invalid_json',
 			'polymart_ai_invalid_response',
 			'polymart_ai_missing_choices',
@@ -3265,7 +3339,10 @@ final class Post_Translator {
 		return false !== strpos( $message, 'timeout' )
 			|| false !== strpos( $message, 'timed out' )
 			|| false !== strpos( $message, 'منقضی' )
-			|| false !== strpos( $message, 'gateway' );
+			|| false !== strpos( $message, 'gateway' )
+			|| false !== strpos( $message, 'rate limit' )
+			|| false !== strpos( $message, '429' )
+			|| false !== strpos( $message, 'ربات' );
 	}
 
 	/**
@@ -4085,10 +4162,6 @@ final class Post_Translator {
 				);
 
 				if ( is_wp_error( $recovered ) ) {
-					foreach ( array_keys( $chunk ) as $failed_key ) {
-						$failures[ (string) $failed_key ] = absint( $failures[ (string) $failed_key ] ?? 0 ) + 1;
-					}
-
 					$state['elementor_failures'] = $failures;
 
 					return self::handle_elementor_job_slice_failure(
@@ -4106,13 +4179,30 @@ final class Post_Translator {
 				$chunk_result = $recovered;
 			}
 
-			$map = array_merge(
-				$map,
-				self::unmap_elementor_aliases(
-					self::collapse_payload_parts( $chunk_result ),
-					$alias_to_path
-				)
+			$mapped_chunk = self::unmap_elementor_aliases(
+				self::collapse_payload_parts( $chunk_result ),
+				$alias_to_path
 			);
+
+			foreach ( $mapped_chunk as $path => $translated ) {
+				$translated = trim( (string) $translated );
+				$path       = (string) $path;
+
+				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+					$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+
+					if ( $failures[ $path ] >= 2 ) {
+						$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+						$skipped[] = $path;
+						$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+						unset( $failures[ $path ] );
+					}
+
+					unset( $mapped_chunk[ $path ] );
+				}
+			}
+
+			$map = array_merge( $map, $mapped_chunk );
 			++$processed;
 		}
 
@@ -4867,17 +4957,34 @@ final class Post_Translator {
 			'isInner'    => true,
 			'url'        => true,
 			'link'       => true,
+			'src'        => true,
+			'href'      => true,
 		);
 
 		if ( isset( $blocked_keys[ $key ] ) ) {
 			return true;
 		}
 
-		if ( preg_match( '/(_url|_link|_id|_css|_class|_icon|_image|_size|_color|_width|_height|_align|typography|animation|custom_css|z_index|motion_fx)/i', $key ) ) {
+		if ( preg_match( '/(_url|_link|_id|_css|_class|_icon|_image|_img|_media|_src|_size|_color|_width|_height|_align|typography|animation|custom_css|z_index|motion_fx|background|overlay|mask)/i', $key ) ) {
 			return true;
 		}
 
-		if ( preg_match( '/^(https?:\/\/|#|[0-9a-f]{3,8}$|\d+px)$/i', $value ) ) {
+		// URLs, data-URIs, hex colors, pure numbers/units, SVG/path junk.
+		if ( preg_match( '/^(https?:\/\/|\/\/|data:|#|[0-9a-f]{3,8}$|\d+(\.\d+)?(px|em|rem|%|vh|vw)?)$/i', $value ) ) {
+			return true;
+		}
+
+		if ( preg_match( '/^(data:image\/|data:application\/|blob:)/i', $value ) ) {
+			return true;
+		}
+
+		// Mostly media/path content with only incidental Persian.
+		if ( preg_match( '/\.(jpe?g|png|gif|webp|svg|mp4|webm|pdf)(\?|$)/i', $value ) ) {
+			return true;
+		}
+
+		// Extremely short non-prose tokens.
+		if ( mb_strlen( $value ) <= 2 ) {
 			return true;
 		}
 
@@ -6343,6 +6450,8 @@ final class Post_Translator {
 		}
 
 		if ( 'woodmart_slide' === $post->post_type && get_post_thumbnail_id( $post_id ) ) {
+			self::ensure_translated_thumbnail_fallback( $post_id, $lang );
+
 			$fields[] = array(
 				'key'        => 'thumbnail',
 				'label'      => __( 'تصویر شاخص', 'polymart-ai' ),

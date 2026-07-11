@@ -52,6 +52,11 @@ final class AI_Client {
 	const MAX_TRANSPORT_RETRIES = 3;
 
 	/**
+	 * Maximum retries for HTTP 429 / 5xx rate-limit style responses.
+	 */
+	const MAX_RATE_LIMIT_RETRIES = 4;
+
+	/**
 	 * cURL timeout (seconds) for the in-flight translation HTTP request.
 	 *
 	 * @var int|null
@@ -317,7 +322,87 @@ final class AI_Client {
 			return $response;
 		}
 
-		return self::parse_response( $response, $data_array );
+		$parsed = self::parse_response( $response, $data_array );
+
+		if ( is_wp_error( $parsed ) && self::should_retry_rate_limited_error( $parsed ) ) {
+			return self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $parsed, 1 );
+		}
+
+		return $parsed;
+	}
+
+	/**
+	 * Whether an API error should be retried with exponential backoff.
+	 *
+	 * @param \WP_Error $error Error object.
+	 * @return bool
+	 */
+	private static function should_retry_rate_limited_error( \WP_Error $error ) {
+		$data   = $error->get_error_data();
+		$status = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
+
+		if ( in_array( $status, array( 429, 502, 503, 504 ), true ) ) {
+			return true;
+		}
+
+		$message = strtolower( $error->get_error_message() );
+
+		foreach ( array( '429', 'too many requests', 'rate limit', 'bot', 'ربات', 'captcha' ) as $keyword ) {
+			if ( false !== strpos( $message, $keyword ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Retry a chat completion after a rate-limit / WAF challenge response.
+	 *
+	 * @param string               $endpoint   API base.
+	 * @param string               $api_key    API key.
+	 * @param array<string, mixed> $payload    Request body.
+	 * @param array<string, string> $data_array Original fields.
+	 * @param array<string, mixed> $options    Request options.
+	 * @param \WP_Error            $last_error Last error.
+	 * @param int                  $attempt    Retry attempt (1-based).
+	 * @return array<string, string>|\WP_Error
+	 */
+	private static function retry_after_rate_limit( $endpoint, $api_key, array $payload, array $data_array, array $options, \WP_Error $last_error, $attempt ) {
+		if ( $attempt > self::MAX_RATE_LIMIT_RETRIES ) {
+			return $last_error;
+		}
+
+		$sleep = min( 45, (int) pow( 2, $attempt ) + wp_rand( 1, 3 ) );
+
+		/**
+		 * Filter backoff seconds before retrying a rate-limited ArvanCloud request.
+		 *
+		 * @param int       $sleep   Seconds to wait.
+		 * @param int       $attempt Retry attempt number.
+		 * @param \WP_Error $error   Last error.
+		 */
+		$sleep = max( 1, (int) apply_filters( 'polymart_ai_rate_limit_backoff_sec', $sleep, $attempt, $last_error ) );
+
+		sleep( $sleep );
+
+		$response = self::post_chat_completion( $endpoint, $api_key, $payload, 1, $options );
+
+		if ( is_wp_error( $response ) ) {
+			if ( self::should_retry_rate_limited_error( $response ) ) {
+				return self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $response, $attempt + 1 );
+			}
+
+			return $response;
+		}
+
+		$parsed = self::parse_response( $response, $data_array );
+
+		if ( is_wp_error( $parsed ) && self::should_retry_rate_limited_error( $parsed ) ) {
+			return self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $parsed, $attempt + 1 );
+		}
+
+		return $parsed;
 	}
 
 	/**
@@ -519,6 +604,7 @@ final class AI_Client {
 				'polymart_ai_timeout',
 				'polymart_ai_http_error',
 				'polymart_ai_api_error',
+				'polymart_ai_rate_limited',
 			),
 			true
 		);
@@ -690,8 +776,12 @@ final class AI_Client {
 				? $decoded['error']['message']
 				: $body;
 
+			$error_code = in_array( $status_code, array( 429, 502, 503, 504 ), true )
+				? 'polymart_ai_rate_limited'
+				: 'polymart_ai_api_error';
+
 			return new \WP_Error(
-				'polymart_ai_api_error',
+				$error_code,
 				sprintf(
 					/* translators: 1: HTTP status code, 2: error message */
 					__( 'API آروان‌کلاد کد HTTP %1$d برگرداند: %2$s', 'polymart-ai' ),

@@ -29,6 +29,10 @@ final class Activity_Logger {
 	const STEP_LOCK_TTL        = 600;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	const CRON_INTERVAL_SEC    = 8;
+	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
+	const CRON_STEP_BUDGET_SEC = 75;
+	/** Max steps inside one cron tick (safety cap). */
+	const CRON_MAX_STEPS_PER_TICK = 12;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -38,6 +42,26 @@ final class Activity_Logger {
 	public static function init() {
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
 		add_action( self::CRON_HOOK, array( __CLASS__, 'process_background_step' ) );
+		self::maybe_heal_background_worker();
+	}
+
+	/**
+	 * Re-schedule the worker if a job is running but the cron event was orphaned.
+	 *
+	 * @return void
+	 */
+	public static function maybe_heal_background_worker() {
+		$job = get_option( self::JOB_OPTION, array() );
+
+		if ( ! is_array( $job ) || 'running' !== ( $job['status'] ?? '' ) ) {
+			return;
+		}
+
+		if ( wp_next_scheduled( self::CRON_HOOK ) ) {
+			return;
+		}
+
+		self::schedule_background_worker();
 	}
 
 	/**
@@ -317,6 +341,8 @@ final class Activity_Logger {
 			'consecutive_post_id'    => 0,
 			'consecutive_post_steps' => 0,
 			'stuck_progress_steps'   => 0,
+			'last_cron_at'           => null,
+			'last_cron_steps'        => 0,
 		);
 	}
 
@@ -334,6 +360,10 @@ final class Activity_Logger {
 		}
 
 		$job = wp_parse_args( $job, self::empty_job() );
+
+		if ( 'running' === ( $job['status'] ?? '' ) && ! wp_next_scheduled( self::CRON_HOOK ) ) {
+			self::schedule_background_worker();
+		}
 
 		return self::normalize_job_for_response( $job, $deep_sync );
 	}
@@ -1538,6 +1568,10 @@ final class Activity_Logger {
 		self::sync_job_remaining( $job, $lang );
 		self::save_job( $job );
 
+		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			self::schedule_background_worker();
+		}
+
 		self::log(
 			'warning',
 			sprintf(
@@ -1597,11 +1631,12 @@ final class Activity_Logger {
 		if ( $lock ) {
 			$lock_age = time() - absint( $lock );
 			$job      = self::get_job_raw();
-			$step_age = isset( $job['step_started_at'] )
+			$step_age = isset( $job['step_started_at'] ) && absint( $job['step_started_at'] ) > 0
 				? time() - absint( $job['step_started_at'] )
 				: PHP_INT_MAX;
 
-			if ( $lock_age < self::STEP_LOCK_TTL && $step_age <= 300 ) {
+			// Honor full lock TTL — long AI steps often exceed 300s.
+			if ( $lock_age < self::STEP_LOCK_TTL && $step_age < self::STEP_LOCK_TTL ) {
 				return false;
 			}
 
@@ -1616,14 +1651,17 @@ final class Activity_Logger {
 	/**
 	 * Schedule the next server-side job step (survives closed browser tabs).
 	 *
+	 * @param int $delay_sec Optional delay before the next tick.
 	 * @return void
 	 */
-	public static function schedule_background_worker() {
+	public static function schedule_background_worker( $delay_sec = null ) {
 		if ( wp_next_scheduled( self::CRON_HOOK ) ) {
 			return;
 		}
 
-		wp_schedule_single_event( time() + self::CRON_INTERVAL_SEC, self::CRON_HOOK );
+		$delay = null === $delay_sec ? self::CRON_INTERVAL_SEC : max( 1, absint( $delay_sec ) );
+
+		wp_schedule_single_event( time() + $delay, self::CRON_HOOK );
 
 		if ( ! wp_doing_cron() && ( ! defined( 'DISABLE_WP_CRON' ) || ! DISABLE_WP_CRON ) ) {
 			spawn_cron();
@@ -1640,7 +1678,24 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * WP-Cron callback: process one job step and re-schedule while running.
+	 * Wall-clock budget for multi-step cron ticks.
+	 *
+	 * @return int
+	 */
+	private static function get_cron_step_budget_sec() {
+		/**
+		 * Filter seconds of work allowed per translation-job cron invocation.
+		 *
+		 * @param int $seconds Default 75.
+		 */
+		return max( 20, min( 240, (int) apply_filters( 'polymart_ai_job_cron_step_budget_sec', self::CRON_STEP_BUDGET_SEC ) ) );
+	}
+
+	/**
+	 * WP-Cron callback: process multiple job steps within a time budget.
+	 *
+	 * Schedules the next event BEFORE work so fatals/timeouts do not orphan the chain.
+	 * Multi-step ticks matter when system crontab only hits wp-cron.php every few minutes.
 	 *
 	 * @return void
 	 */
@@ -1653,14 +1708,48 @@ final class Activity_Logger {
 			return;
 		}
 
-		self::process_job_step();
+		// Ensure a follow-up tick exists even if this request fatals mid-step.
+		self::unschedule_background_worker();
+		self::schedule_background_worker( self::CRON_INTERVAL_SEC );
 
-		$job = self::get_job_raw();
+		$started   = time();
+		$budget    = self::get_cron_step_budget_sec();
+		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
+		$max_steps = max( 1, min( 30, $max_steps ) );
+		$steps_run = 0;
 
-		if ( 'running' === ( $job['status'] ?? '' ) ) {
-			self::schedule_background_worker();
-		} else {
-			self::unschedule_background_worker();
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( max( 120, $budget + 60 ) );
+		}
+
+		while ( $steps_run < $max_steps ) {
+			if ( ( time() - $started ) >= $budget ) {
+				break;
+			}
+
+			$result = self::process_job_step();
+
+			++$steps_run;
+
+			$job = self::get_job_raw();
+			$job['last_cron_at']    = time();
+			$job['last_cron_steps'] = $steps_run;
+			self::save_job( $job );
+
+			if ( 'running' !== ( $job['status'] ?? '' ) ) {
+				self::unschedule_background_worker();
+
+				return;
+			}
+
+			if ( is_array( $result ) && ! empty( $result['step_deferred'] ) ) {
+				// Lock contention or in-progress translation — wait for next cron tick.
+				break;
+			}
+
+			if ( is_array( $result ) && ! empty( $result['pause_reason'] ) && 'running' !== ( $result['status'] ?? '' ) ) {
+				break;
+			}
 		}
 	}
 
@@ -1988,9 +2077,44 @@ final class Activity_Logger {
 				unset( $job['recoverable'] );
 			}
 
+			$phase_key = (string) ( $slice['phase'] ?? '' );
+
 			if ( $made_progress ) {
-				$job['consecutive_post_steps'] = 1;
-				$job['stuck_progress_steps']   = 0;
+				$job['stuck_progress_steps'] = 0;
+
+				if ( isset( $job['defer_rounds'][ $post_id ] ) ) {
+					unset( $job['defer_rounds'][ $post_id ] );
+				}
+
+				// Keep consecutive count growing on heavy phases so fairness rotation can fire.
+				if ( ! in_array( $phase_key, array( 'variations', 'elementor' ), true ) ) {
+					$job['consecutive_post_steps'] = 1;
+				}
+			}
+
+			$fairness_threshold = max( 12, (int) floor( max( 1, $max_consecutive ) / 4 ) );
+			$should_rotate_fair = $made_progress
+				&& in_array( $phase_key, array( 'variations', 'elementor' ), true )
+				&& absint( $job['consecutive_post_steps'] ?? 0 ) >= $fairness_threshold;
+
+			if ( $should_rotate_fair ) {
+				Post_Translator::release_translation_lock( $post_id, $lang );
+				self::rotate_job_post_for_fairness( $job, $post_id, $lang, $phase_key, $current_progress );
+				self::increment_job_step( $job );
+				self::set_job_last_step(
+					$job,
+					$post_id,
+					'deferred',
+					sprintf(
+						/* translators: 1: phase key, 2: progress marker */
+						__( 'چرخش صف (%1$s — %2$s) — بقیه سایت ادامه می‌یابد', 'polymart-ai' ),
+						$phase_key,
+						'' !== $current_progress ? $current_progress : '…'
+					)
+				);
+				self::save_job( $job );
+
+				return self::normalize_job_for_response( $job, false );
 			}
 
 			$job['current_post_id']   = null;
@@ -2257,6 +2381,38 @@ final class Activity_Logger {
 			return;
 		}
 
+		self::enqueue_job_defer( $job, $post_id, true );
+	}
+
+	/**
+	 * Rotate a heavy in-progress post without burning park defer rounds.
+	 *
+	 * Keeps partial meta on the post; clears pinning so the forward scan can move on.
+	 *
+	 * @param array<string, mixed> $job      Job state.
+	 * @param int                  $post_id  Post ID.
+	 * @param string               $lang     Language code.
+	 * @param string               $phase    Phase key.
+	 * @param string               $progress Progress marker.
+	 * @return void
+	 */
+	private static function rotate_job_post_for_fairness( array &$job, $post_id, $lang, $phase, $progress ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		$job['partial_post_id']        = null;
+		$job['partial_phase']          = $phase;
+		$job['partial_progress']       = $progress;
+		$job['current_post_id']        = null;
+		$job['step_started_at']        = null;
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['last_post_id']           = $post_id;
+		$job['step_deferred']          = true;
+		$job['step_deferred_reason']   = 'fairness_rotation';
+
+		self::track_partial_post( $job, $post_id );
 		self::enqueue_job_defer( $job, $post_id, true );
 	}
 
@@ -3068,7 +3224,12 @@ final class Activity_Logger {
 		$data    = $error->get_error_data();
 		$status  = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
 
-		if ( in_array( $status, array( 401, 403, 429 ), true ) ) {
+		// Rate limits / bot challenges are recoverable with backoff — do not kill the job.
+		if ( 429 === $status || self::is_rate_limit_or_bot_error( $error ) ) {
+			return false;
+		}
+
+		if ( in_array( $status, array( 401, 403 ), true ) ) {
 			return true;
 		}
 
@@ -3083,10 +3244,7 @@ final class Activity_Logger {
 		}
 
 		$critical_keywords = array(
-			'429',
-			'too many requests',
 			'quota',
-			'rate limit',
 			'insufficient',
 			'unauthorized',
 			'invalid api key',
@@ -3099,6 +3257,43 @@ final class Activity_Logger {
 		);
 
 		foreach ( $critical_keywords as $keyword ) {
+			if ( false !== strpos( $message, $keyword ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether an API error looks like rate limiting or bot/WAF challenge.
+	 *
+	 * @param \WP_Error $error Error object.
+	 * @return bool
+	 */
+	public static function is_rate_limit_or_bot_error( \WP_Error $error ) {
+		$message = strtolower( $error->get_error_message() );
+		$data    = $error->get_error_data();
+		$status  = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
+
+		if ( 429 === $status ) {
+			return true;
+		}
+
+		$keywords = array(
+			'429',
+			'too many requests',
+			'rate limit',
+			'rate-limit',
+			'bot',
+			'captcha',
+			'cf-ray',
+			'cloudflare',
+			'ربات',
+			'تشخیص',
+		);
+
+		foreach ( $keywords as $keyword ) {
 			if ( false !== strpos( $message, $keyword ) ) {
 				return true;
 			}
