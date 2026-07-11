@@ -877,6 +877,7 @@ export default function AutoTranslateApp() {
     }
     return Math.max(0, Math.floor(Date.now() / 1000) - stamp);
   })();
+  const latestActivityAt = latestWorkerStamp(job);
 
   const workerLabel =
     job?.last_worker === 'cron'
@@ -1185,9 +1186,9 @@ export default function AutoTranslateApp() {
                         : 'بین دو مرحله / انتخاب مورد بعدی…'}
                     </p>
                   )}
-                  {job?.last_cron_at ? (
+                  {latestActivityAt ? (
                     <p className="mt-2 text-xs opacity-80">
-                      آخرین تیک کارگر: {formatTime(job.last_cron_at)}
+                      آخرین فعالیت کارگر: {formatTime(latestActivityAt)}
                       {job.last_cron_steps ? ` · ${job.last_cron_steps} مرحله` : ''}
                       {job.worker_lock ? ' · قفل فعال' : ''}
                       {job.cron_scheduled ? ' · event بعدی زمان‌بندی شده' : ''}
