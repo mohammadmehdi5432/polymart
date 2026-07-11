@@ -26,8 +26,11 @@ final class Activity_Logger {
 	const MAX_REPORT_ENTRIES   = 1000;
 	const MAX_JOB_RETRIES      = 3;
 	const STEP_LOCK_KEY        = 'polymart_ai_job_step_lock';
-	/** Soft lock ceiling — must stay above one cron tick budget, but not 10 minutes. */
-	const STEP_LOCK_TTL        = 150;
+	/**
+	 * Absolute orphan ceiling for the step lock.
+	 * Living workers must call touch_step_lock() so this only trips on dead PHP processes.
+	 */
+	const STEP_LOCK_TTL        = 300;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	/** Seconds between self-chained cron ticks while a job is running (traffic WP-Cron). */
 	const CRON_INTERVAL_SEC    = 3;
@@ -131,14 +134,43 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	public static function log( $level, $message, array $context = array() ) {
-		$logs   = get_option( self::LOG_OPTION, array() );
-		$logs   = is_array( $logs ) ? $logs : array();
+		$message = sanitize_text_field( (string) $message );
+		$level   = sanitize_key( (string) $level );
+		$logs    = get_option( self::LOG_OPTION, array() );
+		$logs    = is_array( $logs ) ? $logs : array();
+
+		// Suppress duplicate success/info lines within 45s (concurrent workers).
+		$post_id = absint( $context['post_id'] ?? 0 );
+		$now     = time();
+		$count   = count( $logs );
+
+		for ( $i = $count - 1; $i >= max( 0, $count - 15 ); $i-- ) {
+			$entry = $logs[ $i ];
+
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+
+			$entry_time = absint( $entry['time'] ?? 0 );
+
+			if ( $entry_time > 0 && ( $now - $entry_time ) > 45 ) {
+				break;
+			}
+
+			$same_message = (string) ( $entry['message'] ?? '' ) === $message;
+			$same_post    = $post_id <= 0 || absint( $entry['context']['post_id'] ?? 0 ) === $post_id;
+
+			if ( $same_message && $same_post ) {
+				return;
+			}
+		}
+
 		$logs[] = array(
 			'id'      => uniqid( 'log_', true ),
-			'level'   => sanitize_key( (string) $level ),
-			'message' => sanitize_text_field( (string) $message ),
+			'level'   => $level,
+			'message' => $message,
 			'context' => $context,
-			'time'    => time(),
+			'time'    => $now,
 		);
 
 		if ( count( $logs ) > self::MAX_LOG_ENTRIES ) {
@@ -857,6 +889,10 @@ final class Activity_Logger {
 	/**
 	 * Drop an orphaned step lock left by a killed/timed-out PHP process.
 	 *
+	 * IMPORTANT: Do NOT use heartbeat silence alone. A single AI call can take
+	 * well over 60s without updating job state — releasing then causes a second
+	 * worker to steal the same product (duplicate "ترجمه شد" logs).
+	 *
 	 * @return bool True when a stale lock was cleared.
 	 */
 	private static function maybe_release_stale_step_lock() {
@@ -866,25 +902,54 @@ final class Activity_Logger {
 			return false;
 		}
 
-		$lock_age   = time() - absint( $lock );
-		$max_age    = self::get_cron_step_budget_sec() + 45;
-		$job        = self::get_job_raw();
-		$heartbeat  = absint( $job['worker_heartbeat_at'] ?? 0 );
-		$heart_age  = $heartbeat > 0 ? ( time() - $heartbeat ) : PHP_INT_MAX;
+		$lock_age = time() - absint( $lock );
 
-		// Lock older than one tick budget, or heartbeat went silent while lock remains.
-		if ( $lock_age >= $max_age || ( $lock_age >= 60 && $heart_age >= 60 ) ) {
-			delete_transient( self::STEP_LOCK_KEY );
-
-			$job = self::get_job_raw();
-			$job['step_started_at'] = null;
-			$job['current_post_id'] = null;
-			self::save_job( $job );
-
-			return true;
+		// Only steal when the living worker stopped touching the lock for the full TTL.
+		if ( $lock_age < self::STEP_LOCK_TTL ) {
+			return false;
 		}
 
-		return false;
+		delete_transient( self::STEP_LOCK_KEY );
+
+		$job = self::get_job_raw();
+		$job['step_started_at'] = null;
+		$job['current_post_id'] = null;
+		self::save_job( $job );
+
+		return true;
+	}
+
+	/**
+	 * Refresh the step lock timestamp so long AI calls do not look orphaned.
+	 *
+	 * @return void
+	 */
+	private static function touch_step_lock() {
+		if ( ! get_transient( self::STEP_LOCK_KEY ) ) {
+			return;
+		}
+
+		set_transient( self::STEP_LOCK_KEY, time(), self::STEP_LOCK_TTL );
+	}
+
+	/**
+	 * Persist a lightweight heartbeat while a tick is in flight.
+	 *
+	 * @return void
+	 */
+	private static function touch_worker_heartbeat() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return;
+		}
+
+		$job['worker_heartbeat_at'] = time();
+		$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+		// Avoid full merge side-effects during mid-step touches.
+		$job['updated_at'] = time();
+		update_option( self::JOB_OPTION, $job, false );
+		self::touch_step_lock();
 	}
 
 	/**
@@ -1292,6 +1357,90 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Whether this post was already counted as fully translated in the current run.
+	 *
+	 * @param array<string, mixed> $job     Job state.
+	 * @param int                  $post_id Post ID.
+	 * @return bool
+	 */
+	private static function job_already_counted_success( array $job, $post_id ) {
+		$post_id = absint( $post_id );
+		$ids     = is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array();
+
+		return $post_id > 0 && in_array( $post_id, array_map( 'absint', $ids ), true );
+	}
+
+	/**
+	 * Skip AI work when the post is already durably translated; advance the cursor.
+	 *
+	 * @param array<string, mixed> $job     Job state.
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @return array<string, mixed>
+	 */
+	private static function advance_past_already_translated_post( array $job, $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$title   = get_the_title( $post_id ) ?: ( '#' . $post_id );
+
+		Post_Translator::clear_job_partial_state( $post_id, $lang );
+		Post_Translator::release_translation_lock( $post_id, $lang );
+
+		$was_new = ! self::job_already_counted_success( $job, $post_id );
+		self::track_succeeded_post( $job, $post_id );
+		self::clear_partial_post( $job, $post_id );
+
+		$job['partial_post_id']   = null;
+		$job['partial_phase']     = null;
+		$job['partial_progress']  = null;
+		$job['current_post_id']   = null;
+		$job['step_started_at']   = null;
+		$job['last_post_id']      = max( (int) ( $job['last_post_id'] ?? 0 ), $post_id );
+		$job['last_error']        = null;
+
+		self::increment_job_step( $job );
+
+		if ( $was_new ) {
+			self::log(
+				'success',
+				sprintf(
+					/* translators: 1: post title, 2: language label */
+					__( '«%1$s» به %2$s ترجمه شد.', 'polymart-ai' ),
+					$title,
+					$job['lang_label'] ?? $lang
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+			self::set_job_last_step(
+				$job,
+				$post_id,
+				'translated',
+				sprintf(
+					/* translators: 1: post title, 2: language label */
+					__( '«%1$s» به %2$s ترجمه شد.', 'polymart-ai' ),
+					$title,
+					$job['lang_label'] ?? $lang
+				)
+			);
+		} else {
+			self::set_job_last_step(
+				$job,
+				$post_id,
+				'skipped',
+				sprintf(
+					/* translators: %s: post title */
+					__( '«%s» از قبل در موفق‌های این اجرا بود — رفتیم سراغ بعدی.', 'polymart-ai' ),
+					$title
+				)
+			);
+		}
+
+		self::sync_job_remaining( $job, $lang );
+		self::save_job( $job );
+
+		return $job;
+	}
+
+	/**
 	 * Remove a post from the durable success list.
 	 *
 	 * @param array<string, mixed> $job     Job state (by reference).
@@ -1428,6 +1577,31 @@ final class Activity_Logger {
 	 * @return array<string, mixed>
 	 */
 	public static function save_job( array $job ) {
+		$fresh = get_option( self::JOB_OPTION, array() );
+
+		// Same run: merge durable success IDs so concurrent ticks cannot wipe each other.
+		if (
+			is_array( $fresh )
+			&& ! empty( $fresh )
+			&& absint( $job['started_at'] ?? 0 ) > 0
+			&& absint( $job['started_at'] ?? 0 ) === absint( $fresh['started_at'] ?? 0 )
+			&& 'idle' !== ( $job['status'] ?? '' )
+		) {
+			$job_ids   = is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array();
+			$fresh_ids = is_array( $fresh['succeeded_ids'] ?? null ) ? $fresh['succeeded_ids'] : array();
+			$merged    = array_values(
+				array_unique(
+					array_filter(
+						array_map( 'absint', array_merge( $fresh_ids, $job_ids ) )
+					)
+				)
+			);
+			$job['succeeded_ids'] = $merged;
+			$job['succeeded']     = count( $merged );
+			$job['steps']         = max( (int) ( $job['steps'] ?? 0 ), (int) ( $fresh['steps'] ?? 0 ) );
+			$job['processed']     = max( (int) ( $job['processed'] ?? 0 ), (int) ( $fresh['processed'] ?? 0 ), (int) $job['steps'] );
+		}
+
 		$job['updated_at'] = time();
 		update_option( self::JOB_OPTION, $job, false );
 
@@ -1799,14 +1973,9 @@ final class Activity_Logger {
 
 		if ( $lock ) {
 			$lock_age = time() - absint( $lock );
-			$job      = self::get_job_raw();
-			$step_age = isset( $job['step_started_at'] ) && absint( $job['step_started_at'] ) > 0
-				? time() - absint( $job['step_started_at'] )
-				: PHP_INT_MAX;
 
-			$max_age = self::get_cron_step_budget_sec() + 45;
-
-			if ( $lock_age < $max_age && $step_age < $max_age ) {
+			// Another worker is alive and still refreshing the lock.
+			if ( $lock_age < self::STEP_LOCK_TTL ) {
 				return false;
 			}
 
@@ -1930,6 +2099,17 @@ final class Activity_Logger {
 		}
 
 		$released_stale_lock = self::maybe_release_stale_step_lock();
+		$lock_held           = (bool) get_transient( self::STEP_LOCK_KEY );
+
+		// A living tick owns the lock — never start a second worker beside it.
+		if ( $lock_held ) {
+			$job = self::get_job_raw();
+			$job['worker_ensured'] = true;
+			$job['cron_scheduled'] = (bool) wp_next_scheduled( self::CRON_HOOK );
+			$job['next_cron_at']   = wp_next_scheduled( self::CRON_HOOK ) ?: null;
+
+			return self::normalize_job_for_response( $job, false );
+		}
 
 		$next = wp_next_scheduled( self::CRON_HOOK );
 		$last = max(
@@ -1938,8 +2118,7 @@ final class Activity_Logger {
 		);
 		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		// Due event sitting past its time with no lock → run now instead of waiting for crontab.
-		$due_and_idle = $next && $next <= time() && ! get_transient( self::STEP_LOCK_KEY );
+		$due_and_idle = $next && $next <= time();
 
 		if ( ! $next ) {
 			self::schedule_background_worker( 0 );
@@ -1965,9 +2144,9 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 
-		$stale_limit = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 75 : 45;
+		$stale_limit = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 90 : 60;
 
-		if ( ( $age > $stale_limit || $due_and_idle || $released_stale_lock ) && ! get_transient( self::STEP_LOCK_KEY ) ) {
+		if ( $age > $stale_limit || $due_and_idle || $released_stale_lock ) {
 			return self::process_background_step();
 		}
 
@@ -2051,8 +2230,10 @@ final class Activity_Logger {
 				break;
 			}
 
+			self::touch_worker_heartbeat();
 			$result = self::process_job_step();
 			$last_result = $result;
+			self::touch_worker_heartbeat();
 
 			++$steps_run;
 
@@ -2062,6 +2243,7 @@ final class Activity_Logger {
 			$job['last_cron_steps']     = $steps_run;
 			$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
 			self::save_job( $job );
+			self::touch_step_lock();
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
 				self::unschedule_background_worker();
@@ -2145,6 +2327,8 @@ final class Activity_Logger {
 
 			return self::normalize_job_for_response( $job, false );
 		}
+
+		self::touch_worker_heartbeat();
 
 		try {
 			return self::run_job_step( $job );
@@ -2313,6 +2497,17 @@ final class Activity_Logger {
 
 		$job['current_post_id'] = $post_id;
 		$job['step_started_at'] = time();
+
+		// Already done for this language — do not burn an AI call or spam "ترجمه شد".
+		if (
+			self::job_already_counted_success( $job, $post_id )
+			|| 'translated' === self::resolve_post_job_status( $post_id, $lang )
+		) {
+			return self::normalize_job_for_response(
+				self::advance_past_already_translated_post( $job, $post_id, $lang ),
+				false
+			);
+		}
 
 		$step_counts = is_array( $job['post_step_counts'] ?? null ) ? $job['post_step_counts'] : array();
 		$step_counts[ $post_id ] = absint( $step_counts[ $post_id ] ?? 0 ) + 1;
@@ -3333,6 +3528,7 @@ final class Activity_Logger {
 		self::log_report( $post_id, $lang, $title_source, $title_translated, 'auto' );
 
 		$status = self::resolve_post_job_status( $post_id, $lang );
+		$already_counted = self::job_already_counted_success( $job, $post_id );
 
 		if ( 'translated' === $status ) {
 			self::track_succeeded_post( $job, $post_id );
@@ -3371,7 +3567,6 @@ final class Activity_Logger {
 		}
 
 		// Keep the current post in the retry queue only while it is still incomplete.
-		// (Previous logic was inverted and dropped partial posts immediately.)
 		$retry_queue = array_values(
 			array_filter(
 				self::get_retry_queue( $job ),
@@ -3386,7 +3581,7 @@ final class Activity_Logger {
 		);
 		$job['retry_queue'] = $retry_queue;
 
-		if ( 'translated' === $status ) {
+		if ( 'translated' === $status && ! $already_counted ) {
 			self::log(
 				'success',
 				sprintf(
@@ -3415,13 +3610,19 @@ final class Activity_Logger {
 			self::set_job_last_step(
 				$job,
 				$post_id,
-				'translated',
-				sprintf(
-					/* translators: 1: post title, 2: language label */
-					__( '«%1$s» به %2$s ترجمه شد.', 'polymart-ai' ),
-					$title_source,
-					$job['lang_label'] ?? $lang
-				)
+				$already_counted ? 'skipped' : 'translated',
+				$already_counted
+					? sprintf(
+						/* translators: %s: post title */
+						__( '«%s» از قبل موفق ثبت شده بود — مورد بعدی.', 'polymart-ai' ),
+						$title_source
+					)
+					: sprintf(
+						/* translators: 1: post title, 2: language label */
+						__( '«%1$s» به %2$s ترجمه شد.', 'polymart-ai' ),
+						$title_source,
+						$job['lang_label'] ?? $lang
+					)
 			);
 		} else {
 			self::set_job_last_step(

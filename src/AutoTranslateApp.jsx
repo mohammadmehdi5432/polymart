@@ -220,37 +220,39 @@ export default function AutoTranslateApp() {
       return;
     }
 
-    // Server sends newest-first; show oldest→newest in the live panel.
+    // Server sends newest-first; show oldest→newest. Replace panel with this run's server log.
     const chronological = [...recentLogs].reverse();
+    const seenMessages = new Set();
+    const next = [];
 
-    setLogs((prev) => {
-      const seen = new Set(prev.map((entry) => entry.id));
-      const next = [...prev];
+    chronological.forEach((entry) => {
+      const raw = String(entry.message || '').trim();
+      if (!raw) {
+        return;
+      }
 
-      chronological.forEach((entry) => {
-        const id = entry.id || `srv-${entry.time}-${entry.message}`;
-        if (seen.has(id)) {
-          return;
-        }
-        seen.add(id);
-        next.push({
-          id,
-          message: entry.time
-            ? `[${formatTime(entry.time)}] ${entry.message}`
-            : entry.message,
-          type:
-            entry.level === 'success'
-              ? 'success'
-              : entry.level === 'error'
-                ? 'error'
-                : entry.level === 'warning'
-                  ? 'warning'
-                  : 'info',
-        });
+      // Drop near-duplicate lines (same text within the run).
+      const dedupeKey = raw.replace(/\s+/g, ' ');
+      if (seenMessages.has(dedupeKey)) {
+        return;
+      }
+      seenMessages.add(dedupeKey);
+
+      next.push({
+        id: entry.id || `srv-${entry.time}-${dedupeKey}`,
+        message: entry.time ? `[${formatTime(entry.time)}] ${raw}` : raw,
+        type:
+          entry.level === 'success'
+            ? 'success'
+            : entry.level === 'error'
+              ? 'error'
+              : entry.level === 'warning'
+                ? 'warning'
+                : 'info',
       });
-
-      return next.slice(-200);
     });
+
+    setLogs(next.slice(-200));
   }, []);
 
   const appendStepLog = useCallback(
@@ -269,16 +271,19 @@ export default function AutoTranslateApp() {
         return;
       }
 
+      // Prefer server recent_logs for "translated" lines — avoid duplicate client echoes.
+      if (step.status === 'translated' || step.status === 'skipped') {
+        return;
+      }
+
       const type =
-        step.status === 'translated'
-          ? 'success'
-          : step.status === 'failed'
-            ? 'error'
-            : step.status === 'skipped'
-              ? 'warning'
-            : step.status === 'partial'
-              ? 'warning'
-              : 'info';
+        step.status === 'failed'
+          ? 'error'
+          : step.status === 'skipped'
+            ? 'warning'
+          : step.status === 'partial'
+            ? 'warning'
+            : 'info';
 
       appendLog(message, type);
     },
@@ -355,12 +360,10 @@ export default function AutoTranslateApp() {
       setActivePost(display);
     }
 
-    if (data.last_step) {
-      appendStepLog(data.last_step);
-    }
-
-    if (Array.isArray(data.recent_logs)) {
+    if (Array.isArray(data.recent_logs) && data.recent_logs.length > 0) {
       syncServerLogs(data.recent_logs);
+    } else if (data.last_step) {
+      appendStepLog(data.last_step);
     }
 
     return merged;
@@ -1131,7 +1134,7 @@ export default function AutoTranslateApp() {
                     hint: liveStats.total != null ? `از ${liveStats.total} محتوای قابل ترجمه` : null,
                     color: 'text-gray-800',
                   },
-                  { label: 'موفق (این اجرا)', value: job?.succeeded ?? 0, color: 'text-green-700' },
+                  { label: 'موفق قطعی (این اجرا)', value: job?.succeeded ?? 0, hint: 'فقط مواردی که ۱۰۰٪ کامل و یک‌بار شمرده شده‌اند', color: 'text-green-700' },
                   { label: 'ناقص در صف اجرا', value: job?.partial ?? 0, color: 'text-amber-700' },
                   { label: 'ناموفق (این اجرا)', value: job?.failed ?? 0, color: 'text-red-700' },
                   { label: 'رد شده (این اجرا)', value: job?.skipped ?? 0, color: 'text-amber-800' },
@@ -1143,9 +1146,9 @@ export default function AutoTranslateApp() {
                   },
                   { label: 'تلاش API (slice)', value: steps, color: 'text-gray-700' },
                   {
-                    label: 'پیشرفت این اجرا',
+                    label: 'پیشرفت بودجه این اجرا',
                     value: queueTotal > 0 ? `${runDone} / ${queueTotal}` : '—',
-                    hint: 'فقط موارد ۱۰۰٪ تمام‌شده در این اجرا',
+                    hint: 'موفق قطعی + ردشده‌های تمام‌شده',
                     color: 'text-pmai-primary',
                   },
                   { label: 'باقی بودجه این اجرا', value: runRemaining, color: runRemaining > 0 ? 'text-blue-700' : 'text-green-700' },
