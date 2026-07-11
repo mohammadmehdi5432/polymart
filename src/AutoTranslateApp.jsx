@@ -7,8 +7,8 @@ import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi 
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
-/** If cron has not ticked for this long, nudge/ensure the server worker. */
-const CRON_STALE_SEC = 8;
+/** AS keep-alive is ~60s; treat worker stale only after a missed pulse. */
+const CRON_STALE_SEC = 70;
 /**
  * Lock alone is trusted this long without a completed tick.
  * Must stay above max AI HTTP timeout (~165s) so the monitor does not steal a living worker.
@@ -880,15 +880,17 @@ export default function AutoTranslateApp() {
   const latestActivityAt = latestWorkerStamp(job);
 
   const workerLabel =
-    job?.last_worker === 'cli'
-      ? 'CLI'
-      : job?.last_worker === 'cron'
-        ? 'کرون keep-alive'
-        : job?.last_worker === 'loopback'
-          ? 'CLI'
-          : job?.last_worker === 'admin'
-            ? 'سرور'
-            : null;
+    job?.last_worker === 'as'
+      ? 'Action Scheduler'
+      : job?.last_worker === 'cli'
+        ? 'Action Scheduler'
+        : job?.last_worker === 'cron'
+          ? 'کرون keep-alive'
+          : job?.last_worker === 'loopback'
+            ? 'Action Scheduler'
+            : job?.last_worker === 'admin'
+              ? 'سرور'
+              : null;
 
   const statusLabel = actionPendingLabel
     ? actionPendingLabel
@@ -918,13 +920,13 @@ export default function AutoTranslateApp() {
       subtitle={`ترجمه خودکار محتوای فارسی به ${targetLabel} — اجرا روی سرور با کرون، مانیتور در این صفحه`}
     >
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
-        <p className="font-medium">کارگر CLI پیوسته (Long-Running Worker)</p>
+        <p className="font-medium">صف Action Scheduler (موتور پس‌زمینه ووکامرس)</p>
         <p className="mt-1 text-pmai-muted">
-          ترجمه در یک پروسهٔ CLI پشت‌صحنه پشت‌سرهم اجرا می‌شود — بدون AJAX Loopback و بدون وابستگی به فایروال.
-          کرون‌جاب سرور فقط keep-alive است: اگر کارگر قطع شده باشد دوباره استارتش می‌زند.
+          هر دسته ترجمه به‌صورت Action در صف رسمی وردپرس/ووکامرس ثبت می‌شود. کرون‌جاب ۱ دقیقه‌ای سرور فقط
+          همین صف را تیک می‌زند — بدون CLI و بدون HTTP Loopback.
         </p>
         <p className="mt-1">
-          بستن این تب صف را متوقف نمی‌کند. اگر هاست اجازهٔ exec ندهد، همان کرون هر دقیقه یک حلقهٔ فشرده اجرا می‌کند.
+          بستن این تب صف را متوقف نمی‌کند. ووکامرس باید فعال باشد تا Action Scheduler در دسترس باشد.
         </p>
       </div>
 
@@ -953,7 +955,7 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message="DISABLE_WP_CRON فعال است — کارگر CLI مستقل صف را جلو می‌برد و pulse دقیقه‌ای فقط keep-alive است (اگر کارگر مرده باشد دوباره استارتش می‌زند)."
+            message="DISABLE_WP_CRON فعال است — ترجمه با Action Scheduler جلو می‌رود و crontab هر دقیقه صف AS را تیک می‌زند (بدون CLI و بدون loopback)."
           />
         </div>
       ) : !config.devMode ? (

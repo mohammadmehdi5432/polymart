@@ -85,16 +85,10 @@ PolymartAI\Autoloader::register();
 
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	require_once POLYMART_AI_PLUGIN_DIR . 'includes/CLI/class-variation-sync-command.php';
-	require_once POLYMART_AI_PLUGIN_DIR . 'includes/CLI/class-job-worker-command.php';
 
 	\WP_CLI::add_command(
 		'polymart-ai resync-variations',
 		'PolymartAI\\CLI\\Variation_Sync_Command'
-	);
-
-	\WP_CLI::add_command(
-		'polymart-ai job-worker',
-		'PolymartAI\\CLI\\Job_Worker_Command'
 	);
 }
 
