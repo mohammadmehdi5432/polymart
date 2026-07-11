@@ -313,14 +313,24 @@ final class Job_Action_Scheduler {
 		}
 
 		$job     = Activity_Logger::get_job_for_as_debug();
-		$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
 		$queued  = is_array( $job['deferred_queue'] ?? null ) ? count( $job['deferred_queue'] ) : 0;
+		$next_hint = 0;
+
+		if ( ! empty( $job['deferred_queue'][0] ) ) {
+			$next_hint = absint( $job['deferred_queue'][0] );
+		}
+
+		$post_id = absint( $job['current_post_id'] ?? 0 )
+			?: absint( $job['partial_post_id'] ?? 0 )
+			?: $next_hint;
 
 		Activity_Logger::log(
 			'info',
 			sprintf(
 				/* translators: 1: AS action ID, 2: post ID, 3: queued count */
-				__( 'AS #%1$d: شروع batch ترجمه (پست جاری/جزئی: #%2$d، %3$d مورد در صف آماده).', 'polymart-ai' ),
+				$next_hint > 0 && 0 === absint( $job['current_post_id'] ?? 0 ) && 0 === absint( $job['partial_post_id'] ?? 0 )
+					? __( 'AS #%1$d: شروع batch ترجمه (مورد بعدی از صف: #%2$d، %3$d مورد آماده).', 'polymart-ai' )
+					: __( 'AS #%1$d: شروع batch ترجمه (پست جاری/جزئی: #%2$d، %3$d مورد در صف آماده).', 'polymart-ai' ),
 				self::$current_action_id,
 				$post_id,
 				$queued
@@ -424,6 +434,10 @@ final class Job_Action_Scheduler {
 
 		self::$handler_clean_exit = true;
 		self::release_slice_mutex();
+
+		if ( Activity_Logger::is_bulk_job_running() ) {
+			self::chain_next_slice_immediately();
+		}
 	}
 
 	/**
@@ -435,7 +449,10 @@ final class Job_Action_Scheduler {
 		self::release_slice_mutex();
 
 		if ( self::$handler_clean_exit ) {
-			if ( Activity_Logger::is_bulk_job_running() ) {
+			if (
+				Activity_Logger::is_bulk_job_running()
+				&& ! self::has_pending_or_running()
+			) {
 				self::chain_next_slice_immediately();
 			}
 

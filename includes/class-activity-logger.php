@@ -48,6 +48,8 @@ final class Activity_Logger {
 	const CRON_INTERVAL_SEC    = 0;
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
 	const CRON_SAFETY_SEC      = 120;
+	/** Faster AS fallback when inline chaining does not start the next slice. */
+	const AS_CRON_SAFETY_SEC   = 8;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per Action Scheduler / cron batch. */
 	const CRON_STEP_BUDGET_SEC = 55;
@@ -3157,7 +3159,8 @@ final class Activity_Logger {
 		self::clear_chain_events();
 		self::ensure_recurring_pulse();
 		// Do not ping here — mid-tick ping spawned nested cron workers and froze the site.
-		wp_schedule_single_event( time() + self::CRON_SAFETY_SEC, self::CRON_HOOK );
+		$safety_sec = self::$trusted_as_tick ? self::AS_CRON_SAFETY_SEC : self::CRON_SAFETY_SEC;
+		wp_schedule_single_event( time() + $safety_sec, self::CRON_HOOK );
 
 		$started   = time();
 		$budget    = null !== $budget_override
@@ -4057,11 +4060,11 @@ final class Activity_Logger {
 
 		$queue = self::get_deferred_queue( $job );
 
-		if ( count( $queue ) >= 5 ) {
+		if ( count( $queue ) >= 8 ) {
 			return;
 		}
 
-		$seed_limit = min( 8, max( 3, 5 - count( $queue ) ) );
+		$seed_limit = min( 10, max( 3, 8 - count( $queue ) ) );
 		$new_ids    = Translation_Query::seed_actionable_post_ids(
 			$lang,
 			$seed_limit,
