@@ -46,6 +46,11 @@ function isCronHealthy(job) {
   const lockAge = Number(job?.worker_lock_age || 0);
   const hasActivePost = Boolean(job?.current_post?.title && !job?.current_post?.from_last_step);
 
+  // AS action queued but worker silent — don't wait 150s for the monitor kick.
+  if (job?.status === 'running' && job?.as_pending && activityAge > 15) {
+    return false;
+  }
+
   if (job?.worker_lock) {
     // Actively translating a known post — trust the lock for one AI-call window.
     if (hasActivePost && lockAge >= 0 && lockAge < LOCK_HEALTHY_SEC) {

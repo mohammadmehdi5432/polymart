@@ -2498,7 +2498,7 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 		Job_Action_Scheduler::cancel_all();
-		self::bootstrap_background_worker( false );
+		self::bootstrap_background_worker( true );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -2575,8 +2575,8 @@ final class Activity_Logger {
 				);
 			}
 
-			self::save_job( $job );
-			self::bootstrap_background_worker( false );
+		self::save_job( $job );
+		self::bootstrap_background_worker( true );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -4042,6 +4042,44 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Top up deferred_queue after a success so pick_next never stalls on an empty buffer.
+	 *
+	 * @param array<string, mixed> $job  Job state (by reference).
+	 * @param string               $lang Target language code.
+	 * @return void
+	 */
+	private static function replenish_deferred_queue_if_low( array &$job, $lang ) {
+		$lang = sanitize_key( (string) $lang );
+
+		if ( '' === $lang ) {
+			return;
+		}
+
+		$queue = self::get_deferred_queue( $job );
+
+		if ( count( $queue ) >= 5 ) {
+			return;
+		}
+
+		$seed_limit = min( 8, max( 3, 5 - count( $queue ) ) );
+		$new_ids    = Translation_Query::seed_actionable_post_ids(
+			$lang,
+			$seed_limit,
+			self::get_exhausted_job_post_ids( $job )
+		);
+
+		if ( empty( $new_ids ) ) {
+			return;
+		}
+
+		$job['deferred_queue'] = array_values(
+			array_unique(
+				array_merge( $queue, array_map( 'absint', $new_ids ) )
+			)
+		);
+	}
+
+	/**
 	 * Normalize deferred queue from job state.
 	 *
 	 * @param array<string, mixed> $job Job state.
@@ -4666,6 +4704,11 @@ final class Activity_Logger {
 		// Full-site scans are expensive; refresh at most every few seconds.
 		$live_age = time() - (int) ( $job['live_stats_at'] ?? 0 );
 		self::sync_job_live_stats( $job, $lang, $live_age >= 5 );
+
+		if ( 'translated' === $status ) {
+			self::replenish_deferred_queue_if_low( $job, $lang );
+		}
+
 		self::save_job( $job );
 
 		return $job;

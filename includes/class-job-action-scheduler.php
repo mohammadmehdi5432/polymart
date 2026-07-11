@@ -30,8 +30,14 @@ final class Job_Action_Scheduler {
 	/** Wall-clock budget for one AS slice callback (shared-host safe). */
 	const SLICE_BUDGET_SEC = 90;
 
-	/** Breathing room before the next slice is scheduled after a successful one. */
-	const CHAIN_DELAY_SEC = 4;
+	/** Default delay when chaining via shutdown only (0 = ASAP). */
+	const CHAIN_DELAY_SEC = 0;
+
+	/** Max translation steps per single AS callback (same HTTP request). */
+	const AS_MAX_STEPS_PER_ACTION = 5;
+
+	/** Guard against run_queue_inline recursion blowing the PHP time limit. */
+	const MAX_INLINE_CHAIN_DEPTH = 3;
 
 	/** When another slice is in-flight, defer this action by this many seconds. */
 	const CONCURRENCY_DEFER_SEC = 45;
@@ -66,6 +72,13 @@ final class Job_Action_Scheduler {
 	 * @var bool
 	 */
 	private static $shutdown_registered = false;
+
+	/**
+	 * Nesting depth for inline queue runs triggered from slice shutdown chaining.
+	 *
+	 * @var int
+	 */
+	private static $inline_chain_depth = 0;
 
 	/**
 	 * Whether Action Scheduler APIs are loaded (normally via WooCommerce).
@@ -148,7 +161,13 @@ final class Job_Action_Scheduler {
 		$delay_sec = max( 0, min( 30, absint( $delay_sec ) ) );
 
 		if ( $delay_sec <= 1 && self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0 ) {
-			return 0;
+			$running_ids = self::query_running_action_ids( 5 );
+			$only_self   = 1 === count( $running_ids )
+				&& absint( $running_ids[0] ) === absint( self::$current_action_id );
+
+			if ( ! $only_self ) {
+				return 0;
+			}
 		}
 
 		do_action( 'polymart_ai_before_enqueue_as_slice' );
@@ -322,33 +341,55 @@ final class Job_Action_Scheduler {
 			)
 		);
 
-		try {
-			Activity_Logger::run_action_scheduler_batch( 1, self::SLICE_BUDGET_SEC );
-		} catch ( \Throwable $e ) {
-			Activity_Logger::log(
-				'error',
-				sprintf(
-					/* translators: 1: AS action ID, 2: error */
-					__( 'AS #%1$d: Exception در batch — %2$s', 'polymart-ai' ),
-					self::$current_action_id,
-					$e->getMessage()
-				),
-				array(
-					'as_action_id' => self::$current_action_id,
-					'exception'    => get_class( $e ),
-					'file'         => $e->getFile(),
-					'line'         => $e->getLine(),
-				)
-			);
+		$slices_done = 0;
+		$batch_start = time();
 
-			Activity_Logger::recover_job_item_failure(
-				$e->getMessage(),
-				$post_id,
-				array(
-					'source'       => 'as_handle_slice',
-					'as_action_id' => self::$current_action_id,
-				)
-			);
+		while (
+			Activity_Logger::is_bulk_job_running()
+			&& $slices_done < self::AS_MAX_STEPS_PER_ACTION
+			&& ( time() - $batch_start ) < ( self::SLICE_BUDGET_SEC - 3 )
+		) {
+			$remaining_budget = max( 20, self::SLICE_BUDGET_SEC - ( time() - $batch_start ) );
+
+			try {
+				$step_result = Activity_Logger::run_action_scheduler_batch( 1, $remaining_budget );
+			} catch ( \Throwable $e ) {
+				Activity_Logger::log(
+					'error',
+					sprintf(
+						/* translators: 1: AS action ID, 2: error */
+						__( 'AS #%1$d: Exception در batch — %2$s', 'polymart-ai' ),
+						self::$current_action_id,
+						$e->getMessage()
+					),
+					array(
+						'as_action_id' => self::$current_action_id,
+						'exception'    => get_class( $e ),
+						'file'         => $e->getFile(),
+						'line'         => $e->getLine(),
+					)
+				);
+
+				Activity_Logger::recover_job_item_failure(
+					$e->getMessage(),
+					$post_id,
+					array(
+						'source'       => 'as_handle_slice',
+						'as_action_id' => self::$current_action_id,
+					)
+				);
+				break;
+			}
+
+			++$slices_done;
+
+			if ( is_array( $step_result ) && ! empty( $step_result['step_deferred'] ) ) {
+				break;
+			}
+
+			if ( 'running' !== (string) ( $step_result['status'] ?? Activity_Logger::get_job_for_as_debug()['status'] ?? '' ) ) {
+				break;
+			}
 		}
 
 		$job_after  = Activity_Logger::get_job_for_as_debug();
@@ -395,7 +436,7 @@ final class Job_Action_Scheduler {
 
 		if ( self::$handler_clean_exit ) {
 			if ( Activity_Logger::is_bulk_job_running() ) {
-				self::enqueue_next( true, self::CHAIN_DELAY_SEC );
+				self::chain_next_slice_immediately();
 			}
 
 			return;
@@ -446,6 +487,35 @@ final class Job_Action_Scheduler {
 		}
 
 		self::$current_action_id = 0;
+	}
+
+	/**
+	 * Enqueue the next slice and run due AS actions in-process (no wp-cron wait).
+	 *
+	 * @return void
+	 */
+	private static function chain_next_slice_immediately() {
+		if ( ! Activity_Logger::is_bulk_job_running() ) {
+			return;
+		}
+
+		if ( self::$inline_chain_depth >= self::MAX_INLINE_CHAIN_DEPTH ) {
+			self::enqueue_next( true, 0 );
+			return;
+		}
+
+		self::enqueue_next( true, 0 );
+
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) <= 0 ) {
+			return;
+		}
+
+		++self::$inline_chain_depth;
+		try {
+			self::run_queue_inline( true );
+		} finally {
+			--self::$inline_chain_depth;
+		}
 	}
 
 	/**
