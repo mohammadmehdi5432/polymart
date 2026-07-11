@@ -21,12 +21,20 @@ function stepLogSignature(step) {
 }
 
 function isCronHealthy(job) {
-  if (!job?.last_cron_at) {
+  if (job?.worker_alive) {
+    return true;
+  }
+
+  const stamp = Number(job?.last_cron_at || job?.worker_heartbeat_at || job?.worker_scheduled_at || 0);
+
+  if (!stamp) {
     return false;
   }
 
-  const age = Math.floor(Date.now() / 1000) - Number(job.last_cron_at);
-  return age >= 0 && age < CRON_STALE_SEC;
+  const age = Math.floor(Date.now() / 1000) - stamp;
+  const windowSec = job?.cron_disabled ? 180 : 90;
+
+  return age >= 0 && age < windowSec;
 }
 
 function resolveDisplayPost(job, stickyPost = null) {
@@ -365,7 +373,7 @@ export default function AutoTranslateApp() {
           return;
         }
 
-        if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight) {
+        if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight && !data.worker_lock) {
           ensureInFlight = true;
           await ensureServerWorker();
           ensureInFlight = false;
@@ -702,9 +710,13 @@ export default function AutoTranslateApp() {
               ? 'در حال رد کردن…'
               : null;
 
-  const cronAgeSec = job?.last_cron_at
-    ? Math.max(0, Math.floor(Date.now() / 1000) - Number(job.last_cron_at))
-    : null;
+  const cronAgeSec = (() => {
+    const stamp = Number(job?.last_cron_at || job?.worker_heartbeat_at || 0);
+    if (!stamp) {
+      return null;
+    }
+    return Math.max(0, Math.floor(Date.now() / 1000) - stamp);
+  })();
 
   const workerLabel =
     job?.last_worker === 'cron' ? 'کرون' : job?.last_worker === 'admin' ? 'سرور' : null;
@@ -717,8 +729,10 @@ export default function AutoTranslateApp() {
         : cronAgeSec != null
           ? cronAgeSec < CRON_STALE_SEC
             ? `در حال اجرا روی سرور — آخرین تیک ${cronAgeSec}ث پیش`
-            : `در حال اجرا — منتظر تیک کرون (${cronAgeSec}ث)`
-          : 'در حال اجرا روی سرور (کارگر کرون)'
+            : `در حال اجرا — آخرین فعالیت ${cronAgeSec}ث پیش`
+          : job?.cron_scheduled
+            ? 'زمان‌بندی شده — منتظر اجرای crontab'
+            : 'در حال اجرا روی سرور (کارگر کرون)'
       : isPaused
         ? isOutdated
           ? 'نیاز به اجرای مجدد'
@@ -765,7 +779,7 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message="حالت سرور فعال است (DISABLE_WP_CRON): crontab باید هر ۱ تا ۲ دقیقه wp-cron.php را اجرا کند — ترجمه بدون تب باز ادامه می‌یابد."
+            message="حالت سرور فعال است (DISABLE_WP_CRON): با زدن شروع، اولین تیک همان لحظه اجرا می‌شود؛ ادامه‌اش با crontab هر ۱ دقیقه (مسیر واقعی wp-cron.php سایت، نه /path/to/)."
           />
         </div>
       ) : !config.devMode ? (
@@ -777,20 +791,31 @@ export default function AutoTranslateApp() {
         </div>
       ) : null}
 
-      {!loading && job?.status === 'running' && job?.last_cron_at ? (
+      {!loading && job?.status === 'running' && (job?.last_cron_at || job?.worker_heartbeat_at) ? (
         <div className="mb-4">
           <Notice
             type="info"
-            message={`کارگر کرون زنده است — آخرین تیک: ${formatTime(job.last_cron_at)}${
-              job.last_cron_steps ? ` (${job.last_cron_steps} مرحله)` : ''
+            message={`کارگر سرور زنده است — آخرین فعالیت: ${formatTime(
+              job.last_cron_at || job.worker_heartbeat_at
+            )}${job.last_cron_steps ? ` (${job.last_cron_steps} مرحله)` : ''}${
+              job.next_cron_at ? ` · تیک بعدی حدود ${formatTime(job.next_cron_at)}` : ''
             }. بستن تب اشکالی ندارد.`}
           />
         </div>
-      ) : !loading && job?.status === 'running' && !job?.last_cron_at ? (
+      ) : !loading && job?.status === 'running' && job?.cron_scheduled ? (
+        <div className="mb-4">
+          <Notice
+            type="info"
+            message={`کارگر زمان‌بندی شده است${
+              job.next_cron_at ? ` — اجرای بعدی حدود ${formatTime(job.next_cron_at)}` : ''
+            }. با DISABLE_WP_CRON تا رسیدن crontab بعدی (حداکثر حدود ۱ دقیقه) صبر کنید؛ شروع/ادامه خودش اولین تیک را می‌زند.`}
+          />
+        </div>
+      ) : !loading && job?.status === 'running' ? (
         <div className="mb-4">
           <Notice
             type="warning"
-            message="کارگر هنوز اولین تیک را نزده — اگر crontab تنظیم شده چند ثانیه صبر کنید، یا مطمئن شوید DISABLE_WP_CRON + crontab فعال است."
+            message="هنوز event کرون دیده نمی‌شود — یک‌بار «ادامه» بزنید. مسیر crontab باید به wp-cron.php واقعی همین سایت اشاره کند (مثلاً …/public_html/wp-cron.php)."
           />
         </div>
       ) : null}

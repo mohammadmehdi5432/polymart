@@ -4,6 +4,8 @@ import api from './settings';
 export const JOB_STEP_TIMEOUT_MS = 180000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
+/** Start/resume bootstrap runs the first worker tick inline. */
+const JOB_BOOTSTRAP_TIMEOUT_MS = 180000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
 const JOB_STEP_RETRIES = 1;
@@ -65,8 +67,10 @@ export async function fetchJob() {
 
 export async function jobAction(action, lang = 'en', extra = {}) {
   abortJobStep();
+  const bootstrapActions = new Set(['start', 'resume', 'ensure', 'kick']);
+  const timeout = bootstrapActions.has(action) ? JOB_BOOTSTRAP_TIMEOUT_MS : JOB_FETCH_TIMEOUT_MS;
   const { data } = await withRetries(() =>
-    api.post('/translation-job', { action, lang, ...extra }, { timeout: JOB_FETCH_TIMEOUT_MS })
+    api.post('/translation-job', { action, lang, ...extra }, { timeout })
   );
   return data;
 }

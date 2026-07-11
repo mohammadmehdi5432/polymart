@@ -781,9 +781,37 @@ final class Activity_Logger {
 		$lock = get_transient( self::STEP_LOCK_KEY );
 		$job['worker_lock']     = (bool) $lock;
 		$job['worker_lock_age'] = $lock ? max( 0, time() - absint( $lock ) ) : null;
-		$job['cron_scheduled']  = (bool) wp_next_scheduled( self::CRON_HOOK );
+
+		$next_cron = wp_next_scheduled( self::CRON_HOOK );
+		$job['cron_scheduled'] = (bool) $next_cron;
+		$job['next_cron_at']   = $next_cron ? (int) $next_cron : null;
+		$job['cron_disabled']  = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+		$job['worker_alive']   = self::is_worker_heartbeat_fresh( $job );
 
 		return $job;
+	}
+
+	/**
+	 * Whether the worker has checked in recently (heartbeat or completed tick).
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return bool
+	 */
+	private static function is_worker_heartbeat_fresh( array $job ) {
+		$last = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 ),
+			absint( $job['worker_scheduled_at'] ?? 0 )
+		);
+
+		if ( $last <= 0 ) {
+			return false;
+		}
+
+		// With real crontab (often every 60s), allow a wider window before alarming.
+		$window = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 180 : 90;
+
+		return ( time() - $last ) < $window;
 	}
 
 	/**
@@ -1411,8 +1439,7 @@ final class Activity_Logger {
 		);
 
 		self::save_job( $job );
-		self::schedule_background_worker( 1 );
-		self::ping_wp_cron();
+		self::bootstrap_background_worker();
 		self::log(
 			'info',
 			sprintf(
@@ -1424,7 +1451,7 @@ final class Activity_Logger {
 			array( 'lang' => $lang, 'total' => $total )
 		);
 
-		return self::normalize_job_for_response( $job, false );
+		return self::normalize_job_for_response( self::get_job_raw(), false );
 	}
 
 	/**
@@ -1464,12 +1491,11 @@ final class Activity_Logger {
 			$job['step_started_at'] = null;
 
 			self::save_job( $job );
-			self::schedule_background_worker( 1 );
-			self::ping_wp_cron();
+			self::bootstrap_background_worker();
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (کارگر کرون).', 'polymart-ai' ) );
 		}
 
-		return self::normalize_job_for_response( $job, false );
+		return self::normalize_job_for_response( self::get_job_raw(), false );
 	}
 
 	/**
@@ -1700,13 +1726,20 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	public static function schedule_background_worker( $delay_sec = null ) {
-		if ( wp_next_scheduled( self::CRON_HOOK ) ) {
-			self::ping_wp_cron();
+		$next = wp_next_scheduled( self::CRON_HOOK );
 
-			return;
+		if ( $next ) {
+			// Keep existing soon-due event; do not constantly push it forward.
+			if ( $next <= time() + 120 ) {
+				self::ping_wp_cron();
+
+				return;
+			}
+
+			self::unschedule_background_worker();
 		}
 
-		$delay = null === $delay_sec ? self::CRON_INTERVAL_SEC : max( 1, absint( $delay_sec ) );
+		$delay = null === $delay_sec ? self::CRON_INTERVAL_SEC : max( 0, absint( $delay_sec ) );
 
 		wp_schedule_single_event( time() + $delay, self::CRON_HOOK );
 		self::ping_wp_cron();
@@ -1757,8 +1790,36 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Ensure the background worker is scheduled (and nudged) without running a heavy tick.
-	 * Used by the admin monitor so the browser never owns translation work.
+	 * Mark the job as scheduled and run the first worker tick immediately.
+	 *
+	 * With DISABLE_WP_CRON, HTTP loopback often fails and the real crontab may
+	 * take up to a minute — so Start/Resume always bootstraps one tick here.
+	 * Follow-up ticks continue via cron self-chain + server crontab.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function bootstrap_background_worker() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		self::unschedule_background_worker();
+		self::schedule_background_worker( 0 );
+
+		$job = self::get_job_raw();
+		$job['worker_scheduled_at'] = time();
+		$job['worker_heartbeat_at'] = time();
+		$job['next_cron_at']        = wp_next_scheduled( self::CRON_HOOK ) ?: null;
+		self::save_job( $job );
+
+		return self::process_background_step();
+	}
+
+	/**
+	 * Ensure the background worker is scheduled (and nudged) without thrashing events.
+	 * If the heartbeat is very stale, run one tick as a safety fallback.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -1770,19 +1831,32 @@ final class Activity_Logger {
 		}
 
 		$next = wp_next_scheduled( self::CRON_HOOK );
-		$last = absint( $job['last_cron_at'] ?? 0 );
-		$stale = $last <= 0 || ( time() - $last ) > 45;
+		$last = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 )
+		);
+		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		if ( ! $next || $stale ) {
-			self::unschedule_background_worker();
-			self::schedule_background_worker( 1 );
+		if ( ! $next ) {
+			self::schedule_background_worker( 0 );
+			$next = wp_next_scheduled( self::CRON_HOOK );
 		} else {
 			self::ping_wp_cron();
 		}
 
 		$job = self::get_job_raw();
-		$job['cron_scheduled'] = (bool) wp_next_scheduled( self::CRON_HOOK );
-		$job['worker_ensured'] = true;
+		$job['worker_scheduled_at'] = absint( $job['worker_scheduled_at'] ?? 0 ) ?: time();
+		$job['next_cron_at']        = $next ? (int) $next : null;
+		$job['cron_scheduled']      = (bool) $next;
+		$job['worker_ensured']      = true;
+		self::save_job( $job );
+
+		// Safety net: if no completed tick for too long, run one now (crontab gap / failed loopback).
+		$stale_limit = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 90 : 60;
+
+		if ( $age > $stale_limit && ! get_transient( self::STEP_LOCK_KEY ) ) {
+			return self::process_background_step();
+		}
 
 		return self::normalize_job_for_response( $job, false );
 	}
@@ -1838,6 +1912,11 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		// Heartbeat BEFORE work so the monitor knows the worker is alive during long AI calls.
+		$job['worker_heartbeat_at'] = time();
+		$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+		self::save_job( $job );
+
 		// Ensure a follow-up tick exists even if this request fatals mid-step.
 		self::unschedule_background_worker();
 		self::schedule_background_worker( self::CRON_INTERVAL_SEC );
@@ -1864,9 +1943,10 @@ final class Activity_Logger {
 			++$steps_run;
 
 			$job = self::get_job_raw();
-			$job['last_cron_at']     = time();
-			$job['last_cron_steps']  = $steps_run;
-			$job['last_worker']      = wp_doing_cron() ? 'cron' : 'admin';
+			$job['last_cron_at']         = time();
+			$job['worker_heartbeat_at']  = time();
+			$job['last_cron_steps']     = $steps_run;
+			$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
 			self::save_job( $job );
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -1888,9 +1968,10 @@ final class Activity_Logger {
 		}
 
 		if ( is_array( $last_result ) ) {
-			$last_result['last_cron_at']    = time();
-			$last_result['last_cron_steps'] = $steps_run;
-			$last_result['last_worker']     = wp_doing_cron() ? 'cron' : 'admin';
+			$last_result['last_cron_at']        = time();
+			$last_result['worker_heartbeat_at'] = time();
+			$last_result['last_cron_steps']     = $steps_run;
+			$last_result['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
 
 			return $last_result;
 		}
