@@ -504,6 +504,11 @@ final class Translation_Query {
 				}
 			}
 
+			/**
+			 * Fires between batched catalog scans so long DB walks keep the job heartbeat fresh.
+			 */
+			do_action( 'polymart_ai_worker_heartbeat' );
+
 			++$paged;
 		} while ( $paged <= (int) $query->max_num_pages );
 	}

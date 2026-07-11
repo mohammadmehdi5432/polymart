@@ -258,6 +258,8 @@ final class Job_Action_Scheduler {
 			return;
 		}
 
+		Activity_Logger::on_ai_http_heartbeat();
+
 		self::$handler_clean_exit = false;
 		self::$current_action_id  = self::resolve_current_action_id();
 		self::register_handler_shutdown();

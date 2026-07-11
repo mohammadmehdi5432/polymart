@@ -103,6 +103,7 @@ final class Activity_Logger {
 		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'keep_alive_as_worker' ) );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_during_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
+		add_action( 'polymart_ai_worker_heartbeat', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		// Legacy endpoint: nudge AS instead of HTTP/CLI chains.
 		add_action( 'wp_ajax_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
 		add_action( 'wp_ajax_nopriv_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
@@ -1429,9 +1430,11 @@ final class Activity_Logger {
 		$worker_dead = $idle_for >= self::STEP_LOCK_TTL;
 
 		// Between items: lock held, no active post, and no completed tick recently.
+		// Do not steal the lock while a worker is still picking/scanning the catalog.
 		$idle_orphan = ( 0 === $current )
 			&& $idle_for >= self::LOCK_IDLE_ORPHAN_SEC
-			&& $lock_age >= self::LOCK_IDLE_ORPHAN_SEC;
+			&& $lock_age >= self::LOCK_IDLE_ORPHAN_SEC
+			&& ! self::is_bulk_worker_lively( self::LOCK_IDLE_ORPHAN_SEC );
 
 		// Living worker stopped touching the lock for the full TTL.
 		$ttl_expired = $lock_age >= self::STEP_LOCK_TTL;
@@ -1865,6 +1868,11 @@ final class Activity_Logger {
 			Post_Translator::flush_translation_status_cache();
 			REST_API::invalidate_stats_cache();
 		}
+
+		/**
+		 * Fires before a potentially long stats recompute during background jobs.
+		 */
+		do_action( 'polymart_ai_worker_heartbeat' );
 
 		$stats = Translation_Query::compute_translation_stats( $lang, $force_full );
 
@@ -2519,13 +2527,18 @@ final class Activity_Logger {
 		$job = self::get_job_raw();
 
 		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
+			// Halt chaining before cleanup so in-flight AS/cron callbacks see idle state.
+			self::unschedule_background_worker();
+			$job['status']          = 'idle';
+			$job['current_post_id'] = null;
+			$job['step_started_at'] = null;
+			self::save_job( $job );
 			self::cleanup_job_translation_locks( $job, true );
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
 		} else {
 			self::release_step_lock();
+			self::unschedule_background_worker();
 		}
-
-		self::unschedule_background_worker();
 
 		return self::save_job( self::empty_job() );
 	}
@@ -3326,7 +3339,8 @@ final class Activity_Logger {
 				// Cursor may have walked past posts that only look done in-memory.
 				// Reset and pull a fresh actionable set while site work remains.
 				self::touch_worker_heartbeat();
-				self::sync_job_live_stats( $job, $lang, true );
+				// Avoid flushing the full catalog cache while picking — that scan can exceed 30s.
+				self::sync_job_live_stats( $job, $lang, false );
 				self::touch_worker_heartbeat();
 				self::reconcile_succeeded_posts( $job, $lang );
 
