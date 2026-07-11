@@ -8,16 +8,16 @@ import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
 /** If cron has not ticked for this long, nudge/ensure the server worker. */
-const CRON_STALE_SEC = 30;
+const CRON_STALE_SEC = 10;
 /**
  * Lock alone is trusted this long without a completed tick.
  * Must stay above max AI HTTP timeout (~165s) so the monitor does not steal a living worker.
  */
 const LOCK_HEALTHY_SEC = 200;
 /** Between-item lock with no progress — force ensure. */
-const LOCK_IDLE_STALE_SEC = 60;
+const LOCK_IDLE_STALE_SEC = 25;
 /** Do not hammer ensure more than once per this interval. */
-const ENSURE_MIN_INTERVAL_MS = 45000;
+const ENSURE_MIN_INTERVAL_MS = 8000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -495,7 +495,9 @@ export default function AutoTranslateApp() {
             lastEnsureAt = nowMs;
             const recovered = await ensureServerWorker();
             if (recovered?.lock_recovered && isActiveRef.current) {
-              appendLog('قفل گیرکرده آزاد شد — منتظر تیک کرون سرور…', 'warning');
+              appendLog('قفل گیرکرده آزاد شد — تیک بعدی فوراً شروع می‌شود…', 'warning');
+            } else if (recovered?.loopback_spawned && isActiveRef.current) {
+              appendLog('کارگر پس‌زمینه بیدار شد — ادامه صف…', 'info');
             }
             ensureInFlight = false;
           }
@@ -841,22 +843,28 @@ export default function AutoTranslateApp() {
   })();
 
   const workerLabel =
-    job?.last_worker === 'cron' ? 'کرون' : job?.last_worker === 'admin' ? 'سرور' : null;
+    job?.last_worker === 'cron'
+      ? 'کرون'
+      : job?.last_worker === 'loopback'
+        ? 'زنجیره سریع'
+        : job?.last_worker === 'admin'
+          ? 'سرور'
+          : null;
 
   const statusLabel = actionPendingLabel
     ? actionPendingLabel
     : isRunning
       ? job?.worker_lock && cronAgeSec != null && cronAgeSec < LOCK_HEALTHY_SEC
-        ? `کرون در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
+        ? `در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
         : cronAgeSec != null
           ? cronAgeSec < CRON_STALE_SEC
-            ? `در حال اجرا روی سرور — آخرین تیک ${cronAgeSec}ث پیش`
-            : cronAgeSec >= 45
-              ? `کارگر خوابیده (${cronAgeSec}ث) — در حال بازیابی اجباری…`
-              : `در حال اجرا — آخرین فعالیت ${cronAgeSec}ث پیش`
+            ? `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
+            : cronAgeSec < 45
+              ? `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`
+              : `کارگر کند شد (${cronAgeSec}ث) — در حال بازیابی…`
           : job?.cron_scheduled
-            ? 'زمان‌بندی شده — منتظر اجرای crontab'
-            : 'در حال اجرا روی سرور (کارگر کرون)'
+            ? 'زمان‌بندی شده — شروع زنجیره پس‌زمینه'
+            : 'در حال اجرا روی سرور'
       : isPaused
         ? isOutdated
           ? 'نیاز به اجرای مجدد'
@@ -871,14 +879,13 @@ export default function AutoTranslateApp() {
       subtitle={`ترجمه خودکار محتوای فارسی به ${targetLabel} — اجرا روی سرور با کرون، مانیتور در این صفحه`}
     >
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
-        <p className="font-medium">کارگر کرون سرور (بدون وابستگی به مرورگر)</p>
+        <p className="font-medium">کارگر پس‌زمینهٔ پیوسته (زنجیره سریع)</p>
         <p className="mt-1 text-pmai-muted">
-          علاوه بر زنجیرهٔ سریع، یک pulse تکراری هر دقیقه روی سرور می‌ماند تا حتی با بستن این تب صف جلو برود.
-          فاصلهٔ چند دقیقه‌ای بین محصولات معمولاً زمان خود ترجمهٔ AI است، نه توقف کرون.
+          بعد از هر تیک، سرور خودش تیک بعدی را فوراً صدا می‌زند — دیگر منتظر crontab هر ۱ دقیقه نمی‌ماند.
+          فاصلهٔ بین محصولات معمولاً زمان خود ترجمهٔ AI است، نه خواب کرون.
         </p>
         <p className="mt-1">
-          ترجمه فقط روی سرور با WP-Cron اجرا می‌شود. بستن یا قطع شدن تب هیچ اثری روی صف ندارد — این صفحه فقط مانیتور و کنترل
-          (شروع / توقف / رد) است. آمار «کل سایت» منبع حقیقت پیشرفت است.
+          بستن این تب صف را متوقف نمی‌کند. pulse دقیقه‌ای فقط پشتیبان است.
         </p>
       </div>
 
@@ -907,14 +914,14 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message="حالت سرور فعال است (DISABLE_WP_CRON): با زدن شروع، اولین تیک همان لحظه اجرا می‌شود؛ ادامه‌اش با crontab هر ۱ دقیقه (مسیر واقعی wp-cron.php سایت، نه /path/to/)."
+            message="DISABLE_WP_CRON فعال است — ترجمه با زنجیرهٔ سریع admin-ajax جلو می‌رود (نه فقط crontab هر دقیقه). pulse دقیقه‌ای فقط پشتیبان است."
           />
         </div>
       ) : !config.devMode ? (
         <div className="mb-4">
           <Notice
             type="warning"
-            message="پیشنهاد پروداکشن: در wp-config مقدار define('DISABLE_WP_CRON', true) بگذارید و در cPanel هر ۱–۲ دقیقه /usr/local/bin/php …/wp-cron.php را زمان‌بندی کنید تا ترجمه مستقل از ترافیک سایت پیش برود."
+            message="پیشنهاد پروداکشن: define('DISABLE_WP_CRON', true) به‌همراه crontab برای wp-cron.php — زنجیرهٔ سریع پلاگین خودش صف را جلو می‌برد."
           />
         </div>
       ) : null}

@@ -66,9 +66,16 @@ export async function fetchJob() {
 }
 
 export async function jobAction(action, lang = 'en', extra = {}) {
-  abortJobStep();
-  const bootstrapActions = new Set(['start', 'resume', 'ensure', 'kick']);
-  const timeout = bootstrapActions.has(action) ? JOB_BOOTSTRAP_TIMEOUT_MS : JOB_FETCH_TIMEOUT_MS;
+  // ensure is lightweight (schedule + spawn) — don't abort an in-flight kick.
+  if (action !== 'ensure') {
+    abortJobStep();
+  }
+  const heavyActions = new Set(['start', 'resume', 'kick']);
+  const timeout = heavyActions.has(action)
+    ? JOB_BOOTSTRAP_TIMEOUT_MS
+    : action === 'ensure'
+      ? 30000
+      : JOB_FETCH_TIMEOUT_MS;
   const { data } = await withRetries(() =>
     api.post('/translation-job', { action, lang, ...extra }, { timeout })
   );

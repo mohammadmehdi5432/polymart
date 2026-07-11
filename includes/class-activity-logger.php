@@ -40,25 +40,30 @@ final class Activity_Logger {
 	const LOCK_FORCE_IDLE_SEC  = 200;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	/**
-	 * Recurring pulse — survives closed admin tabs. Crontab every minute fires this
-	 * even when the fast single-event chain / loopback fails.
+	 * Recurring pulse — backup only. Fast progress comes from the AJAX loopback chain.
 	 */
 	const CRON_PULSE_HOOK      = 'polymart_ai_translation_job_pulse';
 	const CRON_PULSE_SCHEDULE  = 'polymart_ai_every_minute';
 	/** Seconds before the next self-chained tick after work finishes. */
-	const CRON_INTERVAL_SEC    = 3;
+	const CRON_INTERVAL_SEC    = 1;
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
 	const CRON_SAFETY_SEC      = 120;
-	const CRON_INTERVAL_SERVER_SEC = 3;
+	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
-	const CRON_STEP_BUDGET_SEC = 120;
+	const CRON_STEP_BUDGET_SEC = 150;
 	/** Max steps inside one cron tick (safety cap). */
-	const CRON_MAX_STEPS_PER_TICK = 20;
+	const CRON_MAX_STEPS_PER_TICK = 25;
 	/**
 	 * If last_cron_at is older than this while the step lock is held with no
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
 	 */
 	const LOCK_IDLE_ORPHAN_SEC = 45;
+	/** admin-ajax action for the self-driving worker chain (works with DISABLE_WP_CRON). */
+	const LOOPBACK_ACTION      = 'polymart_ai_job_loopback';
+	const LOOPBACK_TOKEN_OPTION = 'polymart_ai_job_loopback_token';
+	const LOOPBACK_GATE_KEY    = 'polymart_ai_job_loopback_gate';
+	/** Min seconds between non-forced loopback spawns. */
+	const LOOPBACK_GATE_SEC    = 1;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -72,6 +77,8 @@ final class Activity_Logger {
 		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'process_background_step' ) );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_during_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
+		add_action( 'wp_ajax_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
+		add_action( 'wp_ajax_nopriv_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
 		// Heal ONLY inside cron/REST — never on storefront/admin HTML loads
 		// (pinging cron on every page was spawning heavy AI work and freezing the site).
 		if ( wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_ajax() ) {
@@ -111,6 +118,126 @@ final class Activity_Logger {
 		}
 
 		self::touch_worker_heartbeat();
+	}
+
+	/**
+	 * Shared secret for the async job loopback endpoint.
+	 *
+	 * @return string
+	 */
+	private static function get_loopback_token() {
+		$token = get_option( self::LOOPBACK_TOKEN_OPTION, '' );
+
+		if ( ! is_string( $token ) || strlen( $token ) < 32 ) {
+			$token = wp_generate_password( 43, false, false );
+			update_option( self::LOOPBACK_TOKEN_OPTION, $token, false );
+		}
+
+		return $token;
+	}
+
+	/**
+	 * admin-ajax entry for the self-driving worker (Action Scheduler-style).
+	 *
+	 * Independent of WP-Cron / DISABLE_WP_CRON — this is what keeps the queue
+	 * moving every few seconds instead of waiting for a 1-minute crontab.
+	 *
+	 * @return void
+	 */
+	public static function handle_loopback_tick() {
+		$token = isset( $_REQUEST['token'] ) // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			? sanitize_text_field( wp_unslash( (string) $_REQUEST['token'] ) )
+			: '';
+
+		if ( ! hash_equals( self::get_loopback_token(), $token ) ) {
+			status_header( 403 );
+			exit( 'forbidden' );
+		}
+
+		if ( ! self::is_bulk_job_running() ) {
+			status_header( 200 );
+			exit( 'idle' );
+		}
+
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
+		}
+
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 300 );
+		}
+
+		// Another worker already owns the lock — exit quietly; it will chain itself.
+		if ( self::is_step_lock_held_fresh() ) {
+			status_header( 200 );
+			exit( 'busy' );
+		}
+
+		self::process_background_step();
+
+		status_header( 200 );
+		exit( 'ok' );
+	}
+
+	/**
+	 * Whether the global step lock is currently held by a living worker.
+	 *
+	 * @return bool
+	 */
+	private static function is_step_lock_held_fresh() {
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
+
+		if ( $stamp <= 0 ) {
+			return false;
+		}
+
+		return ( time() - $stamp ) < self::STEP_LOCK_TTL;
+	}
+
+	/**
+	 * Fire a non-blocking admin-ajax request that runs the next job tick.
+	 *
+	 * This is the primary fast path. WP-Cron pulse remains a backup only.
+	 *
+	 * @param bool $force Bypass the short spawn gate.
+	 * @return void
+	 */
+	public static function spawn_job_loopback( $force = false ) {
+		if ( ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		// Never stack while a living tick holds the lock.
+		if ( self::is_step_lock_held_fresh() ) {
+			return;
+		}
+
+		if ( ! $force ) {
+			if ( get_transient( self::LOOPBACK_GATE_KEY ) ) {
+				return;
+			}
+
+			set_transient( self::LOOPBACK_GATE_KEY, 1, self::LOOPBACK_GATE_SEC );
+		} else {
+			set_transient( self::LOOPBACK_GATE_KEY, 1, self::LOOPBACK_GATE_SEC );
+		}
+
+		$url = admin_url( 'admin-ajax.php' );
+
+		wp_remote_post(
+			$url,
+			array(
+				'timeout'   => 0.01,
+				'blocking'  => false,
+				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+				'body'      => array(
+					'action' => self::LOOPBACK_ACTION,
+					'token'  => self::get_loopback_token(),
+				),
+			)
+		);
 	}
 
 	/**
@@ -959,7 +1086,7 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	private static function get_cron_chain_delay_sec() {
-		return max( 2, min( 15, (int) apply_filters( 'polymart_ai_job_cron_chain_delay_sec', self::CRON_INTERVAL_SEC ) ) );
+		return max( 1, min( 5, (int) apply_filters( 'polymart_ai_job_cron_chain_delay_sec', self::CRON_INTERVAL_SEC ) ) );
 	}
 
 	/**
@@ -2313,10 +2440,12 @@ final class Activity_Logger {
 				self::clear_chain_events();
 			} elseif ( $next <= $want + 15 && $next >= $want - 5 ) {
 				self::ping_wp_cron();
+				self::spawn_job_loopback();
 
 				return;
 			} elseif ( $next <= time() + 30 && $delay >= self::CRON_SAFETY_SEC ) {
 				self::ping_wp_cron();
+				self::spawn_job_loopback();
 
 				return;
 			} else {
@@ -2326,6 +2455,7 @@ final class Activity_Logger {
 
 		wp_schedule_single_event( $want, self::CRON_HOOK );
 		self::ping_wp_cron();
+		self::spawn_job_loopback( 0 === $delay );
 	}
 
 	/**
@@ -2345,7 +2475,9 @@ final class Activity_Logger {
 				return;
 			}
 
-			set_transient( 'polymart_ai_cron_ping_gate', 1, 45 );
+			// Keep the gate short while a job runs so the chain stays snappy.
+			$gate_ttl = self::is_bulk_job_running() ? 3 : 45;
+			set_transient( 'polymart_ai_cron_ping_gate', 1, $gate_ttl );
 		}
 
 		if ( wp_doing_cron() ) {
@@ -2360,6 +2492,7 @@ final class Activity_Logger {
 						}
 
 						self::spawn_cron_request();
+						self::spawn_job_loopback( true );
 					}
 				);
 			}
@@ -2368,6 +2501,7 @@ final class Activity_Logger {
 		}
 
 		self::spawn_cron_request();
+		self::spawn_job_loopback( $force );
 	}
 
 	/**
@@ -2376,13 +2510,11 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	private static function spawn_cron_request() {
-		// Prefer real server crontab when DISABLE_WP_CRON is on — loopback from
-		// PHP often blocks or races with page traffic on production hosts.
+		// Prefer real server crontab when DISABLE_WP_CRON is on — but still allow
+		// loopback when the job needs another tick soon (crontab alone is ~60s).
 		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
 			$allow_loopback = (bool) apply_filters( 'polymart_ai_job_cron_loopback', false );
 
-			// Safety net: if the worker looks dead, try a one-shot loopback so a
-			// misconfigured crontab cannot stall the queue forever.
 			if ( ! $allow_loopback ) {
 				$job  = self::get_job_raw();
 				$last = max(
@@ -2391,7 +2523,8 @@ final class Activity_Logger {
 				);
 				$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-				if ( 'running' === ( $job['status'] ?? '' ) && $age >= self::LOCK_FORCE_IDLE_SEC ) {
+				// Chain continuation: spawn wp-cron.php once the previous tick is idle.
+				if ( 'running' === ( $job['status'] ?? '' ) && $age >= 8 ) {
 					$allow_loopback = true;
 				}
 			}
@@ -2482,10 +2615,25 @@ final class Activity_Logger {
 
 		self::ensure_recurring_pulse();
 
+		$last = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 )
+		);
+		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+		$busy = self::is_step_lock_held_fresh();
+
 		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
 			self::schedule_background_worker( 0 );
 		} else {
 			self::ping_wp_cron();
+		}
+
+		// Fast path: if the worker looks idle, kick the AJAX chain immediately.
+		// Do not run AI inline here — only spawn a background tick.
+		if ( ! $busy && $age >= 5 ) {
+			self::spawn_job_loopback( true );
+		} elseif ( ! $busy ) {
+			self::spawn_job_loopback( false );
 		}
 
 		$next = self::get_next_worker_cron();
@@ -2495,6 +2643,7 @@ final class Activity_Logger {
 		$job['cron_scheduled']      = (bool) $next;
 		$job['worker_ensured']      = true;
 		$job['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
+		$job['loopback_spawned']    = ! $busy;
 
 		if ( $released_stale_lock ) {
 			$job['lock_recovered'] = true;
@@ -2542,7 +2691,24 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Shared worker tick used by WP-Cron AND the admin UI kick.
+	 * Label for which driver ran the last tick.
+	 *
+	 * @return string
+	 */
+	private static function resolve_last_worker_label() {
+		if ( wp_doing_cron() ) {
+			return 'cron';
+		}
+
+		if ( wp_doing_ajax() && isset( $_REQUEST['action'] ) && self::LOOPBACK_ACTION === (string) $_REQUEST['action'] ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return 'loopback';
+		}
+
+		return 'admin';
+	}
+
+	/**
+	 * Shared worker tick used by WP-Cron, AJAX loopback, AND the admin UI kick.
 	 *
 	 * One code path for both drivers so browser and cron stay on the same job state.
 	 * Schedules the next event BEFORE work so fatals/timeouts do not orphan the chain.
@@ -2562,9 +2728,11 @@ final class Activity_Logger {
 			ignore_user_abort( true );
 		}
 
+		$worker_label = self::resolve_last_worker_label();
+
 		// Heartbeat BEFORE work so the monitor knows the worker is alive during long AI calls.
 		$job['worker_heartbeat_at'] = time();
-		$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+		$job['last_worker']         = $worker_label;
 		self::save_job( $job );
 
 		// Fatal-recovery chain only — never clear the recurring pulse here.
@@ -2577,7 +2745,7 @@ final class Activity_Logger {
 		$started   = time();
 		$budget    = self::get_cron_step_budget_sec();
 		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
-		$max_steps = max( 1, min( 30, $max_steps ) );
+		$max_steps = max( 1, min( 40, $max_steps ) );
 		$steps_run = 0;
 		$last_result = null;
 
@@ -2612,7 +2780,7 @@ final class Activity_Logger {
 			$job['last_cron_at']         = time();
 			$job['worker_heartbeat_at']  = time();
 			$job['last_cron_steps']     = $steps_run;
-			$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+			$job['last_worker']         = $worker_label;
 			self::save_job( $job );
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -2633,15 +2801,6 @@ final class Activity_Logger {
 			}
 		}
 
-		// Immediate follow-up chain + keep recurring pulse (no UI required).
-		self::clear_chain_events();
-		if ( 'running' === ( self::get_job_raw()['status'] ?? '' ) ) {
-			self::schedule_background_worker( self::get_cron_chain_delay_sec() );
-			self::ping_wp_cron();
-		} else {
-			self::unschedule_background_worker();
-		}
-
 		$end_deferred_busy = is_array( $last_result )
 			&& ! empty( $last_result['step_deferred'] )
 			&& 'step_lock_busy' === (string) ( $last_result['step_deferred_reason'] ?? '' );
@@ -2650,14 +2809,25 @@ final class Activity_Logger {
 			self::release_step_lock();
 		}
 
+		// Immediate follow-up: AJAX loopback is the fast path (not the 1-min pulse).
+		// Release lock first so spawn_job_loopback is not blocked by our own claim.
+		self::clear_chain_events();
+		if ( 'running' === ( self::get_job_raw()['status'] ?? '' ) ) {
+			$delay = $end_deferred_busy ? 5 : self::get_cron_chain_delay_sec();
+			self::schedule_background_worker( $delay );
+			self::spawn_job_loopback( ! $end_deferred_busy );
+		} else {
+			self::unschedule_background_worker();
+		}
+
 		if ( is_array( $last_result ) ) {
 			$last_result['last_cron_at']        = time();
 			$last_result['worker_heartbeat_at'] = time();
 			$last_result['last_cron_steps']     = $steps_run;
-			$last_result['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+			$last_result['last_worker']         = $worker_label;
 			$last_result['cron_scheduled']      = (bool) self::get_next_worker_cron();
 			$last_result['next_cron_at']        = self::get_next_worker_cron() ?: null;
-			$last_result['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY );
+			$last_result['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
 
 			return $last_result;
 		}
