@@ -110,12 +110,21 @@ function jobPhaseLabel(phase) {
 }
 
 function jobStepHeadline(lastStepStatus, displayPost, job) {
-  if (job?.worker_lock && !displayPost?.title) {
-    return 'کارگر مشترک در حال ترجمه است';
+  if (job?.worker_lock && Number(job?.worker_lock_age || 0) > 120) {
+    return 'قفل مرحله گیر کرده — در حال بازیابی…';
+  }
+
+  if (job?.worker_lock && !displayPost?.from_last_step) {
+    return 'کارگر سرور در حال ترجمه است';
   }
 
   if (displayPost?.from_last_step) {
-    return 'آخرین مورد پردازش‌شده';
+    if (job?.status === 'running') {
+      return job?.cron_scheduled
+        ? 'آخرین مورد تمام شد — منتظر تیک بعدی کرون'
+        : 'آخرین مورد تمام شد — در حال زمان‌بندی تیک بعدی';
+    }
+    return 'آخرین مورد این اجرا';
   }
 
   if (!displayPost?.title) {
@@ -206,6 +215,44 @@ export default function AutoTranslateApp() {
     setLogs((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, message, type }]);
   }, []);
 
+  const syncServerLogs = useCallback((recentLogs) => {
+    if (!Array.isArray(recentLogs) || recentLogs.length === 0) {
+      return;
+    }
+
+    // Server sends newest-first; show oldest→newest in the live panel.
+    const chronological = [...recentLogs].reverse();
+
+    setLogs((prev) => {
+      const seen = new Set(prev.map((entry) => entry.id));
+      const next = [...prev];
+
+      chronological.forEach((entry) => {
+        const id = entry.id || `srv-${entry.time}-${entry.message}`;
+        if (seen.has(id)) {
+          return;
+        }
+        seen.add(id);
+        next.push({
+          id,
+          message: entry.time
+            ? `[${formatTime(entry.time)}] ${entry.message}`
+            : entry.message,
+          type:
+            entry.level === 'success'
+              ? 'success'
+              : entry.level === 'error'
+                ? 'error'
+                : entry.level === 'warning'
+                  ? 'warning'
+                  : 'info',
+        });
+      });
+
+      return next.slice(-200);
+    });
+  }, []);
+
   const appendStepLog = useCallback(
     (step) => {
       const signature = stepLogSignature(step);
@@ -251,6 +298,10 @@ export default function AutoTranslateApp() {
         setActivePost(display);
       }
 
+      if (Array.isArray(data?.recent_logs)) {
+        syncServerLogs(data.recent_logs);
+      }
+
       if (data?.lang && data.status !== 'idle') {
         setTargetLang(data.lang);
       }
@@ -275,7 +326,7 @@ export default function AutoTranslateApp() {
 
       return null;
     }
-  }, [setTargetLang]);
+  }, [setTargetLang, syncServerLogs]);
 
   useEffect(() => {
     loadJob().finally(() => setLoading(false));
@@ -308,8 +359,12 @@ export default function AutoTranslateApp() {
       appendStepLog(data.last_step);
     }
 
+    if (Array.isArray(data.recent_logs)) {
+      syncServerLogs(data.recent_logs);
+    }
+
     return merged;
-  }, [appendStepLog]);
+  }, [appendStepLog, syncServerLogs]);
 
   /**
    * Light server nudge: schedule/ping cron only — never run translation in the browser.
@@ -373,10 +428,19 @@ export default function AutoTranslateApp() {
           return;
         }
 
-        if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight && !data.worker_lock) {
-          ensureInFlight = true;
-          await ensureServerWorker();
-          ensureInFlight = false;
+        if (
+          data.status === 'running' &&
+          !isCronHealthy(data) &&
+          !ensureInFlight
+        ) {
+          const lockAge = Number(data.worker_lock_age || 0);
+          const lockBlocks = Boolean(data.worker_lock) && lockAge > 0 && lockAge < 120;
+
+          if (!lockBlocks) {
+            ensureInFlight = true;
+            await ensureServerWorker();
+            ensureInFlight = false;
+          }
         }
       } catch (error) {
         pollErrorCountRef.current += 1;
@@ -448,7 +512,7 @@ export default function AutoTranslateApp() {
       setJob(data);
       setActionPending(null);
       appendLog(
-        `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود؛ بستن تب اشکالی ندارد.`,
+        `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود.`,
         'success'
       );
       await ensureServerWorker();
@@ -799,7 +863,7 @@ export default function AutoTranslateApp() {
               job.last_cron_at || job.worker_heartbeat_at
             )}${job.last_cron_steps ? ` (${job.last_cron_steps} مرحله)` : ''}${
               job.next_cron_at ? ` · تیک بعدی حدود ${formatTime(job.next_cron_at)}` : ''
-            }. بستن تب اشکالی ندارد.`}
+            }`}
           />
         </div>
       ) : !loading && job?.status === 'running' && job?.cron_scheduled ? (
@@ -808,14 +872,14 @@ export default function AutoTranslateApp() {
             type="info"
             message={`کارگر زمان‌بندی شده است${
               job.next_cron_at ? ` — اجرای بعدی حدود ${formatTime(job.next_cron_at)}` : ''
-            }. با DISABLE_WP_CRON تا رسیدن crontab بعدی (حداکثر حدود ۱ دقیقه) صبر کنید؛ شروع/ادامه خودش اولین تیک را می‌زند.`}
+            }. با DISABLE_WP_CRON تا رسیدن crontab بعدی صبر کنید؛ شروع/ادامه خودش اولین تیک را می‌زند.`}
           />
         </div>
       ) : !loading && job?.status === 'running' ? (
         <div className="mb-4">
           <Notice
             type="warning"
-            message="هنوز event کرون دیده نمی‌شود — یک‌بار «ادامه» بزنید. مسیر crontab باید به wp-cron.php واقعی همین سایت اشاره کند (مثلاً …/public_html/wp-cron.php)."
+            message="هنوز event کرون دیده نمی‌شود — یک‌بار «ادامه» بزنید. مسیر crontab باید به wp-cron.php واقعی همین سایت اشاره کند."
           />
         </div>
       ) : null}
@@ -1239,8 +1303,8 @@ export default function AutoTranslateApp() {
       <aside className="mt-6 rounded-lg border border-blue-200 bg-blue-50 p-5 text-sm text-blue-950">
         <h3 className="font-semibold text-blue-900">نکات مهم</h3>
         <ul className="mt-2 list-inside list-disc space-y-1">
-          <li>کار ترجمه فقط با کرون سرور انجام می‌شود — بستن مرورگر یا قطع اینترنت مانیتور، صف را متوقف نمی‌کند.</li>
-          <li>محصولات با تنوع زیاد ممکن است چند ده مرحله طول بکشند؛ نوار «پیشرفت کل سایت» منبع حقیقت است نه فقط «موفق این اجرا».</li>
+          <li>کار ترجمه روی سرور با کرون انجام می‌شود؛ این صفحه مانیتور و کنترل است.</li>
+          <li>گزارش لحظه‌ای از لاگ سرور همین اجرا پر می‌شود — اگر متوقف شد «ادامه» یا «به‌روزرسانی» را بزنید.</li>
           <li>اگر یک مورد گیر کرد، «رد کردن» را بزنید تا کرون به مورد بعدی برود.</li>
           <li>
             برای ترجمه ساده‌تر بدون resume، از{' '}

@@ -26,10 +26,16 @@ final class Activity_Logger {
 	const MAX_REPORT_ENTRIES   = 1000;
 	const MAX_JOB_RETRIES      = 3;
 	const STEP_LOCK_KEY        = 'polymart_ai_job_step_lock';
-	const STEP_LOCK_TTL        = 600;
+	/** Soft lock ceiling — must stay above one cron tick budget, but not 10 minutes. */
+	const STEP_LOCK_TTL        = 150;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
-	/** Seconds between self-chained cron ticks while a job is running. */
+	/** Seconds between self-chained cron ticks while a job is running (traffic WP-Cron). */
 	const CRON_INTERVAL_SEC    = 3;
+	/**
+	 * When DISABLE_WP_CRON + real crontab (~60s), chain farther out so a long tick
+	 * and the next crontab invocation do not overlap.
+	 */
+	const CRON_INTERVAL_SERVER_SEC = 55;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
 	const CRON_STEP_BUDGET_SEC = 90;
 	/** Max steps inside one cron tick (safety cap). */
@@ -787,8 +793,98 @@ final class Activity_Logger {
 		$job['next_cron_at']   = $next_cron ? (int) $next_cron : null;
 		$job['cron_disabled']  = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
 		$job['worker_alive']   = self::is_worker_heartbeat_fresh( $job );
+		$job['recent_logs']    = self::get_recent_job_logs( $job, 60 );
 
 		return $job;
+	}
+
+	/**
+	 * Recent activity-log lines for the current job run (newest first).
+	 *
+	 * @param array<string, mixed> $job   Job state.
+	 * @param int                  $limit Max entries.
+	 * @return array<int, array<string, mixed>>
+	 */
+	private static function get_recent_job_logs( array $job, $limit = 60 ) {
+		$limit   = max( 1, min( 100, absint( $limit ) ) );
+		$started = absint( $job['started_at'] ?? 0 );
+		$logs    = self::get_logs( 200 );
+		$out     = array();
+
+		foreach ( $logs as $entry ) {
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+
+			$time = absint( $entry['time'] ?? 0 );
+
+			if ( $started > 0 && $time > 0 && $time < ( $started - 30 ) ) {
+				break;
+			}
+
+			$out[] = array(
+				'id'      => (string) ( $entry['id'] ?? uniqid( 'log_', true ) ),
+				'level'   => (string) ( $entry['level'] ?? 'info' ),
+				'message' => (string) ( $entry['message'] ?? '' ),
+				'time'    => $time,
+			);
+
+			if ( count( $out ) >= $limit ) {
+				break;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Chain delay before the next worker event.
+	 *
+	 * @return int
+	 */
+	private static function get_cron_chain_delay_sec() {
+		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
+			// Keep the next event outside the current tick budget to avoid overlap.
+			return max(
+				self::CRON_INTERVAL_SERVER_SEC,
+				self::get_cron_step_budget_sec() + 5
+			);
+		}
+
+		return self::CRON_INTERVAL_SEC;
+	}
+
+	/**
+	 * Drop an orphaned step lock left by a killed/timed-out PHP process.
+	 *
+	 * @return bool True when a stale lock was cleared.
+	 */
+	private static function maybe_release_stale_step_lock() {
+		$lock = get_transient( self::STEP_LOCK_KEY );
+
+		if ( ! $lock ) {
+			return false;
+		}
+
+		$lock_age   = time() - absint( $lock );
+		$max_age    = self::get_cron_step_budget_sec() + 45;
+		$job        = self::get_job_raw();
+		$heartbeat  = absint( $job['worker_heartbeat_at'] ?? 0 );
+		$heart_age  = $heartbeat > 0 ? ( time() - $heartbeat ) : PHP_INT_MAX;
+
+		// Lock older than one tick budget, or heartbeat went silent while lock remains.
+		if ( $lock_age >= $max_age || ( $lock_age >= 60 && $heart_age >= 60 ) ) {
+			delete_transient( self::STEP_LOCK_KEY );
+
+			$job = self::get_job_raw();
+			$job['step_started_at'] = null;
+			$job['current_post_id'] = null;
+			self::save_job( $job );
+
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -1697,6 +1793,8 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function acquire_step_lock() {
+		self::maybe_release_stale_step_lock();
+
 		$lock = get_transient( self::STEP_LOCK_KEY );
 
 		if ( $lock ) {
@@ -1706,8 +1804,9 @@ final class Activity_Logger {
 				? time() - absint( $job['step_started_at'] )
 				: PHP_INT_MAX;
 
-			// Honor full lock TTL — long AI steps often exceed 300s.
-			if ( $lock_age < self::STEP_LOCK_TTL && $step_age < self::STEP_LOCK_TTL ) {
+			$max_age = self::get_cron_step_budget_sec() + 45;
+
+			if ( $lock_age < $max_age && $step_age < $max_age ) {
 				return false;
 			}
 
@@ -1830,6 +1929,8 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		$released_stale_lock = self::maybe_release_stale_step_lock();
+
 		$next = wp_next_scheduled( self::CRON_HOOK );
 		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
@@ -1837,7 +1938,14 @@ final class Activity_Logger {
 		);
 		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
+		// Due event sitting past its time with no lock → run now instead of waiting for crontab.
+		$due_and_idle = $next && $next <= time() && ! get_transient( self::STEP_LOCK_KEY );
+
 		if ( ! $next ) {
+			self::schedule_background_worker( 0 );
+			$next = wp_next_scheduled( self::CRON_HOOK );
+		} elseif ( $next > time() + 180 ) {
+			self::unschedule_background_worker();
 			self::schedule_background_worker( 0 );
 			$next = wp_next_scheduled( self::CRON_HOOK );
 		} else {
@@ -1846,15 +1954,20 @@ final class Activity_Logger {
 
 		$job = self::get_job_raw();
 		$job['worker_scheduled_at'] = absint( $job['worker_scheduled_at'] ?? 0 ) ?: time();
-		$job['next_cron_at']        = $next ? (int) $next : null;
-		$job['cron_scheduled']      = (bool) $next;
+		$job['next_cron_at']        = $next ? (int) $next : ( wp_next_scheduled( self::CRON_HOOK ) ?: null );
+		$job['cron_scheduled']      = (bool) ( $job['next_cron_at'] ?? false );
 		$job['worker_ensured']      = true;
+
+		if ( $released_stale_lock ) {
+			$job['lock_recovered'] = true;
+			self::log( 'warning', __( 'قفل مرحلهٔ گیرکرده آزاد شد — کارگر دوباره شروع می‌کند.', 'polymart-ai' ) );
+		}
+
 		self::save_job( $job );
 
-		// Safety net: if no completed tick for too long, run one now (crontab gap / failed loopback).
-		$stale_limit = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 90 : 60;
+		$stale_limit = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 75 : 45;
 
-		if ( $age > $stale_limit && ! get_transient( self::STEP_LOCK_KEY ) ) {
+		if ( ( $age > $stale_limit || $due_and_idle || $released_stale_lock ) && ! get_transient( self::STEP_LOCK_KEY ) ) {
 			return self::process_background_step();
 		}
 
@@ -1918,8 +2031,9 @@ final class Activity_Logger {
 		self::save_job( $job );
 
 		// Ensure a follow-up tick exists even if this request fatals mid-step.
+		// With server crontab, chain outside the current budget to prevent overlap.
 		self::unschedule_background_worker();
-		self::schedule_background_worker( self::CRON_INTERVAL_SEC );
+		self::schedule_background_worker( self::get_cron_chain_delay_sec() );
 
 		$started   = time();
 		$budget    = self::get_cron_step_budget_sec();
