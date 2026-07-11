@@ -5726,14 +5726,65 @@ final class Post_Translator {
 		foreach ( $fields as $key => $source ) {
 			$context = self::attribute_runtime_context_for_key( $key );
 
-			if ( '' === $context || self::has_product_attribute_translation( $post->ID, $source, $lang, $context ) ) {
+			if ( '' === $context ) {
 				continue;
+			}
+
+			if ( self::has_product_attribute_translation( $post->ID, $source, $lang, $context ) ) {
+				continue;
+			}
+
+			// Eastern digits only (e.g. «۴») — map to Western digits without an API call.
+			if ( Persian_Detector::is_eastern_digit_string( $source ) ) {
+				$western = Persian_Detector::westernize_digits( $source );
+
+				if ( '' !== $western && Persian_Detector::is_acceptable_translation_for_language( $western, $lang ) ) {
+					self::store_product_attribute_translation( $post->ID, $source, $lang, $context, $western );
+					continue;
+				}
 			}
 
 			$pending[ $key ] = $source;
 		}
 
 		return $pending;
+	}
+
+	/**
+	 * Persist one durable product attribute translation.
+	 *
+	 * @param int    $post_id    Product ID.
+	 * @param string $source     Persian source text.
+	 * @param string $lang       Target language code.
+	 * @param string $context    Runtime context.
+	 * @param string $translated Translated text.
+	 * @return void
+	 */
+	private static function store_product_attribute_translation( $post_id, $source, $lang, $context, $translated ) {
+		$post_id    = absint( $post_id );
+		$source     = is_string( $source ) ? trim( $source ) : '';
+		$lang       = sanitize_key( (string) $lang );
+		$context    = (string) $context;
+		$translated = is_string( $translated ) ? trim( $translated ) : '';
+
+		if ( $post_id <= 0 || '' === $source || '' === $lang || '' === $context || '' === $translated ) {
+			return;
+		}
+
+		Runtime_String_Translator::store_translation( $source, $lang, $context, $translated );
+
+		$meta_key = self::get_attribute_translations_meta_key( $lang );
+		$durable  = get_post_meta( $post_id, $meta_key, true );
+		$durable  = is_array( $durable ) ? $durable : array();
+
+		$durable[ self::attribute_translation_map_key( $source, $context ) ] = $translated;
+
+		update_post_meta( $post_id, $meta_key, $durable );
+		update_post_meta(
+			$post_id,
+			'_polymart_ai_attr_cache_snapshot',
+			self::get_product_attribute_runtime_cache_entries( $post_id )
+		);
 	}
 
 	/**

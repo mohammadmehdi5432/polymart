@@ -118,7 +118,51 @@ final class Persian_Detector {
 			return false;
 		}
 
-		return (bool) preg_match( '/[A-Za-z]/', $plain );
+		// Accept Latin letters and Western digits (e.g. attribute "۴" → "4").
+		return (bool) preg_match( '/[A-Za-z0-9]/', $plain );
+	}
+
+	/**
+	 * Whether text is only Eastern Arabic-Indic digits (۰-۹) and whitespace.
+	 *
+	 * @param string $text Source text.
+	 * @return bool
+	 */
+	public static function is_eastern_digit_string( $text ) {
+		if ( ! is_string( $text ) || '' === trim( $text ) ) {
+			return false;
+		}
+
+		$plain = trim( $text );
+
+		return (bool) preg_match( '/^[\x{06F0}-\x{06F9}\s]+$/u', $plain );
+	}
+
+	/**
+	 * Map Eastern Arabic-Indic digits to Western ASCII digits.
+	 *
+	 * @param string $text Source text.
+	 * @return string
+	 */
+	public static function westernize_digits( $text ) {
+		if ( ! is_string( $text ) || '' === $text ) {
+			return '';
+		}
+
+		$map = array(
+			'۰' => '0',
+			'۱' => '1',
+			'۲' => '2',
+			'۳' => '3',
+			'۴' => '4',
+			'۵' => '5',
+			'۶' => '6',
+			'۷' => '7',
+			'۸' => '8',
+			'۹' => '9',
+		);
+
+		return strtr( $text, $map );
 	}
 
 	/**
