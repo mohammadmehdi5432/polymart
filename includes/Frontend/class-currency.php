@@ -689,7 +689,17 @@ final class Currency {
 					}
 				}
 
-				$prices[ $key ][ $variation_id ] = (float) self::convert_toman_to_usd( $amount );
+				$converted = self::convert_toman_to_usd( $amount );
+
+				// Keep empty sale prices empty — casting '' to float becomes 0 and breaks is_on_sale().
+				if ( '' === $converted || null === $converted ) {
+					if ( 'sale_price' === $key ) {
+						$prices[ $key ][ $variation_id ] = '';
+						continue;
+					}
+				}
+
+				$prices[ $key ][ $variation_id ] = (float) $converted;
 			}
 		}
 

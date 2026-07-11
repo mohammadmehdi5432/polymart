@@ -736,9 +736,33 @@ final class Activity_Logger {
 				$job['current_post']['partial_phase']    = (string) $job['partial_phase'];
 				$job['current_post']['partial_progress'] = (string) ( $job['partial_progress'] ?? '' );
 			}
+
+			if ( is_array( $job['last_step'] ?? null ) && absint( $job['last_step']['post_id'] ?? 0 ) === $current_post_id ) {
+				$job['current_post']['step_status']  = (string) ( $job['last_step']['status'] ?? '' );
+				$job['current_post']['step_message'] = (string) ( $job['last_step']['message'] ?? '' );
+			}
+		} elseif ( is_array( $job['last_step'] ?? null ) && absint( $job['last_step']['post_id'] ?? 0 ) > 0 ) {
+			// Between steps, surface the last completed/partial item so the monitor isn't blank.
+			$job['current_post'] = array(
+				'post_id'       => absint( $job['last_step']['post_id'] ),
+				'title'         => (string) ( $job['last_step']['title'] ?? get_the_title( absint( $job['last_step']['post_id'] ) ) ),
+				'step_status'   => (string) ( $job['last_step']['status'] ?? '' ),
+				'step_message'  => (string) ( $job['last_step']['message'] ?? '' ),
+				'from_last_step'=> true,
+			);
+
+			if ( ! empty( $job['partial_phase'] ) ) {
+				$job['current_post']['partial_phase']    = (string) $job['partial_phase'];
+				$job['current_post']['partial_progress'] = (string) ( $job['partial_progress'] ?? '' );
+			}
 		} else {
 			$job['current_post'] = null;
 		}
+
+		$lock = get_transient( self::STEP_LOCK_KEY );
+		$job['worker_lock']     = (bool) $lock;
+		$job['worker_lock_age'] = $lock ? max( 0, time() - absint( $lock ) ) : null;
+		$job['cron_scheduled']  = (bool) wp_next_scheduled( self::CRON_HOOK );
 
 		return $job;
 	}

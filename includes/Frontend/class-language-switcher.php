@@ -413,6 +413,31 @@ final class Language_Switcher {
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .wd-nav,
 			body.polymart-lang-' . esc_attr( $language['code'] ) . ' .wd-tools-element {
 				direction: ltr;
+			}
+			/* Single product: Elementor Pro title/meta + KND add-to-cart */
+			body.ltr .elementor-widget-woocommerce-product-title,
+			body.ltr .elementor-widget-woocommerce-product-meta,
+			body.ltr .elementor-widget-knd-add-to-cart,
+			body.ltr .knd-add-to-cart-widget,
+			body.ltr .knd-add-to-cart-widget .knd-product-price,
+			body.ltr .product_title.entry-title,
+			body.ltr .product_meta {
+				direction: ltr !important;
+				text-align: left !important;
+			}
+			body.ltr .knd-add-to-cart-widget form.cart,
+			body.ltr .knd-add-to-cart-widget .woocommerce-variation-add-to-cart,
+			body.ltr .knd-add-to-cart-widget .knd-buttons-row {
+				direction: ltr !important;
+			}
+			body.ltr .knd-add-to-cart-widget .single_add_to_cart_button,
+			body.ltr .knd-add-to-cart-widget .quantity,
+			body.ltr .knd-add-to-cart-widget .knd-buttons-row .single_add_to_cart_button,
+			body.ltr .knd-add-to-cart-widget .knd-buttons-row .quantity {
+				order: unset !important;
+			}
+			body.ltr .knd-stock-status {
+				direction: ltr !important;
 			}'
 		);
 	}
