@@ -51,15 +51,34 @@ if ( ! class_exists( '\PolymartAI\Activity_Logger' ) ) {
 	exit( 1 );
 }
 
-$result = \PolymartAI\Activity_Logger::run_cli_worker(
-	array(
-		'max_seconds' => $max_seconds,
-		'max_steps'   => $max_steps,
-	)
-);
+try {
+	$result = \PolymartAI\Activity_Logger::run_cli_worker(
+		array(
+			'max_seconds' => $max_seconds,
+			'max_steps'   => $max_steps,
+		)
+	);
+} catch ( \Throwable $e ) {
+	if ( class_exists( '\PolymartAI\Activity_Logger' ) ) {
+		\PolymartAI\Activity_Logger::recover_job_item_failure(
+			$e->getMessage(),
+			0,
+			array(
+				'exception' => get_class( $e ),
+				'file'      => $e->getFile(),
+				'line'      => $e->getLine(),
+				'source'    => 'bin/job-worker.php',
+			)
+		);
+	}
+
+	fwrite( STDERR, 'PolyMartAI job worker exception: ' . $e->getMessage() . "\n" );
+	exit( 1 );
+}
 
 $status = is_array( $result ) ? (string) ( $result['exit_reason'] ?? 'done' ) : 'done';
 $steps  = is_array( $result ) ? (int) ( $result['steps_run'] ?? 0 ) : 0;
+$fails  = is_array( $result ) ? (int) ( $result['soft_fails'] ?? 0 ) : 0;
 
-fwrite( STDOUT, "PolyMartAI job worker finished: {$status} (steps={$steps})\n" );
+fwrite( STDOUT, "PolyMartAI job worker finished: {$status} (steps={$steps}, soft_fails={$fails})\n" );
 exit( 0 );

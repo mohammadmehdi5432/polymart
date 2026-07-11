@@ -106,6 +106,18 @@ final class Activity_Logger {
 	 * @var resource|null
 	 */
 	private static $cli_lock_fp = null;
+	/**
+	 * Set true when run_cli_worker() exits the loop normally (not a fatal crash).
+	 *
+	 * @var bool
+	 */
+	private static $cli_worker_clean_exit = false;
+	/**
+	 * Post ID being processed when a fatal may interrupt the CLI worker.
+	 *
+	 * @var int
+	 */
+	private static $cli_active_post_id = 0;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -367,8 +379,10 @@ final class Activity_Logger {
 			);
 		}
 
-		self::$trusted_cli_tick = true;
-		self::$trusted_job_tick = true;
+		self::$trusted_cli_tick       = true;
+		self::$trusted_job_tick       = true;
+		self::$cli_worker_clean_exit  = false;
+		self::$cli_active_post_id     = 0;
 
 		if ( function_exists( 'ignore_user_abort' ) ) {
 			ignore_user_abort( true );
@@ -378,9 +392,13 @@ final class Activity_Logger {
 			@set_time_limit( 0 );
 		}
 
+		// Fatal recovery: park the broken item and leave the pulse running so keep-alive respawns.
+		register_shutdown_function( array( __CLASS__, 'cli_worker_shutdown_recovery' ) );
+
 		$started     = time();
 		$steps_run   = 0;
 		$exit_reason = 'done';
+		$soft_fails  = 0;
 
 		try {
 			while ( true ) {
@@ -403,6 +421,14 @@ final class Activity_Logger {
 
 				if ( self::cli_memory_exhausted() ) {
 					$exit_reason = 'memory';
+					self::log(
+						'warning',
+						sprintf(
+							/* translators: %d: steps completed in this CLI process */
+							__( 'کارگر CLI به‌خاطر حافظه متوقف شد (پس از %d مرحله) — keep-alive دوباره استارت می‌زند.', 'polymart-ai' ),
+							$steps_run
+						)
+					);
 					break;
 				}
 
@@ -414,10 +440,66 @@ final class Activity_Logger {
 				$job['last_cron_steps']     = $steps_run;
 				self::save_job( $job );
 
-				$result = self::process_job_step();
+				self::$cli_active_post_id = absint( $job['current_post_id'] ?? 0 );
+				if ( self::$cli_active_post_id <= 0 ) {
+					self::$cli_active_post_id = absint( $job['partial_post_id'] ?? 0 );
+				}
+
+				$result = null;
+
+				try {
+					$result = self::process_job_step();
+				} catch ( \Throwable $e ) {
+					// Never let one product kill the CLI process.
+					$result = self::recover_job_item_failure(
+						$e->getMessage(),
+						self::$cli_active_post_id,
+						array(
+							'exception' => get_class( $e ),
+							'file'      => $e->getFile(),
+							'line'      => $e->getLine(),
+						)
+					);
+					++$soft_fails;
+				}
+
 				++$steps_run;
+				self::$cli_active_post_id = 0;
 
 				$job = self::get_job_raw();
+
+				// Auth/billing critical pause must stop the worker; item-level crashes must not.
+				if ( 'paused' === ( $job['status'] ?? '' ) ) {
+					$pause_reason = (string) ( $job['pause_reason'] ?? '' );
+
+					if ( 'critical' === $pause_reason && self::is_job_pause_auth_critical( $job ) ) {
+						$exit_reason = 'paused';
+						self::log(
+							'error',
+							sprintf(
+								/* translators: %s: last error */
+								__( 'کارگر CLI به‌خاطر خطای حیاتی API متوقف شد: %s', 'polymart-ai' ),
+								(string) ( $job['last_error'] ?? '' )
+							)
+						);
+						break;
+					}
+
+					// Soft/unexpected pause (legacy path) — resume and keep bulldozing.
+					if ( 'critical' === $pause_reason || 'stalled' === $pause_reason ) {
+						self::recover_job_item_failure(
+							(string) ( $job['last_error'] ?? $pause_reason ),
+							absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 ),
+							array( 'recovered_pause' => $pause_reason )
+						);
+						++$soft_fails;
+						$job = self::get_job_raw();
+					} else {
+						$exit_reason = 'paused';
+						break;
+					}
+				}
+
 				$job['last_cron_at']        = time();
 				$job['worker_heartbeat_at'] = time();
 				$job['last_worker']         = 'cli';
@@ -437,22 +519,37 @@ final class Activity_Logger {
 						break;
 					}
 
-					// Soft defer (e.g. per-post translation lock) — brief pause, then continue.
 					usleep( 250000 );
 					continue;
 				}
 
-				if ( is_array( $result ) && ! empty( $result['pause_reason'] ) && 'running' !== ( $result['status'] ?? '' ) ) {
-					$exit_reason = 'paused';
+				// Safety valve: too many soft failures in one process → exit so keep-alive respawns fresh.
+				if ( $soft_fails >= 25 ) {
+					$exit_reason = 'soft_fail_budget';
+					self::log(
+						'warning',
+						__( 'کارگر CLI پس از خطاهای پیاپی ریست می‌شود — keep-alive ادامه می‌دهد.', 'polymart-ai' )
+					);
 					break;
 				}
 			}
+		} catch ( \Throwable $e ) {
+			$exit_reason = 'exception';
+			self::recover_job_item_failure(
+				$e->getMessage(),
+				self::$cli_active_post_id,
+				array(
+					'exception' => get_class( $e ),
+					'fatal_loop' => true,
+				)
+			);
 		} finally {
+			self::$cli_worker_clean_exit = true;
+			self::$cli_active_post_id    = 0;
 			self::release_cli_worker_slot();
 			self::$trusted_cli_tick = false;
 			self::$trusted_job_tick = false;
 
-			// If the job is still running, keep-alive pulse will respawn us.
 			if ( self::is_bulk_job_running() ) {
 				self::ensure_recurring_pulse();
 			}
@@ -461,10 +558,207 @@ final class Activity_Logger {
 		$out = self::normalize_job_for_response( self::get_job_raw(), false );
 		$out['exit_reason'] = $exit_reason;
 		$out['steps_run']   = $steps_run;
+		$out['soft_fails']  = $soft_fails;
 		$out['busy']        = false;
 		$out['worker_mode'] = 'cli';
 
 		return $out;
+	}
+
+	/**
+	 * Shutdown handler: if the CLI process dies mid-item, park it and keep the job running.
+	 *
+	 * @return void
+	 */
+	public static function cli_worker_shutdown_recovery() {
+		if ( self::$cli_worker_clean_exit ) {
+			return;
+		}
+
+		// Only act when this request was a CLI worker.
+		if ( ! self::$trusted_cli_tick && 0 === self::$cli_active_post_id ) {
+			return;
+		}
+
+		$last = error_get_last();
+		$fatal_types = array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR );
+
+		$message = __( 'کارگر CLI بدون خروجی تمیز متوقف شد.', 'polymart-ai' );
+
+		if ( is_array( $last ) && in_array( (int) ( $last['type'] ?? 0 ), $fatal_types, true ) ) {
+			$message = sprintf(
+				'%s in %s:%s',
+				(string) ( $last['message'] ?? 'fatal' ),
+				(string) ( $last['file'] ?? '' ),
+				(string) ( $last['line'] ?? '' )
+			);
+		} elseif ( ! is_array( $last ) ) {
+			// Process ended oddly without a PHP fatal — still recover locks.
+			$message = __( 'کارگر CLI ناگهانی قطع شد (احتمالاً kill/timeout سرور).', 'polymart-ai' );
+		} else {
+			return;
+		}
+
+		try {
+			self::recover_job_item_failure(
+				$message,
+				self::$cli_active_post_id,
+				array(
+					'fatal'   => true,
+					'shutdown' => true,
+				)
+			);
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			// Last resort — avoid throwing from shutdown.
+		}
+
+		try {
+			self::release_cli_worker_slot();
+			self::release_step_lock();
+
+			if ( self::is_bulk_job_running() ) {
+				self::ensure_recurring_pulse();
+			}
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
+		self::$trusted_cli_tick = false;
+		self::$trusted_job_tick = false;
+	}
+
+	/**
+	 * Park/defer a failing item, release locks, keep the job running, and log details.
+	 *
+	 * @param string               $message Error message.
+	 * @param int                  $post_id Post ID if known.
+	 * @param array<string, mixed> $context Extra log context.
+	 * @return array<string, mixed>
+	 */
+	public static function recover_job_item_failure( $message, $post_id = 0, array $context = array() ) {
+		$job     = self::get_job_raw();
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $post_id );
+		$message = is_string( $message ) ? $message : wp_json_encode( $message );
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['current_post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['partial_post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 && is_array( $job['last_step'] ?? null ) ) {
+			$post_id = absint( $job['last_step']['post_id'] ?? 0 );
+		}
+
+		$title = $post_id > 0 ? (string) ( get_the_title( $post_id ) ?: '' ) : '';
+
+		self::log(
+			'error',
+			sprintf(
+				/* translators: 1: post ID, 2: title, 3: error */
+				__( 'CLI: مورد #%1$d «%2$s» خطا داد و کنار گذاشته شد — صف ادامه می‌یابد. خطا: %3$s', 'polymart-ai' ),
+				$post_id,
+				'' !== $title ? $title : __( '(نامشخص)', 'polymart-ai' ),
+				$message
+			),
+			array_merge(
+				array(
+					'post_id' => $post_id,
+					'lang'    => $lang,
+					'cli'     => 1,
+				),
+				$context
+			)
+		);
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_translation_lock( $post_id, $lang );
+		}
+
+		self::release_step_lock();
+
+		// Re-load after lock release in case another writer touched state.
+		$job = self::get_job_raw();
+
+		if ( $post_id > 0 ) {
+			self::park_job_post( $job, $post_id, $lang );
+			self::remove_post_from_deferred_queue( $job, $post_id );
+
+			// Don't keep pinning a crashing partial — move forward in the queue.
+			if ( absint( $job['partial_post_id'] ?? 0 ) === $post_id ) {
+				$job['partial_post_id']  = null;
+				$job['partial_phase']    = null;
+				$job['partial_progress'] = null;
+			}
+
+			$job['failed'] = (int) ( $job['failed'] ?? 0 ) + 1;
+			self::set_job_last_step( $job, $post_id, 'failed', $message );
+			$job['last_post_id'] = max( absint( $job['last_post_id'] ?? 0 ), $post_id );
+			self::increment_job_step( $job );
+		}
+
+		// Never leave the bulk job paused because of one bad product (auth/billing still stops).
+		$status = (string) ( $job['status'] ?? '' );
+
+		if ( ! in_array( $status, array( 'idle', 'completed' ), true ) ) {
+			if ( ! ( 'paused' === $status && self::is_job_pause_auth_critical( $job ) ) ) {
+				$job['status']       = 'running';
+				$job['pause_reason'] = null;
+			}
+		}
+
+		$job['current_post_id']        = null;
+		$job['step_started_at']        = null;
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['last_error']             = $message;
+		$job['worker_heartbeat_at']    = time();
+		$job['last_cron_at']           = time();
+		$job['last_worker']            = self::$trusted_cli_tick ? 'cli' : self::resolve_last_worker_label();
+
+		self::save_job( $job );
+
+		return self::normalize_job_for_response( $job, false );
+	}
+
+	/**
+	 * Whether a paused job is an auth/billing stop (must not auto-resume).
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return bool
+	 */
+	private static function is_job_pause_auth_critical( array $job ) {
+		if ( 'critical' !== (string) ( $job['pause_reason'] ?? '' ) ) {
+			return false;
+		}
+
+		$message = strtolower( (string) ( $job['last_error'] ?? '' ) );
+
+		$auth_keywords = array(
+			'unauthorized',
+			'invalid api',
+			'api key',
+			'authentication',
+			'billing',
+			'quota',
+			'missing_credentials',
+			'missing_api_key',
+			'توکن',
+			'کلید api',
+			'سهمیه',
+			'اعتبار',
+		);
+
+		foreach ( $auth_keywords as $keyword ) {
+			if ( false !== strpos( $message, $keyword ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -1806,6 +2100,12 @@ final class Activity_Logger {
 			if ( is_array( $claim ) && absint( $claim['pid'] ?? 0 ) === (int) getmypid() ) {
 				$claim['heartbeat_at'] = time();
 				update_option( self::CLI_WORKER_LOCK_OPTION, $claim, false );
+			}
+
+			$active = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+
+			if ( $active > 0 ) {
+				self::$cli_active_post_id = $active;
 			}
 		}
 	}
@@ -3548,22 +3848,34 @@ final class Activity_Logger {
 		self::touch_worker_heartbeat();
 
 		try {
-			return self::run_job_step( $job );
-		} catch ( \Throwable $e ) {
-			$job = self::get_job_raw();
-			$job['status']          = 'paused';
-			$job['pause_reason']    = 'critical';
-			$job['current_post_id'] = null;
-			$job['step_started_at'] = null;
-			$job['last_error']      = sprintf(
-				/* translators: %s: exception message */
-				__( 'مرحله ترجمه با خطای سرور متوقف شد: %s', 'polymart-ai' ),
-				$e->getMessage()
-			);
-			self::save_job( $job );
-			self::log( 'error', $job['last_error'] );
+			$result = self::run_job_step( $job );
 
-			return self::normalize_job_for_response( $job, false );
+			// Track active post for fatal recovery while AI HTTP is in flight.
+			if ( self::$trusted_cli_tick ) {
+				$live = self::get_job_raw();
+				self::$cli_active_post_id = absint( $live['current_post_id'] ?? 0 )
+					?: absint( $live['partial_post_id'] ?? 0 )
+					?: self::$cli_active_post_id;
+			}
+
+			return $result;
+		} catch ( \Throwable $e ) {
+			// One bad product must not pause/kill the whole bulk job.
+			$live    = self::get_job_raw();
+			$post_id = absint( $live['current_post_id'] ?? 0 )
+				?: absint( $live['partial_post_id'] ?? 0 )
+				?: self::$cli_active_post_id;
+
+			return self::recover_job_item_failure(
+				$e->getMessage(),
+				$post_id,
+				array(
+					'exception' => get_class( $e ),
+					'file'      => $e->getFile(),
+					'line'      => $e->getLine(),
+					'source'    => 'process_job_step',
+				)
+			);
 		} finally {
 			self::release_step_lock();
 		}
