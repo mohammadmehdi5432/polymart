@@ -15,7 +15,7 @@ const CRON_STALE_SEC = 8;
  */
 const LOCK_HEALTHY_SEC = 200;
 /** Between-item lock with no progress — force ensure. */
-const LOCK_IDLE_STALE_SEC = 12;
+const LOCK_IDLE_STALE_SEC = 30;
 /** Do not hammer ensure more than once per this interval. */
 const ENSURE_MIN_INTERVAL_MS = 5000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
@@ -242,6 +242,7 @@ export default function AutoTranslateApp() {
   const autoResumedRef = useRef(false);
   const lastStepLogRef = useRef('');
   const pollErrorCountRef = useRef(0);
+  const lastEnsureErrorAtRef = useRef(0);
   const logsRef = useRef(null);
   const isActiveRef = useRef(true);
   const activePostRef = useRef(null);
@@ -423,14 +424,27 @@ export default function AutoTranslateApp() {
   const ensureServerWorker = useCallback(async () => {
     try {
       const data = await jobAction('ensure');
+      lastEnsureErrorAtRef.current = 0;
       if (isActiveRef.current) {
         applyJobUpdate(data);
       }
       return data;
-    } catch {
+    } catch (error) {
+      const now = Date.now();
+      if (
+        isActiveRef.current &&
+        now - lastEnsureErrorAtRef.current >= 30000
+      ) {
+        lastEnsureErrorAtRef.current = now;
+        const message =
+          error?.response?.data?.message ||
+          'بیدار کردن کارگر ناموفق بود؛ کرون پشتیبان دوباره تلاش می‌کند.';
+        appendLog(message, 'warning');
+        setNotice({ type: 'warning', message });
+      }
       return null;
     }
-  }, [applyJobUpdate]);
+  }, [applyJobUpdate, appendLog]);
 
   useEffect(() => {
     if (!job || job.status !== 'running') {

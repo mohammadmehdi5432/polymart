@@ -51,13 +51,17 @@ final class Activity_Logger {
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
 	const CRON_STEP_BUDGET_SEC = 150;
-	/** Max steps inside one cron tick (safety cap). */
-	const CRON_MAX_STEPS_PER_TICK = 25;
+	/**
+	 * One AI slice per PHP request. The one-second loopback chain supplies
+	 * throughput without letting several 1-3 minute translations accumulate
+	 * inside one cron process or exceed a proxy execution limit.
+	 */
+	const CRON_MAX_STEPS_PER_TICK = 1;
 	/**
 	 * If last_cron_at is older than this while the step lock is held with no
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
 	 */
-	const LOCK_IDLE_ORPHAN_SEC = 90;
+	const LOCK_IDLE_ORPHAN_SEC = 30;
 	/** admin-ajax action for the self-driving worker chain (works with DISABLE_WP_CRON). */
 	const LOOPBACK_ACTION      = 'polymart_ai_job_loopback';
 	const LOOPBACK_TOKEN_OPTION = 'polymart_ai_job_loopback_token';
@@ -1305,7 +1309,7 @@ final class Activity_Logger {
 		}
 
 		$job['worker_heartbeat_at'] = time();
-		$job['last_worker']         = wp_doing_cron() ? 'cron' : 'admin';
+		$job['last_worker']         = self::resolve_last_worker_label();
 		// Avoid full merge side-effects during mid-step touches.
 		$job['updated_at'] = time();
 		update_option( self::JOB_OPTION, $job, false );
@@ -2666,7 +2670,10 @@ final class Activity_Logger {
 		$job['next_cron_at']        = self::get_next_worker_cron() ?: null;
 		self::save_job( $job );
 
-		return self::process_background_step();
+		// Start with one bounded slice; the server-side chain continues the queue.
+		// This keeps the REST request below proxy/browser limits even when AI takes
+		// longer than one minute.
+		return self::process_background_step( 1 );
 	}
 
 	/**
@@ -2723,7 +2730,9 @@ final class Activity_Logger {
 				ignore_user_abort( true );
 			}
 
-			$result = self::process_background_step();
+			// Recovery requests must stay bounded. One translation slice may still
+			// take up to the AI timeout, and the async chain handles later slices.
+			$result = self::process_background_step( 1 );
 
 			if ( ! is_array( $result ) ) {
 				$result = self::normalize_job_for_response( self::get_job_raw(), false );
@@ -2817,9 +2826,10 @@ final class Activity_Logger {
 	 * One code path for both drivers so browser and cron stay on the same job state.
 	 * Schedules the next event BEFORE work so fatals/timeouts do not orphan the chain.
 	 *
+	 * @param int|null $max_steps_override Optional bounded step count for REST recovery.
 	 * @return array<string, mixed> Normalized job after the tick.
 	 */
-	public static function process_background_step() {
+	public static function process_background_step( $max_steps_override = null ) {
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -2850,6 +2860,9 @@ final class Activity_Logger {
 		$budget    = self::get_cron_step_budget_sec();
 		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
 		$max_steps = max( 1, min( 40, $max_steps ) );
+		if ( null !== $max_steps_override ) {
+			$max_steps = max( 1, min( $max_steps, absint( $max_steps_override ) ) );
+		}
 		$steps_run = 0;
 		$last_result = null;
 
@@ -3052,7 +3065,9 @@ final class Activity_Logger {
 
 		$cursor = (int) ( $job['last_post_id'] ?? 0 );
 
+		self::touch_worker_heartbeat();
 		self::reconcile_stuck_job_queues( $job, $lang );
+		self::touch_worker_heartbeat();
 
 		if ( self::job_exceeded_step_budget( $job ) && (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 ) > 0 ) {
 			$remaining_ids       = Translation_Query::collect_remaining_post_ids( $lang, 10 );
@@ -3088,13 +3103,17 @@ final class Activity_Logger {
 			if ( ! $pick['post_id'] ) {
 				// Cursor may have walked past posts that only look done in-memory.
 				// Reset and pull a fresh actionable set while site work remains.
+				self::touch_worker_heartbeat();
 				self::sync_job_live_stats( $job, $lang, true );
+				self::touch_worker_heartbeat();
 				self::reconcile_succeeded_posts( $job, $lang );
 
 				$needs_work = (int) ( $job['needs_work'] ?? 0 );
 
 				if ( $needs_work > 0 ) {
+					self::touch_worker_heartbeat();
 					$actionable = self::get_actionable_remaining_ids( $lang, $job, min( 50, max( 1, $needs_work ) ) );
+					self::touch_worker_heartbeat();
 
 					if ( ! empty( $actionable ) ) {
 						$job['last_post_id'] = 0;
@@ -3382,10 +3401,14 @@ final class Activity_Logger {
 	private static function pick_next_job_post_id( array &$job, $lang, $cursor ) {
 		$exclude_ids = self::get_forward_scan_exclude_ids( $job );
 
+		self::touch_worker_heartbeat();
 		$post_id = Translation_Query::find_next_untranslated_post_id( $lang, $cursor, $exclude_ids );
+		self::touch_worker_heartbeat();
 
 		if ( ! $post_id && $cursor > 0 ) {
+			self::touch_worker_heartbeat();
 			$post_id = Translation_Query::find_next_untranslated_post_id( $lang, 0, $exclude_ids );
+			self::touch_worker_heartbeat();
 		}
 
 		if ( $post_id ) {
@@ -3395,7 +3418,9 @@ final class Activity_Logger {
 			);
 		}
 
+		self::touch_worker_heartbeat();
 		$deferred_queue = self::get_actionable_deferred_queue( $job, $lang );
+		self::touch_worker_heartbeat();
 
 		if ( ! empty( $deferred_queue ) ) {
 			$post_id               = (int) array_shift( $deferred_queue );
@@ -3440,7 +3465,9 @@ final class Activity_Logger {
 			);
 		}
 
+		self::touch_worker_heartbeat();
 		$actionable = self::get_actionable_remaining_ids( $lang, $job, 50 );
+		self::touch_worker_heartbeat();
 
 		if ( ! empty( $actionable ) ) {
 			$post_id               = (int) $actionable[0];

@@ -331,7 +331,7 @@ final class Post_Translator {
 	/**
 	 * Minimum HTTP timeout (seconds) for auto-translate job AI calls.
 	 *
-	 * Must stay below the admin SPA step timeout (180s) including PHP overhead.
+	 * Must stay below the admin SPA step timeout (240s) including PHP overhead.
 	 */
 	const JOB_REQUEST_MIN_TIMEOUT = 120;
 

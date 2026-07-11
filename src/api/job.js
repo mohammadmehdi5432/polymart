@@ -1,11 +1,11 @@
 import api from './settings';
 
-/** Max wait for one worker tick (multi-step cron budget + buffer). */
-export const JOB_STEP_TIMEOUT_MS = 180000;
+/** Max wait for one AI slice plus PHP/database overhead. */
+export const JOB_STEP_TIMEOUT_MS = 240000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
-/** Start/resume bootstrap runs the first worker tick inline. */
-const JOB_BOOTSTRAP_TIMEOUT_MS = 180000;
+/** Start/resume/recovery runs one bounded worker slice inline. */
+const JOB_BOOTSTRAP_TIMEOUT_MS = 240000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
 const JOB_STEP_RETRIES = 1;
