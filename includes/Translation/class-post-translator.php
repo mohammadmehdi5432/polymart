@@ -1839,7 +1839,13 @@ final class Post_Translator {
 	public static function request_ai_term_translation( $term_id, $lang = 'en' ) {
 		$term_id = absint( $term_id );
 
-		if ( ! $term_id || ( ! wp_doing_cron() && ! current_user_can( 'manage_categories' ) ) ) {
+		if (
+			! $term_id
+			|| (
+				! \PolymartAI\Activity_Logger::is_trusted_job_worker()
+				&& ! current_user_can( 'manage_categories' )
+			)
+		) {
 			return new \WP_Error(
 				'polymart_ai_forbidden',
 				__( 'شما اجازه ترجمه این برچسب را ندارید.', 'polymart-ai' )
@@ -2950,8 +2956,10 @@ final class Post_Translator {
 					$max_chars
 				);
 			case 'commerce':
-				$max_fields = 2;
-				$max_chars  = 2000;
+				// Keep related WooCommerce fields in one request when possible.
+				// Fewer sequential gateway calls materially shortens each product.
+				$max_fields = self::COMMERCE_AI_FIELD_CHUNK_SIZE;
+				$max_chars  = self::COMMERCE_AI_MAX_CHUNK_CHARS;
 
 				if ( $post_id > 0 && function_exists( 'wc_get_product' ) ) {
 					$product = wc_get_product( $post_id );
@@ -2971,8 +2979,8 @@ final class Post_Translator {
 			default:
 				return self::chunk_payload_with_limits(
 					$payload,
-					2,
-					2500
+					self::AI_FIELD_CHUNK_SIZE,
+					self::AI_MAX_CHUNK_CHARS
 				);
 		}
 	}

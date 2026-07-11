@@ -75,6 +75,15 @@ final class Activity_Logger {
 	 * @var bool
 	 */
 	private static $trusted_loopback_tick = false;
+	/**
+	 * True while the shared worker pipeline is executing.
+	 *
+	 * REST bootstrap/recovery ticks are server-authorized too, even though they
+	 * are neither WP-Cron nor the tokenized AJAX endpoint.
+	 *
+	 * @var bool
+	 */
+	private static $trusted_job_tick = false;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -203,7 +212,7 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	public static function is_trusted_job_worker() {
-		if ( wp_doing_cron() || self::$trusted_loopback_tick ) {
+		if ( wp_doing_cron() || self::$trusted_loopback_tick || self::$trusted_job_tick ) {
 			return true;
 		}
 
@@ -2838,6 +2847,8 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		self::$trusted_job_tick = true;
+
 		if ( function_exists( 'ignore_user_abort' ) ) {
 			ignore_user_abort( true );
 		}
@@ -2902,6 +2913,7 @@ final class Activity_Logger {
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
 				self::unschedule_background_worker();
+				self::$trusted_job_tick = false;
 
 				return is_array( $result )
 					? $result
@@ -2945,10 +2957,12 @@ final class Activity_Logger {
 			$last_result['cron_scheduled']      = (bool) self::get_next_worker_cron();
 			$last_result['next_cron_at']        = self::get_next_worker_cron() ?: null;
 			$last_result['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
+			self::$trusted_job_tick = false;
 
 			return $last_result;
 		}
 
+		self::$trusted_job_tick = false;
 		return self::normalize_job_for_response( self::get_job_raw(), false );
 	}
 
