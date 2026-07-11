@@ -30,14 +30,14 @@ final class Activity_Logger {
 	const STEP_LOCK_CLAIM_KEY  = 'polymart_ai_job_step_lock_claim';
 	/**
 	 * Absolute orphan ceiling. Living ticks refresh the lock before/during AI HTTP.
-	 * Must stay above Post_Translator::JOB_REQUEST_MAX_TIMEOUT (165s).
+	 * Must stay above Post_Translator::JOB_REQUEST_MAX_TIMEOUT (~50s) plus overhead.
 	 */
-	const STEP_LOCK_TTL        = 210;
+	const STEP_LOCK_TTL        = 90;
 	/**
-	 * ensure/kick must not force-unlock during a normal long AI call.
-	 * Keep above JOB_REQUEST_MAX_TIMEOUT so monitors cannot start a second worker.
+	 * ensure/kick must not force-unlock during a normal AI call.
+	 * Keep slightly above JOB_REQUEST_MAX_TIMEOUT.
 	 */
-	const LOCK_FORCE_IDLE_SEC  = 200;
+	const LOCK_FORCE_IDLE_SEC  = 70;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	/**
 	 * Recurring pulse — keep-alive: ensure AS action exists + run queue inline.
@@ -50,9 +50,9 @@ final class Activity_Logger {
 	const CRON_SAFETY_SEC      = 120;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per Action Scheduler / cron batch. */
-	const CRON_STEP_BUDGET_SEC = 45;
-	/** Max AI slices per AS action / cron batch. */
-	const CRON_MAX_STEPS_PER_TICK = 8;
+	const CRON_STEP_BUDGET_SEC = 55;
+	/** Max AI slices per AS action / cron batch (AI call ≤50s). */
+	const CRON_MAX_STEPS_PER_TICK = 2;
 	/**
 	 * If last_cron_at is older than this while the step lock is held with no
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
@@ -1477,8 +1477,82 @@ final class Activity_Logger {
 			return;
 		}
 
-		update_option( self::STEP_LOCK_CLAIM_KEY, (string) $now, false );
 		set_transient( self::STEP_LOCK_KEY, $now, self::STEP_LOCK_TTL );
+		update_option( self::STEP_LOCK_CLAIM_KEY, $now, false );
+	}
+
+	/**
+	 * Lightweight job snapshot for Action Scheduler logging (no expensive sync).
+	 *
+	 * @return array<string, mixed>
+	 */
+	public static function get_job_for_as_debug() {
+		return self::get_job_raw();
+	}
+
+	/**
+	 * Immediately release the global step lock (AS fatal / stale recovery).
+	 *
+	 * @return void
+	 */
+	public static function force_unlock_step_now() {
+		$job     = self::get_job_raw();
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+		$partial = absint( $job['partial_post_id'] ?? 0 );
+		$current = absint( $job['current_post_id'] ?? 0 );
+
+		foreach ( array_unique( array_filter( array( $partial, $current ) ) ) as $post_id ) {
+			if ( $post_id > 0 && '' !== $lang ) {
+				Post_Translator::release_translation_lock( $post_id, $lang );
+			}
+		}
+
+		self::release_step_lock();
+
+		$job['current_post_id'] = null;
+		$job['step_started_at'] = null;
+		$job['worker_heartbeat_at'] = time();
+		self::save_job( $job );
+	}
+
+	/**
+	 * Break plugin locks when an AS action has been silent longer than $idle_sec.
+	 *
+	 * @param int $idle_sec Silence threshold (default 60).
+	 * @return bool True when something was released.
+	 */
+	public static function release_stale_locks_for_as( $idle_sec = 60 ) {
+		$idle_sec = max( 30, absint( $idle_sec ) );
+		$job      = self::get_job_raw();
+		$last     = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 ),
+			absint( $job['step_started_at'] ?? 0 )
+		);
+		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+		$has_lock = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
+
+		if ( $age < $idle_sec && $has_lock ) {
+			return self::maybe_release_stale_step_lock();
+		}
+
+		if ( $age < $idle_sec && ! $has_lock ) {
+			return false;
+		}
+
+		self::force_unlock_step_now();
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: %d: idle seconds */
+				__( 'قفل ترجمه پس از %dث سکوت آزاد شد (بازیابی Action Scheduler).', 'polymart-ai' ),
+				$idle_sec
+			)
+		);
+
+		return true;
 	}
 
 	/**
@@ -2831,11 +2905,15 @@ final class Activity_Logger {
 
 		Job_Action_Scheduler::ensure_scheduled();
 
-		if ( ! $busy && $age >= $inline_idle ) {
+		if ( ! $busy && $age >= min( $inline_idle, Job_Action_Scheduler::STALE_RUNNING_SEC ) ) {
+			Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
+			self::release_stale_locks_for_as( Job_Action_Scheduler::STALE_RUNNING_SEC );
+
 			if ( Job_Action_Scheduler::is_available() ) {
+				Job_Action_Scheduler::enqueue_next( true );
 				Job_Action_Scheduler::run_queue_inline();
 			} else {
-				self::run_action_scheduler_batch( 3 );
+				self::run_action_scheduler_batch( 2 );
 			}
 		}
 

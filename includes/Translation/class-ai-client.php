@@ -37,14 +37,14 @@ final class AI_Client {
 	/**
 	 * Minimum HTTP timeout for a translation request (seconds).
 	 *
-	 * ArvanCloud inference often exceeds 30s even for modest payloads.
+	 * Job/AS path typically caps at 45–50s via request options.
 	 */
-	const REQUEST_TIMEOUT_MIN = 90;
+	const REQUEST_TIMEOUT_MIN = 45;
 
 	/**
 	 * Maximum HTTP timeout for a translation request (seconds).
 	 */
-	const REQUEST_TIMEOUT_MAX = 240;
+	const REQUEST_TIMEOUT_MAX = 90;
 
 	/**
 	 * Maximum automatic retries after transport failures.
@@ -90,7 +90,7 @@ final class AI_Client {
 		curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, min( 45, $timeout ) );
 
 		// Keep the auto-translate worker heartbeat alive while Arvan is thinking.
-		if ( $timeout >= 60 && function_exists( 'curl_setopt' ) ) {
+		if ( $timeout >= 20 && function_exists( 'curl_setopt' ) ) {
 			curl_setopt( $handle, CURLOPT_NOPROGRESS, false );
 			curl_setopt(
 				$handle,
@@ -451,14 +451,6 @@ final class AI_Client {
 
 		$timeout = self::request_timeout_for_payload( $payload );
 
-		if ( ! empty( $options['min_timeout'] ) ) {
-			$timeout = max( $timeout, max( 30, absint( $options['min_timeout'] ) ) );
-		}
-
-		if ( ! empty( $options['max_timeout'] ) ) {
-			$timeout = min( $timeout, max( 30, absint( $options['max_timeout'] ) ) );
-		}
-
 		/**
 		 * Filter the HTTP timeout used for ArvanCloud translation requests.
 		 *
@@ -466,7 +458,15 @@ final class AI_Client {
 		 * @param array<string, mixed>  $payload Outbound request body.
 		 */
 		$timeout = (int) apply_filters( 'polymart_ai_request_timeout', $timeout, $payload );
-		$timeout = max( self::REQUEST_TIMEOUT_MIN, min( self::REQUEST_TIMEOUT_MAX, $timeout ) );
+
+		$floor = ! empty( $options['min_timeout'] )
+			? max( 20, absint( $options['min_timeout'] ) )
+			: self::REQUEST_TIMEOUT_MIN;
+		$ceil  = ! empty( $options['max_timeout'] )
+			? max( $floor, absint( $options['max_timeout'] ) )
+			: self::REQUEST_TIMEOUT_MAX;
+
+		$timeout = max( $floor, min( $ceil, $timeout ) );
 
 		self::$active_curl_timeout = $timeout;
 
@@ -493,13 +493,22 @@ final class AI_Client {
 			$error_message = $response->get_error_message();
 
 			if ( 'http_request_failed' === $error_code && $attempt < self::MAX_TRANSPORT_RETRIES ) {
-				$retry_options            = $options;
-				$retry_options['min_timeout'] = max(
-					(int) ( $retry_options['min_timeout'] ?? 0 ),
-					min( self::REQUEST_TIMEOUT_MAX, $timeout + ( 30 * $attempt ) )
-				);
+				$retry_options = $options;
+				$cap           = ! empty( $options['max_timeout'] )
+					? max( 20, absint( $options['max_timeout'] ) )
+					: self::REQUEST_TIMEOUT_MAX;
 
-				sleep( min( 6, $attempt * 2 ) );
+				// Never inflate retries past the job/AS timeout ceiling (avoids 2–3 minute hangs).
+				$retry_options['min_timeout'] = min(
+					$cap,
+					max(
+						(int) ( $retry_options['min_timeout'] ?? 0 ),
+						min( $cap, $timeout )
+					)
+				);
+				$retry_options['max_timeout'] = $cap;
+
+				sleep( min( 3, $attempt ) );
 
 				return self::post_chat_completion( $endpoint, $api_key, $payload, $attempt + 1, $retry_options );
 			}

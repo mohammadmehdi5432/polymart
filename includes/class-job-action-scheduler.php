@@ -21,6 +21,37 @@ final class Job_Action_Scheduler {
 	const HOOK  = 'polymart_ai_as_translate_slice';
 	const GROUP = 'polymart_ai_translation';
 
+	/** Seconds after which an In-progress AS action is treated as dead. */
+	const STALE_RUNNING_SEC = 60;
+
+	/**
+	 * Action ID currently executing (for fatal shutdown recovery).
+	 *
+	 * @var int
+	 */
+	private static $current_action_id = 0;
+
+	/**
+	 * Last action ID seen on action_scheduler_before_execute.
+	 *
+	 * @var int
+	 */
+	private static $captured_action_id = 0;
+
+	/**
+	 * Whether the current AS callback exited cleanly.
+	 *
+	 * @var bool
+	 */
+	private static $handler_clean_exit = false;
+
+	/**
+	 * Whether a shutdown recovery callback was registered for this request.
+	 *
+	 * @var bool
+	 */
+	private static $shutdown_registered = false;
+
 	/**
 	 * Whether Action Scheduler APIs are loaded (normally via WooCommerce).
 	 *
@@ -40,10 +71,21 @@ final class Job_Action_Scheduler {
 	 */
 	public static function init() {
 		add_action( self::HOOK, array( __CLASS__, 'handle_slice_action' ) );
+		add_action( 'action_scheduler_before_execute', array( __CLASS__, 'capture_before_execute' ), 1, 1 );
 
 		// Prefer WP-Cron / inline queue runs over AS HTTP async loopbacks while
 		// a PolyMart job is active (same firewall issue as our old loopback).
 		add_filter( 'action_scheduler_allow_async_request_runner', array( __CLASS__, 'filter_async_runner' ) );
+	}
+
+	/**
+	 * Capture the AS action ID before the callback runs.
+	 *
+	 * @param int $action_id Action ID.
+	 * @return void
+	 */
+	public static function capture_before_execute( $action_id ) {
+		self::$captured_action_id = absint( $action_id );
 	}
 
 	/**
@@ -61,9 +103,9 @@ final class Job_Action_Scheduler {
 	}
 
 	/**
-	 * Enqueue the next unique async slice-batch action.
+	 * Enqueue the next async slice-batch action.
 	 *
-	 * @param bool $force Enqueue even if one appears pending (still unique-safe).
+	 * @param bool $force Recover stale In-progress actions first when true.
 	 * @return int Action ID or 0.
 	 */
 	public static function enqueue_next( $force = false ) {
@@ -75,7 +117,13 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
-		if ( ! $force && self::has_pending_or_running() ) {
+		if ( $force ) {
+			self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
+		}
+
+		// Prefer a pending follow-up over stacking duplicates — but never block
+		// while the *current* callback is still STATUS_RUNNING (unique would jam).
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
 			return 0;
 		}
 
@@ -84,13 +132,30 @@ final class Job_Action_Scheduler {
 		 */
 		do_action( 'polymart_ai_before_enqueue_as_slice' );
 
-		$action_id = as_enqueue_async_action( self::HOOK, array(), self::GROUP, true );
+		// Unique args so chaining from inside a still-running callback is allowed.
+		$args = array(
+			'n' => sprintf( '%.6F', microtime( true ) ),
+		);
+
+		$action_id = as_enqueue_async_action( self::HOOK, $args, self::GROUP, false );
+
+		Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: %d: Action Scheduler action ID */
+				__( 'Action Scheduler: اکشن ترجمه #%d در صف قرار گرفت.', 'polymart-ai' ),
+				absint( $action_id )
+			),
+			array( 'as_action_id' => absint( $action_id ) )
+		);
 
 		return absint( $action_id );
 	}
 
 	/**
 	 * Ensure a pending/running action exists for a live job.
+	 *
+	 * Also breaks stale In-progress actions and plugin locks so the chain cannot jam.
 	 *
 	 * @return int Action ID or 0.
 	 */
@@ -103,11 +168,32 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
-		if ( self::has_pending_or_running() ) {
+		$recovered = self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
+		Activity_Logger::release_stale_locks_for_as( self::STALE_RUNNING_SEC );
+
+		if ( $recovered > 0 ) {
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: %d: number of recovered actions */
+					__( 'Action Scheduler: %d اکشن گیرکرده In-progress آزاد شد — زنجیره از سر گرفته می‌شود.', 'polymart-ai' ),
+					$recovered
+				)
+			);
+		}
+
+		// Pending follow-up already waiting — no need to stack another.
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
 			return 0;
 		}
 
-		return self::enqueue_next( true );
+		// A fresh In-progress action (< stale threshold) is actively working.
+		$running = self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING );
+		if ( $running > 0 && 0 === $recovered ) {
+			return 0;
+		}
+
+		return self::enqueue_next( false );
 	}
 
 	/**
@@ -141,23 +227,118 @@ final class Job_Action_Scheduler {
 			return;
 		}
 
-		as_unschedule_all_actions( self::HOOK, array(), self::GROUP );
+		self::fail_all_running_actions();
 
-		// Also clear null-args variants if any were scheduled.
+		as_unschedule_all_actions( self::HOOK, array(), self::GROUP );
 		as_unschedule_all_actions( self::HOOK, null, self::GROUP );
 	}
 
 	/**
 	 * AS callback: run one bounded multi-slice batch, then chain the next action.
 	 *
+	 * @param mixed ...$unused AS may pass action args.
 	 * @return void
 	 */
-	public static function handle_slice_action() {
+	public static function handle_slice_action( ...$unused ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter
+		unset( $unused );
+
 		if ( ! Activity_Logger::is_bulk_job_running() ) {
 			return;
 		}
 
-		Activity_Logger::run_action_scheduler_batch();
+		self::$handler_clean_exit = false;
+		self::$current_action_id  = self::resolve_current_action_id();
+		self::register_handler_shutdown();
+
+		$job     = Activity_Logger::get_job_for_as_debug();
+		$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+
+		Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: 1: AS action ID, 2: post ID */
+				__( 'AS #%1$d: شروع batch ترجمه (پست جاری/جزئی: #%2$d).', 'polymart-ai' ),
+				self::$current_action_id,
+				$post_id
+			),
+			array(
+				'as_action_id' => self::$current_action_id,
+				'post_id'      => $post_id,
+			)
+		);
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log(
+			sprintf(
+				'[PolyMartAI AS] start action=%d post=%d mem=%s',
+				self::$current_action_id,
+				$post_id,
+				size_format( memory_get_usage( true ) )
+			)
+		);
+
+		self::recover_stale_running_actions( self::STALE_RUNNING_SEC, self::$current_action_id );
+		Activity_Logger::release_stale_locks_for_as( self::STALE_RUNNING_SEC );
+
+		try {
+			Activity_Logger::run_action_scheduler_batch();
+		} catch ( \Throwable $e ) {
+			Activity_Logger::log(
+				'error',
+				sprintf(
+					/* translators: 1: AS action ID, 2: error */
+					__( 'AS #%1$d: Exception در batch — %2$s', 'polymart-ai' ),
+					self::$current_action_id,
+					$e->getMessage()
+				),
+				array(
+					'as_action_id' => self::$current_action_id,
+					'exception'    => get_class( $e ),
+					'file'         => $e->getFile(),
+					'line'         => $e->getLine(),
+				)
+			);
+
+			Activity_Logger::recover_job_item_failure(
+				$e->getMessage(),
+				$post_id,
+				array(
+					'source'       => 'as_handle_slice',
+					'as_action_id' => self::$current_action_id,
+				)
+			);
+		}
+
+		$job_after = Activity_Logger::get_job_for_as_debug();
+		$post_after = absint( $job_after['current_post_id'] ?? 0 ) ?: absint( $job_after['partial_post_id'] ?? 0 );
+
+		Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: 1: AS action ID, 2: post ID, 3: job status */
+				__( 'AS #%1$d: پایان batch (پست: #%2$d، وضعیت جاب: %3$s).', 'polymart-ai' ),
+				self::$current_action_id,
+				$post_after,
+				(string) ( $job_after['status'] ?? '' )
+			),
+			array(
+				'as_action_id' => self::$current_action_id,
+				'post_id'      => $post_after,
+			)
+		);
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log(
+			sprintf(
+				'[PolyMartAI AS] end action=%d post=%d status=%s mem=%s',
+				self::$current_action_id,
+				$post_after,
+				(string) ( $job_after['status'] ?? '' ),
+				size_format( memory_get_usage( true ) )
+			)
+		);
+
+		self::$handler_clean_exit = true;
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
 			self::enqueue_next( true );
@@ -165,9 +346,249 @@ final class Job_Action_Scheduler {
 	}
 
 	/**
-	 * Run due Action Scheduler actions in this PHP request (cron keep-alive path).
+	 * Fatal/timeout shutdown: fail the AS action, release locks, keep the chain moving.
 	 *
-	 * Does not open outbound HTTP — processes the DB queue inline.
+	 * @return void
+	 */
+	public static function handler_shutdown_recovery() {
+		if ( self::$handler_clean_exit ) {
+			return;
+		}
+
+		$action_id = self::$current_action_id;
+		$last      = error_get_last();
+		$fatal_types = array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR );
+
+		$message = __( 'اکشن Action Scheduler ناگهانی قطع شد (kill/timeout/fatal).', 'polymart-ai' );
+
+		if ( is_array( $last ) && in_array( (int) ( $last['type'] ?? 0 ), $fatal_types, true ) ) {
+			$message = sprintf(
+				'%s in %s:%s',
+				(string) ( $last['message'] ?? 'fatal' ),
+				(string) ( $last['file'] ?? '' ),
+				(string) ( $last['line'] ?? '' )
+			);
+		} elseif ( ! is_array( $last ) && $action_id <= 0 ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( sprintf( '[PolyMartAI AS] shutdown recovery action=%d msg=%s', $action_id, $message ) );
+
+		try {
+			if ( $action_id > 0 ) {
+				self::mark_action_failed( $action_id );
+			}
+
+			$job     = Activity_Logger::get_job_for_as_debug();
+			$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+
+			Activity_Logger::recover_job_item_failure(
+				$message,
+				$post_id,
+				array(
+					'source'       => 'as_shutdown',
+					'as_action_id' => $action_id,
+					'fatal'        => 1,
+				)
+			);
+
+			Activity_Logger::force_unlock_step_now();
+
+			if ( Activity_Logger::is_bulk_job_running() ) {
+				// Unique enqueue may still see this action as running — force-fail first done above.
+				self::enqueue_next( true );
+			}
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
+		self::$current_action_id = 0;
+	}
+
+	/**
+	 * Register shutdown recovery once per request.
+	 *
+	 * @return void
+	 */
+	private static function register_handler_shutdown() {
+		if ( self::$shutdown_registered ) {
+			return;
+		}
+
+		self::$shutdown_registered = true;
+		register_shutdown_function( array( __CLASS__, 'handler_shutdown_recovery' ) );
+	}
+
+	/**
+	 * Best-effort current Action Scheduler action ID.
+	 *
+	 * @return int
+	 */
+	private static function resolve_current_action_id() {
+		if ( self::$captured_action_id > 0 ) {
+			return self::$captured_action_id;
+		}
+
+		// Fallback: newest running action for our hook.
+		$ids = self::query_running_action_ids( 1 );
+
+		return ! empty( $ids[0] ) ? absint( $ids[0] ) : 0;
+	}
+
+	/**
+	 * Mark stuck In-progress actions as failed so the chain can continue.
+	 *
+	 * @param int $older_than_sec Age threshold.
+	 * @param int $except_id      Optional action ID to leave alone (current).
+	 * @return int Number recovered.
+	 */
+	public static function recover_stale_running_actions( $older_than_sec = 60, $except_id = 0 ) {
+		if ( ! self::is_available() || ! class_exists( 'ActionScheduler' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		$older_than_sec = max( 30, absint( $older_than_sec ) );
+		$except_id      = absint( $except_id );
+		$recovered      = 0;
+
+		try {
+			$store = \ActionScheduler::store();
+			$ids   = $store->query_actions(
+				array(
+					'hook'             => self::HOOK,
+					'group'            => self::GROUP,
+					'status'           => \ActionScheduler_Store::STATUS_RUNNING,
+					'modified'         => time() - $older_than_sec,
+					'modified_compare' => '<=',
+					'per_page'         => 20,
+					'orderby'          => 'none',
+				)
+			);
+
+			if ( ! is_array( $ids ) ) {
+				$ids = array();
+			}
+
+			foreach ( $ids as $action_id ) {
+				$action_id = absint( $action_id );
+
+				if ( $action_id <= 0 || $action_id === $except_id ) {
+					continue;
+				}
+
+				self::mark_action_failed( $action_id );
+				++$recovered;
+
+				Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: 1: action ID, 2: age seconds */
+						__( 'AS #%1$d بیش از %2$dث روی In-progress مانده بود — Failed شد.', 'polymart-ai' ),
+						$action_id,
+						$older_than_sec
+					),
+					array( 'as_action_id' => $action_id )
+				);
+			}
+		} catch ( \Throwable $e ) {
+			Activity_Logger::log(
+				'error',
+				sprintf(
+					/* translators: %s: error */
+					__( 'بازیابی اکشن‌های AS ناموفق: %s', 'polymart-ai' ),
+					$e->getMessage()
+				)
+			);
+		}
+
+		return $recovered;
+	}
+
+	/**
+	 * @param string $status AS status constant.
+	 * @return int
+	 */
+	private static function count_actions_by_status( $status ) {
+		if ( ! class_exists( 'ActionScheduler' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		try {
+			$store = \ActionScheduler::store();
+			$count = $store->query_actions(
+				array(
+					'hook'     => self::HOOK,
+					'group'    => self::GROUP,
+					'status'   => $status,
+					'per_page' => 1,
+				),
+				'count'
+			);
+
+			return absint( $count );
+		} catch ( \Throwable $e ) {
+			return 0;
+		}
+	}
+
+	/**
+	 * @param int $limit Max IDs.
+	 * @return array<int, int>
+	 */
+	private static function query_running_action_ids( $limit = 10 ) {
+		if ( ! class_exists( 'ActionScheduler' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return array();
+		}
+
+		try {
+			$store = \ActionScheduler::store();
+			$ids   = $store->query_actions(
+				array(
+					'hook'     => self::HOOK,
+					'group'    => self::GROUP,
+					'status'   => \ActionScheduler_Store::STATUS_RUNNING,
+					'per_page' => max( 1, absint( $limit ) ),
+					'orderby'  => 'date',
+					'order'    => 'DESC',
+				)
+			);
+
+			return is_array( $ids ) ? array_map( 'absint', $ids ) : array();
+		} catch ( \Throwable $e ) {
+			return array();
+		}
+	}
+
+	/**
+	 * @param int $action_id Action ID.
+	 * @return void
+	 */
+	private static function mark_action_failed( $action_id ) {
+		$action_id = absint( $action_id );
+
+		if ( $action_id <= 0 || ! class_exists( 'ActionScheduler' ) ) {
+			return;
+		}
+
+		try {
+			\ActionScheduler::store()->mark_failure( $action_id );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+	}
+
+	/**
+	 * Fail every running action for our hook (used on job stop).
+	 *
+	 * @return void
+	 */
+	private static function fail_all_running_actions() {
+		foreach ( self::query_running_action_ids( 50 ) as $action_id ) {
+			self::mark_action_failed( $action_id );
+		}
+	}
+
+	/**
+	 * Run due Action Scheduler actions in this PHP request (cron keep-alive path).
 	 *
 	 * @return int Number of actions processed, or 0.
 	 */
@@ -182,15 +603,15 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
-		// Give the runner enough room for several AI slices in one cron hit.
-		$time_limit = (int) apply_filters( 'polymart_ai_as_queue_time_limit', 50 );
-		$batch_size = (int) apply_filters( 'polymart_ai_as_queue_batch_size', 5 );
+		// One AI call ≤50s — keep the runner budget tight for shared hosts.
+		$time_limit = (int) apply_filters( 'polymart_ai_as_queue_time_limit', 55 );
+		$batch_size = (int) apply_filters( 'polymart_ai_as_queue_batch_size', 2 );
 
 		$time_filter = static function () use ( $time_limit ) {
-			return max( 20, min( 120, $time_limit ) );
+			return max( 25, min( 70, $time_limit ) );
 		};
 		$batch_filter = static function () use ( $batch_size ) {
-			return max( 1, min( 25, $batch_size ) );
+			return max( 1, min( 5, $batch_size ) );
 		};
 
 		add_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
