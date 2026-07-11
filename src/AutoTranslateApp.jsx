@@ -9,6 +9,10 @@ import { HiBolt, HiArrowPath } from './components/ui/icons';
 const POLL_INTERVAL_MS = 2000;
 /** If cron has not ticked for this long, nudge/ensure the server worker. */
 const CRON_STALE_SEC = 20;
+/** Lock alone is only trusted this long without a completed tick. */
+const LOCK_HEALTHY_SEC = 90;
+/** Between-item lock with no progress — force ensure. */
+const LOCK_IDLE_STALE_SEC = 45;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -21,13 +25,29 @@ function stepLogSignature(step) {
 }
 
 function isCronHealthy(job) {
+  const now = Math.floor(Date.now() / 1000);
+  const lastCron = Number(job?.last_cron_at || 0);
+  const heartbeat = Number(job?.worker_heartbeat_at || 0);
+  const lastActivity = Math.max(lastCron, heartbeat);
+  const activityAge = lastActivity > 0 ? now - lastActivity : Number.POSITIVE_INFINITY;
+  const lockAge = Number(job?.worker_lock_age || 0);
+  const hasActivePost = Boolean(job?.current_post?.title && !job?.current_post?.from_last_step);
+
   if (job?.worker_lock) {
-    // A living tick owns the queue — do not spam ensure.
-    const lockAge = Number(job.worker_lock_age || 0);
-    return lockAge >= 0 && lockAge < 180;
+    // Actively translating a known post — trust the lock for one AI-call window.
+    if (hasActivePost && lockAge >= 0 && lockAge < LOCK_HEALTHY_SEC) {
+      return true;
+    }
+
+    // Between items with a stuck lock — NOT healthy (this is the production stall).
+    if (!hasActivePost && activityAge >= LOCK_IDLE_STALE_SEC) {
+      return false;
+    }
+
+    return lockAge >= 0 && lockAge < LOCK_HEALTHY_SEC && activityAge < LOCK_HEALTHY_SEC;
   }
 
-  if (job?.worker_alive) {
+  if (job?.worker_alive && activityAge < CRON_STALE_SEC) {
     return true;
   }
 
@@ -37,7 +57,7 @@ function isCronHealthy(job) {
     return false;
   }
 
-  const age = Math.floor(Date.now() / 1000) - stamp;
+  const age = now - stamp;
   return age >= 0 && age < CRON_STALE_SEC;
 }
 
@@ -118,8 +138,14 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
     return 'قفل مرحله گیر کرده — در حال بازیابی…';
   }
 
-  if (job?.worker_lock && !displayPost?.from_last_step) {
+  const hasActivePost = Boolean(displayPost?.title && !displayPost?.from_last_step);
+
+  if (job?.worker_lock && hasActivePost) {
     return 'کارگر سرور در حال ترجمه است';
+  }
+
+  if (job?.worker_lock && displayPost?.from_last_step && job?.status === 'running') {
+    return 'قفل بین دو مورد گیر کرده — در حال بازیابی کارگر…';
   }
 
   if (displayPost?.from_last_step) {
@@ -441,7 +467,15 @@ export default function AutoTranslateApp() {
           !ensureInFlight
         ) {
           const lockAge = Number(data.worker_lock_age || 0);
-          const lockBlocks = Boolean(data.worker_lock) && lockAge > 0 && lockAge < 120;
+          const hasActivePost = Boolean(
+            data.current_post?.title && !data.current_post?.from_last_step
+          );
+          // Only block ensure while a real in-flight post translation owns the lock.
+          const lockBlocks =
+            Boolean(data.worker_lock) &&
+            hasActivePost &&
+            lockAge >= 0 &&
+            lockAge < LOCK_HEALTHY_SEC;
 
           if (!lockBlocks) {
             ensureInFlight = true;
@@ -819,6 +853,10 @@ export default function AutoTranslateApp() {
     >
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
         <p className="font-medium">کارگر کرون سرور (بدون وابستگی به مرورگر)</p>
+        <p className="mt-1 text-pmai-muted">
+          علاوه بر زنجیرهٔ سریع، یک pulse تکراری هر دقیقه روی سرور می‌ماند تا حتی با بستن این تب صف جلو برود.
+          فاصلهٔ چند دقیقه‌ای بین محصولات معمولاً زمان خود ترجمهٔ AI است، نه توقف کرون.
+        </p>
         <p className="mt-1">
           ترجمه فقط روی سرور با WP-Cron اجرا می‌شود. بستن یا قطع شدن تب هیچ اثری روی صف ندارد — این صفحه فقط مانیتور و کنترل
           (شروع / توقف / رد) است. آمار «کل سایت» منبع حقیقت پیشرفت است.

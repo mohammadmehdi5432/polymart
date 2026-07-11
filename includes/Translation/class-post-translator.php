@@ -113,8 +113,10 @@ final class Post_Translator {
 
 	/**
 	 * TTL for per-post translation locks (seconds).
+	 * Must stay above one AI call, but not so long that a killed PHP worker
+	 * blocks the queue for a quarter hour.
 	 */
-	const TRANSLATION_LOCK_TTL = 900;
+	const TRANSLATION_LOCK_TTL = 240;
 
 	/**
 	 * Post meta flag: this post has Persian source content worth translating.
