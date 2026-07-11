@@ -64,7 +64,13 @@ final class Activity_Logger {
 		add_action( self::CRON_HOOK, array( __CLASS__, 'process_background_step' ) );
 		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'process_background_step' ) );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
-		self::maybe_heal_background_worker();
+		// Heal ONLY inside cron/REST — never on storefront/admin HTML loads
+		// (pinging cron on every page was spawning heavy AI work and freezing the site).
+		if ( wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_ajax() ) {
+			self::maybe_heal_background_worker();
+		} else {
+			self::maybe_ensure_pulse_quietly();
+		}
 	}
 
 	/**
@@ -97,6 +103,26 @@ final class Activity_Logger {
 		}
 
 		self::touch_worker_heartbeat();
+	}
+
+	/**
+	 * Ensure the recurring pulse exists without spawning cron (safe on page loads).
+	 *
+	 * @return void
+	 */
+	private static function maybe_ensure_pulse_quietly() {
+		$job = get_option( self::JOB_OPTION, array() );
+
+		if ( ! is_array( $job ) || 'running' !== ( $job['status'] ?? '' ) ) {
+			return;
+		}
+
+		if ( wp_next_scheduled( self::CRON_PULSE_HOOK ) ) {
+			return;
+		}
+
+		// Schedule only — never ping/spawn from HTML traffic.
+		wp_schedule_event( time() + 30, self::CRON_PULSE_SCHEDULE, self::CRON_PULSE_HOOK );
 	}
 
 	/**
@@ -2173,15 +2199,23 @@ final class Activity_Logger {
 	/**
 	 * Nudge WP-Cron so the job worker starts without waiting for page traffic.
 	 *
-	 * Works for both traffic-based WP-Cron and DISABLE_WP_CRON + real crontab setups
-	 * (loopback still helps immediately after Start/Resume).
+	 * Rate-limited: spawning wp-cron on every admin/REST poll was stacking
+	 * concurrent AI workers and freezing the whole site (~60s page loads).
 	 *
-	 * When already inside a cron run, defer the nudge until shutdown so the
-	 * follow-up event (+5s) is not stranded until the next crontab minute.
-	 *
+	 * @param bool $force Bypass the rate limit (Start/Resume/Kick only).
 	 * @return void
 	 */
-	public static function ping_wp_cron() {
+	public static function ping_wp_cron( $force = false ) {
+		if ( ! $force ) {
+			$gate = get_transient( 'polymart_ai_cron_ping_gate' );
+
+			if ( $gate ) {
+				return;
+			}
+
+			set_transient( 'polymart_ai_cron_ping_gate', 1, 45 );
+		}
+
 		if ( wp_doing_cron() ) {
 			static $shutdown_ping_registered = false;
 
@@ -2210,35 +2244,32 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	private static function spawn_cron_request() {
-		if ( ! defined( 'DISABLE_WP_CRON' ) || ! DISABLE_WP_CRON ) {
-			spawn_cron();
+		// Prefer real server crontab when DISABLE_WP_CRON is on — loopback from
+		// PHP often blocks or races with page traffic on production hosts.
+		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
+			if ( ! apply_filters( 'polymart_ai_job_cron_loopback', false ) ) {
+				return;
+			}
+
+			$cron_url = add_query_arg(
+				'doing_wp_cron',
+				sprintf( '%.22F', microtime( true ) ),
+				site_url( 'wp-cron.php' )
+			);
+
+			wp_remote_post(
+				$cron_url,
+				array(
+					'timeout'   => 0.01,
+					'blocking'  => false,
+					'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+				)
+			);
 
 			return;
 		}
 
-		/**
-		 * Allow hosts to disable the loopback cron nudge.
-		 *
-		 * @param bool $enabled Default true.
-		 */
-		if ( ! apply_filters( 'polymart_ai_job_cron_loopback', true ) ) {
-			return;
-		}
-
-		$cron_url = add_query_arg(
-			'doing_wp_cron',
-			sprintf( '%.22F', microtime( true ) ),
-			site_url( 'wp-cron.php' )
-		);
-
-		wp_remote_post(
-			$cron_url,
-			array(
-				'timeout'   => 0.01,
-				'blocking'  => false,
-				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
-			)
-		);
+		spawn_cron();
 	}
 
 	/**
@@ -2257,8 +2288,14 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
+		}
+
+		self::force_release_step_lock_if_idle( 90 );
 		self::clear_chain_events();
 		self::schedule_background_worker( 0 );
+		self::ping_wp_cron( true );
 
 		$job = self::get_job_raw();
 		$job['worker_scheduled_at'] = time();
@@ -2275,15 +2312,20 @@ final class Activity_Logger {
 	 *
 	 * @return array<string, mixed>
 	 */
+	/**
+	 * Ensure the background worker is scheduled (and nudged) without thrashing events.
+	 *
+	 * LIGHTWEIGHT by default: unlock stale locks + schedule pulse/chain + rate-limited ping.
+	 * Does NOT run AI translation inline — that froze admin/storefront when polled every 2s.
+	 * Use kick_worker() / bootstrap_background_worker() for an inline tick.
+	 *
+	 * @return array<string, mixed>
+	 */
 	public static function ensure_background_worker() {
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
 			return self::normalize_job_for_response( $job, false );
-		}
-
-		if ( function_exists( 'ignore_user_abort' ) ) {
-			ignore_user_abort( true );
 		}
 
 		$last = max(
@@ -2292,58 +2334,33 @@ final class Activity_Logger {
 		);
 		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		// After ~90s of silence the previous worker is dead — never block on its lock.
 		$released_stale_lock = self::force_release_step_lock_if_idle( 90 );
 		$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
-		$lock_held           = (bool) get_transient( self::STEP_LOCK_KEY );
 
-		$next = self::get_next_worker_cron();
-
-		// Only trust a lock when activity is still fresh.
-		if ( $lock_held && $age < 90 && absint( $job['current_post_id'] ?? 0 ) > 0 ) {
-			self::ensure_recurring_pulse();
-			self::ping_wp_cron();
-			$job = self::get_job_raw();
-			$job['worker_ensured'] = true;
-			$job['cron_scheduled'] = (bool) self::get_next_worker_cron();
-			$job['next_cron_at']   = self::get_next_worker_cron() ?: null;
-
-			return self::normalize_job_for_response( $job, false );
-		}
-
-		if ( $lock_held && $age >= 90 ) {
+		if ( $age >= 90 && get_transient( self::STEP_LOCK_KEY ) ) {
 			delete_transient( self::STEP_LOCK_KEY );
-			$released_stale_lock = true;
-			$lock_held           = false;
-			$job                 = self::get_job_raw();
+			$released_stale_lock    = true;
+			$job                    = self::get_job_raw();
 			$job['step_started_at'] = null;
 			$job['current_post_id'] = null;
 			self::save_job( $job );
 		}
 
-		if ( $lock_held ) {
-			self::ensure_recurring_pulse();
-			self::ping_wp_cron();
-			$job = self::get_job_raw();
-			$job['worker_ensured'] = true;
-			$job['cron_scheduled'] = (bool) self::get_next_worker_cron();
-			$job['next_cron_at']   = self::get_next_worker_cron() ?: null;
+		self::ensure_recurring_pulse();
 
-			return self::normalize_job_for_response( $job, false );
+		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
+			self::schedule_background_worker( 0 );
+		} else {
+			self::ping_wp_cron();
 		}
 
-		$due_and_idle = $next && $next <= time();
-
-		self::ensure_recurring_pulse();
-		self::clear_chain_events();
-		self::schedule_background_worker( 0 );
 		$next = self::get_next_worker_cron();
-
-		$job = self::get_job_raw();
+		$job  = self::get_job_raw();
 		$job['worker_scheduled_at'] = time();
 		$job['next_cron_at']        = $next ? (int) $next : null;
 		$job['cron_scheduled']      = (bool) $next;
 		$job['worker_ensured']      = true;
+		$job['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY );
 
 		if ( $released_stale_lock ) {
 			$job['lock_recovered'] = true;
@@ -2351,13 +2368,6 @@ final class Activity_Logger {
 		}
 
 		self::save_job( $job );
-
-		// Stale job: run a tick inline. Cron alone is not reliable on many hosts.
-		if ( $age > 15 || $due_and_idle || $released_stale_lock ) {
-			return self::process_background_step();
-		}
-
-		self::ping_wp_cron();
 
 		return self::normalize_job_for_response( $job, false );
 	}
@@ -2427,7 +2437,8 @@ final class Activity_Logger {
 		// Real fast chain is scheduled AFTER work; pulse covers closed-tab gaps.
 		self::clear_chain_events();
 		self::ensure_recurring_pulse();
-		self::schedule_background_worker( self::CRON_SAFETY_SEC );
+		// Do not ping here — mid-tick ping spawned nested cron workers and froze the site.
+		wp_schedule_single_event( time() + self::CRON_SAFETY_SEC, self::CRON_HOOK );
 
 		$started   = time();
 		$budget    = self::get_cron_step_budget_sec();
@@ -2539,7 +2550,7 @@ final class Activity_Logger {
 
 		self::force_release_step_lock_if_idle( 90 );
 		self::schedule_background_worker( 1 );
-		self::ping_wp_cron();
+		self::ping_wp_cron( true );
 
 		return self::process_background_step();
 	}

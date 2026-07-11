@@ -3,7 +3,7 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi, jobStep } from './api/job';
+import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
@@ -13,6 +13,8 @@ const CRON_STALE_SEC = 20;
 const LOCK_HEALTHY_SEC = 90;
 /** Between-item lock with no progress — force ensure. */
 const LOCK_IDLE_STALE_SEC = 45;
+/** Do not hammer ensure more than once per this interval. */
+const ENSURE_MIN_INTERVAL_MS = 30000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -400,11 +402,12 @@ export default function AutoTranslateApp() {
   }, [appendStepLog, syncServerLogs]);
 
   /**
-   * Recover a stalled server worker. Soft ensure first; hard kick if silent too long.
+   * Lightweight: unlock/schedule/ping only. Never run AI inline from the poll loop
+   * (that was freezing the whole admin/site for ~60s per request).
    */
-  const ensureServerWorker = useCallback(async (forceKick = false) => {
+  const ensureServerWorker = useCallback(async () => {
     try {
-      const data = forceKick ? await jobStep() : await jobAction('ensure');
+      const data = await jobAction('ensure');
       if (isActiveRef.current) {
         applyJobUpdate(data);
       }
@@ -422,6 +425,7 @@ export default function AutoTranslateApp() {
     writeAutoRunFlag(true);
 
     let ensureInFlight = false;
+    let lastEnsureAt = 0;
 
     const tick = async () => {
       if (!isActiveRef.current) {
@@ -462,7 +466,12 @@ export default function AutoTranslateApp() {
         }
 
         if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight) {
-          const now = Math.floor(Date.now() / 1000);
+          const nowMs = Date.now();
+          if (nowMs - lastEnsureAt < ENSURE_MIN_INTERVAL_MS) {
+            return;
+          }
+
+          const now = Math.floor(nowMs / 1000);
           const activityAge = Math.max(
             0,
             now - Number(data.last_cron_at || data.worker_heartbeat_at || 0)
@@ -480,10 +489,10 @@ export default function AutoTranslateApp() {
 
           if (!lockBlocks) {
             ensureInFlight = true;
-            // After 45s silence, force a real kick — ensure alone was getting stuck on locks.
-            const recovered = await ensureServerWorker(activityAge >= 45);
+            lastEnsureAt = nowMs;
+            const recovered = await ensureServerWorker();
             if (recovered?.lock_recovered && isActiveRef.current) {
-              appendLog('قفل گیرکرده آزاد شد — کارگر از نو شروع شد.', 'warning');
+              appendLog('قفل گیرکرده آزاد شد — منتظر تیک کرون سرور…', 'warning');
             }
             ensureInFlight = false;
           }
