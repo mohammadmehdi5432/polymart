@@ -430,25 +430,96 @@ final class Translation_Query {
 		$lang        = sanitize_key( (string) $lang );
 		$limit       = max( 1, min( 50, absint( $limit ) ) );
 		$exclude_ids = array_values( array_filter( array_map( 'absint', $exclude_ids ) ) );
-		$ids         = array();
-		$cursor      = 0;
 
-		while ( count( $ids ) < $limit ) {
-			$next = self::find_next_actionable_post_id(
+		self::maybe_backfill_translation_index( $lang );
+
+		$ids = self::fetch_indexed_actionable_post_ids( $lang, 0, $exclude_ids, $limit );
+
+		if ( ! empty( $ids ) ) {
+			return $ids;
+		}
+
+		$cursor = 0;
+		$found  = array();
+
+		while ( count( $found ) < $limit ) {
+			$next = self::find_next_untranslated_post_id(
 				$lang,
 				$cursor,
-				array_merge( $exclude_ids, $ids )
+				array_merge( $exclude_ids, $found )
 			);
 
 			if ( $next <= 0 ) {
 				break;
 			}
 
-			$ids[]  = $next;
-			$cursor = $next;
+			$found[] = $next;
+			$cursor  = $next;
+
+			if ( count( $found ) >= 3 ) {
+				break;
+			}
 		}
 
-		return $ids;
+		return $found;
+	}
+
+	/**
+	 * @param string $lang        Target language.
+	 * @param int    $after_id    Cursor post ID.
+	 * @param int[]  $exclude_ids Excluded post IDs.
+	 * @param int    $limit       Max IDs.
+	 * @return int[]
+	 */
+	private static function fetch_indexed_actionable_post_ids( $lang, $after_id, array $exclude_ids, $limit ) {
+		global $wpdb;
+
+		$limit      = max( 1, min( 50, absint( $limit ) ) );
+		$post_types = Post_Translator::get_supported_post_types();
+		$status_key = Post_Translator::get_status_index_meta_key( $lang );
+		$clause     = self::build_post_type_in_clause( $post_types );
+		$after_sql  = $after_id > 0 ? ' AND p.ID > %d ' : '';
+		$exclude_sql = '';
+		$exclude_vals = array();
+
+		if ( ! empty( $exclude_ids ) ) {
+			$placeholders = implode( ', ', array_fill( 0, count( $exclude_ids ), '%d' ) );
+			$exclude_sql  = " AND p.ID NOT IN ( {$placeholders} ) ";
+			$exclude_vals = $exclude_ids;
+		}
+
+		$sql = "SELECT p.ID
+			FROM {$wpdb->posts} p
+			INNER JOIN {$wpdb->postmeta} pm_flag
+				ON p.ID = pm_flag.post_id
+				AND pm_flag.meta_key = %s
+				AND pm_flag.meta_value = '1'
+			LEFT JOIN {$wpdb->postmeta} pm_status
+				ON p.ID = pm_status.post_id
+				AND pm_status.meta_key = %s
+			WHERE p.post_status = 'publish' {$clause['sql']}
+				{$after_sql}
+				{$exclude_sql}
+				AND ( pm_status.meta_id IS NULL OR pm_status.meta_value IN ( 'untranslated', 'partial' ) )
+			ORDER BY p.ID ASC
+			LIMIT %d";
+
+		$prepare_args = array_merge(
+			array( Post_Translator::PERSIAN_CONTENT_FLAG_META, $status_key ),
+			$clause['values'],
+			$after_id > 0 ? array( $after_id ) : array(),
+			$exclude_vals,
+			array( $limit )
+		);
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_col( $wpdb->prepare( $sql, $prepare_args ) );
+
+		if ( ! is_array( $rows ) ) {
+			return array();
+		}
+
+		return array_values( array_filter( array_map( 'absint', $rows ) ) );
 	}
 
 	/**
@@ -498,6 +569,7 @@ final class Translation_Query {
 
 		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 		return absint( $wpdb->get_var( $wpdb->prepare( $sql, $prepare_args ) ) );
+	}
 
 	/**
 	 * Collect untranslated post IDs in batches (for bulk backlog endpoint).

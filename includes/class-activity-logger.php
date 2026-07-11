@@ -2408,10 +2408,20 @@ final class Activity_Logger {
 		$existing = self::get_job( false );
 
 		if ( 'running' === ( $existing['status'] ?? '' ) ) {
-			return new \WP_Error(
-				'polymart_ai_job_running',
-				__( 'یک فرآیند ترجمه خودکار در حال اجراست. ابتدا آن را متوقف یا از سرگیری کنید.', 'polymart-ai' )
+			if ( self::is_bulk_worker_lively( 90 ) ) {
+				return new \WP_Error(
+					'polymart_ai_job_running',
+					__( 'یک فرآیند ترجمه خودکار در حال اجراست. ابتدا آن را متوقف یا از سرگیری کنید.', 'polymart-ai' )
+				);
+			}
+
+			self::log(
+				'warning',
+				__( 'اجرای قبلی بدون فعالیت رها شده بود — قبل از شروع جدید پاک شد.', 'polymart-ai' )
 			);
+			self::unschedule_background_worker();
+			self::release_step_lock();
+			self::save_job( self::empty_job() );
 		}
 
 		// Drop leftover locks / partial meta from a previous paused/completed run.
@@ -2426,7 +2436,7 @@ final class Activity_Logger {
 		$total      = $needs_work;
 
 		if ( $total <= 0 ) {
-			$probe_post = Translation_Query::find_next_untranslated_post_id( $lang, 0 );
+			$probe_post = Translation_Query::find_next_actionable_post_id( $lang, 0 );
 
 			if ( $probe_post <= 0 && $menu_needs <= 0 ) {
 				return new \WP_Error(
@@ -2442,7 +2452,7 @@ final class Activity_Logger {
 		$language   = Language_Registry::get_language( $lang );
 		$lang_label = $language ? $language['native_name'] : $lang;
 
-		$seed_limit = min( 30, max( 5, $needs_work ) );
+		$seed_limit = min( 8, max( 3, $needs_work ) );
 		$seed_ids   = Translation_Query::seed_actionable_post_ids( $lang, $seed_limit );
 
 		$job = array(
@@ -2488,7 +2498,8 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 		Job_Action_Scheduler::cancel_all();
-		self::bootstrap_background_worker();
+		self::bootstrap_background_worker( false );
+		self::ping_wp_cron( true );
 		self::log(
 			'info',
 			sprintf(
@@ -2565,7 +2576,8 @@ final class Activity_Logger {
 			}
 
 			self::save_job( $job );
-			self::bootstrap_background_worker();
+			self::bootstrap_background_worker( false );
+			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
 
@@ -2938,9 +2950,10 @@ final class Activity_Logger {
 	 * Enqueues one AS action and runs the queue inline in this request so Start
 	 * shows immediate progress without stacking a parallel inline batch.
 	 *
+	 * @param bool $run_inline When false, only enqueue AS work (fast HTTP start/resume).
 	 * @return array<string, mixed>
 	 */
-	public static function bootstrap_background_worker() {
+	public static function bootstrap_background_worker( $run_inline = true ) {
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -2956,8 +2969,11 @@ final class Activity_Logger {
 		if ( $as_ok ) {
 			Job_Action_Scheduler::clear_slice_mutex();
 			Job_Action_Scheduler::enqueue_next( true, 0 );
-			Job_Action_Scheduler::run_queue_inline( true );
-		} else {
+
+			if ( $run_inline ) {
+				Job_Action_Scheduler::run_queue_inline( true );
+			}
+		} elseif ( $run_inline ) {
 			self::run_action_scheduler_batch( 2 );
 		}
 
