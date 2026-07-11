@@ -57,7 +57,7 @@ final class Activity_Logger {
 	 * If last_cron_at is older than this while the step lock is held with no
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
 	 */
-	const LOCK_IDLE_ORPHAN_SEC = 45;
+	const LOCK_IDLE_ORPHAN_SEC = 90;
 	/** admin-ajax action for the self-driving worker chain (works with DISABLE_WP_CRON). */
 	const LOOPBACK_ACTION      = 'polymart_ai_job_loopback';
 	const LOOPBACK_TOKEN_OPTION = 'polymart_ai_job_loopback_token';
@@ -200,6 +200,7 @@ final class Activity_Logger {
 	 * Fire a non-blocking admin-ajax request that runs the next job tick.
 	 *
 	 * This is the primary fast path. WP-Cron pulse remains a backup only.
+	 * Many hosts drop ultra-short 0.01s loopbacks — we fire two transports.
 	 *
 	 * @param bool $force Bypass the short spawn gate.
 	 * @return void
@@ -214,30 +215,60 @@ final class Activity_Logger {
 			return;
 		}
 
-		if ( ! $force ) {
-			if ( get_transient( self::LOOPBACK_GATE_KEY ) ) {
-				return;
-			}
-
-			set_transient( self::LOOPBACK_GATE_KEY, 1, self::LOOPBACK_GATE_SEC );
-		} else {
-			set_transient( self::LOOPBACK_GATE_KEY, 1, self::LOOPBACK_GATE_SEC );
+		if ( ! $force && get_transient( self::LOOPBACK_GATE_KEY ) ) {
+			return;
 		}
 
-		$url = admin_url( 'admin-ajax.php' );
+		set_transient( self::LOOPBACK_GATE_KEY, 1, max( 1, self::LOOPBACK_GATE_SEC ) );
 
+		$url  = admin_url( 'admin-ajax.php' );
+		$body = array(
+			'action' => self::LOOPBACK_ACTION,
+			'token'  => self::get_loopback_token(),
+		);
+		$args = array(
+			'blocking'  => false,
+			'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+			'headers'   => array(
+				'Connection' => 'Close',
+			),
+			'body'      => $body,
+		);
+
+		// Attempt 1: classic non-blocking micro-timeout.
 		wp_remote_post(
 			$url,
-			array(
-				'timeout'   => 0.01,
-				'blocking'  => false,
-				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
-				'body'      => array(
-					'action' => self::LOOPBACK_ACTION,
-					'token'  => self::get_loopback_token(),
-				),
+			array_merge(
+				$args,
+				array(
+					'timeout' => 0.01,
+				)
 			)
 		);
+
+		// Attempt 2: slightly longer non-blocking timeout — accepted by more hosts
+		// that discard 0.01s requests before PHP boots.
+		wp_remote_post(
+			$url,
+			array_merge(
+				$args,
+				array(
+					'timeout' => 3,
+				)
+			)
+		);
+	}
+
+	/**
+	 * Seconds of silence before ensure runs an inline worker tick.
+	 *
+	 * Loopback HTTP is unreliable on many production hosts; inline ensure is the
+	 * reliable path while an admin is monitoring the job.
+	 *
+	 * @return int
+	 */
+	private static function get_ensure_inline_idle_sec() {
+		return max( 8, min( 60, (int) apply_filters( 'polymart_ai_job_ensure_inline_idle_sec', 12 ) ) );
 	}
 
 	/**
@@ -1028,6 +1059,21 @@ final class Activity_Logger {
 		$stamp = $lock ? absint( $lock ) : $claim;
 		$job['worker_lock']     = $stamp > 0;
 		$job['worker_lock_age'] = $stamp > 0 ? max( 0, time() - $stamp ) : null;
+
+		$live_current = absint( $job['current_post_id'] ?? 0 );
+		if ( $job['worker_lock'] && $live_current > 0 ) {
+			$job['worker_phase'] = 'translating';
+		} elseif ( $job['worker_lock'] ) {
+			// Lock held while scanning/picking the next queue item — normal, not stuck.
+			$job['worker_phase'] = 'picking';
+			if ( is_array( $job['current_post'] ?? null ) && ! empty( $job['current_post']['from_last_step'] ) ) {
+				$job['current_post']['picking_next'] = true;
+			}
+		} elseif ( 'running' === ( $job['status'] ?? '' ) ) {
+			$job['worker_phase'] = 'between';
+		} else {
+			$job['worker_phase'] = 'idle';
+		}
 
 		$next_cron = self::get_next_worker_cron();
 		$job['cron_scheduled'] = (bool) $next_cron;
@@ -2589,17 +2635,12 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Ensure the background worker is scheduled (and nudged) without thrashing events.
-	 * If the heartbeat is very stale, run one tick as a safety fallback.
+	 * Ensure the background worker is alive.
 	 *
-	 * @return array<string, mixed>
-	 */
-	/**
-	 * Ensure the background worker is scheduled (and nudged) without thrashing events.
-	 *
-	 * LIGHTWEIGHT by default: unlock stale locks + schedule pulse/chain + rate-limited ping.
-	 * Does NOT run AI translation inline — that froze admin/storefront when polled every 2s.
-	 * Use kick_worker() / bootstrap_background_worker() for an inline tick.
+	 * 1) Unlock stale locks + schedule cron/pulse + spawn loopback.
+	 * 2) If the job has been idle too long, run one real tick INLINE.
+	 *    (Many hosts silently drop non-blocking loopback HTTP — that caused
+	 *    multi-minute "کارگر کند شد" stalls while the monitor only called ensure.)
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2615,11 +2656,12 @@ final class Activity_Logger {
 
 		self::ensure_recurring_pulse();
 
+		$job  = self::get_job_raw();
 		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 )
 		);
-		$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 		$busy = self::is_step_lock_held_fresh();
 
 		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
@@ -2628,12 +2670,39 @@ final class Activity_Logger {
 			self::ping_wp_cron();
 		}
 
-		// Fast path: if the worker looks idle, kick the AJAX chain immediately.
-		// Do not run AI inline here — only spawn a background tick.
-		if ( ! $busy && $age >= 5 ) {
+		if ( ! $busy ) {
 			self::spawn_job_loopback( true );
-		} elseif ( ! $busy ) {
-			self::spawn_job_loopback( false );
+		}
+
+		$inline_idle = self::get_ensure_inline_idle_sec();
+
+		// Dead lock claim that still looks "busy" but heartbeat is ancient — clear and run.
+		if ( $busy && $age >= self::LOCK_FORCE_IDLE_SEC ) {
+			self::release_step_lock();
+			$busy                = false;
+			$released_stale_lock = true;
+		}
+
+		if ( ! $busy && $age >= $inline_idle ) {
+			if ( function_exists( 'ignore_user_abort' ) ) {
+				ignore_user_abort( true );
+			}
+
+			$result = self::process_background_step();
+
+			if ( ! is_array( $result ) ) {
+				$result = self::normalize_job_for_response( self::get_job_raw(), false );
+			}
+
+			$result['worker_ensured']     = true;
+			$result['worker_inline_tick'] = true;
+			$result['loopback_spawned']   = true;
+
+			if ( $released_stale_lock ) {
+				$result['lock_recovered'] = true;
+			}
+
+			return $result;
 		}
 
 		$next = self::get_next_worker_cron();

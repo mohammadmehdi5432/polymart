@@ -8,16 +8,16 @@ import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
 /** If cron has not ticked for this long, nudge/ensure the server worker. */
-const CRON_STALE_SEC = 10;
+const CRON_STALE_SEC = 8;
 /**
  * Lock alone is trusted this long without a completed tick.
  * Must stay above max AI HTTP timeout (~165s) so the monitor does not steal a living worker.
  */
 const LOCK_HEALTHY_SEC = 200;
 /** Between-item lock with no progress — force ensure. */
-const LOCK_IDLE_STALE_SEC = 25;
+const LOCK_IDLE_STALE_SEC = 12;
 /** Do not hammer ensure more than once per this interval. */
-const ENSURE_MIN_INTERVAL_MS = 8000;
+const ENSURE_MIN_INTERVAL_MS = 5000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -44,8 +44,12 @@ function isCronHealthy(job) {
       return true;
     }
 
-    // Between items with a stuck lock — NOT healthy (this is the production stall).
-    if (!hasActivePost && activityAge >= LOCK_IDLE_STALE_SEC) {
+    // Between items: only unhealthy when BOTH lock and activity are stale.
+    // Fresh lock + last completed item is normal (picking next), not a stall.
+    if (!hasActivePost) {
+      if (activityAge < LOCK_IDLE_STALE_SEC || (lockAge >= 0 && lockAge < LOCK_IDLE_STALE_SEC)) {
+        return true;
+      }
       return false;
     }
 
@@ -64,6 +68,65 @@ function isCronHealthy(job) {
 
   const age = now - stamp;
   return age >= 0 && age < CRON_STALE_SEC;
+}
+
+function jobStepHeadline(lastStepStatus, displayPost, job) {
+  const lockAge = Number(job?.worker_lock_age || 0);
+  const now = Math.floor(Date.now() / 1000);
+  const activityAge = Math.max(
+    0,
+    now - Number(job?.last_cron_at || job?.worker_heartbeat_at || 0)
+  );
+  const hasActivePost = Boolean(displayPost?.title && !displayPost?.from_last_step);
+
+  if (job?.worker_lock && lockAge > LOCK_HEALTHY_SEC && activityAge > LOCK_HEALTHY_SEC) {
+    return 'قفل مرحله منقضی شده — در حال بازیابی…';
+  }
+
+  if (job?.worker_lock && hasActivePost) {
+    return 'کارگر سرور در حال ترجمه است';
+  }
+
+  // Lock + last finished item is normal between ticks — not a deadlock.
+  if (job?.worker_lock && displayPost?.from_last_step && job?.status === 'running') {
+    if (activityAge >= LOCK_IDLE_STALE_SEC && lockAge >= LOCK_IDLE_STALE_SEC) {
+      return 'کارگر بین دو مورد متوقف شد — در حال بیدار کردن…';
+    }
+    return 'در حال انتخاب مورد بعدی…';
+  }
+
+  if (displayPost?.from_last_step) {
+    if (job?.status === 'running') {
+      return 'آخرین مورد تمام شد — آماده‌سازی مورد بعدی';
+    }
+    return 'آخرین مورد این اجرا';
+  }
+
+  if (!displayPost?.title) {
+    return 'در حال آماده‌سازی مورد بعدی';
+  }
+
+  const phase = job?.partial_phase || displayPost?.partial_phase;
+  const progress = job?.partial_progress || displayPost?.partial_progress;
+
+  if (lastStepStatus === 'deferred') {
+    return 'موقتاً کنار گذاشته شد — ادامه بعداً';
+  }
+
+  if (lastStepStatus === 'partial' && phase) {
+    const label = jobPhaseLabel(phase);
+    return progress ? `ادامه ترجمه (${label} — ${progress})` : `ادامه ترجمه (${label})`;
+  }
+
+  if (lastStepStatus === 'partial') {
+    const gapHint = job?.last_step?.message || displayPost?.step_message || '';
+    if (gapHint) {
+      return 'ادامه فیلدهای باقی‌مانده';
+    }
+    return 'تلاش مجدد برای مورد ناقص';
+  }
+
+  return 'در حال ترجمه';
 }
 
 function resolveDisplayPost(job, stickyPost = null) {
@@ -136,57 +199,6 @@ function jobPhaseLabel(phase) {
     default:
       return phase || '';
   }
-}
-
-function jobStepHeadline(lastStepStatus, displayPost, job) {
-  if (job?.worker_lock && Number(job?.worker_lock_age || 0) > LOCK_HEALTHY_SEC) {
-    return 'قفل مرحله گیر کرده — در حال بازیابی…';
-  }
-
-  const hasActivePost = Boolean(displayPost?.title && !displayPost?.from_last_step);
-
-  if (job?.worker_lock && hasActivePost) {
-    return 'کارگر سرور در حال ترجمه است';
-  }
-
-  if (job?.worker_lock && displayPost?.from_last_step && job?.status === 'running') {
-    return 'قفل بین دو مورد گیر کرده — در حال بازیابی کارگر…';
-  }
-
-  if (displayPost?.from_last_step) {
-    if (job?.status === 'running') {
-      return job?.cron_scheduled
-        ? 'آخرین مورد تمام شد — منتظر تیک بعدی کرون'
-        : 'آخرین مورد تمام شد — در حال زمان‌بندی تیک بعدی';
-    }
-    return 'آخرین مورد این اجرا';
-  }
-
-  if (!displayPost?.title) {
-    return 'در حال آماده‌سازی مورد بعدی';
-  }
-
-  const phase = job?.partial_phase || displayPost?.partial_phase;
-  const progress = job?.partial_progress || displayPost?.partial_progress;
-
-  if (lastStepStatus === 'deferred') {
-    return 'موقتاً کنار گذاشته شد — ادامه بعداً';
-  }
-
-  if (lastStepStatus === 'partial' && phase) {
-    const label = jobPhaseLabel(phase);
-    return progress ? `ادامه ترجمه (${label} — ${progress})` : `ادامه ترجمه (${label})`;
-  }
-
-  if (lastStepStatus === 'partial') {
-    const gapHint = job?.last_step?.message || displayPost?.step_message || '';
-    if (gapHint) {
-      return 'ادامه فیلدهای باقی‌مانده';
-    }
-    return 'تلاش مجدد برای مورد ناقص';
-  }
-
-  return 'در حال ترجمه';
 }
 
 const config = window.polymartAiSettings ?? {};
@@ -494,8 +506,10 @@ export default function AutoTranslateApp() {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
             const recovered = await ensureServerWorker();
-            if (recovered?.lock_recovered && isActiveRef.current) {
-              appendLog('قفل گیرکرده آزاد شد — تیک بعدی فوراً شروع می‌شود…', 'warning');
+            if (recovered?.worker_inline_tick && isActiveRef.current) {
+              appendLog('تیک بازیابی اجرا شد — صف دوباره جلو می‌رود.', 'success');
+            } else if (recovered?.lock_recovered && isActiveRef.current) {
+              appendLog('قفل گیرکرده آزاد شد — تیک بعدی شروع می‌شود…', 'warning');
             } else if (recovered?.loopback_spawned && isActiveRef.current) {
               appendLog('کارگر پس‌زمینه بیدار شد — ادامه صف…', 'info');
             }
@@ -859,9 +873,9 @@ export default function AutoTranslateApp() {
         : cronAgeSec != null
           ? cronAgeSec < CRON_STALE_SEC
             ? `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
-            : cronAgeSec < 45
+            : cronAgeSec < 20
               ? `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`
-              : `کارگر کند شد (${cronAgeSec}ث) — در حال بازیابی…`
+              : `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`
           : job?.cron_scheduled
             ? 'زمان‌بندی شده — شروع زنجیره پس‌زمینه'
             : 'در حال اجرا روی سرور'
