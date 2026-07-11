@@ -2616,9 +2616,17 @@ final class Activity_Logger {
 					absint( $job['worker_heartbeat_at'] ?? 0 )
 				);
 				$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+				$next_chain = wp_next_scheduled( self::CRON_HOOK );
 
 				// Chain continuation: spawn wp-cron.php once the previous tick is idle.
 				if ( 'running' === ( $job['status'] ?? '' ) && $age >= 8 ) {
+					$allow_loopback = true;
+				}
+
+				// Immediate follow-up: when a near-term chain event is already queued,
+				// always nudge wp-cron.php once so hosts that drop admin-ajax loopbacks
+				// do not fall back to minute-granularity crontab pacing.
+				if ( ! $allow_loopback && 'running' === ( $job['status'] ?? '' ) && $next_chain && (int) $next_chain <= ( time() + 5 ) ) {
 					$allow_loopback = true;
 				}
 			}
@@ -2633,12 +2641,30 @@ final class Activity_Logger {
 				site_url( 'wp-cron.php' )
 			);
 
+			$args = array(
+				'blocking'  => false,
+				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+			);
+
+			// Attempt 1: classic micro-timeout.
 			wp_remote_post(
 				$cron_url,
-				array(
-					'timeout'   => 0.01,
-					'blocking'  => false,
-					'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+				array_merge(
+					$args,
+					array(
+						'timeout' => 0.01,
+					)
+				)
+			);
+
+			// Attempt 2: some hosts drop ultra-short non-blocking requests.
+			wp_remote_post(
+				$cron_url,
+				array_merge(
+					$args,
+					array(
+						'timeout' => 3,
+					)
 				)
 			);
 
