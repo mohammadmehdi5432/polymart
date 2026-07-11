@@ -2442,6 +2442,9 @@ final class Activity_Logger {
 		$language   = Language_Registry::get_language( $lang );
 		$lang_label = $language ? $language['native_name'] : $lang;
 
+		$seed_limit = min( 30, max( 5, $needs_work ) );
+		$seed_ids   = Translation_Query::seed_actionable_post_ids( $lang, $seed_limit );
+
 		$job = array(
 			'status'             => 'running',
 			'lang'               => $lang,
@@ -2449,7 +2452,7 @@ final class Activity_Logger {
 			'last_post_id'       => 0,
 			'queue'              => array(),
 			'retry_queue'        => array(),
-			'deferred_queue'     => array(),
+			'deferred_queue'     => $seed_ids,
 			'retry_attempts'     => array(),
 			'remaining'          => $total,
 			'total'              => $total,
@@ -2543,11 +2546,23 @@ final class Activity_Logger {
 		$job = wp_parse_args( $job, self::empty_job() );
 
 		if ( in_array( $job['status'], array( 'paused', 'running' ), true ) ) {
+			$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
 			$job['status']          = 'running';
 			$job['last_error']      = null;
 			$job['pause_reason']    = null;
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
+
+			if ( empty( $job['deferred_queue'] ) && '' !== $lang ) {
+				$needs      = (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 );
+				$seed_limit = min( 30, max( 5, $needs > 0 ? $needs : 10 ) );
+				$job['deferred_queue'] = Translation_Query::seed_actionable_post_ids(
+					$lang,
+					$seed_limit,
+					self::get_exhausted_job_post_ids( $job )
+				);
+			}
 
 			self::save_job( $job );
 			self::bootstrap_background_worker();
@@ -3688,42 +3703,12 @@ final class Activity_Logger {
 		$exclude_ids = self::get_forward_scan_exclude_ids( $job );
 
 		self::touch_worker_heartbeat();
-		$post_id = Translation_Query::find_next_untranslated_post_id( $lang, $cursor, $exclude_ids );
-		self::touch_worker_heartbeat();
-
-		if ( ! $post_id && $cursor > 0 ) {
-			self::touch_worker_heartbeat();
-			$post_id = Translation_Query::find_next_untranslated_post_id( $lang, 0, $exclude_ids );
-			self::touch_worker_heartbeat();
-		}
-
-		if ( $post_id ) {
-			return array(
-				'post_id'    => $post_id,
-				'from_retry' => false,
-			);
-		}
-
-		self::touch_worker_heartbeat();
 		$deferred_queue = self::get_actionable_deferred_queue( $job, $lang );
 		self::touch_worker_heartbeat();
 
 		if ( ! empty( $deferred_queue ) ) {
 			$post_id               = (int) array_shift( $deferred_queue );
 			$job['deferred_queue'] = $deferred_queue;
-
-			return array(
-				'post_id'    => $post_id,
-				'from_retry' => true,
-			);
-		}
-
-		$parked = self::get_parked_ids( $job );
-
-		if ( ! empty( $parked ) ) {
-			$post_id = (int) array_shift( $parked );
-			self::remove_post_from_deferred_queue( $job, $post_id );
-			$job['parked_ids'] = $parked;
 
 			return array(
 				'post_id'    => $post_id,
@@ -3751,8 +3736,49 @@ final class Activity_Logger {
 			);
 		}
 
+		$parked = self::get_parked_ids( $job );
+
+		if ( ! empty( $parked ) ) {
+			$post_id = (int) array_shift( $parked );
+			self::remove_post_from_deferred_queue( $job, $post_id );
+			$job['parked_ids'] = $parked;
+
+			return array(
+				'post_id'    => $post_id,
+				'from_retry' => true,
+			);
+		}
+
 		self::touch_worker_heartbeat();
-		$actionable = self::get_actionable_remaining_ids( $lang, $job, 50 );
+		$post_id = Translation_Query::find_next_actionable_post_id( $lang, $cursor, $exclude_ids );
+		self::touch_worker_heartbeat();
+
+		if ( ! $post_id && $cursor > 0 ) {
+			self::touch_worker_heartbeat();
+			$post_id = Translation_Query::find_next_actionable_post_id( $lang, 0, $exclude_ids );
+			self::touch_worker_heartbeat();
+		}
+
+		if ( ! $post_id ) {
+			self::touch_worker_heartbeat();
+			$post_id = Translation_Query::find_next_untranslated_post_id( $lang, $cursor, $exclude_ids );
+			self::touch_worker_heartbeat();
+
+			if ( ! $post_id && $cursor > 0 ) {
+				$post_id = Translation_Query::find_next_untranslated_post_id( $lang, 0, $exclude_ids );
+				self::touch_worker_heartbeat();
+			}
+		}
+
+		if ( $post_id ) {
+			return array(
+				'post_id'    => $post_id,
+				'from_retry' => false,
+			);
+		}
+
+		self::touch_worker_heartbeat();
+		$actionable = self::get_actionable_remaining_ids( $lang, $job, 10 );
 		self::touch_worker_heartbeat();
 
 		if ( ! empty( $actionable ) ) {

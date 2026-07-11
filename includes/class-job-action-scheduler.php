@@ -295,14 +295,16 @@ final class Job_Action_Scheduler {
 
 		$job     = Activity_Logger::get_job_for_as_debug();
 		$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+		$queued  = is_array( $job['deferred_queue'] ?? null ) ? count( $job['deferred_queue'] ) : 0;
 
 		Activity_Logger::log(
 			'info',
 			sprintf(
-				/* translators: 1: AS action ID, 2: post ID */
-				__( 'AS #%1$d: شروع batch ترجمه (پست جاری/جزئی: #%2$d).', 'polymart-ai' ),
+				/* translators: 1: AS action ID, 2: post ID, 3: queued count */
+				__( 'AS #%1$d: شروع batch ترجمه (پست جاری/جزئی: #%2$d، %3$d مورد در صف آماده).', 'polymart-ai' ),
 				self::$current_action_id,
-				$post_id
+				$post_id,
+				$queued
 			),
 			array(
 				'as_action_id' => self::$current_action_id,

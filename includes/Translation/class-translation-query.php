@@ -309,6 +309,12 @@ final class Translation_Query {
 	 * @return int Post ID or 0 when none remain.
 	 */
 	public static function find_next_untranslated_post_id( $lang, $after_id = 0, array $exclude_ids = array() ) {
+		$fast = self::find_next_actionable_post_id( $lang, $after_id, $exclude_ids );
+
+		if ( $fast > 0 ) {
+			return $fast;
+		}
+
 		$lang         = sanitize_key( (string) $lang );
 		$after_id     = absint( $after_id );
 		$exclude_ids  = array_filter( array_map( 'absint', $exclude_ids ) );
@@ -360,7 +366,7 @@ final class Translation_Query {
 		// First candidate may lack Persian content; scan forward in small batches.
 		$scan_after = $after_id;
 		$attempts   = 0;
-		$max_scan   = 50;
+		$max_scan   = 8;
 
 		while ( $attempts < $max_scan ) {
 			++$attempts;
@@ -381,10 +387,117 @@ final class Translation_Query {
 					return $post_id;
 				}
 			}
+
+			do_action( 'polymart_ai_worker_heartbeat' );
 		}
 
 		return 0;
 	}
+
+	/**
+	 * Fast SQL lookup for the next untranslated/partial Persian post (job picker).
+	 *
+	 * @param string $lang        Target language code.
+	 * @param int    $after_id    Resume cursor (post ID).
+	 * @param int[]  $exclude_ids Post IDs to skip.
+	 * @return int Post ID or 0.
+	 */
+	public static function find_next_actionable_post_id( $lang, $after_id = 0, array $exclude_ids = array() ) {
+		$lang        = sanitize_key( (string) $lang );
+		$after_id    = absint( $after_id );
+		$exclude_ids = array_values( array_filter( array_map( 'absint', $exclude_ids ) ) );
+
+		self::maybe_backfill_translation_index( $lang );
+
+		$indexed = self::find_next_indexed_actionable_post_id( $lang, $after_id, $exclude_ids );
+
+		if ( $indexed > 0 ) {
+			return $indexed;
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Collect the first N actionable post IDs for job queue seeding.
+	 *
+	 * @param string $lang        Target language code.
+	 * @param int    $limit       Maximum IDs.
+	 * @param int[]  $exclude_ids Post IDs to skip.
+	 * @return int[]
+	 */
+	public static function seed_actionable_post_ids( $lang, $limit = 20, array $exclude_ids = array() ) {
+		$lang        = sanitize_key( (string) $lang );
+		$limit       = max( 1, min( 50, absint( $limit ) ) );
+		$exclude_ids = array_values( array_filter( array_map( 'absint', $exclude_ids ) ) );
+		$ids         = array();
+		$cursor      = 0;
+
+		while ( count( $ids ) < $limit ) {
+			$next = self::find_next_actionable_post_id(
+				$lang,
+				$cursor,
+				array_merge( $exclude_ids, $ids )
+			);
+
+			if ( $next <= 0 ) {
+				break;
+			}
+
+			$ids[]  = $next;
+			$cursor = $next;
+		}
+
+		return $ids;
+	}
+
+	/**
+	 * @param string $lang        Target language.
+	 * @param int    $after_id    Cursor post ID.
+	 * @param int[]  $exclude_ids Excluded post IDs.
+	 * @return int
+	 */
+	private static function find_next_indexed_actionable_post_id( $lang, $after_id, array $exclude_ids ) {
+		global $wpdb;
+
+		$post_types = Post_Translator::get_supported_post_types();
+		$status_key = Post_Translator::get_status_index_meta_key( $lang );
+		$clause     = self::build_post_type_in_clause( $post_types );
+		$after_sql  = $after_id > 0 ? ' AND p.ID > %d ' : '';
+		$exclude_sql = '';
+		$exclude_vals = array();
+
+		if ( ! empty( $exclude_ids ) ) {
+			$placeholders = implode( ', ', array_fill( 0, count( $exclude_ids ), '%d' ) );
+			$exclude_sql  = " AND p.ID NOT IN ( {$placeholders} ) ";
+			$exclude_vals = $exclude_ids;
+		}
+
+		$sql = "SELECT p.ID
+			FROM {$wpdb->posts} p
+			INNER JOIN {$wpdb->postmeta} pm_flag
+				ON p.ID = pm_flag.post_id
+				AND pm_flag.meta_key = %s
+				AND pm_flag.meta_value = '1'
+			LEFT JOIN {$wpdb->postmeta} pm_status
+				ON p.ID = pm_status.post_id
+				AND pm_status.meta_key = %s
+			WHERE p.post_status = 'publish' {$clause['sql']}
+				{$after_sql}
+				{$exclude_sql}
+				AND ( pm_status.meta_id IS NULL OR pm_status.meta_value IN ( 'untranslated', 'partial' ) )
+			ORDER BY p.ID ASC
+			LIMIT 1";
+
+		$prepare_args = array_merge(
+			array( Post_Translator::PERSIAN_CONTENT_FLAG_META, $status_key ),
+			$clause['values'],
+			$after_id > 0 ? array( $after_id ) : array(),
+			$exclude_vals
+		);
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		return absint( $wpdb->get_var( $wpdb->prepare( $sql, $prepare_args ) ) );
 
 	/**
 	 * Collect untranslated post IDs in batches (for bulk backlog endpoint).
