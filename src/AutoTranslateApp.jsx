@@ -880,13 +880,15 @@ export default function AutoTranslateApp() {
   const latestActivityAt = latestWorkerStamp(job);
 
   const workerLabel =
-    job?.last_worker === 'cron'
-      ? 'کرون'
-      : job?.last_worker === 'loopback'
-        ? 'زنجیره سریع'
-        : job?.last_worker === 'admin'
-          ? 'سرور'
-          : null;
+    job?.last_worker === 'cli'
+      ? 'CLI'
+      : job?.last_worker === 'cron'
+        ? 'کرون keep-alive'
+        : job?.last_worker === 'loopback'
+          ? 'CLI'
+          : job?.last_worker === 'admin'
+            ? 'سرور'
+            : null;
 
   const statusLabel = actionPendingLabel
     ? actionPendingLabel
@@ -916,13 +918,13 @@ export default function AutoTranslateApp() {
       subtitle={`ترجمه خودکار محتوای فارسی به ${targetLabel} — اجرا روی سرور با کرون، مانیتور در این صفحه`}
     >
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
-        <p className="font-medium">کارگر پس‌زمینهٔ پیوسته (چند اسلایس در هر تیک)</p>
+        <p className="font-medium">کارگر CLI پیوسته (Long-Running Worker)</p>
         <p className="mt-1 text-pmai-muted">
-          هر تیک تا ۵ اسلایس ترجمه را پشت‌سرهم اجرا می‌کند. بعد از تیک، سرور هم loopback و هم
-          wp-cron.php را برای تیک بعدی صدا می‌زند تا اگر یکی قطع شد صف متوقف نشود.
+          ترجمه در یک پروسهٔ CLI پشت‌صحنه پشت‌سرهم اجرا می‌شود — بدون AJAX Loopback و بدون وابستگی به فایروال.
+          کرون‌جاب سرور فقط keep-alive است: اگر کارگر قطع شده باشد دوباره استارتش می‌زند.
         </p>
         <p className="mt-1">
-          بستن این تب صف را متوقف نمی‌کند. pulse دقیقه‌ای فقط پشتیبان آخر است.
+          بستن این تب صف را متوقف نمی‌کند. اگر هاست اجازهٔ exec ندهد، همان کرون هر دقیقه یک حلقهٔ فشرده اجرا می‌کند.
         </p>
       </div>
 
@@ -951,7 +953,7 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message="DISABLE_WP_CRON فعال است — هر تیک چند اسلایس اجرا می‌کند و بعد از آن wp-cron.php هم force می‌شود تا صف فقط به crontab دقیقه‌ای وابسته نباشد."
+            message="DISABLE_WP_CRON فعال است — کارگر CLI مستقل صف را جلو می‌برد و pulse دقیقه‌ای فقط keep-alive است (اگر کارگر مرده باشد دوباره استارتش می‌زند)."
           />
         </div>
       ) : !config.devMode ? (

@@ -40,36 +40,47 @@ final class Activity_Logger {
 	const LOCK_FORCE_IDLE_SEC  = 200;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	/**
-	 * Recurring pulse — backup only. Fast progress comes from the AJAX loopback chain.
+	 * Recurring pulse — keep-alive only. The long-running CLI worker does the work.
 	 */
 	const CRON_PULSE_HOOK      = 'polymart_ai_translation_job_pulse';
 	const CRON_PULSE_SCHEDULE  = 'polymart_ai_every_minute';
-	/** Seconds before the next self-chained tick after work finishes. */
+	/** @deprecated Kept for schedule_background_worker signature compatibility. */
 	const CRON_INTERVAL_SEC    = 0;
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
 	const CRON_SAFETY_SEC      = 120;
 	const CRON_INTERVAL_SERVER_SEC = 1;
-	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
-	const CRON_STEP_BUDGET_SEC = 240;
 	/**
-	 * AI slices per PHP request. Hosts that drop HTTP loopback only advance on
-	 * real crontab (~60s); packing several slices into one tick keeps throughput
-	 * high even when the fast chain is dead. Budget still caps wall-clock time.
+	 * Wall-clock budget when the keep-alive falls back to an inline cron loop
+	 * (exec/spawn disabled on the host).
 	 */
-	const CRON_MAX_STEPS_PER_TICK = 5;
+	const CRON_STEP_BUDGET_SEC = 50;
+	/**
+	 * Max slices for the inline cron fallback loop (spawn unavailable).
+	 * The real CLI worker ignores this and runs until done/budget.
+	 */
+	const CRON_MAX_STEPS_PER_TICK = 40;
 	/**
 	 * If last_cron_at is older than this while the step lock is held with no
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
 	 */
 	const LOCK_IDLE_ORPHAN_SEC = 30;
-	/** admin-ajax action for the self-driving worker chain (works with DISABLE_WP_CRON). */
+	/** Legacy admin-ajax action — now only wakes the CLI worker. */
 	const LOOPBACK_ACTION      = 'polymart_ai_job_loopback';
 	const LOOPBACK_TOKEN_OPTION = 'polymart_ai_job_loopback_token';
 	const LOOPBACK_GATE_KEY    = 'polymart_ai_job_loopback_gate';
-	/** Min seconds between non-forced loopback spawns. */
 	const LOOPBACK_GATE_SEC    = 1;
-	/** Gate for forced wp-cron.php continuation after a tick. */
 	const CRON_CONTINUE_GATE_KEY = 'polymart_ai_job_cron_continue_gate';
+	/** Soft gate between CLI spawn attempts. */
+	const CLI_SPAWN_GATE_KEY   = 'polymart_ai_cli_spawn_gate';
+	const CLI_SPAWN_GATE_SEC   = 15;
+	/** Heartbeat age under which the CLI worker is considered alive. */
+	const CLI_WORKER_ALIVE_SEC = 200;
+	/** Default wall-clock budget for a detached CLI process (seconds). */
+	const CLI_WORKER_MAX_SEC   = 3600;
+	/** Inline keep-alive fallback budget when process spawn is disabled. */
+	const CLI_INLINE_FALLBACK_SEC = 50;
+	/** Option storing the active CLI worker claim (pid + started_at). */
+	const CLI_WORKER_LOCK_OPTION = 'polymart_ai_cli_worker_lock';
 
 	/**
 	 * True while a token-authenticated loopback tick is executing.
@@ -80,18 +91,21 @@ final class Activity_Logger {
 	/**
 	 * True while the shared worker pipeline is executing.
 	 *
-	 * REST bootstrap/recovery ticks are server-authorized too, even though they
-	 * are neither WP-Cron nor the tokenized AJAX endpoint.
-	 *
 	 * @var bool
 	 */
 	private static $trusted_job_tick = false;
 	/**
-	 * Whether a shutdown continuation has already been registered for this request.
+	 * True while run_cli_worker() owns the queue.
 	 *
 	 * @var bool
 	 */
-	private static $shutdown_chain_registered = false;
+	private static $trusted_cli_tick = false;
+	/**
+	 * File handle for the exclusive CLI flock (held for process lifetime).
+	 *
+	 * @var resource|null
+	 */
+	private static $cli_lock_fp = null;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -101,14 +115,14 @@ final class Activity_Logger {
 	public static function init() {
 		add_filter( 'cron_schedules', array( __CLASS__, 'register_cron_schedules' ) );
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
-		add_action( self::CRON_HOOK, array( __CLASS__, 'process_background_step' ) );
-		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'process_background_step' ) );
+		// Cron is keep-alive only — it must NOT process AI slices itself when CLI is alive.
+		add_action( self::CRON_HOOK, array( __CLASS__, 'keep_alive_cli_worker' ) );
+		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'keep_alive_cli_worker' ) );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_during_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
+		// Legacy endpoint: wake CLI instead of running HTTP loopback chain.
 		add_action( 'wp_ajax_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
 		add_action( 'wp_ajax_nopriv_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
-		// Heal ONLY inside cron/REST — never on storefront/admin HTML loads
-		// (pinging cron on every page was spawning heavy AI work and freezing the site).
 		if ( wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_ajax() ) {
 			self::maybe_heal_background_worker();
 		} else {
@@ -165,10 +179,10 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * admin-ajax entry for the self-driving worker (Action Scheduler-style).
+	 * Legacy admin-ajax entry — no longer runs AI work over HTTP.
 	 *
-	 * Independent of WP-Cron / DISABLE_WP_CRON — this is what keeps the queue
-	 * moving every few seconds instead of waiting for a 1-minute crontab.
+	 * Wakes the CLI worker (or inline fallback) and exits. Kept so old cron
+	 * bookmarks / leftover clients do not 404.
 	 *
 	 * @return void
 	 */
@@ -187,40 +201,27 @@ final class Activity_Logger {
 			exit( 'idle' );
 		}
 
-		if ( function_exists( 'ignore_user_abort' ) ) {
-			ignore_user_abort( true );
-		}
-
-		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( max( 300, self::CRON_STEP_BUDGET_SEC + 180 ) );
-		}
-
-		// Another worker already owns the lock — exit quietly; it will chain itself.
-		if ( self::is_step_lock_held_fresh() ) {
-			status_header( 200 );
-			exit( 'busy' );
-		}
-
-		self::$trusted_loopback_tick = true;
-
-		try {
-			self::process_background_step();
-		} finally {
-			self::$trusted_loopback_tick = false;
-		}
+		self::keep_alive_cli_worker();
 
 		status_header( 200 );
-		exit( 'ok' );
+		exit( 'cli' );
 	}
 
 	/**
-	 * Whether the current request is a trusted auto-translate worker
-	 * (WP-Cron or token-authenticated AJAX loopback).
+	 * Whether the current request is a trusted auto-translate worker.
 	 *
 	 * @return bool
 	 */
 	public static function is_trusted_job_worker() {
-		if ( wp_doing_cron() || self::$trusted_loopback_tick || self::$trusted_job_tick ) {
+		if ( wp_doing_cron() || self::$trusted_loopback_tick || self::$trusted_job_tick || self::$trusted_cli_tick ) {
+			return true;
+		}
+
+		if ( defined( 'WP_CLI' ) && WP_CLI && self::$trusted_cli_tick ) {
+			return true;
+		}
+
+		if ( 'cli' === PHP_SAPI && self::$trusted_cli_tick ) {
 			return true;
 		}
 
@@ -253,157 +254,537 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Fire a non-blocking admin-ajax request that runs the next job tick.
-	 *
-	 * Primary fast path. WP-Cron pulse remains a backup only.
-	 * Many hosts drop ultra-short loopbacks — fire several URL/timeout variants.
+	 * Legacy name — redirects to CLI worker spawn (HTTP loopback removed).
 	 *
 	 * @param bool $force Bypass the short spawn gate.
 	 * @return void
 	 */
 	public static function spawn_job_loopback( $force = false ) {
-		if ( ! self::is_bulk_job_running() ) {
-			return;
-		}
-
-		// Never stack while a living tick holds the lock.
-		if ( self::is_step_lock_held_fresh() ) {
-			return;
-		}
-
-		if ( ! $force && get_transient( self::LOOPBACK_GATE_KEY ) ) {
-			return;
-		}
-
-		set_transient( self::LOOPBACK_GATE_KEY, 1, max( 1, self::LOOPBACK_GATE_SEC ) );
-
-		$token = self::get_loopback_token();
-		$body  = array(
-			'action' => self::LOOPBACK_ACTION,
-			'token'  => $token,
-		);
-		$query = array(
-			'action' => self::LOOPBACK_ACTION,
-			'token'  => $token,
-		);
-		$args  = array(
-			'blocking'  => false,
-			'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
-			'headers'   => array(
-				'Connection' => 'Close',
-			),
-			'body'      => $body,
-		);
-
-		$urls = array_unique(
-			array_filter(
-				array(
-					admin_url( 'admin-ajax.php' ),
-					site_url( 'wp-admin/admin-ajax.php' ),
-				)
-			)
-		);
-
-		foreach ( $urls as $url ) {
-			// Attempt 1: classic non-blocking micro-timeout.
-			wp_remote_post(
-				$url,
-				array_merge(
-					$args,
-					array(
-						'timeout' => 0.01,
-					)
-				)
-			);
-
-			// Attempt 2: slightly longer non-blocking timeout — accepted by more hosts
-			// that discard 0.01s requests before PHP boots.
-			wp_remote_post(
-				$url,
-				array_merge(
-					$args,
-					array(
-						'timeout' => 3,
-					)
-				)
-			);
-
-			// Attempt 3: GET — some reverse proxies only allow non-blocking GET loopbacks.
-			wp_remote_get(
-				add_query_arg( $query, $url ),
-				array(
-					'blocking'  => false,
-					'timeout'   => 3,
-					'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
-					'headers'   => array(
-						'Connection' => 'Close',
-					),
-				)
-			);
-		}
+		self::spawn_cli_worker( $force );
 	}
 
 	/**
-	 * Schedule the next tick and fire every continuation transport.
+	 * After work / start: keep the pulse scheduled and ensure a CLI worker is up.
 	 *
-	 * Loopback (admin-ajax) is preferred; forced wp-cron.php spawn covers hosts
-	 * that silently drop loopback HTTP. A shutdown re-fire helps proxies that
-	 * only accept outbound HTTP after the current request ends.
-	 *
-	 * @param int  $delay_sec Delay before the next single-event chain tick.
-	 * @param bool $force     Bypass spawn gates (normal after a completed tick).
+	 * @param int  $delay_sec Unused (kept for call-site compatibility).
+	 * @param bool $force     Force a spawn attempt even if recently gated.
 	 * @return void
 	 */
 	private static function continue_job_chain( $delay_sec = null, $force = true ) {
+		unset( $delay_sec );
+
 		if ( ! self::is_bulk_job_running() ) {
 			self::unschedule_background_worker();
 
 			return;
 		}
 
-		$delay = null === $delay_sec ? self::get_cron_chain_delay_sec() : max( 0, absint( $delay_sec ) );
-
-		self::schedule_background_worker( $delay );
-		self::spawn_job_loopback( $force );
-		self::spawn_cron_request( $force );
-		self::register_shutdown_chain_continuation( $force );
+		self::ensure_recurring_pulse();
+		self::spawn_cli_worker( $force );
 	}
 
 	/**
-	 * Re-fire loopback + wp-cron.php after the current PHP request ends.
+	 * Cron / REST keep-alive: if the CLI worker is dead, start it again.
 	 *
-	 * @param bool $force Bypass spawn gates.
-	 * @return void
+	 * When process spawn is disabled by the host, runs an inline slice loop
+	 * for ~CLI_INLINE_FALLBACK_SEC inside this request instead.
+	 *
+	 * @return array<string, mixed>|null Normalized job when work ran inline, else null.
 	 */
-	private static function register_shutdown_chain_continuation( $force = true ) {
-		if ( self::$shutdown_chain_registered ) {
-			return;
+	public static function keep_alive_cli_worker() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			self::unschedule_background_worker();
+
+			return null;
 		}
 
-		self::$shutdown_chain_registered = true;
+		self::ensure_recurring_pulse();
+		self::maybe_release_stale_step_lock();
+		self::force_release_step_lock_if_idle();
 
-		register_shutdown_function(
-			static function () use ( $force ) {
-				if ( ! self::is_bulk_job_running() ) {
-					return;
-				}
+		if ( self::is_cli_worker_alive() ) {
+			return null;
+		}
 
-				// Lock may still look fresh for a moment after our tick; force loopback
-				// only when idle so we do not stack workers.
-				if ( ! self::is_step_lock_held_fresh() ) {
-					self::spawn_job_loopback( $force );
-				}
+		self::spawn_cli_worker( true );
 
-				self::spawn_cron_request( true );
+		// Give a freshly detached process a moment to claim the flock.
+		if ( self::can_spawn_detached_cli() ) {
+			usleep( 500000 );
+
+			if ( self::is_cli_worker_alive() ) {
+				return null;
 			}
+		}
+
+		// Spawn unavailable or failed — bulldoze slices inside this request.
+		// Flock still prevents overlap if a CLI process races us.
+		return self::run_cli_worker(
+			array(
+				'max_seconds' => (int) apply_filters(
+					'polymart_ai_cli_inline_fallback_sec',
+					self::CLI_INLINE_FALLBACK_SEC
+				),
+				'max_steps'   => 0,
+			)
 		);
 	}
 
 	/**
-	 * Seconds of silence before ensure runs an inline worker tick.
+	 * Long-running worker: process slices back-to-back with no HTTP chaining.
 	 *
-	 * Loopback HTTP is unreliable on many production hosts; inline ensure is the
-	 * reliable path while an admin is monitoring the job.
+	 * @param array<string, mixed> $args {
+	 *     @type int $max_seconds Wall-clock budget (0 = unlimited). Default CLI_WORKER_MAX_SEC.
+	 *     @type int $max_steps   Max slices (0 = unlimited).
+	 * }
+	 * @return array<string, mixed>
+	 */
+	public static function run_cli_worker( array $args = array() ) {
+		$max_seconds = array_key_exists( 'max_seconds', $args )
+			? max( 0, absint( $args['max_seconds'] ) )
+			: self::CLI_WORKER_MAX_SEC;
+		$max_steps = array_key_exists( 'max_steps', $args )
+			? max( 0, absint( $args['max_steps'] ) )
+			: 0;
+
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return array(
+				'exit_reason' => 'idle',
+				'steps_run'   => 0,
+				'busy'        => false,
+			);
+		}
+
+		if ( ! self::claim_cli_worker_slot() ) {
+			return array(
+				'exit_reason' => 'busy',
+				'steps_run'   => 0,
+				'busy'        => true,
+			);
+		}
+
+		self::$trusted_cli_tick = true;
+		self::$trusted_job_tick = true;
+
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
+		}
+
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 0 );
+		}
+
+		$started     = time();
+		$steps_run   = 0;
+		$exit_reason = 'done';
+
+		try {
+			while ( true ) {
+				$job = self::get_job_raw();
+
+				if ( 'running' !== ( $job['status'] ?? '' ) ) {
+					$exit_reason = 'stopped';
+					break;
+				}
+
+				if ( $max_seconds > 0 && ( time() - $started ) >= $max_seconds ) {
+					$exit_reason = 'time_budget';
+					break;
+				}
+
+				if ( $max_steps > 0 && $steps_run >= $max_steps ) {
+					$exit_reason = 'step_budget';
+					break;
+				}
+
+				if ( self::cli_memory_exhausted() ) {
+					$exit_reason = 'memory';
+					break;
+				}
+
+				self::touch_worker_heartbeat();
+				$job = self::get_job_raw();
+				$job['worker_heartbeat_at'] = time();
+				$job['last_cron_at']        = time();
+				$job['last_worker']         = 'cli';
+				$job['last_cron_steps']     = $steps_run;
+				self::save_job( $job );
+
+				$result = self::process_job_step();
+				++$steps_run;
+
+				$job = self::get_job_raw();
+				$job['last_cron_at']        = time();
+				$job['worker_heartbeat_at'] = time();
+				$job['last_worker']         = 'cli';
+				$job['last_cron_steps']     = $steps_run;
+				self::save_job( $job );
+
+				if ( 'running' !== ( $job['status'] ?? '' ) ) {
+					$exit_reason = 'stopped';
+					break;
+				}
+
+				if ( is_array( $result ) && ! empty( $result['step_deferred'] ) ) {
+					$reason = (string) ( $result['step_deferred_reason'] ?? '' );
+
+					if ( 'step_lock_busy' === $reason ) {
+						$exit_reason = 'lock_busy';
+						break;
+					}
+
+					// Soft defer (e.g. per-post translation lock) — brief pause, then continue.
+					usleep( 250000 );
+					continue;
+				}
+
+				if ( is_array( $result ) && ! empty( $result['pause_reason'] ) && 'running' !== ( $result['status'] ?? '' ) ) {
+					$exit_reason = 'paused';
+					break;
+				}
+			}
+		} finally {
+			self::release_cli_worker_slot();
+			self::$trusted_cli_tick = false;
+			self::$trusted_job_tick = false;
+
+			// If the job is still running, keep-alive pulse will respawn us.
+			if ( self::is_bulk_job_running() ) {
+				self::ensure_recurring_pulse();
+			}
+		}
+
+		$out = self::normalize_job_for_response( self::get_job_raw(), false );
+		$out['exit_reason'] = $exit_reason;
+		$out['steps_run']   = $steps_run;
+		$out['busy']        = false;
+		$out['worker_mode'] = 'cli';
+
+		return $out;
+	}
+
+	/**
+	 * Detach a background PHP process that runs bin/job-worker.php.
+	 *
+	 * @param bool $force Bypass spawn gate / alive check.
+	 * @return bool True when a spawn was attempted (or worker already alive).
+	 */
+	public static function spawn_cli_worker( $force = false ) {
+		if ( ! self::is_bulk_job_running() ) {
+			return false;
+		}
+
+		if ( ! $force && self::is_cli_worker_alive() ) {
+			return true;
+		}
+
+		if ( ! $force && get_transient( self::CLI_SPAWN_GATE_KEY ) ) {
+			return false;
+		}
+
+		set_transient( self::CLI_SPAWN_GATE_KEY, 1, self::CLI_SPAWN_GATE_SEC );
+
+		if ( ! self::can_spawn_detached_cli() ) {
+			return false;
+		}
+
+		$php    = self::resolve_php_binary();
+		$script = POLYMART_AI_PLUGIN_DIR . 'bin/job-worker.php';
+		$max    = (int) apply_filters( 'polymart_ai_cli_worker_max_sec', self::CLI_WORKER_MAX_SEC );
+		$max    = max( 60, $max );
+
+		if ( ! is_readable( $script ) ) {
+			return false;
+		}
+
+		$cmd = escapeshellarg( $php ) . ' ' . escapeshellarg( $script ) . ' --max-seconds=' . $max;
+
+		/**
+		 * Filter the shell command used to start the detached CLI worker.
+		 *
+		 * @param string $cmd    Full command.
+		 * @param string $php    PHP binary.
+		 * @param string $script Worker script path.
+		 */
+		$cmd = (string) apply_filters( 'polymart_ai_cli_worker_command', $cmd, $php, $script );
+
+		$is_windows = ( defined( 'PHP_WINDOWS_VERSION_BUILD' ) || 'WIN' === strtoupper( substr( PHP_OS, 0, 3 ) ) );
+
+		if ( $is_windows ) {
+			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.system_calls_popen
+			$handle = popen( 'start /B "" ' . $cmd, 'r' );
+
+			if ( is_resource( $handle ) ) {
+				pclose( $handle );
+
+				return true;
+			}
+
+			return false;
+		}
+
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.system_calls_exec
+		exec( $cmd . ' > /dev/null 2>&1 &', $output, $code );
+
+		return 0 === (int) $code || empty( $output );
+	}
+
+	/**
+	 * Whether the CLI worker heartbeat / flock claim looks alive.
+	 *
+	 * @return bool
+	 */
+	public static function is_cli_worker_alive() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return false;
+		}
+
+		$alive_sec = (int) apply_filters( 'polymart_ai_cli_worker_alive_sec', self::CLI_WORKER_ALIVE_SEC );
+		$alive_sec = max( 60, $alive_sec );
+
+		$claim = get_option( self::CLI_WORKER_LOCK_OPTION, null );
+
+		if ( is_array( $claim ) ) {
+			$pid = absint( $claim['pid'] ?? 0 );
+			$hb  = max(
+				absint( $claim['heartbeat_at'] ?? 0 ),
+				absint( $job['worker_heartbeat_at'] ?? 0 ),
+				absint( $job['last_cron_at'] ?? 0 )
+			);
+			$age = $hb > 0 ? ( time() - $hb ) : PHP_INT_MAX;
+
+			if ( $pid > 0 && self::cli_pid_is_running( $pid ) && $age < $alive_sec ) {
+				return true;
+			}
+
+			// Claim exists with fresh heartbeat even if PID checks are unavailable.
+			if ( $age < $alive_sec && $pid > 0 ) {
+				return true;
+			}
+		}
+
+		if ( self::is_step_lock_held_fresh() ) {
+			return true;
+		}
+
+		return self::is_worker_heartbeat_fresh( $job );
+	}
+
+	/**
+	 * Whether this host can detach a background PHP process.
+	 *
+	 * @return bool
+	 */
+	private static function can_spawn_detached_cli() {
+		if ( defined( 'POLYMART_AI_DISABLE_CLI_SPAWN' ) && POLYMART_AI_DISABLE_CLI_SPAWN ) {
+			return false;
+		}
+
+		$disabled = array_map( 'trim', explode( ',', (string) ini_get( 'disable_functions' ) ) );
+		$disabled = array_filter( $disabled );
+
+		$is_windows = ( defined( 'PHP_WINDOWS_VERSION_BUILD' ) || 'WIN' === strtoupper( substr( PHP_OS, 0, 3 ) ) );
+
+		if ( $is_windows ) {
+			return function_exists( 'popen' ) && ! in_array( 'popen', $disabled, true );
+		}
+
+		return function_exists( 'exec' ) && ! in_array( 'exec', $disabled, true );
+	}
+
+	/**
+	 * Resolve the PHP CLI binary path.
+	 *
+	 * @return string
+	 */
+	private static function resolve_php_binary() {
+		$filtered = apply_filters( 'polymart_ai_php_binary', '' );
+
+		if ( is_string( $filtered ) && '' !== $filtered ) {
+			return $filtered;
+		}
+
+		if ( defined( 'PHP_BINARY' ) && is_string( PHP_BINARY ) && '' !== PHP_BINARY && 'php' !== PHP_BINARY ) {
+			$bin = PHP_BINARY;
+
+			// php-fpm / php-cgi cannot run CLI scripts reliably.
+			if ( false === stripos( $bin, 'fpm' ) && false === stripos( $bin, 'cgi' ) ) {
+				return $bin;
+			}
+		}
+
+		return 'php';
+	}
+
+	/**
+	 * Path to the exclusive CLI flock file.
+	 *
+	 * @return string
+	 */
+	private static function get_cli_lock_file_path() {
+		$dir = WP_CONTENT_DIR . '/uploads/polymart-ai';
+
+		if ( ! is_dir( $dir ) ) {
+			wp_mkdir_p( $dir );
+		}
+
+		return $dir . '/job-worker.lock';
+	}
+
+	/**
+	 * Claim exclusive ownership of the CLI worker slot.
+	 *
+	 * @return bool
+	 */
+	private static function claim_cli_worker_slot() {
+		$path = self::get_cli_lock_file_path();
+		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
+		$fp = fopen( $path, 'c+' );
+
+		if ( ! is_resource( $fp ) ) {
+			return false;
+		}
+
+		if ( ! flock( $fp, LOCK_EX | LOCK_NB ) ) {
+			fclose( $fp );
+
+			return false;
+		}
+
+		self::$cli_lock_fp = $fp;
+
+		ftruncate( $fp, 0 );
+		rewind( $fp );
+		fwrite(
+			$fp,
+			wp_json_encode(
+				array(
+					'pid'          => getmypid(),
+					'started_at'   => time(),
+					'heartbeat_at' => time(),
+				)
+			)
+		);
+		fflush( $fp );
+
+		update_option(
+			self::CLI_WORKER_LOCK_OPTION,
+			array(
+				'pid'          => getmypid(),
+				'started_at'   => time(),
+				'heartbeat_at' => time(),
+			),
+			false
+		);
+
+		return true;
+	}
+
+	/**
+	 * Release the CLI worker flock + option claim.
+	 *
+	 * @return void
+	 */
+	private static function release_cli_worker_slot() {
+		$claim = get_option( self::CLI_WORKER_LOCK_OPTION, null );
+
+		if ( is_array( $claim ) && absint( $claim['pid'] ?? 0 ) === (int) getmypid() ) {
+			delete_option( self::CLI_WORKER_LOCK_OPTION );
+		}
+
+		if ( is_resource( self::$cli_lock_fp ) ) {
+			flock( self::$cli_lock_fp, LOCK_UN );
+			fclose( self::$cli_lock_fp );
+			self::$cli_lock_fp = null;
+		}
+	}
+
+	/**
+	 * Best-effort PID liveness check.
+	 *
+	 * @param int $pid Process ID.
+	 * @return bool
+	 */
+	private static function cli_pid_is_running( $pid ) {
+		$pid = absint( $pid );
+
+		if ( $pid <= 0 ) {
+			return false;
+		}
+
+		if ( function_exists( 'posix_kill' ) ) {
+			// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			return @posix_kill( $pid, 0 );
+		}
+
+		$is_windows = ( defined( 'PHP_WINDOWS_VERSION_BUILD' ) || 'WIN' === strtoupper( substr( PHP_OS, 0, 3 ) ) );
+
+		if ( $is_windows && function_exists( 'exec' ) ) {
+			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.system_calls_exec
+			exec( 'tasklist /FI "PID eq ' . $pid . '" 2>NUL', $out );
+
+			return isset( $out[1] ) && false !== strpos( implode( ' ', $out ), (string) $pid );
+		}
+
+		return false;
+	}
+
+	/**
+	 * Stop the CLI loop before the process OOMs.
+	 *
+	 * @return bool
+	 */
+	private static function cli_memory_exhausted() {
+		$limit = ini_get( 'memory_limit' );
+
+		if ( ! is_string( $limit ) || '' === $limit || '-1' === $limit ) {
+			return false;
+		}
+
+		$bytes = self::parse_ini_bytes( $limit );
+
+		if ( $bytes <= 0 ) {
+			return false;
+		}
+
+		$used = memory_get_usage( true );
+
+		return $used >= (int) ( $bytes * 0.85 );
+	}
+
+	/**
+	 * Parse PHP ini size notation to bytes.
+	 *
+	 * @param string $value Ini value.
+	 * @return int
+	 */
+	private static function parse_ini_bytes( $value ) {
+		$value = trim( (string) $value );
+		$unit  = strtolower( substr( $value, -1 ) );
+		$num   = (float) $value;
+
+		switch ( $unit ) {
+			case 'g':
+				$num *= 1024;
+				// Intentional fall-through.
+			case 'm':
+				$num *= 1024;
+				// Intentional fall-through.
+			case 'k':
+				$num *= 1024;
+		}
+
+		return (int) $num;
+	}
+
+	/**
+	 * Seconds of silence before ensure may force a keep-alive / spawn.
 	 *
 	 * @return int
 	 */
@@ -445,13 +826,12 @@ final class Activity_Logger {
 
 		self::ensure_recurring_pulse();
 
-		if ( wp_next_scheduled( self::CRON_HOOK ) || wp_next_scheduled( self::CRON_PULSE_HOOK ) ) {
-			self::ping_wp_cron();
-
+		if ( self::is_cli_worker_alive() ) {
 			return;
 		}
 
-		self::schedule_background_worker( 1 );
+		// Only spawn from cron/REST heal — never run a long inline loop on every heal.
+		self::spawn_cli_worker( false );
 	}
 
 	/**
@@ -1221,6 +1601,9 @@ final class Activity_Logger {
 		$job['cron_disabled']  = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
 		$job['cron_pulse']     = (bool) wp_next_scheduled( self::CRON_PULSE_HOOK );
 		$job['worker_alive']   = self::is_worker_heartbeat_fresh( $job );
+		$job['cli_alive']      = self::is_cli_worker_alive();
+		$job['worker_mode']    = 'cli';
+		$job['cli_spawn_ok']   = self::can_spawn_detached_cli();
 		$job['recent_logs']    = self::get_recent_job_logs( $job, 60 );
 
 		return $job;
@@ -1416,6 +1799,15 @@ final class Activity_Logger {
 		$job['updated_at'] = time();
 		update_option( self::JOB_OPTION, $job, false );
 		self::touch_step_lock();
+
+		if ( self::$trusted_cli_tick ) {
+			$claim = get_option( self::CLI_WORKER_LOCK_OPTION, null );
+
+			if ( is_array( $claim ) && absint( $claim['pid'] ?? 0 ) === (int) getmypid() ) {
+				$claim['heartbeat_at'] = time();
+				update_option( self::CLI_WORKER_LOCK_OPTION, $claim, false );
+			}
+		}
 	}
 
 	/**
@@ -2244,7 +2636,7 @@ final class Activity_Logger {
 			'info',
 			sprintf(
 				/* translators: 1: language name, 2: count */
-				__( 'ترجمه خودکار به %1$s شروع شد — %2$d مورد در صف (کارگر کرون).', 'polymart-ai' ),
+				__( 'ترجمه خودکار به %1$s شروع شد — %2$d مورد در صف (کارگر CLI).', 'polymart-ai' ),
 				$lang_label,
 				$total
 			),
@@ -2305,7 +2697,7 @@ final class Activity_Logger {
 
 			self::save_job( $job );
 			self::bootstrap_background_worker();
-			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (کارگر کرون).', 'polymart-ai' ) );
+			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (کارگر CLI).', 'polymart-ai' ) );
 		}
 
 		return self::normalize_job_for_response( self::get_job_raw(), false );
@@ -2607,51 +2999,22 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Schedule the next server-side job step (survives closed browser tabs).
+	 * Ensure the keep-alive pulse exists and wake the CLI worker.
 	 *
-	 * Always maintains the recurring pulse; optionally adds a near-term single event
-	 * so work continues within seconds when loopback/crontab cooperates.
-	 *
-	 * @param int $delay_sec Optional delay before the next tick.
+	 * @param int $delay_sec Unused (signature kept for callers).
 	 * @return void
 	 */
 	public static function schedule_background_worker( $delay_sec = null ) {
+		unset( $delay_sec );
+
 		self::ensure_recurring_pulse();
-
-		$next  = wp_next_scheduled( self::CRON_HOOK );
-		$delay = null === $delay_sec ? self::CRON_INTERVAL_SEC : max( 0, absint( $delay_sec ) );
-		$want  = time() + $delay;
-
-		if ( $next ) {
-			if ( $next <= time() ) {
-				self::clear_chain_events();
-			} elseif ( $next <= $want + 15 && $next >= $want - 5 ) {
-				self::ping_wp_cron();
-				self::spawn_job_loopback();
-
-				return;
-			} elseif ( $next <= time() + 30 && $delay >= self::CRON_SAFETY_SEC ) {
-				self::ping_wp_cron();
-				self::spawn_job_loopback();
-
-				return;
-			} else {
-				self::clear_chain_events();
-			}
-		}
-
-		wp_schedule_single_event( $want, self::CRON_HOOK );
-		self::ping_wp_cron();
-		self::spawn_job_loopback( 0 === $delay );
+		self::spawn_cli_worker( false );
 	}
 
 	/**
-	 * Nudge WP-Cron so the job worker starts without waiting for page traffic.
+	 * Nudge WP-Cron so the keep-alive pulse can fire (when DISABLE_WP_CRON is off).
 	 *
-	 * Rate-limited: spawning wp-cron on every admin/REST poll was stacking
-	 * concurrent AI workers and freezing the whole site (~60s page loads).
-	 *
-	 * @param bool $force Bypass the rate limit (Start/Resume/Kick only).
+	 * @param bool $force Bypass the rate limit.
 	 * @return void
 	 */
 	public static function ping_wp_cron( $force = false ) {
@@ -2662,33 +3025,24 @@ final class Activity_Logger {
 				return;
 			}
 
-			// Keep the gate short while a job runs so the chain stays snappy.
-			$gate_ttl = self::is_bulk_job_running() ? 3 : 45;
+			$gate_ttl = self::is_bulk_job_running() ? 15 : 45;
 			set_transient( 'polymart_ai_cron_ping_gate', 1, $gate_ttl );
 		}
 
-		if ( wp_doing_cron() ) {
-			static $shutdown_ping_registered = false;
+		// Prefer spawning the CLI worker directly — do not depend on HTTP loopbacks.
+		if ( self::is_bulk_job_running() && ! self::is_cli_worker_alive() ) {
+			self::spawn_cli_worker( $force );
+		}
 
-			if ( ! $shutdown_ping_registered ) {
-				$shutdown_ping_registered = true;
-				register_shutdown_function(
-					static function () {
-						if ( ! self::is_bulk_job_running() ) {
-							return;
-						}
-
-						self::spawn_cron_request( true );
-						self::spawn_job_loopback( true );
-					}
-				);
-			}
-
+		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
 			return;
 		}
 
-		self::spawn_cron_request( $force );
-		self::spawn_job_loopback( $force );
+		if ( wp_doing_cron() ) {
+			return;
+		}
+
+		spawn_cron();
 	}
 
 	/**
@@ -2804,11 +3158,10 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Mark the job as scheduled and run the first worker tick immediately.
+	 * Mark the job as scheduled and start the long-running CLI worker.
 	 *
-	 * With DISABLE_WP_CRON, HTTP loopback often fails and the real crontab may
-	 * take up to a minute — so Start/Resume always bootstraps one tick here.
-	 * Follow-up ticks continue via cron self-chain + server crontab.
+	 * Does not run AI inside the REST request — that caused proxy timeouts and
+	 * still depended on HTTP loopback for follow-up slices.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2819,34 +3172,47 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( function_exists( 'ignore_user_abort' ) ) {
-			ignore_user_abort( true );
-		}
-
 		self::force_release_step_lock_if_idle();
 		self::clear_chain_events();
-		self::schedule_background_worker( 0 );
-		self::ping_wp_cron( true );
+		self::ensure_recurring_pulse();
 
 		$job = self::get_job_raw();
 		$job['worker_scheduled_at'] = time();
 		$job['worker_heartbeat_at'] = time();
 		$job['next_cron_at']        = self::get_next_worker_cron() ?: null;
+		$job['worker_mode']         = 'cli';
 		self::save_job( $job );
 
-		// Start with one bounded slice; the server-side chain continues the queue.
-		// This keeps the REST request below proxy/browser limits even when AI takes
-		// longer than one minute.
-		return self::process_background_step( 1 );
+		$spawned = self::spawn_cli_worker( true );
+
+		// If the host cannot detach a process, start the bulldozer inline briefly
+		// so Start/Resume is never a no-op, then keep-alive continues it.
+		if ( ! $spawned || ! self::can_spawn_detached_cli() ) {
+			$result = self::run_cli_worker(
+				array(
+					'max_seconds' => min( 25, self::CLI_INLINE_FALLBACK_SEC ),
+					'max_steps'   => 0,
+				)
+			);
+			$result['worker_bootstrapped'] = true;
+			$result['cli_spawned']         = false;
+
+			return $result;
+		}
+
+		$out = self::normalize_job_for_response( self::get_job_raw(), false );
+		$out['worker_bootstrapped'] = true;
+		$out['cli_spawned']         = true;
+		$out['worker_mode']         = 'cli';
+
+		return $out;
 	}
 
 	/**
-	 * Ensure the background worker is alive.
+	 * Ensure the CLI worker is alive (SPA monitor / recovery).
 	 *
-	 * 1) Unlock stale locks + schedule cron/pulse + spawn loopback.
-	 * 2) If the job has been idle too long, run one real tick INLINE.
-	 *    (Many hosts silently drop non-blocking loopback HTTP — that caused
-	 *    multi-minute "کارگر کند شد" stalls while the monitor only called ensure.)
+	 * Spawns the detached worker when heartbeat is stale. Never runs an unbounded
+	 * AI loop inside the REST request.
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -2868,49 +3234,42 @@ final class Activity_Logger {
 			absint( $job['worker_heartbeat_at'] ?? 0 )
 		);
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
-		$busy = self::is_step_lock_held_fresh();
-
-		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
-			self::schedule_background_worker( 0 );
-		} else {
-			self::ping_wp_cron();
-		}
-
-		if ( ! $busy ) {
-			self::spawn_job_loopback( true );
-		}
+		$busy = self::is_cli_worker_alive() || self::is_step_lock_held_fresh();
 
 		$inline_idle = self::get_ensure_inline_idle_sec();
 
-		// Dead lock claim that still looks "busy" but heartbeat is ancient — clear and run.
 		if ( $busy && $age >= self::LOCK_FORCE_IDLE_SEC ) {
 			self::release_step_lock();
+			delete_option( self::CLI_WORKER_LOCK_OPTION );
 			$busy                = false;
 			$released_stale_lock = true;
 		}
 
+		$cli_spawned = false;
+
 		if ( ! $busy && $age >= $inline_idle ) {
-			if ( function_exists( 'ignore_user_abort' ) ) {
-				ignore_user_abort( true );
+			$cli_spawned = self::spawn_cli_worker( true );
+
+			if ( ! $cli_spawned || ! self::can_spawn_detached_cli() ) {
+				$result = self::run_cli_worker(
+					array(
+						'max_seconds' => min( 20, self::CLI_INLINE_FALLBACK_SEC ),
+						'max_steps'   => 3,
+					)
+				);
+				$result['worker_ensured']     = true;
+				$result['worker_inline_tick'] = true;
+				$result['cli_spawned']        = false;
+				$result['loopback_spawned']   = false;
+
+				if ( $released_stale_lock ) {
+					$result['lock_recovered'] = true;
+				}
+
+				return $result;
 			}
-
-			// Recovery requests must stay bounded. One translation slice may still
-			// take up to the AI timeout, and the async chain handles later slices.
-			$result = self::process_background_step( 1 );
-
-			if ( ! is_array( $result ) ) {
-				$result = self::normalize_job_for_response( self::get_job_raw(), false );
-			}
-
-			$result['worker_ensured']     = true;
-			$result['worker_inline_tick'] = true;
-			$result['loopback_spawned']   = true;
-
-			if ( $released_stale_lock ) {
-				$result['lock_recovered'] = true;
-			}
-
-			return $result;
+		} elseif ( ! $busy ) {
+			$cli_spawned = self::spawn_cli_worker( false );
 		}
 
 		$next = self::get_next_worker_cron();
@@ -2920,11 +3279,13 @@ final class Activity_Logger {
 		$job['cron_scheduled']      = (bool) $next;
 		$job['worker_ensured']      = true;
 		$job['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
-		$job['loopback_spawned']    = ! $busy;
+		$job['loopback_spawned']    = false;
+		$job['cli_spawned']         = $cli_spawned || self::is_cli_worker_alive();
+		$job['worker_mode']         = 'cli';
 
 		if ( $released_stale_lock ) {
 			$job['lock_recovered'] = true;
-			self::log( 'warning', __( 'قفل مرحلهٔ گیرکرده آزاد شد — کارگر دوباره شروع می‌کند.', 'polymart-ai' ) );
+			self::log( 'warning', __( 'قفل مرحلهٔ گیرکرده آزاد شد — کارگر CLI دوباره شروع می‌کند.', 'polymart-ai' ) );
 		}
 
 		self::save_job( $job );
@@ -2940,6 +3301,7 @@ final class Activity_Logger {
 	public static function unschedule_background_worker() {
 		self::clear_chain_events();
 		wp_clear_scheduled_hook( self::CRON_PULSE_HOOK );
+		delete_option( self::CLI_WORKER_LOCK_OPTION );
 	}
 
 	/**
@@ -2973,12 +3335,12 @@ final class Activity_Logger {
 	 * @return string
 	 */
 	private static function resolve_last_worker_label() {
-		if ( wp_doing_cron() ) {
-			return 'cron';
+		if ( self::$trusted_cli_tick || ( 'cli' === PHP_SAPI && ! wp_doing_cron() ) ) {
+			return 'cli';
 		}
 
-		if ( wp_doing_ajax() && isset( $_REQUEST['action'] ) && self::LOOPBACK_ACTION === (string) $_REQUEST['action'] ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
-			return 'loopback';
+		if ( wp_doing_cron() ) {
+			return 'cron';
 		}
 
 		return 'admin';
@@ -3093,12 +3455,10 @@ final class Activity_Logger {
 			self::release_step_lock();
 		}
 
-		// Immediate follow-up: multi-transport chain (loopback + forced wp-cron.php +
-		// shutdown re-fire). Do not rely on the 1-min pulse alone when loopback dies.
+		// Keep-alive pulse + CLI spawn — no HTTP loopback chain.
 		self::clear_chain_events();
 		if ( 'running' === ( self::get_job_raw()['status'] ?? '' ) ) {
-			$delay = $end_deferred_busy ? 5 : self::get_cron_chain_delay_sec();
-			self::continue_job_chain( $delay, ! $end_deferred_busy );
+			self::continue_job_chain( 0, ! $end_deferred_busy );
 		} else {
 			self::unschedule_background_worker();
 		}
@@ -3121,9 +3481,7 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Admin/UI entry: run the same worker tick as cron (unified pipeline).
-	 *
-	 * Prefer ensure_background_worker() from the SPA — kick is kept for recovery/debug.
+	 * Admin/UI entry: force keep-alive / CLI spawn (no inline multi-step AI).
 	 *
 	 * @return array<string, mixed>
 	 */
@@ -3134,15 +3492,23 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( function_exists( 'ignore_user_abort' ) ) {
-			ignore_user_abort( true );
+		self::force_release_step_lock_if_idle();
+		self::ensure_recurring_pulse();
+
+		$result = self::keep_alive_cli_worker();
+
+		if ( is_array( $result ) ) {
+			$result['worker_kicked'] = true;
+
+			return $result;
 		}
 
-		self::force_release_step_lock_if_idle();
-		self::schedule_background_worker( 1 );
-		self::ping_wp_cron( true );
+		$out = self::normalize_job_for_response( self::get_job_raw(), false );
+		$out['worker_kicked'] = true;
+		$out['cli_alive']     = self::is_cli_worker_alive();
+		$out['worker_mode']   = 'cli';
 
-		return self::process_background_step();
+		return $out;
 	}
 
 	/**
