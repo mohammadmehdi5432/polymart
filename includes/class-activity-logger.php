@@ -45,18 +45,18 @@ final class Activity_Logger {
 	const CRON_PULSE_HOOK      = 'polymart_ai_translation_job_pulse';
 	const CRON_PULSE_SCHEDULE  = 'polymart_ai_every_minute';
 	/** Seconds before the next self-chained tick after work finishes. */
-	const CRON_INTERVAL_SEC    = 1;
+	const CRON_INTERVAL_SEC    = 0;
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
 	const CRON_SAFETY_SEC      = 120;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per WP-Cron invocation (multi-step). */
-	const CRON_STEP_BUDGET_SEC = 150;
+	const CRON_STEP_BUDGET_SEC = 240;
 	/**
-	 * One AI slice per PHP request. The one-second loopback chain supplies
-	 * throughput without letting several 1-3 minute translations accumulate
-	 * inside one cron process or exceed a proxy execution limit.
+	 * AI slices per PHP request. Hosts that drop HTTP loopback only advance on
+	 * real crontab (~60s); packing several slices into one tick keeps throughput
+	 * high even when the fast chain is dead. Budget still caps wall-clock time.
 	 */
-	const CRON_MAX_STEPS_PER_TICK = 1;
+	const CRON_MAX_STEPS_PER_TICK = 5;
 	/**
 	 * If last_cron_at is older than this while the step lock is held with no
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
@@ -68,6 +68,8 @@ final class Activity_Logger {
 	const LOOPBACK_GATE_KEY    = 'polymart_ai_job_loopback_gate';
 	/** Min seconds between non-forced loopback spawns. */
 	const LOOPBACK_GATE_SEC    = 1;
+	/** Gate for forced wp-cron.php continuation after a tick. */
+	const CRON_CONTINUE_GATE_KEY = 'polymart_ai_job_cron_continue_gate';
 
 	/**
 	 * True while a token-authenticated loopback tick is executing.
@@ -84,6 +86,12 @@ final class Activity_Logger {
 	 * @var bool
 	 */
 	private static $trusted_job_tick = false;
+	/**
+	 * Whether a shutdown continuation has already been registered for this request.
+	 *
+	 * @var bool
+	 */
+	private static $shutdown_chain_registered = false;
 
 	/**
 	 * Register admin notice display and background job worker.
@@ -184,7 +192,7 @@ final class Activity_Logger {
 		}
 
 		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 300 );
+			@set_time_limit( max( 300, self::CRON_STEP_BUDGET_SEC + 180 ) );
 		}
 
 		// Another worker already owns the lock — exit quietly; it will chain itself.
@@ -247,8 +255,8 @@ final class Activity_Logger {
 	/**
 	 * Fire a non-blocking admin-ajax request that runs the next job tick.
 	 *
-	 * This is the primary fast path. WP-Cron pulse remains a backup only.
-	 * Many hosts drop ultra-short 0.01s loopbacks — we fire two transports.
+	 * Primary fast path. WP-Cron pulse remains a backup only.
+	 * Many hosts drop ultra-short loopbacks — fire several URL/timeout variants.
 	 *
 	 * @param bool $force Bypass the short spawn gate.
 	 * @return void
@@ -269,12 +277,16 @@ final class Activity_Logger {
 
 		set_transient( self::LOOPBACK_GATE_KEY, 1, max( 1, self::LOOPBACK_GATE_SEC ) );
 
-		$url  = admin_url( 'admin-ajax.php' );
-		$body = array(
+		$token = self::get_loopback_token();
+		$body  = array(
 			'action' => self::LOOPBACK_ACTION,
-			'token'  => self::get_loopback_token(),
+			'token'  => $token,
 		);
-		$args = array(
+		$query = array(
+			'action' => self::LOOPBACK_ACTION,
+			'token'  => $token,
+		);
+		$args  = array(
 			'blocking'  => false,
 			'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
 			'headers'   => array(
@@ -283,27 +295,107 @@ final class Activity_Logger {
 			'body'      => $body,
 		);
 
-		// Attempt 1: classic non-blocking micro-timeout.
-		wp_remote_post(
-			$url,
-			array_merge(
-				$args,
+		$urls = array_unique(
+			array_filter(
 				array(
-					'timeout' => 0.01,
+					admin_url( 'admin-ajax.php' ),
+					site_url( 'wp-admin/admin-ajax.php' ),
 				)
 			)
 		);
 
-		// Attempt 2: slightly longer non-blocking timeout — accepted by more hosts
-		// that discard 0.01s requests before PHP boots.
-		wp_remote_post(
-			$url,
-			array_merge(
-				$args,
-				array(
-					'timeout' => 3,
+		foreach ( $urls as $url ) {
+			// Attempt 1: classic non-blocking micro-timeout.
+			wp_remote_post(
+				$url,
+				array_merge(
+					$args,
+					array(
+						'timeout' => 0.01,
+					)
 				)
-			)
+			);
+
+			// Attempt 2: slightly longer non-blocking timeout — accepted by more hosts
+			// that discard 0.01s requests before PHP boots.
+			wp_remote_post(
+				$url,
+				array_merge(
+					$args,
+					array(
+						'timeout' => 3,
+					)
+				)
+			);
+
+			// Attempt 3: GET — some reverse proxies only allow non-blocking GET loopbacks.
+			wp_remote_get(
+				add_query_arg( $query, $url ),
+				array(
+					'blocking'  => false,
+					'timeout'   => 3,
+					'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+					'headers'   => array(
+						'Connection' => 'Close',
+					),
+				)
+			);
+		}
+	}
+
+	/**
+	 * Schedule the next tick and fire every continuation transport.
+	 *
+	 * Loopback (admin-ajax) is preferred; forced wp-cron.php spawn covers hosts
+	 * that silently drop loopback HTTP. A shutdown re-fire helps proxies that
+	 * only accept outbound HTTP after the current request ends.
+	 *
+	 * @param int  $delay_sec Delay before the next single-event chain tick.
+	 * @param bool $force     Bypass spawn gates (normal after a completed tick).
+	 * @return void
+	 */
+	private static function continue_job_chain( $delay_sec = null, $force = true ) {
+		if ( ! self::is_bulk_job_running() ) {
+			self::unschedule_background_worker();
+
+			return;
+		}
+
+		$delay = null === $delay_sec ? self::get_cron_chain_delay_sec() : max( 0, absint( $delay_sec ) );
+
+		self::schedule_background_worker( $delay );
+		self::spawn_job_loopback( $force );
+		self::spawn_cron_request( $force );
+		self::register_shutdown_chain_continuation( $force );
+	}
+
+	/**
+	 * Re-fire loopback + wp-cron.php after the current PHP request ends.
+	 *
+	 * @param bool $force Bypass spawn gates.
+	 * @return void
+	 */
+	private static function register_shutdown_chain_continuation( $force = true ) {
+		if ( self::$shutdown_chain_registered ) {
+			return;
+		}
+
+		self::$shutdown_chain_registered = true;
+
+		register_shutdown_function(
+			static function () use ( $force ) {
+				if ( ! self::is_bulk_job_running() ) {
+					return;
+				}
+
+				// Lock may still look fresh for a moment after our tick; force loopback
+				// only when idle so we do not stack workers.
+				if ( ! self::is_step_lock_held_fresh() ) {
+					self::spawn_job_loopback( $force );
+				}
+
+				self::spawn_cron_request( true );
+			}
 		);
 	}
 
@@ -1180,7 +1272,8 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	private static function get_cron_chain_delay_sec() {
-		return max( 1, min( 5, (int) apply_filters( 'polymart_ai_job_cron_chain_delay_sec', self::CRON_INTERVAL_SEC ) ) );
+		// Allow 0 for immediate follow-up when the host's wp-cron.php spawn works.
+		return max( 0, min( 5, (int) apply_filters( 'polymart_ai_job_cron_chain_delay_sec', self::CRON_INTERVAL_SEC ) ) );
 	}
 
 	/**
@@ -2585,7 +2678,7 @@ final class Activity_Logger {
 							return;
 						}
 
-						self::spawn_cron_request();
+						self::spawn_cron_request( true );
 						self::spawn_job_loopback( true );
 					}
 				);
@@ -2594,20 +2687,21 @@ final class Activity_Logger {
 			return;
 		}
 
-		self::spawn_cron_request();
+		self::spawn_cron_request( $force );
 		self::spawn_job_loopback( $force );
 	}
 
 	/**
 	 * Fire a non-blocking request that makes WP-Cron process due events.
 	 *
+	 * @param bool $force Bypass DISABLE_WP_CRON idle gates (use after a completed tick).
 	 * @return void
 	 */
-	private static function spawn_cron_request() {
-		// Prefer real server crontab when DISABLE_WP_CRON is on — but still allow
-		// loopback when the job needs another tick soon (crontab alone is ~60s).
+	private static function spawn_cron_request( $force = false ) {
+		// Prefer real server crontab when DISABLE_WP_CRON is on — but still spawn
+		// wp-cron.php so the chain does not wait a full minute when loopback dies.
 		if ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) {
-			$allow_loopback = (bool) apply_filters( 'polymart_ai_job_cron_loopback', false );
+			$allow_loopback = $force || (bool) apply_filters( 'polymart_ai_job_cron_loopback', false );
 
 			if ( ! $allow_loopback ) {
 				$job  = self::get_job_raw();
@@ -2618,15 +2712,21 @@ final class Activity_Logger {
 				$age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 				$next_chain = wp_next_scheduled( self::CRON_HOOK );
 
-				// Chain continuation: spawn wp-cron.php once the previous tick is idle.
-				if ( 'running' === ( $job['status'] ?? '' ) && $age >= 8 ) {
+				// Chain continuation: spawn once the previous tick is idle.
+				// Keep the age gate low — waiting 8s after every tick wasted throughput.
+				if ( 'running' === ( $job['status'] ?? '' ) && $age >= 2 ) {
 					$allow_loopback = true;
 				}
 
 				// Immediate follow-up: when a near-term chain event is already queued,
-				// always nudge wp-cron.php once so hosts that drop admin-ajax loopbacks
+				// always nudge wp-cron.php so hosts that drop admin-ajax loopbacks
 				// do not fall back to minute-granularity crontab pacing.
-				if ( ! $allow_loopback && 'running' === ( $job['status'] ?? '' ) && $next_chain && (int) $next_chain <= ( time() + 5 ) ) {
+				if ( ! $allow_loopback && 'running' === ( $job['status'] ?? '' ) && $next_chain && (int) $next_chain <= ( time() + 15 ) ) {
+					$allow_loopback = true;
+				}
+
+				// Job running with no recent heartbeat — keep the queue moving.
+				if ( ! $allow_loopback && 'running' === ( $job['status'] ?? '' ) && $age >= 15 ) {
 					$allow_loopback = true;
 				}
 			}
@@ -2635,38 +2735,67 @@ final class Activity_Logger {
 				return;
 			}
 
-			$cron_url = add_query_arg(
-				'doing_wp_cron',
-				sprintf( '%.22F', microtime( true ) ),
-				site_url( 'wp-cron.php' )
+			// Soft gate so forced continuations from schedule+shutdown do not stampede.
+			if ( ! $force && get_transient( self::CRON_CONTINUE_GATE_KEY ) ) {
+				return;
+			}
+
+			set_transient( self::CRON_CONTINUE_GATE_KEY, 1, 2 );
+
+			$cron_urls = array_unique(
+				array_filter(
+					array(
+						site_url( 'wp-cron.php' ),
+						home_url( 'wp-cron.php' ),
+					)
+				)
 			);
 
 			$args = array(
 				'blocking'  => false,
 				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+				'headers'   => array(
+					'Connection' => 'Close',
+				),
 			);
 
-			// Attempt 1: classic micro-timeout.
-			wp_remote_post(
-				$cron_url,
-				array_merge(
-					$args,
-					array(
-						'timeout' => 0.01,
-					)
-				)
-			);
+			foreach ( $cron_urls as $base_url ) {
+				$cron_url = add_query_arg(
+					'doing_wp_cron',
+					sprintf( '%.22F', microtime( true ) ),
+					$base_url
+				);
 
-			// Attempt 2: some hosts drop ultra-short non-blocking requests.
-			wp_remote_post(
-				$cron_url,
-				array_merge(
-					$args,
-					array(
-						'timeout' => 3,
+				wp_remote_post(
+					$cron_url,
+					array_merge(
+						$args,
+						array(
+							'timeout' => 0.01,
+						)
 					)
-				)
-			);
+				);
+
+				wp_remote_post(
+					$cron_url,
+					array_merge(
+						$args,
+						array(
+							'timeout' => 3,
+						)
+					)
+				);
+
+				wp_remote_get(
+					$cron_url,
+					array_merge(
+						$args,
+						array(
+							'timeout' => 3,
+						)
+					)
+				);
+			}
 
 			return;
 		}
@@ -2833,9 +2962,9 @@ final class Activity_Logger {
 		/**
 		 * Filter seconds of work allowed per translation-job cron invocation.
 		 *
-		 * @param int $seconds Default 75.
+		 * @param int $seconds Default CRON_STEP_BUDGET_SEC.
 		 */
-		return max( 20, min( 240, (int) apply_filters( 'polymart_ai_job_cron_step_budget_sec', self::CRON_STEP_BUDGET_SEC ) ) );
+		return max( 20, min( 360, (int) apply_filters( 'polymart_ai_job_cron_step_budget_sec', self::CRON_STEP_BUDGET_SEC ) ) );
 	}
 
 	/**
@@ -2964,13 +3093,12 @@ final class Activity_Logger {
 			self::release_step_lock();
 		}
 
-		// Immediate follow-up: AJAX loopback is the fast path (not the 1-min pulse).
-		// Release lock first so spawn_job_loopback is not blocked by our own claim.
+		// Immediate follow-up: multi-transport chain (loopback + forced wp-cron.php +
+		// shutdown re-fire). Do not rely on the 1-min pulse alone when loopback dies.
 		self::clear_chain_events();
 		if ( 'running' === ( self::get_job_raw()['status'] ?? '' ) ) {
 			$delay = $end_deferred_busy ? 5 : self::get_cron_chain_delay_sec();
-			self::schedule_background_worker( $delay );
-			self::spawn_job_loopback( ! $end_deferred_busy );
+			self::continue_job_chain( $delay, ! $end_deferred_busy );
 		} else {
 			self::unschedule_background_worker();
 		}

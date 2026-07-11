@@ -916,13 +916,13 @@ export default function AutoTranslateApp() {
       subtitle={`ترجمه خودکار محتوای فارسی به ${targetLabel} — اجرا روی سرور با کرون، مانیتور در این صفحه`}
     >
       <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
-        <p className="font-medium">کارگر پس‌زمینهٔ پیوسته (زنجیره سریع)</p>
+        <p className="font-medium">کارگر پس‌زمینهٔ پیوسته (چند اسلایس در هر تیک)</p>
         <p className="mt-1 text-pmai-muted">
-          بعد از هر تیک، سرور خودش تیک بعدی را فوراً صدا می‌زند — دیگر منتظر crontab هر ۱ دقیقه نمی‌ماند.
-          فاصلهٔ بین محصولات معمولاً زمان خود ترجمهٔ AI است، نه خواب کرون.
+          هر تیک تا ۵ اسلایس ترجمه را پشت‌سرهم اجرا می‌کند. بعد از تیک، سرور هم loopback و هم
+          wp-cron.php را برای تیک بعدی صدا می‌زند تا اگر یکی قطع شد صف متوقف نشود.
         </p>
         <p className="mt-1">
-          بستن این تب صف را متوقف نمی‌کند. pulse دقیقه‌ای فقط پشتیبان است.
+          بستن این تب صف را متوقف نمی‌کند. pulse دقیقه‌ای فقط پشتیبان آخر است.
         </p>
       </div>
 
@@ -951,7 +951,7 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="info"
-            message="DISABLE_WP_CRON فعال است — ترجمه با زنجیرهٔ سریع admin-ajax جلو می‌رود (نه فقط crontab هر دقیقه). pulse دقیقه‌ای فقط پشتیبان است."
+            message="DISABLE_WP_CRON فعال است — هر تیک چند اسلایس اجرا می‌کند و بعد از آن wp-cron.php هم force می‌شود تا صف فقط به crontab دقیقه‌ای وابسته نباشد."
           />
         </div>
       ) : !config.devMode ? (
