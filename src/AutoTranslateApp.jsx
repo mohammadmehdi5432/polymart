@@ -21,6 +21,14 @@ const ENSURE_MIN_INTERVAL_MS = 5000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
+function latestWorkerStamp(job, includeScheduled = false) {
+  return Math.max(
+    Number(job?.last_cron_at || 0),
+    Number(job?.worker_heartbeat_at || 0),
+    includeScheduled ? Number(job?.worker_scheduled_at || 0) : 0
+  );
+}
+
 function stepLogSignature(step) {
   if (!step) {
     return '';
@@ -60,7 +68,7 @@ function isCronHealthy(job) {
     return true;
   }
 
-  const stamp = Number(job?.last_cron_at || job?.worker_heartbeat_at || job?.worker_scheduled_at || 0);
+  const stamp = latestWorkerStamp(job, true);
 
   if (!stamp) {
     return false;
@@ -75,7 +83,7 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
   const now = Math.floor(Date.now() / 1000);
   const activityAge = Math.max(
     0,
-    now - Number(job?.last_cron_at || job?.worker_heartbeat_at || 0)
+    now - latestWorkerStamp(job)
   );
   const hasActivePost = Boolean(displayPost?.title && !displayPost?.from_last_step);
 
@@ -503,7 +511,7 @@ export default function AutoTranslateApp() {
           const now = Math.floor(nowMs / 1000);
           const activityAge = Math.max(
             0,
-            now - Number(data.last_cron_at || data.worker_heartbeat_at || 0)
+            now - latestWorkerStamp(data)
           );
           const lockAge = Number(data.worker_lock_age || 0);
           const hasActivePost = Boolean(
@@ -863,7 +871,7 @@ export default function AutoTranslateApp() {
               : null;
 
   const cronAgeSec = (() => {
-    const stamp = Number(job?.last_cron_at || job?.worker_heartbeat_at || 0);
+    const stamp = latestWorkerStamp(job);
     if (!stamp) {
       return null;
     }
@@ -959,7 +967,7 @@ export default function AutoTranslateApp() {
           <Notice
             type="info"
             message={`کارگر سرور زنده است — آخرین فعالیت: ${formatTime(
-              job.last_cron_at || job.worker_heartbeat_at
+              latestWorkerStamp(job)
             )}${job.last_cron_steps ? ` (${job.last_cron_steps} مرحله)` : ''}${
               job.next_cron_at ? ` · تیک بعدی حدود ${formatTime(job.next_cron_at)}` : ''
             }`}
