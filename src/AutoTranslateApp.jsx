@@ -25,6 +25,7 @@ function latestWorkerStamp(job, includeScheduled = false) {
   return Math.max(
     Number(job?.last_cron_at || 0),
     Number(job?.worker_heartbeat_at || 0),
+    Number(job?.partial_progress_at || 0),
     includeScheduled ? Number(job?.worker_scheduled_at || 0) : 0
   );
 }
@@ -77,9 +78,7 @@ function stepLogSignature(step) {
 
 function isCronHealthy(job) {
   const now = Math.floor(Date.now() / 1000);
-  const lastCron = Number(job?.last_cron_at || 0);
-  const heartbeat = Number(job?.worker_heartbeat_at || 0);
-  const lastActivity = Math.max(lastCron, heartbeat);
+  const lastActivity = latestWorkerStamp(job);
   const activityAge = lastActivity > 0 ? now - lastActivity : Number.POSITIVE_INFINITY;
   const lockAge = Number(job?.worker_lock_age || 0);
   const hasActivePost = Boolean(job?.current_post?.title && !job?.current_post?.from_last_step);
@@ -130,18 +129,11 @@ function isCronHealthy(job) {
     return lockAge >= 0 && lockAge < LOCK_HEALTHY_SEC && activityAge < LOCK_HEALTHY_SEC;
   }
 
-  if (job?.worker_alive && activityAge < CRON_STALE_SEC) {
-    return true;
-  }
-
-  const stamp = latestWorkerStamp(job, true);
-
-  if (!stamp) {
+  if (!lastActivity) {
     return false;
   }
 
-  const age = now - stamp;
-  return age >= 0 && age < CRON_STALE_SEC;
+  return activityAge < CRON_STALE_SEC;
 }
 
 function jobStepHeadline(lastStepStatus, displayPost, job) {
@@ -769,7 +761,13 @@ export default function AutoTranslateApp() {
         `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود.`,
         'success'
       );
-      await ensureServerWorker();
+      const kicked = await jobStep().catch(() => ensureServerWorker());
+      if (kicked?.worker_inline_tick || kicked?.worker_kicked) {
+        applyJobUpdate(kicked);
+        appendLog('اولین تیک کارگر اجرا شد — صف شروع به جلو رفتن می‌کند.', 'success');
+      } else {
+        await ensureServerWorker();
+      }
     } catch (error) {
       const code = error?.response?.data?.code;
       const isTimeout =
@@ -1120,7 +1118,7 @@ export default function AutoTranslateApp() {
             if (cronAgeSec < 25) {
               return `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`;
             }
-            return `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`;
+            return `کارگر متوقف شد (${cronAgeSec}ث) — در حال اجرای تیک بازیابی…`;
           }
 
           return job?.cron_scheduled

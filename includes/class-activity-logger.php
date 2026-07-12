@@ -542,7 +542,10 @@ final class Activity_Logger {
 			}
 
 			if ( Job_Action_Scheduler::is_available() ) {
-				$processed = Job_Action_Scheduler::run_queue_inline( false );
+				$job        = self::get_job_raw();
+				$last_real  = self::get_worker_real_activity_at( $job );
+				$force_as   = $last_real <= 0 || ( time() - $last_real ) >= self::get_ensure_inline_idle_sec();
+				$processed  = Job_Action_Scheduler::run_queue_inline( $force_as );
 
 				if ( $processed > 0 ) {
 					return self::normalize_job_for_response( self::get_job_raw(), false );
@@ -1992,25 +1995,33 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Latest timestamp that reflects real worker progress (not schedule-only nudges).
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return int Unix timestamp.
+	 */
+	private static function get_worker_real_activity_at( array $job ) {
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
+
+		return max(
+			$stamp,
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 ),
+			absint( $job['step_started_at'] ?? 0 ),
+			absint( $job['partial_progress_at'] ?? 0 )
+		);
+	}
+
+	/**
 	 * Whether the worker has checked in recently (heartbeat or completed tick).
 	 *
 	 * @param array<string, mixed> $job Job state.
 	 * @return bool
 	 */
 	private static function is_worker_heartbeat_fresh( array $job ) {
-		$lock  = get_transient( self::STEP_LOCK_KEY );
-		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
-		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
-
-		if ( $stamp > 0 ) {
-			return ( time() - $stamp ) < self::STEP_LOCK_TTL;
-		}
-
-		$last = max(
-			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 ),
-			absint( $job['worker_scheduled_at'] ?? 0 )
-		);
+		$last = self::get_worker_real_activity_at( $job );
 
 		if ( $last <= 0 ) {
 			return false;
@@ -4260,10 +4271,7 @@ final class Activity_Logger {
 		}
 
 		if ( self::should_prioritize_elementor_partial( $job ) ) {
-			$last = max(
-				absint( $job['last_cron_at'] ?? 0 ),
-				absint( $job['worker_heartbeat_at'] ?? 0 )
-			);
+			$last = self::get_worker_real_activity_at( $job );
 			$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
 			if ( $age >= self::get_ensure_inline_idle_sec() ) {
@@ -4288,10 +4296,7 @@ final class Activity_Logger {
 
 		$job  = self::get_job_raw();
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-		$last = max(
-			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 )
-		);
+		$last = self::get_worker_real_activity_at( $job );
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
 		if ( $released_stale_lock || ( $age >= self::PICK_STALL_SEC && ! self::should_prioritize_elementor_partial( $job ) ) ) {
@@ -4303,10 +4308,7 @@ final class Activity_Logger {
 		self::ensure_recurring_pulse();
 
 		$job  = self::get_job_raw();
-		$last = max(
-			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 )
-		);
+		$last = self::get_worker_real_activity_at( $job );
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 		$busy = self::is_step_lock_held_fresh();
 		$stale_sec = Job_Action_Scheduler::STALE_RUNNING_SEC;
@@ -4338,7 +4340,9 @@ final class Activity_Logger {
 				self::save_job( $job );
 			}
 		} elseif ( $should_tick ) {
-			self::run_inline_worker_tick( $worker_dead ? 2 : 1, $worker_dead ? 90 : 60 );
+			$inline_steps = $worker_dead || $age >= self::PICK_STALL_SEC ? 2 : 1;
+			$inline_budget = $worker_dead || $age >= self::PICK_STALL_SEC ? 90 : 60;
+			self::run_inline_worker_tick( $inline_steps, $inline_budget );
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;
 			self::save_job( $job );
@@ -4347,7 +4351,6 @@ final class Activity_Logger {
 		$next = self::get_next_worker_cron();
 		$job  = self::get_job_raw();
 		$as   = Job_Action_Scheduler::status_payload();
-		$job['worker_scheduled_at'] = time();
 		$job['next_cron_at']        = $next ? (int) $next : null;
 		$job['cron_scheduled']      = (bool) $next;
 		$job['worker_ensured']      = true;
@@ -5563,7 +5566,7 @@ final class Activity_Logger {
 				continue;
 			}
 
-			if ( '' !== $lang && ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+			if ( '' !== $lang && ! Post_Translator::post_is_actionable_for_job( $post_id, $lang ) ) {
 				continue;
 			}
 
