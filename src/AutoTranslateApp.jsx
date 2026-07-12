@@ -67,6 +67,11 @@ function stepLogSignature(step) {
     return '';
   }
 
+  // Ignore `time` — partial rows refresh each poll with the same message.
+  if (step.status === 'partial' || step.status === 'deferred') {
+    return `${step.post_id ?? ''}:${step.status ?? ''}:${step.message ?? ''}`;
+  }
+
   return `${step.post_id ?? ''}:${step.status ?? ''}:${step.time ?? ''}:${step.message ?? ''}`;
 }
 
@@ -629,17 +634,19 @@ export default function AutoTranslateApp() {
           return;
         }
 
-        if (data.status === 'running' && !isCronHealthy(data) && !ensureInFlight) {
+        const now = Math.floor(Date.now() / 1000);
+        const activityAge = Math.max(0, now - latestWorkerStamp(data));
+        const elementorNeedsKick =
+          isElementorPartialJob(data) &&
+          activityAge > 28 &&
+          Number(data?.api_cooldown_remaining || 0) <= 0;
+
+        if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
           const nowMs = Date.now();
           if (nowMs - lastEnsureAt < ENSURE_MIN_INTERVAL_MS) {
             return;
           }
 
-          const now = Math.floor(nowMs / 1000);
-          const activityAge = Math.max(
-            0,
-            now - latestWorkerStamp(data)
-          );
           const lockAge = Number(data.worker_lock_age || 0);
           const hasActivePost = Boolean(
             data.current_post?.title && !data.current_post?.from_last_step
@@ -656,7 +663,7 @@ export default function AutoTranslateApp() {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
             const recovered =
-              activityAge >= CRON_STALE_SEC
+              activityAge >= CRON_STALE_SEC || elementorNeedsKick || Boolean(data.elementor_progress_stalled)
                 ? await jobStep().catch(() => ensureServerWorker())
                 : await ensureServerWorker();
             if (recovered?.worker_direct_tick && isActiveRef.current) {

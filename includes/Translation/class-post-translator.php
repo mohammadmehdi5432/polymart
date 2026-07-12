@@ -3551,31 +3551,73 @@ final class Post_Translator {
 
 		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 		$rebuilt   = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
-		$map       = array_merge( $rebuilt, $state_map );
+		$map     = array_merge( $rebuilt, $state_map );
 
-		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-		$payload = self::collect_elementor_translation_payload( $data );
-		$remaining = self::filter_remaining_elementor_payload( $payload, $map, $skipped );
-		$done      = count( $map );
-		$total     = max( count( $payload ), $done + count( $remaining ), 1 );
-
-		$state['elementor_map']          = $map;
-		$state['elementor_chunk_index']  = max( $done, absint( $state['elementor_chunk_index'] ?? 0 ) );
-		$state['elementor_chunks_total'] = $total;
+		$state['elementor_map'] = $map;
+		$chunk_progress                  = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$state['elementor_chunk_index']  = $chunk_progress['done'];
+		$state['elementor_chunks_total'] = $chunk_progress['total'];
 
 		return $state;
 	}
 
 	/**
+	 * Chunk-based Elementor progress (remaining payload → done/total).
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Hydrated partial state.
+	 * @return array{done: int, total: int}
+	 */
+	private static function get_elementor_chunk_progress( $post_id, $lang, array $state ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$total   = max( 1, absint( $state['elementor_chunks_total'] ?? 0 ) );
+		$done    = 0;
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+			if ( is_string( $raw ) && '' !== trim( $raw ) ) {
+				$data = json_decode( $raw, true );
+
+				if ( is_array( $data ) ) {
+					$map      = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+					$skipped  = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+					$payload  = self::collect_elementor_translation_payload( $data );
+					$remaining = self::filter_remaining_elementor_payload( $payload, $map, $skipped );
+					$all_chunks = self::chunk_elementor_payload_for_job( $payload );
+					$left_chunks = self::chunk_elementor_payload_for_job( $remaining );
+
+					$total = max( count( $all_chunks ), $total, 1 );
+					$done  = max( 0, $total - count( $left_chunks ) );
+				}
+			}
+		}
+
+		if ( $done <= 0 ) {
+			$map_done = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+			$done     = max( $map_done, absint( $state['elementor_chunk_index'] ?? 0 ) );
+		}
+
+		$total = max( $total, $done, 1 );
+
+		return array(
+			'done'  => $done,
+			'total' => $total,
+		);
+	}
+
+	/**
 	 * Count durable Elementor slice progress for UI markers.
 	 *
-	 * @param array<string, mixed> $state Hydrated partial state.
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Hydrated partial state.
 	 * @return int
 	 */
-	private static function count_elementor_job_progress_done( array $state ) {
-		$map_done = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
-
-		return max( $map_done, absint( $state['elementor_chunk_index'] ?? 0 ) );
+	private static function count_elementor_job_progress_done( $post_id, $lang, array $state ) {
+		return self::get_elementor_chunk_progress( $post_id, $lang, $state )['done'];
 	}
 
 	/**
@@ -3587,11 +3629,10 @@ final class Post_Translator {
 	 * @return string
 	 */
 	public static function format_elementor_job_progress_marker( $post_id, $lang, array $state = array() ) {
-		$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
-		$done  = self::count_elementor_job_progress_done( $state );
-		$total = max( $done, absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+		$state    = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		$progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
 
-		return $done . '/' . $total;
+		return $progress['done'] . '/' . $progress['total'];
 	}
 
 	/**
@@ -4453,7 +4494,8 @@ final class Post_Translator {
 		$processed       = 0;
 		$failures        = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 		$skipped_list    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-		$progress_total  = max( $source_total, count( $map ) + count( $payload ) );
+		$chunk_progress  = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$progress_total  = $chunk_progress['total'];
 		$state['elementor_chunks_total'] = $progress_total;
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
@@ -4471,7 +4513,7 @@ final class Post_Translator {
 
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 
-			$attempt_index = count( $map ) + 1;
+			$attempt_index = $chunk_progress['done'] + $processed + 1;
 			$title         = get_the_title( $post_id );
 			$post_label    = '' !== $title
 				? sprintf( '#%d «%s»', $post_id, $title )
@@ -4543,6 +4585,18 @@ final class Post_Translator {
 			if ( empty( $mapped_chunk ) && ! empty( $chunk ) ) {
 				$first_path = (string) array_key_first( $chunk );
 
+				\PolymartAI\Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post ID, 2: chunk index, 3: field path */
+						__( 'Elementor — #%1$d: بخش %2$d پاسخ خالی یا فارسی از API (%3$s)', 'polymart-ai' ),
+						$post_id,
+						$chunk_progress['done'] + $processed + 1,
+						'' !== $first_path ? $first_path : '…'
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+
 				if ( '' !== $first_path ) {
 					$failures[ $first_path ] = absint( $failures[ $first_path ] ?? 0 ) + 1;
 
@@ -4566,31 +4620,31 @@ final class Post_Translator {
 				$delay = (int) apply_filters( 'polymart_ai_elementor_inter_request_delay_sec', 12 );
 
 				if ( $delay > 0 ) {
-					sleep( max( 2, min( 20, $delay ) ) );
+					\PolymartAI\Activity_Logger::sleep_with_worker_heartbeat( max( 2, min( 20, $delay ) ) );
 				}
 			}
 		}
 
-		$state['elementor_map']          = $map;
-		$state['elementor_chunk_index']  = self::count_elementor_job_progress_done(
+		$state['elementor_map'] = $map;
+		$chunk_progress         = self::get_elementor_chunk_progress(
+			$post_id,
+			$lang,
 			array_merge(
 				$state,
 				array( 'elementor_map' => $map )
 			)
 		);
-		$skipped_list                    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-		$remaining                       = self::filter_remaining_elementor_payload(
+		$state['elementor_chunk_index']  = $chunk_progress['done'];
+		$state['elementor_chunks_total']   = $chunk_progress['total'];
+		$skipped_list                      = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining                         = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
 			$map,
 			$skipped_list
 		);
-		$state['elementor_chunks_total'] = max(
-			$progress_total,
-			count( $map ) + count( $remaining )
-		);
-		$state['elementor_failures']     = $failures;
-		$progress_total                  = max( 1, (int) $state['elementor_chunks_total'] );
-		$done_count                      = self::count_elementor_job_progress_done( $state );
+		$state['elementor_failures']       = $failures;
+		$progress_total                    = max( 1, (int) $chunk_progress['total'] );
+		$done_count                        = $chunk_progress['done'];
 
 		if ( ! empty( $remaining ) ) {
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
@@ -4618,7 +4672,7 @@ final class Post_Translator {
 			$state['elementor_skipped'] = array();
 			$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 			$progress_total             = max( 1, (int) $state['elementor_chunks_total'] );
-			$done_count                 = self::count_elementor_job_progress_done( $state );
+			$done_count                 = self::get_elementor_chunk_progress( $post_id, $lang, $state )['done'];
 
 			if ( $done_count > 0 ) {
 				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $state['elementor_map'], $done_count, $progress_total );

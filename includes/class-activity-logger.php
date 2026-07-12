@@ -2294,7 +2294,7 @@ final class Activity_Logger {
 		$step_started = absint( $job['step_started_at'] ?? 0 );
 		$stall_sec    = (int) apply_filters( 'polymart_ai_elementor_progress_stall_sec', 75, $job );
 
-		if ( $step_started > 0 && ( $now - $step_started ) < 180 ) {
+		if ( $step_started > 0 && ( $now - $step_started ) < 90 ) {
 			return false;
 		}
 
@@ -6504,7 +6504,27 @@ final class Activity_Logger {
 		$wait = $min_gap - ( time() - $last_at );
 
 		if ( $wait > 0 ) {
-			sleep( min( 45, $wait ) );
+			self::sleep_with_worker_heartbeat( min( 45, $wait ) );
+		}
+	}
+
+	/**
+	 * Sleep without letting the job monitor think the worker died mid-batch.
+	 *
+	 * @param int $seconds Seconds to sleep.
+	 * @return void
+	 */
+	public static function sleep_with_worker_heartbeat( $seconds ) {
+		$seconds = max( 0, absint( $seconds ) );
+
+		while ( $seconds > 0 ) {
+			$slice = min( 5, $seconds );
+			sleep( $slice );
+			$seconds -= $slice;
+
+			if ( self::is_bulk_job_running() ) {
+				self::touch_worker_heartbeat();
+			}
 		}
 	}
 
