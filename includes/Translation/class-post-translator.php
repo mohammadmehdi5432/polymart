@@ -3945,6 +3945,21 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Keep or re-acquire the per-post lock immediately before persisting Elementor JSON.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function ensure_translation_lock_for_persist( $post_id, $lang ) {
+		if ( self::owns_translation_lock( $post_id, $lang ) ) {
+			return self::touch_translation_lock( $post_id, $lang );
+		}
+
+		return self::acquire_translation_lock( $post_id, $lang );
+	}
+
+	/**
 	 * Drop a per-post translation lock left by a killed PHP worker.
 	 *
 	 * @param int      $post_id        Post ID.
@@ -4631,6 +4646,18 @@ final class Post_Translator {
 			if ( is_wp_error( $chunk_result ) ) {
 				$state['elementor_failures'] = $failures;
 
+				\PolymartAI\Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post ID, 2: chunk index, 3: error message */
+						__( 'Elementor — #%1$d: خطای API در بخش %2$d — %3$s', 'polymart-ai' ),
+						$post_id,
+						$attempt_index,
+						\PolymartAI\Activity_Logger::humanize_api_error_message( $chunk_result->get_error_message() )
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+
 				return self::handle_elementor_job_slice_failure(
 					$post_id,
 					$lang,
@@ -4699,6 +4726,17 @@ final class Post_Translator {
 
 			if ( ! empty( $mapped_chunk ) ) {
 				\PolymartAI\Activity_Logger::touch_successful_api_call();
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: post label, 2: chunk index, 3: field count */
+						__( 'Elementor — %1$s: بخش %2$d — %3$d فیلد از API دریافت شد', 'polymart-ai' ),
+						$post_label,
+						$attempt_index,
+						count( $mapped_chunk )
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
 			}
 
 			if ( $processed < $budget && ! empty( $chunks ) ) {
@@ -5041,7 +5079,19 @@ final class Post_Translator {
 	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false ) {
 		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
 
-		if ( ! self::owns_translation_lock( $post_id, $lang ) ) {
+		if ( ! self::ensure_translation_lock_for_persist( $post_id, $lang ) ) {
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: done count, 3: total chunks */
+					__( 'Elementor — #%1$d: ذخیره بخش %2$d/%3$d رد شد — قفل ترجمه در اختیار کارگر دیگر است.', 'polymart-ai' ),
+					absint( $post_id ),
+					absint( $done_count ),
+					absint( $total_chunks )
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
 			return new \WP_Error(
 				'polymart_ai_translation_in_progress',
 				__( 'این مورد در حال ترجمه است. لطفاً چند لحظه صبر کنید.', 'polymart-ai' )
@@ -5064,6 +5114,16 @@ final class Post_Translator {
 		$json = wp_json_encode( $tree );
 
 		if ( false === $json || '' === $json ) {
+			\PolymartAI\Activity_Logger::log(
+				'error',
+				sprintf(
+					/* translators: 1: post ID */
+					__( 'Elementor — #%1$d: wp_json_encode برای ذخیره ترجمه ناموفق بود.', 'polymart-ai' ),
+					absint( $post_id )
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
 			return new \WP_Error(
 				'polymart_ai_elementor_save_failed',
 				__( 'ذخیره ترجمه Elementor ناموفق بود.', 'polymart-ai' )

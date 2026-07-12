@@ -532,7 +532,9 @@ final class Activity_Logger {
 
 			if ( self::should_prioritize_elementor_partial( $job ) ) {
 				$cap    = null === $max_steps ? min( 2, self::get_elementor_partial_step_cap( $job ) ) : max( 1, min( 2, absint( $max_steps ) ) );
-				$budget = null === $budget_sec ? max( 60, min( 180, $cap * 40 ) ) : max( 30, absint( $budget_sec ) );
+				$budget = null === $budget_sec
+					? max( 150, min( 300, $cap * 80 ) )
+					: max( 90, absint( $budget_sec ) );
 
 				return self::run_action_scheduler_batch( $cap, $budget );
 			}
@@ -1893,6 +1895,14 @@ final class Activity_Logger {
 
 		self::force_unlock_step_now();
 
+		$job     = self::get_job_raw();
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_stale_translation_lock( $post_id, $lang, $idle_sec );
+		}
+
 		self::log(
 			'warning',
 			sprintf(
@@ -2277,6 +2287,32 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Step/budget limits for inline worker ticks (admin REST, start/resume, recovery).
+	 *
+	 * Elementor slices need one full Arvan HTTP round-trip (~50s) plus persist overhead.
+	 *
+	 * @param array<string, mixed>|null $job Job state.
+	 * @return array{steps: int, budget: int}
+	 */
+	public static function get_inline_worker_tick_limits( $job = null ) {
+		$job = is_array( $job ) ? $job : self::get_job_raw();
+
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			$cap = self::get_elementor_partial_step_cap( $job );
+
+			return array(
+				'steps'  => max( 1, min( 2, $cap ) ),
+				'budget' => max( 150, min( 300, $cap * 80 ) ),
+			);
+		}
+
+		return array(
+			'steps'  => 1,
+			'budget' => 60,
+		);
+	}
+
+	/**
 	 * More Elementor batches per step when Action Scheduler is driving the job.
 	 *
 	 * @return int
@@ -2373,7 +2409,7 @@ final class Activity_Logger {
 		try {
 			$job    = self::get_job_raw();
 			$cap    = self::get_elementor_partial_step_cap( $job );
-			$budget = max( 90, min( 300, $cap * 50 ) );
+			$budget = max( 150, min( 300, $cap * 80 ) );
 			self::run_inline_worker_tick( $cap, $budget );
 		} finally {
 			self::$elementor_burst_inflight = false;
@@ -3395,7 +3431,8 @@ final class Activity_Logger {
 		Job_Action_Scheduler::cancel_all();
 		self::bootstrap_background_worker( false );
 		// Local/cPanel hosts often never run AS HTTP — kick one bounded slice inline now.
-		self::run_inline_worker_tick( 1, 60 );
+		$tick_limits = self::get_inline_worker_tick_limits( $job );
+		self::run_inline_worker_tick( $tick_limits['steps'], $tick_limits['budget'] );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -3482,7 +3519,8 @@ final class Activity_Logger {
 
 			self::save_job( $job );
 			self::bootstrap_background_worker( false );
-			self::run_inline_worker_tick( 1, 60 );
+			$tick_limits = self::get_inline_worker_tick_limits( $job );
+			self::run_inline_worker_tick( $tick_limits['steps'], $tick_limits['budget'] );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -4648,6 +4686,16 @@ final class Activity_Logger {
 			$job['step_deferred_reason']  = 'translation_in_progress';
 			$job['step_deferred_message'] = $slice->get_error_message();
 			self::save_job( $job );
+
+			self::log(
+				'info',
+				sprintf(
+					/* translators: 1: post ID */
+					__( 'ترجمه #%1$d — کارگر دیگری در حال اجراست؛ تیک بعدی دوباره تلاش می‌کند.', 'polymart-ai' ),
+					$post_id
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
 
 			return self::normalize_job_for_response( $job, false );
 		}
@@ -6544,7 +6592,8 @@ final class Activity_Logger {
 	 */
 	public static function wait_for_arvan_api_gap() {
 		$job     = self::get_job_raw();
-		$min_gap = max( 8, (int) apply_filters( 'polymart_ai_arvan_min_api_gap_sec', 18 ) );
+		$default = self::is_elementor_progress_stalled( $job ) ? 6 : 18;
+		$min_gap = max( 4, (int) apply_filters( 'polymart_ai_arvan_min_api_gap_sec', $default ) );
 		$last_at = absint( $job['last_arvan_api_at'] ?? 0 );
 
 		if ( $last_at <= 0 ) {
