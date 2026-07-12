@@ -186,6 +186,12 @@ final class Activity_Logger {
 		}
 
 		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
+
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::run_queue_inline( true );
+			return;
+		}
+
 		self::ping_wp_cron( true );
 	}
 
@@ -3719,7 +3725,8 @@ final class Activity_Logger {
 		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
 		$max_steps = max( 1, min( 40, $max_steps ) );
 		if ( null !== $max_steps_override ) {
-			$max_steps = max( 1, min( $max_steps, absint( $max_steps_override ) ) );
+			// AS / Elementor bursts pass an explicit cap — do not clamp to CRON_MAX_STEPS_PER_TICK.
+			$max_steps = max( 1, min( 40, absint( $max_steps_override ) ) );
 		}
 		$steps_run = 0;
 		$last_result = null;
