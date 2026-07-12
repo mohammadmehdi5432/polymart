@@ -2643,21 +2643,29 @@ final class Activity_Logger {
 		}
 
 		$existing = self::get_job( false );
+		$existing_status = (string) ( $existing['status'] ?? 'idle' );
 
-		if ( 'running' === ( $existing['status'] ?? '' ) ) {
-			if ( self::is_bulk_worker_lively( 90 ) ) {
+		if ( in_array( $existing_status, array( 'running', 'paused' ), true ) ) {
+			if ( 'running' === $existing_status && self::is_bulk_worker_lively( 90 ) ) {
 				return new \WP_Error(
 					'polymart_ai_job_running',
 					__( 'یک فرآیند ترجمه خودکار در حال اجراست. ابتدا آن را متوقف یا از سرگیری کنید.', 'polymart-ai' )
 				);
 			}
 
-			self::log(
-				'warning',
-				__( 'اجرای قبلی بدون فعالیت رها شده بود — قبل از شروع جدید پاک شد.', 'polymart-ai' )
-			);
+			if ( 'running' === $existing_status ) {
+				self::log(
+					'warning',
+					__( 'اجرای قبلی بدون فعالیت رها شده بود — قبل از شروع جدید پاک شد.', 'polymart-ai' )
+				);
+			}
+
 			self::unschedule_background_worker();
 			self::release_step_lock();
+			if ( Job_Action_Scheduler::is_available() ) {
+				Job_Action_Scheduler::clear_slice_mutex();
+			}
+			self::cleanup_job_translation_locks( $existing );
 			self::save_job( self::empty_job() );
 		}
 
@@ -2725,6 +2733,31 @@ final class Activity_Logger {
 			);
 			$seed_ids = array_slice( $seed_ids, 0, max( $seed_limit, count( $probe_ids ) ) );
 		}
+
+		if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
+			$seed_ids = array_values( array_unique( array_map( 'absint', $issue_ids ) ) );
+		}
+
+		if ( empty( $seed_ids ) ) {
+			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit );
+		}
+
+		if ( empty( $seed_ids ) ) {
+			$fallback_id = Translation_Query::find_next_actionable_post_id( $lang, 0 );
+
+			if ( $fallback_id > 0 ) {
+				$seed_ids = array( $fallback_id );
+			}
+		}
+
+		$seed_ids = array_values(
+			array_filter(
+				array_map( 'absint', $seed_ids ),
+				static function ( $post_id ) use ( $lang ) {
+					return $post_id > 0 && Post_Translator::post_needs_translation_work( $post_id, $lang );
+				}
+			)
+		);
 
 		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
 			return new \WP_Error(
@@ -2800,7 +2833,8 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 		Job_Action_Scheduler::cancel_all();
-		self::bootstrap_background_worker( true );
+		// Fast HTTP response — AS/cron run the first slice; avoid 60–150s inline work here.
+		self::bootstrap_background_worker( false );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -2872,7 +2906,7 @@ final class Activity_Logger {
 			self::recover_stalled_job_picker( $job, $lang, true );
 
 			self::save_job( $job );
-			self::bootstrap_background_worker( true );
+			self::bootstrap_background_worker( false );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -2888,18 +2922,17 @@ final class Activity_Logger {
 	public static function stop_job() {
 		$job = self::get_job_raw();
 
+		// Always tear down workers/locks first so Start cannot hit a stale "running" worker.
+		self::unschedule_background_worker();
+		self::release_step_lock();
+
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::clear_slice_mutex();
+		}
+
 		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
-			// Halt chaining before cleanup so in-flight AS/cron callbacks see idle state.
-			self::unschedule_background_worker();
-			$job['status']          = 'idle';
-			$job['current_post_id'] = null;
-			$job['step_started_at'] = null;
-			self::save_job( $job );
 			self::cleanup_job_translation_locks( $job, true );
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
-		} else {
-			self::release_step_lock();
-			self::unschedule_background_worker();
 		}
 
 		return self::save_job( self::empty_job() );

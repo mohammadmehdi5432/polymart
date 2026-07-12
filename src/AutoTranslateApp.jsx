@@ -636,7 +636,11 @@ export default function AutoTranslateApp() {
       await ensureServerWorker();
     } catch (error) {
       const code = error?.response?.data?.code;
-      const message = error?.response?.data?.message || 'شروع ترجمه خودکار ناموفق بود.';
+      const message =
+        error?.response?.data?.message ||
+        (error?.message === 'Network Error'
+          ? 'درخواست شروع قطع شد — صفحه را رفرش کنید؛ اگر وضعیت «در حال اجرا» است کارگر روی سرور شروع شده.'
+          : 'شروع ترجمه خودکار ناموفق بود.');
 
       if (code === 'polymart_ai_job_running') {
         const existing = await loadJob();
