@@ -3365,6 +3365,10 @@ final class Post_Translator {
 			|| false !== strpos( $message, 'gateway' )
 			|| false !== strpos( $message, 'rate limit' )
 			|| false !== strpos( $message, '429' )
+			|| false !== strpos( $message, '404' )
+			|| false !== strpos( $message, 'blocked' )
+			|| false !== strpos( $message, 'arvancloud' )
+			|| false !== strpos( $message, 'مسدود' )
 			|| false !== strpos( $message, 'ربات' );
 	}
 
@@ -4236,7 +4240,6 @@ final class Post_Translator {
 		$ai_options   = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
 		$processed    = 0;
 		$failures     = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
-		$map_before   = count( $map );
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
 			$chunk = array_shift( $chunks );
@@ -4263,32 +4266,18 @@ final class Post_Translator {
 			);
 
 			if ( is_wp_error( $chunk_result ) ) {
-				$recovered = self::translate_job_chunk_with_single_field_fallback(
-					$aliased_payload,
-					$api_key,
-					$api_endpoint,
-					$ai_model,
+				$state['elementor_failures'] = $failures;
+
+				return self::handle_elementor_job_slice_failure(
+					$post_id,
 					$lang,
-					1,
-					$ai_options
+					$data,
+					$state,
+					$map,
+					$source_total,
+					$chunk_result,
+					array_keys( $chunk )
 				);
-
-				if ( is_wp_error( $recovered ) ) {
-					$state['elementor_failures'] = $failures;
-
-					return self::handle_elementor_job_slice_failure(
-						$post_id,
-						$lang,
-						$data,
-						$state,
-						$map,
-						$source_total,
-						$recovered,
-						array_keys( $chunk )
-					);
-				}
-
-				$chunk_result = $recovered;
 			}
 
 			$mapped_chunk = self::unmap_elementor_aliases(
@@ -4315,69 +4304,22 @@ final class Post_Translator {
 			}
 
 			if ( empty( $mapped_chunk ) && ! empty( $chunk ) ) {
-				$recovered = self::translate_job_chunk_with_single_field_fallback(
-					$aliased_payload,
-					$api_key,
-					$api_endpoint,
-					$ai_model,
-					$lang,
-					1,
-					$ai_options
-				);
+				$first_path = (string) array_key_first( $chunk );
 
-				if ( ! is_wp_error( $recovered ) ) {
-					$mapped_chunk = self::unmap_elementor_aliases(
-						self::collapse_payload_parts( $recovered ),
-						$alias_to_path
-					);
+				if ( '' !== $first_path ) {
+					$failures[ $first_path ] = absint( $failures[ $first_path ] ?? 0 ) + 1;
 
-					foreach ( $mapped_chunk as $path => $translated ) {
-						$translated = trim( (string) $translated );
-						$path       = (string) $path;
-
-						if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
-							unset( $mapped_chunk[ $path ] );
-						}
+					if ( $failures[ $first_path ] >= 2 ) {
+						$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+						$skipped[] = $first_path;
+						$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+						unset( $failures[ $first_path ] );
 					}
 				}
 			}
 
 			$map = array_merge( $map, $mapped_chunk );
 			++$processed;
-		}
-
-		if ( count( $map ) <= $map_before && ! empty( $payload ) ) {
-			$retry_path = (string) array_key_first( $payload );
-
-			if ( '' !== $retry_path && ! isset( $failures[ $retry_path ] ) ) {
-				$single = array( $retry_path => (string) $payload[ $retry_path ] );
-				list( $aliased_single, $alias_to_path ) = self::alias_elementor_payload_keys( $single );
-				$recovered = self::translate_job_chunk_with_single_field_fallback(
-					$aliased_single,
-					$api_key,
-					$api_endpoint,
-					$ai_model,
-					$lang,
-					2,
-					$ai_options
-				);
-
-				if ( ! is_wp_error( $recovered ) ) {
-					$mapped_single = self::unmap_elementor_aliases(
-						self::collapse_payload_parts( $recovered ),
-						$alias_to_path
-					);
-
-					foreach ( $mapped_single as $path => $translated ) {
-						$translated = trim( (string) $translated );
-						$path       = (string) $path;
-
-						if ( '' !== $translated && ! Persian_Detector::contains_persian( $translated ) ) {
-							$map[ $path ] = $translated;
-						}
-					}
-				}
-			}
 		}
 
 		$state['elementor_map']          = $map;
@@ -4441,6 +4383,9 @@ final class Post_Translator {
 	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}|\WP_Error
 	 */
 	private static function handle_elementor_job_slice_failure( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, \WP_Error $error, array $failed_keys = array() ) {
+		\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $error );
+		$short_error = \PolymartAI\Activity_Logger::truncate_api_error_message( $error->get_error_message() );
+
 		$state['elementor_map']          = $map;
 		$state['elementor_chunk_index']  = count( $map );
 		$state['elementor_chunks_total'] = max( 1, $source_total );
@@ -4472,7 +4417,7 @@ final class Post_Translator {
 						/* translators: 1: saved widget count, 2: error message */
 						__( 'Elementor — %1$d بخش ذخیره شد. API موقتاً قطع شد: %2$s', 'polymart-ai' ),
 						count( $map ),
-						$error->get_error_message()
+						$short_error
 					)
 				);
 			}
@@ -4487,7 +4432,7 @@ final class Post_Translator {
 				sprintf(
 					/* translators: %s: error message */
 					__( 'Elementor — API موقتاً قطع شد (ادامه در مرحله بعد): %s', 'polymart-ai' ),
-					$error->get_error_message()
+					$short_error
 				)
 			);
 		}
@@ -5141,7 +5086,27 @@ final class Post_Translator {
 			return true;
 		}
 
-		if ( preg_match( '/(_url|_link|_id|_css|_class|_icon|_image|_img|_media|_src|_size|_color|_width|_height|_align|typography|animation|custom_css|z_index|motion_fx|background|overlay|mask)/i', $key ) ) {
+		if ( preg_match( '/(_url|_link|_id|_css|_class|_icon|_image|_img|_media|_src|_size|_color|_width|_height|_align|typography|animation|custom_css|z_index|motion_fx|background|overlay|mask|_json|editor_data|html_cache)/i', $key ) ) {
+			return true;
+		}
+
+		// Embedded JSON/config blobs — not human-readable text.
+		$trimmed = ltrim( $value );
+		if ( '{' === $trimmed || '[' === $trimmed ) {
+			return true;
+		}
+
+		// HTML markup blobs.
+		if ( preg_match( '/^\s*<(?:html|body|div|span|section|style|script|svg|table|ul|ol|p|h[1-6]|!DOCTYPE)/i', $value ) ) {
+			return true;
+		}
+
+		if ( substr_count( $value, '<' ) >= 3 && substr_count( $value, '>' ) >= 3 ) {
+			return true;
+		}
+
+		// Long serialized JSON-like strings.
+		if ( mb_strlen( $value ) > 500 && preg_match( '/["\']\s*:\s*["\[\{]/', $value ) ) {
 			return true;
 		}
 
@@ -6973,7 +6938,7 @@ final class Post_Translator {
 			if ( self::has_elementor_persian_content( $post_id ) ) {
 				$fields[] = array(
 					'key'        => 'elementor_json',
-					'label'      => __( 'Elementor (JSON)', 'polymart-ai' ),
+					'label'      => __( 'بخش‌های Elementor', 'polymart-ai' ),
 					'meta_key'   => self::get_elementor_meta_key( $lang ),
 					'has_source' => true,
 					'translated' => self::has_stored_elementor_translation( $post_id, $lang )
