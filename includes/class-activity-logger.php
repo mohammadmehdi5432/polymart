@@ -2073,7 +2073,7 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	public static function filter_as_elementor_chunk_budget() {
-		return 3;
+		return 4;
 	}
 
 	/**
@@ -3593,8 +3593,16 @@ final class Activity_Logger {
 		// Do not ping here — mid-tick ping spawned nested cron workers and froze the site.
 
 		$started   = time();
+		$job_tick  = self::get_job_raw();
+		$elementor_burst = self::$trusted_as_tick && self::should_prioritize_elementor_partial( $job_tick );
 		$budget    = null !== $budget_override
-			? max( 20, min( 120, absint( $budget_override ) ) )
+			? max(
+				30,
+				min(
+					$elementor_burst ? 300 : 120,
+					absint( $budget_override )
+				)
+			)
 			: self::get_cron_step_budget_sec();
 		$max_steps = (int) apply_filters( 'polymart_ai_job_cron_max_steps_per_tick', self::CRON_MAX_STEPS_PER_TICK );
 		$max_steps = max( 1, min( 40, $max_steps ) );
@@ -3605,7 +3613,7 @@ final class Activity_Logger {
 		$last_result = null;
 
 		if ( function_exists( 'set_time_limit' ) ) {
-			$limit = self::$trusted_as_tick ? 210 : max( 300, $budget + 180 );
+			$limit = $elementor_burst ? 330 : ( self::$trusted_as_tick ? 210 : max( 300, $budget + 180 ) );
 			@set_time_limit( $limit );
 		}
 
@@ -3745,7 +3753,7 @@ final class Activity_Logger {
 	 *
 	 * @return void
 	 */
-	private static function release_step_lock() {
+	public static function release_step_lock() {
 		delete_transient( self::STEP_LOCK_KEY );
 		delete_option( self::STEP_LOCK_CLAIM_KEY );
 	}

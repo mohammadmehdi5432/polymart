@@ -243,8 +243,21 @@ final class Job_Action_Scheduler {
 			);
 		}
 
-		// Pending follow-up already waiting — no need to stack another.
+		// Pending follow-up already waiting — nudge if Elementor pin stalled.
 		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+			$job = Activity_Logger::get_job_for_as_debug();
+
+			if (
+				Activity_Logger::should_prioritize_elementor_partial( $job )
+				&& ! Activity_Logger::is_bulk_worker_lively( 75 )
+			) {
+				self::recover_stale_running_actions( 60 );
+				Activity_Logger::release_stale_locks_for_as( 60 );
+				Activity_Logger::release_step_lock();
+				self::clear_slice_mutex();
+				Activity_Logger::nudge_as_queue_runner();
+			}
+
 			return 0;
 		}
 
@@ -372,75 +385,121 @@ final class Job_Action_Scheduler {
 		$slices_done      = 0;
 		$request_start    = time();
 		$any_productive   = false;
-		$job_start        = Activity_Logger::get_job_for_as_debug();
-		$request_budget   = Activity_Logger::should_prioritize_elementor_partial( $job_start )
-			? max( self::REQUEST_BUDGET_SEC, 210 )
+		$job_step         = Activity_Logger::get_job_for_as_debug();
+		$elementor_burst  = Activity_Logger::should_prioritize_elementor_partial( $job_step );
+		$request_budget   = $elementor_burst
+			? max( self::REQUEST_BUDGET_SEC, 300 )
 			: self::REQUEST_BUDGET_SEC;
 
-		while (
-			Activity_Logger::is_bulk_job_running()
-			&& $slices_done < self::AS_MAX_STEPS_PER_REQUEST
-			&& ( time() - $request_start ) < ( $request_budget - 5 )
-		) {
-			$elapsed          = time() - $request_start;
-			$slice_cap        = Activity_Logger::should_prioritize_elementor_partial( $job_step )
-				? max( self::SLICE_BUDGET_SEC, 165 )
-				: self::SLICE_BUDGET_SEC;
-			$remaining_budget = min( $slice_cap, max( 25, $request_budget - $elapsed ) );
-			$job_step         = Activity_Logger::get_job_for_as_debug();
-			$steps_before     = absint( $job_step['steps'] ?? 0 );
-			$step_cap         = Activity_Logger::get_elementor_partial_step_cap( $job_step );
-			$step_cap         = min( $step_cap, self::AS_MAX_STEPS_PER_REQUEST - $slices_done );
+		if ( $elementor_burst && function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 330 );
+		}
+
+		if ( $elementor_burst ) {
+			$steps_before = absint( $job_step['steps'] ?? 0 );
+			$step_cap     = Activity_Logger::get_elementor_partial_step_cap( $job_step );
 
 			try {
-				$step_result = Activity_Logger::run_action_scheduler_batch( max( 1, $step_cap ), $remaining_budget );
+				$step_result = Activity_Logger::run_action_scheduler_batch(
+					max( 1, min( 20, $step_cap ) ),
+					max( 90, $request_budget - 10 )
+				);
 			} catch ( \Throwable $e ) {
 				Activity_Logger::log(
 					'error',
 					sprintf(
 						/* translators: 1: AS action ID, 2: error */
-						__( 'AS #%1$d: Exception در batch — %2$s', 'polymart-ai' ),
+						__( 'AS #%1$d: Exception در burst Elementor — %2$s', 'polymart-ai' ),
 						self::$current_action_id,
 						$e->getMessage()
 					),
 					array(
 						'as_action_id' => self::$current_action_id,
 						'exception'    => get_class( $e ),
-						'file'         => $e->getFile(),
-						'line'         => $e->getLine(),
 					)
 				);
 
 				Activity_Logger::recover_job_item_failure(
 					$e->getMessage(),
-					$post_id,
+					absint( $job_step['partial_post_id'] ?? 0 ),
 					array(
-						'source'       => 'as_handle_slice',
+						'source'       => 'as_elementor_burst',
 						'as_action_id' => self::$current_action_id,
 					)
 				);
-				break;
+				$step_result = null;
 			}
 
-			++$slices_done;
-
+			$slices_done = 1;
 			$steps_after = absint( Activity_Logger::get_job_for_as_debug()['steps'] ?? 0 );
 			$idle_tick   = is_array( $step_result ) && ! empty( $step_result['idle_tick'] );
 
 			if ( $steps_after > $steps_before && ! $idle_tick ) {
 				$any_productive = true;
 			}
+		} else {
+			while (
+				Activity_Logger::is_bulk_job_running()
+				&& $slices_done < self::AS_MAX_STEPS_PER_REQUEST
+				&& ( time() - $request_start ) < ( $request_budget - 5 )
+			) {
+				$job_step         = Activity_Logger::get_job_for_as_debug();
+				$elapsed          = time() - $request_start;
+				$remaining_budget = max( 25, $request_budget - $elapsed );
+				$steps_before     = absint( $job_step['steps'] ?? 0 );
+				$step_cap         = Activity_Logger::get_elementor_partial_step_cap( $job_step );
+				$step_cap         = min( $step_cap, self::AS_MAX_STEPS_PER_REQUEST - $slices_done );
 
-			if ( $idle_tick ) {
-				break;
-			}
+				try {
+					$step_result = Activity_Logger::run_action_scheduler_batch( max( 1, $step_cap ), $remaining_budget );
+				} catch ( \Throwable $e ) {
+					Activity_Logger::log(
+						'error',
+						sprintf(
+							/* translators: 1: AS action ID, 2: error */
+							__( 'AS #%1$d: Exception در batch — %2$s', 'polymart-ai' ),
+							self::$current_action_id,
+							$e->getMessage()
+						),
+						array(
+							'as_action_id' => self::$current_action_id,
+							'exception'    => get_class( $e ),
+							'file'         => $e->getFile(),
+							'line'         => $e->getLine(),
+						)
+					);
 
-			if ( is_array( $step_result ) && ! empty( $step_result['step_deferred'] ) ) {
-				break;
-			}
+					Activity_Logger::recover_job_item_failure(
+						$e->getMessage(),
+						$post_id,
+						array(
+							'source'       => 'as_handle_slice',
+							'as_action_id' => self::$current_action_id,
+						)
+					);
+					break;
+				}
 
-			if ( 'running' !== (string) ( $step_result['status'] ?? Activity_Logger::get_job_for_as_debug()['status'] ?? '' ) ) {
-				break;
+				++$slices_done;
+
+				$steps_after = absint( Activity_Logger::get_job_for_as_debug()['steps'] ?? 0 );
+				$idle_tick   = is_array( $step_result ) && ! empty( $step_result['idle_tick'] );
+
+				if ( $steps_after > $steps_before && ! $idle_tick ) {
+					$any_productive = true;
+				}
+
+				if ( $idle_tick ) {
+					break;
+				}
+
+				if ( is_array( $step_result ) && ! empty( $step_result['step_deferred'] ) ) {
+					break;
+				}
+
+				if ( 'running' !== (string) ( $step_result['status'] ?? Activity_Logger::get_job_for_as_debug()['status'] ?? '' ) ) {
+					break;
+				}
 			}
 		}
 
@@ -564,6 +623,41 @@ final class Job_Action_Scheduler {
 
 		if ( function_exists( 'set_time_limit' ) ) {
 			@set_time_limit( 120 );
+		}
+
+		$job = Activity_Logger::get_job_for_as_debug();
+
+		if (
+			Activity_Logger::should_prioritize_elementor_partial( $job )
+			&& self::$inline_chain_depth < 2
+		) {
+			++self::$inline_chain_depth;
+
+			try {
+				Activity_Logger::release_step_lock();
+				self::clear_slice_mutex();
+
+				$cap = Activity_Logger::get_elementor_partial_step_cap( $job );
+				Activity_Logger::run_action_scheduler_batch(
+					max( 1, min( 15, $cap ) ),
+					180
+				);
+
+				if ( ! Activity_Logger::should_prioritize_elementor_partial( Activity_Logger::get_job_for_as_debug() ) ) {
+					return;
+				}
+			} catch ( \Throwable $e ) {
+				Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: %s: error message */
+						__( 'زنجیره inline Elementor ناموفق بود — AS دوباره صف می‌کند: %s', 'polymart-ai' ),
+						$e->getMessage()
+					)
+				);
+			} finally {
+				--self::$inline_chain_depth;
+			}
 		}
 
 		if ( self::$inline_chain_depth >= self::MAX_INLINE_CHAIN_DEPTH ) {
