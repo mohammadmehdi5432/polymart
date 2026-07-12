@@ -262,6 +262,7 @@ export default function AutoTranslateApp() {
   const pollErrorCountRef = useRef(0);
   const lastEnsureErrorAtRef = useRef(0);
   const logsRef = useRef(null);
+  const logsPinnedRef = useRef(false);
   const isActiveRef = useRef(true);
   const activePostRef = useRef(null);
 
@@ -404,10 +405,21 @@ export default function AutoTranslateApp() {
   }, [loadJob]);
 
   useEffect(() => {
-    if (logsRef.current) {
-      logsRef.current.scrollTop = logsRef.current.scrollHeight;
+    const el = logsRef.current;
+    if (!el || logsPinnedRef.current) {
+      return;
     }
+    el.scrollTop = el.scrollHeight;
   }, [logs]);
+
+  const handleLogsScroll = useCallback(() => {
+    const el = logsRef.current;
+    if (!el) {
+      return;
+    }
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    logsPinnedRef.current = distanceFromBottom > 48;
+  }, []);
 
   const applyJobUpdate = useCallback((data) => {
     if (!data) {
@@ -1401,6 +1413,7 @@ export default function AutoTranslateApp() {
         </div>
         <div
           ref={logsRef}
+          onScroll={handleLogsScroll}
           className="max-h-72 overflow-y-auto rounded border border-gray-100 bg-gray-50 p-3 font-mono text-xs leading-relaxed"
         >
           {logs.length === 0 ? (

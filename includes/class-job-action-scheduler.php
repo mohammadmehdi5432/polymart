@@ -40,7 +40,7 @@ final class Job_Action_Scheduler {
 	const AS_MAX_STEPS_PER_REQUEST = 18;
 
 	/** Guard against run_queue_inline recursion blowing the PHP time limit. */
-	const MAX_INLINE_CHAIN_DEPTH = 3;
+	const MAX_INLINE_CHAIN_DEPTH = 1;
 
 	/** When another slice is in-flight, defer this action by this many seconds. */
 	const CONCURRENCY_DEFER_SEC = 45;
@@ -367,8 +367,9 @@ final class Job_Action_Scheduler {
 			)
 		);
 
-		$slices_done   = 0;
-		$request_start = time();
+		$slices_done      = 0;
+		$request_start    = time();
+		$any_productive   = false;
 
 		while (
 			Activity_Logger::is_bulk_job_running()
@@ -377,6 +378,7 @@ final class Job_Action_Scheduler {
 		) {
 			$elapsed          = time() - $request_start;
 			$remaining_budget = min( self::SLICE_BUDGET_SEC, max( 25, self::REQUEST_BUDGET_SEC - $elapsed ) );
+			$steps_before     = absint( Activity_Logger::get_job_for_as_debug()['steps'] ?? 0 );
 
 			try {
 				$step_result = Activity_Logger::run_action_scheduler_batch( 1, $remaining_budget );
@@ -409,6 +411,17 @@ final class Job_Action_Scheduler {
 			}
 
 			++$slices_done;
+
+			$steps_after = absint( Activity_Logger::get_job_for_as_debug()['steps'] ?? 0 );
+			$idle_tick   = is_array( $step_result ) && ! empty( $step_result['idle_tick'] );
+
+			if ( $steps_after > $steps_before && ! $idle_tick ) {
+				$any_productive = true;
+			}
+
+			if ( $idle_tick ) {
+				break;
+			}
 
 			if ( is_array( $step_result ) && ! empty( $step_result['step_deferred'] ) ) {
 				break;
@@ -453,8 +466,11 @@ final class Job_Action_Scheduler {
 		self::release_slice_mutex();
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
-			self::chain_next_slice_immediately();
-			Activity_Logger::nudge_as_queue_runner();
+			if ( $any_productive ) {
+				self::chain_next_slice_immediately();
+			} else {
+				Activity_Logger::nudge_as_queue_runner();
+			}
 		}
 	}
 
@@ -553,19 +569,7 @@ final class Job_Action_Scheduler {
 			return;
 		}
 
-		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) <= 0 ) {
-			return;
-		}
-
-		++self::$inline_chain_depth;
-		try {
-			$processed = self::run_queue_inline( true );
-			if ( $processed <= 0 ) {
-				Activity_Logger::nudge_as_queue_runner();
-			}
-		} finally {
-			--self::$inline_chain_depth;
-		}
+		Activity_Logger::nudge_as_queue_runner();
 	}
 
 	/**

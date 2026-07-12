@@ -3289,8 +3289,16 @@ final class Activity_Logger {
 			}
 
 			self::touch_worker_heartbeat();
-			$result = self::process_job_step();
-			$last_result = $result;
+			$job_before   = self::get_job_raw();
+			$steps_before = absint( $job_before['steps'] ?? 0 );
+			$result       = self::process_job_step();
+			$last_result  = $result;
+			$steps_after  = absint( self::get_job_raw()['steps'] ?? 0 );
+
+			if ( $steps_after <= $steps_before && is_array( $result ) && empty( $result['step_deferred'] ) ) {
+				$result['idle_tick'] = true;
+				$last_result         = $result;
+			}
 
 			// Never clear another worker's lock on contention; only clear after our own step.
 			$deferred_busy = is_array( $result )
@@ -3319,6 +3327,10 @@ final class Activity_Logger {
 				return is_array( $result )
 					? $result
 					: self::normalize_job_for_response( $job, false );
+			}
+
+			if ( is_array( $result ) && ! empty( $result['idle_tick'] ) ) {
+				break;
 			}
 
 			if ( is_array( $result ) && ! empty( $result['step_deferred'] ) ) {
@@ -4484,7 +4496,29 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	private static function finalize_job_if_queue_exhausted( array &$job, $lang ) {
-		self::sync_job_remaining( $job, $lang );
+		self::sync_job_live_stats( $job, $lang, true );
+		self::sync_job_remaining( $job, $lang, true );
+
+		$needs_work = (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 );
+
+		if ( $needs_work > 0 ) {
+			self::recover_stalled_job_picker( $job, $lang, false );
+
+			if (
+				'running' === ( $job['status'] ?? '' )
+				&& (
+					! empty( self::get_deferred_queue( $job ) )
+					|| 'menus' === ( $job['phase'] ?? '' )
+					|| Menu_Translator::count_untranslated( $lang ) > 0
+				)
+			) {
+				$job['status']       = 'running';
+				$job['pause_reason'] = null;
+				self::save_job( $job );
+
+				return;
+			}
+		}
 
 		if ( ! empty( self::get_actionable_remaining_ids( $lang, $job, 1 ) ) ) {
 			return;
@@ -4551,11 +4585,34 @@ final class Activity_Logger {
 				return;
 			}
 
-			$stalled_ids         = Translation_Query::collect_remaining_post_ids( $lang, 10 );
+			$stalled_ids = Translation_Query::seed_actionable_post_ids(
+				$lang,
+				10,
+				self::get_exhausted_job_post_ids( $job )
+			);
+
+			if ( empty( $stalled_ids ) ) {
+				$stalled_ids = Translation_Query::collect_remaining_post_ids( $lang, 10 );
+			}
+
 			$job['status']       = 'paused';
 			$job['pause_reason'] = 'stalled';
 			$job['stalled_ids']  = $stalled_ids;
 			$job['last_error']   = self::format_stalled_job_error( $lang, $stalled_ids );
+
+			return;
+		}
+
+		if ( $needs_work > 0 ) {
+			$job['status']       = 'running';
+			$job['pause_reason'] = null;
+			$job['last_error']   = sprintf(
+				/* translators: %d: remaining work count */
+				__( '%d مورد هنوز ناقص است — «ادامه» را بزنید.', 'polymart-ai' ),
+				$needs_work
+			);
+			self::recover_stalled_job_picker( $job, $lang, false );
+			self::save_job( $job );
 
 			return;
 		}
@@ -4624,10 +4681,21 @@ final class Activity_Logger {
 		}
 
 		if ( '' === $template ) {
-			$template = __( 'ترجمه متوقف شد — %1$d مورد ناقص: %2$s. «توقف کامل» و «شروع» مجدد بزنید یا فیلدها را دستی تکمیل کنید.', 'polymart-ai' );
+			$template = __( 'ترجمه متوقف شد — %1$d مورد ناقص: %2$s. «ادامه» / «شروع» مجدد بزنید یا فیلدها را دستی تکمیل کنید.', 'polymart-ai' );
 		}
 
 		$summary = implode( ' | ', $details );
+
+		if ( '' === trim( $summary ) && ! empty( $remaining_ids ) ) {
+			foreach ( array_slice( $remaining_ids, 0, 5 ) as $post_id ) {
+				$details[] = sprintf(
+					'#%1$d: %2$s',
+					$post_id,
+					get_the_title( $post_id ) ?: __( '(بدون عنوان)', 'polymart-ai' )
+				);
+			}
+			$summary = implode( ' | ', $details );
+		}
 
 		if ( count( $remaining_ids ) > count( $details ) ) {
 			$summary .= sprintf(

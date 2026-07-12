@@ -100,6 +100,7 @@ final class Woodmart_Translator {
 		add_filter( 'widget_title', array( $this, 'filter_widget_title' ), 20, 1 );
 		add_filter( 'widget_text', array( $this, 'filter_widget_text' ), 20, 1 );
 		add_filter( 'nav_menu_item_title', array( $this, 'filter_nav_menu_item_title' ), 20, 4 );
+		add_filter( 'wp_get_nav_menu_items', array( $this, 'filter_wp_get_nav_menu_items' ), 20, 3 );
 		add_filter( 'document_title_parts', array( $this, 'filter_document_title_parts' ), 20, 1 );
 		add_filter( 'bloginfo', array( $this, 'filter_bloginfo' ), 20, 2 );
 		add_filter( 'the_title', array( $this, 'filter_header_footer_title' ), 9, 2 );
@@ -191,6 +192,40 @@ final class Woodmart_Translator {
 		}
 
 		return $this->resolve_string( $title, 'menu:' . $menu_item->ID );
+	}
+
+	/**
+	 * Woodmart/mobile menus sometimes read item titles before nav_menu_item_title runs.
+	 *
+	 * @param \WP_Post[] $items Menu items.
+	 * @param \WP_Term   $menu  Menu term.
+	 * @param array      $args  Menu args.
+	 * @return \WP_Post[]
+	 */
+	public function filter_wp_get_nav_menu_items( $items, $menu, $args ) {
+		unset( $menu, $args );
+
+		if ( ! $this->should_intercept() || ! is_array( $items ) ) {
+			return $items;
+		}
+
+		$lang = $this->get_active_lang();
+
+		foreach ( $items as $item ) {
+			if ( ! $item instanceof \WP_Post ) {
+				continue;
+			}
+
+			$title    = is_string( $item->title ?? null ) ? $item->title : (string) $item->post_title;
+			$resolved = Menu_Translator::resolve_storefront_menu_title( $item, $lang, $title );
+
+			if ( '' !== trim( $resolved ) && $resolved !== $title ) {
+				$item->title      = $resolved;
+				$item->post_title = $resolved;
+			}
+		}
+
+		return $items;
 	}
 
 	/**

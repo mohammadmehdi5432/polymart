@@ -230,6 +230,16 @@ final class Menu_Translator {
 			'menu:' . $item_id,
 			$translated
 		);
+
+		clean_post_cache( $item_id );
+
+		$menu_terms = wp_get_post_terms( $item_id, 'nav_menu', array( 'fields' => 'ids' ) );
+
+		if ( is_array( $menu_terms ) ) {
+			foreach ( $menu_terms as $menu_id ) {
+				wp_cache_delete( (int) $menu_id, 'nav_menu' );
+			}
+		}
 	}
 
 	/**
