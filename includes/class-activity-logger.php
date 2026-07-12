@@ -2207,6 +2207,12 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	public static function filter_as_elementor_chunk_budget() {
+		$job = self::get_job_raw();
+
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			return 2;
+		}
+
 		return 1;
 	}
 
@@ -2272,16 +2278,23 @@ final class Activity_Logger {
 		$before  = (string) ( $job['partial_progress'] ?? '' );
 
 		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::cancel_pending_slices();
-			Job_Action_Scheduler::clear_slice_mutex();
+			Job_Action_Scheduler::clear_slice_mutex_if_stale();
 			Job_Action_Scheduler::recover_stale_running_actions( 30 );
+
+			$processed = Job_Action_Scheduler::run_queue_inline( true );
+
+			if ( $processed > 0 ) {
+				$pulse = max(
+					self::CRON_FAST_INTERVAL_SEC,
+					(int) apply_filters( 'polymart_ai_elementor_cron_pulse_sec', 28 )
+				);
+				self::schedule_chain_safety_pulse( $pulse );
+
+				return true;
+			}
 		}
 
-		self::release_step_lock();
-
-		if ( $post_id > 0 && '' !== $lang ) {
-			Post_Translator::release_translation_lock( $post_id, $lang );
-		}
+		self::force_release_step_lock_if_idle();
 
 		if ( $log_stalled || self::is_elementor_progress_stalled( $job ) ) {
 			self::log(
@@ -2296,8 +2309,10 @@ final class Activity_Logger {
 			);
 		}
 
-		$cap = 1;
-		self::run_action_scheduler_batch( 1, 60 );
+		$job    = self::get_job_raw();
+		$cap    = self::get_elementor_partial_step_cap( $job );
+		$budget = max( 90, min( 300, $cap * 50 ) );
+		self::run_action_scheduler_batch( $cap, $budget );
 
 		$pulse = max(
 			self::CRON_FAST_INTERVAL_SEC,

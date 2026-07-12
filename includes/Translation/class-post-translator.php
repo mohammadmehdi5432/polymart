@@ -3560,10 +3560,22 @@ final class Post_Translator {
 		$total     = max( count( $payload ), $done + count( $remaining ), 1 );
 
 		$state['elementor_map']          = $map;
-		$state['elementor_chunk_index']  = $done;
+		$state['elementor_chunk_index']  = max( $done, absint( $state['elementor_chunk_index'] ?? 0 ) );
 		$state['elementor_chunks_total'] = $total;
 
 		return $state;
+	}
+
+	/**
+	 * Count durable Elementor slice progress for UI markers.
+	 *
+	 * @param array<string, mixed> $state Hydrated partial state.
+	 * @return int
+	 */
+	private static function count_elementor_job_progress_done( array $state ) {
+		$map_done = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+
+		return max( $map_done, absint( $state['elementor_chunk_index'] ?? 0 ) );
 	}
 
 	/**
@@ -3576,7 +3588,7 @@ final class Post_Translator {
 	 */
 	public static function format_elementor_job_progress_marker( $post_id, $lang, array $state = array() ) {
 		$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
-		$done  = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+		$done  = self::count_elementor_job_progress_done( $state );
 		$total = max( $done, absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
 
 		return $done . '/' . $total;
@@ -4542,7 +4554,12 @@ final class Post_Translator {
 		}
 
 		$state['elementor_map']          = $map;
-		$state['elementor_chunk_index']  = count( $map );
+		$state['elementor_chunk_index']  = self::count_elementor_job_progress_done(
+			array_merge(
+				$state,
+				array( 'elementor_map' => $map )
+			)
+		);
 		$skipped_list                    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$remaining                       = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
@@ -4555,9 +4572,10 @@ final class Post_Translator {
 		);
 		$state['elementor_failures']     = $failures;
 		$progress_total                  = max( 1, (int) $state['elementor_chunks_total'] );
+		$done_count                      = self::count_elementor_job_progress_done( $state );
 
 		if ( ! empty( $remaining ) ) {
-			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), $progress_total );
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
 
 			if ( is_wp_error( $persisted ) ) {
 				return $persisted;
@@ -4572,7 +4590,7 @@ final class Post_Translator {
 				'message'        => sprintf(
 					/* translators: 1: completed widgets, 2: total widgets */
 					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
-					count( $map ),
+					$done_count,
 					$progress_total
 				),
 			);
@@ -4582,7 +4600,7 @@ final class Post_Translator {
 			$state['elementor_skipped'] = array();
 			$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 			$progress_total             = max( 1, (int) $state['elementor_chunks_total'] );
-			$done_count                 = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+			$done_count                 = self::count_elementor_job_progress_done( $state );
 
 			if ( $done_count > 0 ) {
 				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $state['elementor_map'], $done_count, $progress_total );
@@ -4607,7 +4625,7 @@ final class Post_Translator {
 			);
 		}
 
-		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), $progress_total, true );
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total, true );
 
 		if ( is_wp_error( $persisted ) ) {
 			return $persisted;
@@ -4789,9 +4807,23 @@ final class Post_Translator {
 		$map            = array();
 
 		foreach ( $source_payload as $path => $source_text ) {
+			$source_text = (string) $source_text;
+			$source_raw  = self::get_elementor_value_at_path( $source_data, $path );
+
+			if ( ! is_string( $source_raw ) || '' === trim( $source_raw ) ) {
+				$source_raw = $source_text;
+			}
+
 			$translated = self::get_elementor_value_at_path( $saved, $path );
 
 			if ( ! is_string( $translated ) || '' === trim( $translated ) ) {
+				continue;
+			}
+
+			$translated = trim( $translated );
+
+			// Still the Persian source — not a completed translation.
+			if ( $translated === trim( (string) $source_raw ) ) {
 				continue;
 			}
 
@@ -5397,7 +5429,15 @@ final class Post_Translator {
 	 * @return array<string|int, mixed>
 	 */
 	private static function apply_elementor_translation_payload( array $node, array $translated_map, $path = 'root' ) {
+		if ( isset( $node['settings'] ) && is_array( $node['settings'] ) ) {
+			$node['settings'] = self::apply_elementor_settings_payload( $node['settings'], $translated_map, $path . '.settings' );
+		}
+
 		foreach ( $node as $key => $item ) {
+			if ( 'settings' === $key ) {
+				continue;
+			}
+
 			$child_path = $path . '.' . (string) $key;
 
 			if ( is_string( $item ) && isset( $translated_map[ $child_path ] ) ) {
@@ -5411,6 +5451,31 @@ final class Post_Translator {
 		}
 
 		return $node;
+	}
+
+	/**
+	 * Apply translated values onto Elementor widget settings nodes.
+	 *
+	 * @param array<string|int, mixed> $settings      Settings node.
+	 * @param array<string, string>    $translated_map Path => translated text.
+	 * @param string                   $path           Current path.
+	 * @return array<string|int, mixed>
+	 */
+	private static function apply_elementor_settings_payload( array $settings, array $translated_map, $path ) {
+		foreach ( $settings as $key => $item ) {
+			$child_path = $path . '.' . (string) $key;
+
+			if ( is_string( $item ) && isset( $translated_map[ $child_path ] ) ) {
+				$settings[ $key ] = $translated_map[ $child_path ];
+				continue;
+			}
+
+			if ( is_array( $item ) ) {
+				$settings[ $key ] = self::apply_elementor_settings_payload( $item, $translated_map, $child_path );
+			}
+		}
+
+		return $settings;
 	}
 
 	/**
