@@ -2399,9 +2399,87 @@ final class Activity_Logger {
 		$tracked = (string) ( $job['partial_progress_marker'] ?? '' );
 
 		if ( $progress !== $tracked ) {
+			self::log_partial_progress_saved( $job, $tracked, $progress );
+
 			$job['partial_progress_marker'] = $progress;
 			$job['partial_progress_at']     = time();
 		}
+	}
+
+	/**
+	 * Write a live activity-log line when durable partial progress advances.
+	 *
+	 * @param array<string, mixed> $job      Job state.
+	 * @param string               $previous Previous progress marker.
+	 * @param string               $current  New progress marker.
+	 * @return void
+	 */
+	private static function log_partial_progress_saved( array $job, $previous, $current ) {
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
+		$phase   = sanitize_key( (string) ( $job['partial_phase'] ?? '' ) );
+		$parsed  = self::parse_job_phase_progress( $current );
+
+		if ( $post_id <= 0 || ! is_array( $parsed ) ) {
+			return;
+		}
+
+		$parsed_prev = self::parse_job_phase_progress( $previous );
+
+		if (
+			is_array( $parsed_prev )
+			&& $parsed['done'] <= $parsed_prev['done']
+			&& $parsed['total'] === $parsed_prev['total']
+		) {
+			return;
+		}
+
+		$title = get_the_title( $post_id );
+
+		if ( '' === $title ) {
+			$title = sprintf( '#%d', $post_id );
+		} else {
+			$title = sprintf( '#%d «%s»', $post_id, $title );
+		}
+
+		if ( 'elementor' === $phase ) {
+			self::log(
+				'success',
+				sprintf(
+					/* translators: 1: post label, 2: completed chunks, 3: total chunks */
+					__( 'Elementor — %1$s: بخش %2$d از %3$d ترجمه و ذخیره شد', 'polymart-ai' ),
+					$title,
+					$parsed['done'],
+					$parsed['total']
+				),
+				array( 'post_id' => $post_id, 'lang' => (string) ( $job['lang'] ?? '' ) )
+			);
+
+			return;
+		}
+
+		$phase_label = $phase;
+
+		if ( 'variations' === $phase ) {
+			$phase_label = __( 'تنوع‌های محصول', 'polymart-ai' );
+		} elseif ( 'commerce' === $phase ) {
+			$phase_label = __( 'ویژگی‌ها و دسته‌ها', 'polymart-ai' );
+		} elseif ( 'core' === $phase ) {
+			$phase_label = __( 'محتوای اصلی', 'polymart-ai' );
+		} elseif ( 'fields' === $phase ) {
+			$phase_label = __( 'فیلدهای متنی', 'polymart-ai' );
+		}
+
+		self::log(
+			'success',
+			sprintf(
+				/* translators: 1: phase label, 2: post label, 3: progress marker */
+				__( '%1$s — %2$s: دسته %3$s ذخیره شد', 'polymart-ai' ),
+				$phase_label,
+				$title,
+				$current
+			),
+			array( 'post_id' => $post_id, 'lang' => (string) ( $job['lang'] ?? '' ) )
+		);
 	}
 
 	/**

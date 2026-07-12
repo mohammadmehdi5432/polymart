@@ -288,6 +288,14 @@ function formatTime(ts) {
   return new Date(ts * 1000).toLocaleString('fa-IR');
 }
 
+function partialProgressKey(job) {
+  if (!job?.partial_post_id || !job?.partial_progress) {
+    return '';
+  }
+
+  return `${job.partial_post_id}:${job.partial_phase || ''}:${job.partial_progress}`;
+}
+
 function formatStepLog(step) {
   if (!step) {
     return null;
@@ -319,6 +327,9 @@ export default function AutoTranslateApp() {
   const [apiTestResult, setApiTestResult] = useState(null);
   const autoResumedRef = useRef(false);
   const lastStepLogRef = useRef('');
+  const lastPartialProgressRef = useRef('');
+  const seenServerLogIdsRef = useRef(new Set());
+  const lastWorkerTickLogAtRef = useRef(0);
   const pollErrorCountRef = useRef(0);
   const lastEnsureErrorAtRef = useRef(0);
   const logsRef = useRef(null);
@@ -342,15 +353,18 @@ export default function AutoTranslateApp() {
     setLogs((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, message, type }]);
   }, []);
 
-  const syncServerLogs = useCallback((recentLogs) => {
+  const syncServerLogs = useCallback((recentLogs, replace = false) => {
     if (!Array.isArray(recentLogs) || recentLogs.length === 0) {
       return;
     }
 
-    // Server sends newest-first; show oldest→newest. Replace panel with this run's server log.
+    if (replace) {
+      seenServerLogIdsRef.current = new Set();
+    }
+
+    // Server sends newest-first; append oldest→newest.
     const chronological = [...recentLogs].reverse();
-    const seenMessages = new Set();
-    const next = [];
+    const incoming = [];
 
     chronological.forEach((entry) => {
       const raw = String(entry.message || '').trim();
@@ -358,15 +372,16 @@ export default function AutoTranslateApp() {
         return;
       }
 
-      // Drop near-duplicate lines (same text within the run).
       const dedupeKey = raw.replace(/\s+/g, ' ');
-      if (seenMessages.has(dedupeKey)) {
+      const id = entry.id || `srv-${entry.time}-${dedupeKey}`;
+
+      if (seenServerLogIdsRef.current.has(id)) {
         return;
       }
-      seenMessages.add(dedupeKey);
 
-      next.push({
-        id: entry.id || `srv-${entry.time}-${dedupeKey}`,
+      seenServerLogIdsRef.current.add(id);
+      incoming.push({
+        id,
         message: entry.time ? `[${formatTime(entry.time)}] ${raw}` : raw,
         type:
           entry.level === 'success'
@@ -379,7 +394,25 @@ export default function AutoTranslateApp() {
       });
     });
 
-    setLogs(next.slice(-200));
+    if (incoming.length === 0) {
+      return;
+    }
+
+    setLogs((prev) => {
+      if (replace) {
+        return incoming.slice(-200);
+      }
+
+      const merged = [...prev];
+
+      incoming.forEach((entry) => {
+        if (!merged.some((item) => item.id === entry.id)) {
+          merged.push(entry);
+        }
+      });
+
+      return merged.slice(-200);
+    });
   }, []);
 
   const appendStepLog = useCallback(
@@ -398,7 +431,7 @@ export default function AutoTranslateApp() {
         return;
       }
 
-      // Prefer server recent_logs for "translated" lines — avoid duplicate client echoes.
+      // Prefer server recent_logs for completed items — partial/errors still echo here.
       if (step.status === 'translated' || step.status === 'skipped') {
         return;
       }
@@ -406,10 +439,10 @@ export default function AutoTranslateApp() {
       const type =
         step.status === 'failed'
           ? 'error'
-          : step.status === 'skipped'
+          : step.status === 'deferred'
             ? 'warning'
           : step.status === 'partial'
-            ? 'warning'
+            ? (step.message?.includes('مسدود') || step.message?.includes('محدود') ? 'warning' : 'info')
             : 'info';
 
       appendLog(message, type);
@@ -431,7 +464,8 @@ export default function AutoTranslateApp() {
       }
 
       if (Array.isArray(data?.recent_logs)) {
-        syncServerLogs(data.recent_logs);
+        syncServerLogs(data.recent_logs, true);
+        lastPartialProgressRef.current = partialProgressKey(merged);
       }
 
       if (data?.lang && data.status !== 'idle') {
@@ -481,6 +515,17 @@ export default function AutoTranslateApp() {
     logsPinnedRef.current = distanceFromBottom > 48;
   }, []);
 
+  const trackLiveJobEvents = useCallback(
+    (data) => {
+      if (!data?.last_step) {
+        return;
+      }
+
+      appendStepLog(data.last_step);
+    },
+    [appendStepLog]
+  );
+
   const applyJobUpdate = useCallback((data) => {
     if (!data) {
       return null;
@@ -498,14 +543,14 @@ export default function AutoTranslateApp() {
       setActivePost(display);
     }
 
+    trackLiveJobEvents(data);
+
     if (Array.isArray(data.recent_logs) && data.recent_logs.length > 0) {
       syncServerLogs(data.recent_logs);
-    } else if (data.last_step) {
-      appendStepLog(data.last_step);
     }
 
     return merged;
-  }, [appendStepLog, syncServerLogs]);
+  }, [syncServerLogs, trackLiveJobEvents]);
 
   /**
    * Lightweight: unlock/schedule/ping only. Never run AI inline from the poll loop
@@ -624,6 +669,27 @@ export default function AutoTranslateApp() {
               appendLog('کارگر پس‌زمینه بیدار شد — ادامه صف…', 'info');
             }
             ensureInFlight = false;
+
+            const tickJob = recovered || data;
+            const nowMs = Date.now();
+
+            if (
+              tickJob?.status === 'running' &&
+              nowMs - lastWorkerTickLogAtRef.current >= 15000
+            ) {
+              lastWorkerTickLogAtRef.current = nowMs;
+
+              if (isElementorPartialJob(tickJob)) {
+                appendLog(
+                  `تیک کارگر — Elementor ${tickJob.partial_progress || '…'} (#${tickJob.partial_post_id})`,
+                  'info'
+                );
+              } else if (tickJob?.worker_direct_tick) {
+                appendLog('تیک کارگر — اجرای مستقیم Elementor', 'info');
+              } else if (tickJob?.worker_inline_tick) {
+                appendLog('تیک کارگر — ادامه صف ترجمه', 'info');
+              }
+            }
           }
         }
       } catch (error) {
@@ -675,6 +741,9 @@ export default function AutoTranslateApp() {
     setLogs([]);
     setActivePost(null);
     lastStepLogRef.current = '';
+    lastPartialProgressRef.current = '';
+    seenServerLogIdsRef.current = new Set();
+    lastWorkerTickLogAtRef.current = 0;
     autoResumedRef.current = true;
     writeAutoRunFlag(true);
     setActionPending('start');

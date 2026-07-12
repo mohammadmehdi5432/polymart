@@ -4471,6 +4471,24 @@ final class Post_Translator {
 
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 
+			$attempt_index = count( $map ) + 1;
+			$title         = get_the_title( $post_id );
+			$post_label    = '' !== $title
+				? sprintf( '#%d «%s»', $post_id, $title )
+				: sprintf( '#%d', $post_id );
+
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: 1: post label, 2: chunk index, 3: total chunks */
+					__( 'Elementor — %1$s: ارسال بخش %2$d از %3$d به API آروان…', 'polymart-ai' ),
+					$post_label,
+					$attempt_index,
+					$progress_total
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
 			\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
 
 			$chunk_result = AI_Client::translate_fields(
