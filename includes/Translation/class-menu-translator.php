@@ -295,6 +295,12 @@ final class Menu_Translator {
 			return $title;
 		}
 
+		$attr_title = trim( (string) get_post_meta( $item_id, '_menu_item_attr_title', true ) );
+
+		if ( '' !== $attr_title && Persian_Detector::contains_persian( $attr_title ) ) {
+			return $attr_title;
+		}
+
 		$type      = (string) get_post_meta( $item_id, '_menu_item_type', true );
 		$object    = (string) get_post_meta( $item_id, '_menu_item_object', true );
 		$object_id = absint( get_post_meta( $item_id, '_menu_item_object_id', true ) );

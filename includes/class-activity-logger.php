@@ -62,6 +62,8 @@ final class Activity_Logger {
 	 * current_post_id, treat the lock as orphaned (between-item deadlock).
 	 */
 	const LOCK_IDLE_ORPHAN_SEC = 30;
+	/** Max seconds allowed in catalog pick/scan before force-unlock. */
+	const PICK_STALL_SEC         = 75;
 	/** Legacy admin-ajax action — now only nudges Action Scheduler. */
 	const LOOPBACK_ACTION      = 'polymart_ai_job_loopback';
 	const LOOPBACK_TOKEN_OPTION = 'polymart_ai_job_loopback_token';
@@ -649,6 +651,24 @@ final class Activity_Logger {
 
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::ensure_scheduled();
+
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$last = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 )
+		);
+		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+		if ( $age >= self::PICK_STALL_SEC || self::is_step_lock_held_fresh() ) {
+			$job = self::get_job_raw();
+			if ( self::recover_stalled_job_picker( $job, $lang, false ) ) {
+				self::save_job( $job );
+			}
+		}
+
+		if ( $age >= self::get_ensure_inline_idle_sec() || ! Job_Action_Scheduler::has_pending_or_running() ) {
+			self::keep_alive_as_worker();
+		}
 	}
 
 	/**
@@ -1513,7 +1533,11 @@ final class Activity_Logger {
 		$worker_dead = $idle_for >= self::STEP_LOCK_TTL;
 
 		// Between items: lock held, no active post, and no completed tick recently.
-		// Do not steal the lock while a worker is still picking/scanning the catalog.
+		$pick_started = absint( $job['pick_started_at'] ?? 0 );
+		$pick_stuck     = ( 0 === $current )
+			&& $pick_started > 0
+			&& ( time() - $pick_started ) >= self::PICK_STALL_SEC;
+
 		$idle_orphan = ( 0 === $current )
 			&& $idle_for >= self::LOCK_IDLE_ORPHAN_SEC
 			&& $lock_age >= self::LOCK_IDLE_ORPHAN_SEC
@@ -1522,7 +1546,12 @@ final class Activity_Logger {
 		// Living worker stopped touching the lock for the full TTL.
 		$ttl_expired = $lock_age >= self::STEP_LOCK_TTL;
 
-		if ( ! $worker_dead && ! $idle_orphan && ! $ttl_expired ) {
+		if ( $pick_stuck ) {
+			$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+			self::recover_stalled_job_picker( $job, $lang, false );
+		}
+
+		if ( ! $worker_dead && ! $idle_orphan && ! $ttl_expired && ! $pick_stuck ) {
 			return false;
 		}
 
@@ -2608,19 +2637,13 @@ final class Activity_Logger {
 			$job['pause_reason']    = null;
 			$job['current_post_id'] = null;
 			$job['step_started_at'] = null;
+			$job['pick_started_at'] = null;
 
-			if ( empty( $job['deferred_queue'] ) && '' !== $lang ) {
-				$needs      = (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 );
-				$seed_limit = min( 30, max( 5, $needs > 0 ? $needs : 10 ) );
-				$job['deferred_queue'] = Translation_Query::seed_actionable_post_ids(
-					$lang,
-					$seed_limit,
-					self::get_exhausted_job_post_ids( $job )
-				);
-			}
+			self::release_step_lock();
+			self::recover_stalled_job_picker( $job, $lang, true );
 
-		self::save_job( $job );
-		self::bootstrap_background_worker( true );
+			self::save_job( $job );
+			self::bootstrap_background_worker( true );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -3082,6 +3105,20 @@ final class Activity_Logger {
 		$released_stale_lock = self::force_release_step_lock_if_idle();
 		$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
 
+		$job  = self::get_job_raw();
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$last = max(
+			absint( $job['last_cron_at'] ?? 0 ),
+			absint( $job['worker_heartbeat_at'] ?? 0 )
+		);
+		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+		if ( $released_stale_lock || $age >= self::PICK_STALL_SEC ) {
+			if ( self::recover_stalled_job_picker( $job, $lang, $released_stale_lock ) ) {
+				self::save_job( $job );
+			}
+		}
+
 		self::ensure_recurring_pulse();
 
 		$job  = self::get_job_raw();
@@ -3488,13 +3525,15 @@ final class Activity_Logger {
 			$post_id    = $partial_id;
 			$from_retry = true;
 		} else {
+			$job['pick_started_at'] = time();
+			self::save_job( $job );
+
 			$pick = self::pick_next_job_post_id( $job, $lang, $cursor );
 
 			if ( ! $pick['post_id'] ) {
 				// Cursor may have walked past posts that only look done in-memory.
 				// Reset and pull a fresh actionable set while site work remains.
 				self::touch_worker_heartbeat();
-				// Avoid flushing the full catalog cache while picking — that scan can exceed 30s.
 				self::sync_job_live_stats( $job, $lang, false );
 				self::touch_worker_heartbeat();
 				self::reconcile_succeeded_posts( $job, $lang );
@@ -3503,7 +3542,12 @@ final class Activity_Logger {
 
 				if ( $needs_work > 0 ) {
 					self::touch_worker_heartbeat();
-					$actionable = self::get_actionable_remaining_ids( $lang, $job, min( 50, max( 1, $needs_work ) ) );
+					$seed_limit = min( 25, max( 5, $needs_work + 3 ) );
+					$actionable = Translation_Query::seed_actionable_post_ids(
+						$lang,
+						$seed_limit,
+						self::get_exhausted_job_post_ids( $job )
+					);
 					self::touch_worker_heartbeat();
 
 					if ( ! empty( $actionable ) ) {
@@ -3523,6 +3567,7 @@ final class Activity_Logger {
 			}
 
 			if ( ! $pick['post_id'] ) {
+				self::recover_stalled_job_picker( $job, $lang, false );
 				self::reconcile_stuck_job_queues( $job, $lang );
 				$pick = self::pick_next_job_post_id( $job, $lang, $cursor );
 
@@ -3531,6 +3576,8 @@ final class Activity_Logger {
 					$pick                = self::pick_next_job_post_id( $job, $lang, 0 );
 				}
 			}
+
+			unset( $job['pick_started_at'] );
 
 			if ( ! $pick['post_id'] ) {
 				if ( Menu_Translator::count_untranslated( $lang ) > 0 ) {
@@ -3567,6 +3614,7 @@ final class Activity_Logger {
 			$post_id    = $pick['post_id'];
 			$from_retry = $pick['from_retry'];
 			$job['partial_post_id'] = $post_id;
+			unset( $job['pick_started_at'] );
 
 			if ( absint( $job['consecutive_post_id'] ?? 0 ) !== $post_id ) {
 				$job['consecutive_post_id']    = 0;
@@ -3886,6 +3934,107 @@ final class Activity_Logger {
 			'post_id'    => 0,
 			'from_retry' => false,
 		);
+	}
+
+	/**
+	 * Unstick picker deadlocks: release lock, re-seed queue, switch to menu phase when needed.
+	 *
+	 * @param array<string, mixed> $job  Job state (by reference).
+	 * @param string               $lang Target language code.
+	 * @param bool                 $log  Whether to write an activity log line.
+	 * @return bool True when job state was changed.
+	 */
+	private static function recover_stalled_job_picker( array &$job, $lang, $log = false ) {
+		$lang = sanitize_key( (string) $lang );
+
+		if ( '' === $lang ) {
+			return false;
+		}
+
+		$changed = false;
+
+		if ( get_transient( self::STEP_LOCK_KEY ) || get_option( self::STEP_LOCK_CLAIM_KEY ) ) {
+			self::release_step_lock();
+			$changed = true;
+		}
+
+		if ( absint( $job['current_post_id'] ?? 0 ) > 0 || ! empty( $job['step_started_at'] ) || ! empty( $job['pick_started_at'] ) ) {
+			$job['current_post_id'] = null;
+			$job['step_started_at']  = null;
+			$job['pick_started_at']  = null;
+			$changed                 = true;
+		}
+
+		$parked = self::get_parked_ids( $job );
+		$unpark = array();
+
+		foreach ( $parked as $post_id ) {
+			$post_id = absint( $post_id );
+
+			if ( $post_id <= 0 ) {
+				continue;
+			}
+
+			if ( 'translated' !== Post_Translator::get_translation_status( $post_id, $lang ) ) {
+				$unpark[] = $post_id;
+			}
+		}
+
+		if ( ! empty( $unpark ) ) {
+			$job['parked_ids'] = array_values( array_diff( $parked, $unpark ) );
+			$job['deferred_queue'] = array_values(
+				array_unique(
+					array_merge( self::get_deferred_queue( $job ), $unpark )
+				)
+			);
+			$changed = true;
+		}
+
+		$needs      = max( 1, (int) ( $job['needs_work'] ?? $job['remaining'] ?? 5 ) );
+		$seed_limit = min( 25, max( 5, $needs + 3 ) );
+		$seed_ids   = Translation_Query::seed_actionable_post_ids(
+			$lang,
+			$seed_limit,
+			self::get_exhausted_job_post_ids( $job )
+		);
+
+		if ( ! empty( $seed_ids ) ) {
+			$job['deferred_queue'] = array_values(
+				array_unique(
+					array_merge( self::get_deferred_queue( $job ), array_map( 'absint', $seed_ids ) )
+				)
+			);
+			$job['last_post_id'] = 0;
+			$changed             = true;
+		}
+
+		$menu_left = Menu_Translator::count_untranslated( $lang );
+
+		if ( $menu_left > 0 && empty( self::get_actionable_deferred_queue( $job, $lang ) ) ) {
+			$job['phase']        = 'menus';
+			$job['last_menu_id'] = 0;
+			$changed             = true;
+		} elseif ( 'menus' !== ( $job['phase'] ?? '' ) || empty( self::get_deferred_queue( $job ) ) ) {
+			if ( $menu_left <= 0 ) {
+				$job['phase'] = 'posts';
+			}
+		}
+
+		if ( in_array( (string) ( $job['pause_reason'] ?? '' ), array( 'pick_stalled', 'stalled' ), true ) ) {
+			$job['status']       = 'running';
+			$job['pause_reason'] = null;
+			$job['last_error']   = null;
+			$changed             = true;
+		}
+
+		if ( $log && $changed ) {
+			self::log(
+				'warning',
+				__( 'صف گیرکرده بازیابی شد — انتخاب مورد بعدی و منوها دوباره ادامه می‌یابد.', 'polymart-ai' )
+			);
+		}
+
+		return $changed;
 	}
 
 	/**
@@ -4390,6 +4539,18 @@ final class Activity_Logger {
 		}
 
 		if ( (int) ( $job['remaining'] ?? 0 ) > 0 ) {
+			$menu_left = Menu_Translator::count_untranslated( $lang );
+
+			if ( $menu_left > 0 ) {
+				$job['status']       = 'running';
+				$job['phase']        = 'menus';
+				$job['pause_reason'] = null;
+				$job['last_menu_id'] = 0;
+				$job['last_error']   = null;
+
+				return;
+			}
+
 			$stalled_ids         = Translation_Query::collect_remaining_post_ids( $lang, 10 );
 			$job['status']       = 'paused';
 			$job['pause_reason'] = 'stalled';
