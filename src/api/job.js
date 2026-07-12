@@ -70,8 +70,12 @@ export async function jobAction(action, lang = 'en', extra = {}) {
   if (action !== 'ensure') {
     abortJobStep();
   }
-  const heavyActions = new Set(['start', 'resume', 'kick', 'ensure']);
-  const timeout = heavyActions.has(action) ? JOB_BOOTSTRAP_TIMEOUT_MS : JOB_FETCH_TIMEOUT_MS;
+  const heavyActions = new Set(['resume', 'kick', 'ensure']);
+  const timeout = heavyActions.has(action)
+    ? JOB_BOOTSTRAP_TIMEOUT_MS
+    : action === 'start' || action === 'stop'
+      ? 60000
+      : JOB_FETCH_TIMEOUT_MS;
   const { data } = await withRetries(() =>
     api.post('/translation-job', { action, lang, ...extra }, { timeout })
   );

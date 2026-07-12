@@ -3498,6 +3498,10 @@ final class Post_Translator {
 			return false;
 		}
 
+		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
+			return false;
+		}
+
 		if (
 			! self::post_needs_elementor_job_work( $post_id, $lang )
 			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
@@ -3883,6 +3887,10 @@ final class Post_Translator {
 			return false;
 		}
 
+		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
+			return false;
+		}
+
 		if ( empty( $state ) ) {
 			$state = self::hydrate_elementor_job_partial_state(
 				$post_id,
@@ -3895,6 +3903,103 @@ final class Post_Translator {
 		$done     = self::resolve_elementor_done_count( $state, $progress['done'], $post_id, $lang );
 
 		return $done < max( 1, (int) $progress['total'] );
+	}
+
+	/**
+	 * Whether every scheduled Elementor API batch for this post has been processed.
+	 *
+	 * @param int    $post_id      Post ID.
+	 * @param string $lang         Language code.
+	 * @param int    $done_count   Optional completed batch count.
+	 * @param int    $total_chunks Optional total batch count.
+	 * @return bool
+	 */
+	public static function elementor_job_api_schedule_complete( $post_id, $lang, $done_count = null, $total_chunks = null ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$stored = get_post_meta( $post_id, self::get_elementor_slice_cursor_meta_key( $lang ), true );
+		$cursor = is_array( $stored ) ? absint( $stored['cursor'] ?? 0 ) : absint( $stored );
+		$total  = is_array( $stored ) ? absint( $stored['total'] ?? 0 ) : 0;
+
+		if ( null !== $done_count ) {
+			$cursor = max( $cursor, absint( $done_count ) );
+		}
+
+		if ( null !== $total_chunks ) {
+			$total = max( $total, absint( $total_chunks ) );
+		}
+
+		return $total > 0 && $cursor >= $total;
+	}
+
+	/**
+	 * Finalize Elementor job slice after all API batches (best-effort when minor fields remain).
+	 *
+	 * @param int                   $post_id      Post ID.
+	 * @param string                $lang         Language code.
+	 * @param array<string, mixed>  $source_data  Source Elementor tree.
+	 * @param array<string, string> $map          Translated path map.
+	 * @param array<string, mixed>  $state        Partial state (by reference).
+	 * @param int                   $done_count   Completed batches.
+	 * @param int                   $total_chunks Total batches.
+	 * @param array<string, string> $remaining    Optional remaining source payload.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
+	 */
+	private static function finalize_elementor_job_slice( $post_id, $lang, array $source_data, array $map, array &$state, $done_count, $total_chunks, array $remaining = array() ) {
+		$post_id      = absint( $post_id );
+		$lang         = sanitize_key( (string) $lang );
+		$done_count   = max( 0, absint( $done_count ) );
+		$total_chunks = max( 1, absint( $total_chunks ) );
+
+		if ( ! empty( $remaining ) ) {
+			$preview = array_slice( array_keys( $remaining ), 0, 3 );
+
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: remaining field count, 3: sample paths */
+					__( 'Elementor — #%1$d: %2$d فیلد هنوز در JSON فارسی است (%3$s) — نهایی‌سازی و ادامه صف.', 'polymart-ai' ),
+					$post_id,
+					count( $remaining ),
+					implode( ', ', array_map( 'strval', $preview ) )
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+		} else {
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: 1: post ID, 2: completed batches, 3: total batches */
+					__( 'Elementor — #%1$d: همه %2$d از %3$d بخش ذخیره شد — نهایی‌سازی.', 'polymart-ai' ),
+					$post_id,
+					$done_count,
+					$total_chunks
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+		}
+
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $total_chunks, true );
+
+		if ( is_wp_error( $persisted ) ) {
+			return $persisted;
+		}
+
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang );
+		self::flush_translation_status_cache( $post_id );
+
+		return array(
+			'done'           => true,
+			'phase'          => 'elementor',
+			'phase_progress' => '',
+			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+		);
 	}
 
 	/**
@@ -4395,6 +4500,10 @@ final class Post_Translator {
 			return false;
 		}
 
+		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
+			return false;
+		}
+
 		if ( ! self::should_require_elementor_translation( $post_id ) ) {
 			return false;
 		}
@@ -4440,6 +4549,10 @@ final class Post_Translator {
 		$lang    = sanitize_key( (string) $lang );
 
 		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			return false;
 		}
 
@@ -4798,56 +4911,18 @@ final class Post_Translator {
 					return $elementor_slice;
 				}
 
-				if (
-					self::post_needs_elementor_job_work( $post_id, $lang )
-					|| self::elementor_job_has_remaining_payload( $post_id, $lang )
-				) {
-					$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, self::get_job_partial_state( $post_id, $lang ) );
-					$state['phase'] = 'elementor';
-					self::save_job_partial_state( $post_id, $lang, $state );
-
-					$retry_slice = self::process_elementor_job_slice(
-						$post_id,
-						$lang,
-						$state,
-						$api_key,
-						$api_endpoint,
-						$ai_model
-					);
-
-					if ( is_wp_error( $retry_slice ) ) {
-						return $retry_slice;
-					}
-
-					if ( empty( $retry_slice['done'] ) ) {
-						return $retry_slice;
-					}
-
-					if (
-						self::post_needs_elementor_job_work( $post_id, $lang )
-						|| self::elementor_job_has_remaining_payload( $post_id, $lang )
-					) {
-						$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, self::get_job_partial_state( $post_id, $lang ) );
-						self::save_job_partial_state( $post_id, $lang, $state );
-
-						return array(
-							'done'           => false,
-							'phase'          => 'elementor',
-							'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-							'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
-						);
-					}
-				}
-
+				self::clear_elementor_slice_cursor( $post_id, $lang );
+				delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+				delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 				self::clear_job_partial_state( $post_id, $lang );
 
-			return array(
-				'done'           => true,
-				'phase'          => 'complete',
-				'phase_progress' => '',
-				'message'        => __( 'ترجمه Elementor این مورد تکمیل شد.', 'polymart-ai' ),
-			);
-		}
+				return array(
+					'done'           => true,
+					'phase'          => 'complete',
+					'phase_progress' => '',
+					'message'        => __( 'ترجمه Elementor این مورد تکمیل شد.', 'polymart-ai' ),
+				);
+			}
 
 		self::clear_job_partial_state( $post_id, $lang );
 
@@ -4996,6 +5071,11 @@ final class Post_Translator {
 				$skipped_list
 			);
 			$truly_complete  = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
+			$api_schedule_complete = self::elementor_job_api_schedule_complete( $post_id, $lang, $done_count, $progress_total );
+
+			if ( ! $truly_complete && $api_schedule_complete ) {
+				return self::finalize_elementor_job_slice( $post_id, $lang, $data, $map, $state, $done_count, $progress_total, $remaining );
+			}
 
 			if ( ! $truly_complete ) {
 				if ( ! empty( $remaining ) && $done_count >= $progress_total ) {
@@ -5309,7 +5389,12 @@ final class Post_Translator {
 		$state['elementor_chunk_index']    = $done_count;
 		$state['elementor_slices_completed'] = $done_count;
 		self::write_elementor_slice_cursor( $post_id, $lang, $done_count, $progress_total );
-		$truly_complete                    = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
+		$truly_complete          = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
+		$api_schedule_complete   = self::elementor_job_api_schedule_complete( $post_id, $lang, $done_count, $progress_total );
+
+		if ( ! $truly_complete && $api_schedule_complete ) {
+			return self::finalize_elementor_job_slice( $post_id, $lang, $data, $map, $state, $done_count, $progress_total, $remaining );
+		}
 
 		if ( ! $truly_complete ) {
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );

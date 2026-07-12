@@ -756,25 +756,14 @@ export default function AutoTranslateApp() {
     lastPartialProgressRef.current = '';
     seenServerLogIdsRef.current = new Set();
     lastWorkerTickLogAtRef.current = 0;
-    autoResumedRef.current = true;
-    writeAutoRunFlag(true);
     setActionPending('start');
-    setJob((prev) => ({
-      ...(prev ?? {}),
-      status: 'running',
-      lang: targetLang,
-      lang_label: targetLabel,
-      last_error: null,
-      pause_reason: null,
-      current_post: null,
-      current_post_id: null,
-      step_started_at: null,
-    }));
     appendLog(`در حال آماده‌سازی صف ترجمه برای ${targetLabel}…`);
 
     try {
       const data = await jobAction('start', targetLang);
       setJob(data);
+      autoResumedRef.current = true;
+      writeAutoRunFlag(true);
       setActionPending(null);
       appendLog(
         `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود.`,
@@ -783,11 +772,31 @@ export default function AutoTranslateApp() {
       await ensureServerWorker();
     } catch (error) {
       const code = error?.response?.data?.code;
-      const message =
+      const isTimeout =
+        error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
+      let message =
         error?.response?.data?.message ||
         (error?.message === 'Network Error'
           ? 'درخواست شروع قطع شد — صفحه را رفرش کنید؛ اگر وضعیت «در حال اجرا» است کارگر روی سرور شروع شده.'
           : 'شروع ترجمه خودکار ناموفق بود.');
+
+      if (isTimeout) {
+        const recovered = await loadJob();
+
+        if (recovered?.status === 'running') {
+          autoResumedRef.current = true;
+          writeAutoRunFlag(true);
+          appendLog(
+            `ترجمه روی سرور شروع شد — ${recovered.total ?? 0} مورد در صف (${targetLabel}).`,
+            'success'
+          );
+          await ensureServerWorker();
+          return;
+        }
+
+        message =
+          'درخواست شروع طولانی شد — اگر وضعیت «در حال اجرا» نیست دوباره تلاش کنید.';
+      }
 
       if (code === 'polymart_ai_job_running') {
         const existing = await loadJob();

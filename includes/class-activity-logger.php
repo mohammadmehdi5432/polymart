@@ -3436,12 +3436,21 @@ final class Activity_Logger {
 		}
 
 		// Drop leftover locks from a previous paused/completed run (keep post partial meta).
+		self::unschedule_background_worker();
+		self::release_step_lock();
+
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::cancel_all();
+			Job_Action_Scheduler::clear_slice_mutex();
+		}
+
 		self::release_all_job_translation_locks( $existing );
 
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
-		Post_Translator::reconcile_stale_translation_indexes( $lang, 250 );
+		// Heavy index reconcile runs on worker ticks — start must return quickly to the browser.
+		Post_Translator::reconcile_stale_translation_indexes( $lang, 25 );
 
 		$issues     = Translation_Query::collect_storefront_translation_issues( $lang, 15 );
 		$issue_ids  = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
@@ -3640,11 +3649,13 @@ final class Activity_Logger {
 		);
 
 		self::save_job( $job );
+
+		foreach ( $seed_ids as $seed_post_id ) {
+			Post_Translator::release_translation_lock( absint( $seed_post_id ), $lang, true );
+		}
+
 		Job_Action_Scheduler::cancel_all();
 		self::bootstrap_background_worker( false );
-		// Local/cPanel hosts often never run AS HTTP — kick one bounded slice inline now.
-		$tick_limits = self::get_inline_worker_tick_limits( $job );
-		self::run_inline_worker_tick( $tick_limits['steps'], $tick_limits['budget'] );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -3731,8 +3742,6 @@ final class Activity_Logger {
 
 			self::save_job( $job );
 			self::bootstrap_background_worker( false );
-			$tick_limits = self::get_inline_worker_tick_limits( $job );
-			self::run_inline_worker_tick( $tick_limits['steps'], $tick_limits['budget'] );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -3757,8 +3766,15 @@ final class Activity_Logger {
 			Job_Action_Scheduler::clear_slice_mutex();
 		}
 
-		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
+		$lang = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+
+		if ( '' !== $lang ) {
 			self::release_all_job_translation_locks( $job );
+		} else {
+			self::release_step_lock();
+		}
+
+		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
 		}
 
