@@ -3307,22 +3307,11 @@ final class Post_Translator {
 			self::post_needs_elementor_job_work( $post_id, $lang )
 			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
 		) {
-			$state = array_merge( $base, array( 'phase' => 'elementor' ) );
-			$raw   = get_post_meta( $post_id, '_elementor_data', true );
-
-			if ( is_string( $raw ) && '' !== $raw ) {
-				$source_data = json_decode( $raw, true );
-
-				if ( is_array( $source_data ) ) {
-					$restored_map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
-
-					if ( ! empty( $restored_map ) ) {
-						$state['elementor_map'] = $restored_map;
-					}
-				}
-			}
-
-			return $state;
+			return self::hydrate_elementor_job_partial_state(
+				$post_id,
+				$lang,
+				array_merge( $base, array( 'phase' => 'elementor' ) )
+			);
 		}
 
 		return array_merge( $base, array( 'phase' => 'complete' ) );
@@ -3461,6 +3450,129 @@ final class Post_Translator {
 	 */
 	public static function clear_job_partial_state( $post_id, $lang ) {
 		delete_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ) );
+	}
+
+	/**
+	 * Whether the auto-translate job should run Elementor slices now (field phases first).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function should_run_elementor_job_slice( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if (
+			! self::post_needs_elementor_job_work( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return false;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+		$phase = sanitize_key( (string) ( $state['phase'] ?? '' ) );
+
+		if ( 'elementor' === $phase ) {
+			return true;
+		}
+
+		if ( in_array( $phase, array( 'core', 'commerce', 'variations', 'fields' ), true ) ) {
+			return false;
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post ) {
+			return false;
+		}
+
+		foreach ( self::get_job_field_phases() as $field_phase ) {
+			if ( ! empty( self::collect_persian_fields_for_job_phase( $post, $lang, $field_phase ) ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Restore Elementor partial counters/map from saved JSON without wiping progress.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Existing partial state.
+	 * @return array<string, mixed>
+	 */
+	public static function hydrate_elementor_job_partial_state( $post_id, $lang, array $state = array() ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		$defaults = array(
+			'phase'                  => 'elementor',
+			'elementor_map'          => array(),
+			'elementor_chunk_index'  => 0,
+			'elementor_chunks_total' => 0,
+			'elementor_failures'     => array(),
+			'elementor_skipped'      => array(),
+		);
+
+		$state = array_merge( $defaults, $state );
+		$state['phase'] = 'elementor';
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return $state;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return $state;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return $state;
+		}
+
+		$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+
+		if ( empty( $map ) ) {
+			$map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
+		}
+
+		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$payload = self::collect_elementor_translation_payload( $data );
+		$remaining = self::filter_remaining_elementor_payload( $payload, $map, $skipped );
+		$done      = count( $map );
+		$total     = max( count( $payload ), $done + count( $remaining ), 1 );
+
+		$state['elementor_map']          = $map;
+		$state['elementor_chunk_index']  = $done;
+		$state['elementor_chunks_total'] = $total;
+
+		return $state;
+	}
+
+	/**
+	 * Human-readable Elementor job progress marker (e.g. 3/8).
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Partial state.
+	 * @return string
+	 */
+	public static function format_elementor_job_progress_marker( $post_id, $lang, array $state = array() ) {
+		$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		$done  = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+		$total = max( $done, absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+
+		return $done . '/' . $total;
 	}
 
 	/**
@@ -3703,16 +3815,13 @@ final class Post_Translator {
 			self::post_needs_elementor_job_work( $post_id, $lang )
 			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
 		) {
-			$state['phase']                  = 'elementor';
-			$state['elementor_map']          = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
-			$state['elementor_chunk_index']  = 0;
-			$state['elementor_chunks_total'] = 0;
+			$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 			self::save_job_partial_state( $post_id, $lang, $state );
 
 			return array(
 				'done'           => false,
 				'phase'          => 'elementor',
-				'phase_progress' => '0/…',
+				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
 				'message'        => __( 'فیلدها ذخیره شد — ترجمه Elementor در مراحل بعدی', 'polymart-ai' ),
 			);
 		}
@@ -4107,6 +4216,9 @@ final class Post_Translator {
 			}
 
 			if ( 'elementor' === (string) $state['phase'] ) {
+				$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+				self::save_job_partial_state( $post_id, $lang, $state );
+
 				$elementor_slice = self::process_elementor_job_slice(
 					$post_id,
 					$lang,
@@ -4192,6 +4304,7 @@ final class Post_Translator {
 	private static function process_elementor_job_slice( $post_id, $lang, array &$state, $api_key, $api_endpoint, $ai_model ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
+		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		$raw     = get_post_meta( $post_id, '_elementor_data', true );
 
 		if ( ! is_string( $raw ) || '' === $raw ) {
@@ -4212,10 +4325,6 @@ final class Post_Translator {
 
 		$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 
-		if ( empty( $map ) ) {
-			$map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
-		}
-
 		$payload = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
 			$map,
@@ -4234,19 +4343,15 @@ final class Post_Translator {
 			);
 		}
 
-		$source_total = count( self::collect_elementor_translation_payload( $data ) );
-		$chunks       = self::chunk_elementor_payload_for_job( $payload );
-		$budget       = self::get_job_step_max_elementor_chunks();
-		$ai_options   = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
-		$processed    = 0;
-		$failures     = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
-		$skipped_list = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-		$effective_total = max(
-			1,
-			$source_total,
-			count( $map ) + count( $payload )
-		);
-		$state['elementor_chunks_total'] = $effective_total;
+		$source_total    = max( 1, absint( $state['elementor_chunks_total'] ?? 0 ) );
+		$chunks          = self::chunk_elementor_payload_for_job( $payload );
+		$budget          = self::get_job_step_max_elementor_chunks();
+		$ai_options      = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
+		$processed       = 0;
+		$failures        = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+		$skipped_list    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$progress_total  = max( $source_total, count( $map ) + count( $payload ) );
+		$state['elementor_chunks_total'] = $progress_total;
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
 			$chunk = array_shift( $chunks );
@@ -4281,7 +4386,7 @@ final class Post_Translator {
 					$data,
 					$state,
 					$map,
-					$source_total,
+					$progress_total,
 					$chunk_result,
 					array_keys( $chunk )
 				);
@@ -4337,8 +4442,7 @@ final class Post_Translator {
 			$skipped_list
 		);
 		$state['elementor_chunks_total'] = max(
-			1,
-			$source_total,
+			$progress_total,
 			count( $map ) + count( $remaining )
 		);
 		$state['elementor_failures']     = $failures;
@@ -4356,7 +4460,7 @@ final class Post_Translator {
 			return array(
 				'done'           => false,
 				'phase'          => 'elementor',
-				'phase_progress' => count( $map ) . '/' . $progress_total,
+				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
 				'message'        => sprintf(
 					/* translators: 1: completed widgets, 2: total widgets */
 					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
@@ -4375,7 +4479,7 @@ final class Post_Translator {
 		return array(
 			'done'           => true,
 			'phase'          => 'elementor',
-			'phase_progress' => count( $map ) . '/' . $progress_total,
+			'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
 			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
 		);
 	}
@@ -4397,11 +4501,11 @@ final class Post_Translator {
 		\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $error );
 		$short_error = \PolymartAI\Activity_Logger::truncate_api_error_message( $error->get_error_message() );
 
-		$state['elementor_map']          = $map;
-		$state['elementor_chunk_index']  = count( $map );
-		$state['elementor_chunks_total'] = max( 1, $source_total );
-		$progress                        = count( $map ) . '/' . max( 1, $source_total );
-		$failures                        = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+		$state['elementor_map'] = $map;
+		$state                  = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		$progress               = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
+		$progress_total         = max( 1, absint( $state['elementor_chunks_total'] ?? $source_total ) );
+		$failures               = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 
 		foreach ( $failed_keys as $failed_key ) {
 			$failed_key = (string) $failed_key;
@@ -4416,7 +4520,7 @@ final class Post_Translator {
 		$state['elementor_failures'] = $failures;
 
 		if ( ! empty( $map ) ) {
-			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, count( $map ), max( 1, $source_total ) );
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, count( $map ), $progress_total );
 
 			if ( ! is_wp_error( $persisted ) ) {
 				self::save_job_partial_state( $post_id, $lang, $state );

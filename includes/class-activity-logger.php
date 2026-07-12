@@ -1928,7 +1928,7 @@ final class Activity_Logger {
 				$phase_label = 'Elementor';
 			}
 
-			$progress = self::format_job_partial_progress( $partial );
+			$progress = self::format_job_partial_progress( $partial, $post_id, $lang );
 
 			if ( '' !== $progress ) {
 				$message = trim( $message . ' [' . $phase_label . ' ' . $progress . ']' );
@@ -1974,10 +1974,17 @@ final class Activity_Logger {
 	 * @param array<string, mixed> $state Partial state.
 	 * @return string
 	 */
-	private static function format_job_partial_progress( array $state ) {
+	private static function format_job_partial_progress( array $state, $post_id = 0, $lang = '' ) {
 		$phase = sanitize_key( (string) ( $state['phase'] ?? '' ) );
 
 		if ( 'elementor' === $phase ) {
+			$post_id = absint( $post_id );
+			$lang    = sanitize_key( (string) $lang );
+
+			if ( $post_id > 0 && '' !== $lang ) {
+				return Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state );
+			}
+
 			$done  = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
 			$total = max( $done, absint( $state['elementor_chunks_total'] ?? 0 ) );
 
@@ -2069,25 +2076,7 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function post_has_elementor_job_state( $post_id, $lang ) {
-		$post_id = absint( $post_id );
-		$lang    = sanitize_key( (string) $lang );
-
-		if ( $post_id <= 0 || '' === $lang ) {
-			return false;
-		}
-
-		if ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
-			return true;
-		}
-
-		$state = Post_Translator::get_job_partial_state( $post_id, $lang );
-
-		if ( 'elementor' !== sanitize_key( (string) ( $state['phase'] ?? '' ) ) ) {
-			return false;
-		}
-
-		return Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
-			|| Post_Translator::job_partial_state_has_progress( $post_id, $lang, $state );
+		return Post_Translator::should_run_elementor_job_slice( $post_id, $lang );
 	}
 
 	/**
@@ -2144,28 +2133,17 @@ final class Activity_Logger {
 			return;
 		}
 
-		$state = Post_Translator::get_job_partial_state( $post_id, $lang );
-		$phase = (string) ( $state['phase'] ?? '' );
-
-		if ( '' === $phase || 'complete' === $phase || 'elementor' !== $phase ) {
-			$state = Post_Translator::build_initial_job_partial_state(
-				$post_id,
-				$lang,
-				get_post( $post_id )
-			);
-
-			if ( Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
-				$state['phase'] = 'elementor';
-				Post_Translator::save_job_partial_state( $post_id, $lang, $state );
-			} elseif ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
-				$state['phase'] = 'elementor';
-				Post_Translator::save_job_partial_state( $post_id, $lang, $state );
-			}
+		if ( ! Post_Translator::should_run_elementor_job_slice( $post_id, $lang ) ) {
+			return;
 		}
+
+		$state = Post_Translator::get_job_partial_state( $post_id, $lang );
+		$state = Post_Translator::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		Post_Translator::save_job_partial_state( $post_id, $lang, $state );
 
 		$job['partial_post_id']  = $post_id;
 		$job['partial_phase']    = 'elementor';
-		$job['partial_progress'] = self::format_job_partial_progress( $state );
+		$job['partial_progress'] = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state );
 		self::touch_partial_progress_tracker( $job );
 		$job['step_partial']     = true;
 		$job['current_post_id']  = null;
@@ -2446,7 +2424,7 @@ final class Activity_Logger {
 				sprintf(
 					/* translators: %s: elementor progress marker */
 					__( 'Elementor — ادامه بخش‌ها (%s)', 'polymart-ai' ),
-					'' !== $progress ? $progress : '…'
+					(string) ( $job['partial_progress'] ?? $progress )
 				)
 			);
 
@@ -4339,11 +4317,7 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 
-		if (
-			Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
-			|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
-			|| self::post_has_elementor_job_state( $post_id, $lang )
-		) {
+		if ( Post_Translator::should_run_elementor_job_slice( $post_id, $lang ) ) {
 			self::pin_job_for_elementor_post( $job, $post_id, $lang );
 			self::save_job( $job );
 		}
@@ -4370,7 +4344,7 @@ final class Activity_Logger {
 			) {
 				self::maybe_apply_api_throttle_cooldown( $slice );
 
-				$partial_progress = self::format_job_partial_progress( $partial_state );
+				$partial_progress = self::format_job_partial_progress( $partial_state, $post_id, $lang );
 				$phase            = (string) ( $partial_state['phase'] ?? 'elementor' );
 				$parsed_progress  = self::parse_job_phase_progress( $partial_progress );
 				$elementor_remaining = 'elementor' === $phase
