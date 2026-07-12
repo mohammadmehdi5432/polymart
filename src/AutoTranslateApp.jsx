@@ -1374,6 +1374,11 @@ export default function AutoTranslateApp() {
                         #{item.post_id} {item.title ? `(${item.title})` : ''}
                         {item.status ? ` — ${item.status}` : ''}
                       </p>
+                      {item.status === 'translated' && item.reason ? (
+                        <p className="mt-1 text-xs font-medium text-amber-900">
+                          هشدار: سیستم «ترجمه‌شده» می‌گوید ولی فروشگاه هنوز فارسی دارد — {item.reason}
+                        </p>
+                      ) : null}
                       {(item.fields ?? []).length > 0 ? (
                         <ul className="mt-1 list-inside list-disc text-xs">
                           {item.fields.map((field) => (

@@ -19,6 +19,7 @@ use PolymartAI\Integration\Apd_Integration;
 use PolymartAI\Integration\Cpc_Integration;
 use PolymartAI\Integration\Customer_Portal_Integration;
 use PolymartAI\Integration\Jet_Checkout_Integration;
+use PolymartAI\Integration\Woodmart_Header_Integration;
 use PolymartAI\Integration\Knd_Integration;
 use PolymartAI\Integration\Kndpi_Integration;
 use PolymartAI\Integration\Wve_Integration;
@@ -205,6 +206,7 @@ final class Plugin {
 		Cpc_Integration::init();
 		Customer_Portal_Integration::init();
 		Jet_Checkout_Integration::init();
+		Woodmart_Header_Integration::init();
 		Apd_Integration::init();
 		Knd_Integration::init();
 		Kndpi_Integration::init();

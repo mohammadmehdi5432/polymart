@@ -5297,6 +5297,14 @@ final class Post_Translator {
 			$notes[] = __( 'فروشگاه هنوز متن فارسی نشان می‌دهد', 'polymart-ai' );
 		}
 
+		$front = absint( get_option( 'page_on_front' ) );
+
+		if ( $front === $post_id && empty( array_filter( $notes, static function ( $note ) {
+			return false !== stripos( (string) $note, 'Elementor' );
+		} ) ) ) {
+			$notes[] = __( 'اگر فقط هدر/فوتر فارسی است، آن‌ها در Header Builder وودمارت هستند — تب «رشته‌های UI» را دوباره اسکن کنید.', 'polymart-ai' );
+		}
+
 		if ( empty( $notes ) ) {
 			$notes[] = __( 'وضعیت ترجمه نامشخص — بررسی دستی لازم است', 'polymart-ai' );
 		}

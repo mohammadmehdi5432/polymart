@@ -7,6 +7,7 @@
 
 namespace PolymartAI\Frontend;
 
+use PolymartAI\Integration\Woodmart_Header_Integration;
 use PolymartAI\Routing\Url_Router;
 use PolymartAI\Translation\Layout_Guard;
 use PolymartAI\Translation\Menu_Translator;
@@ -109,7 +110,7 @@ final class Woodmart_Translator {
 		add_filter( 'gettext_with_context', array( $this, 'filter_gettext_with_context' ), 26, 4 );
 		add_filter( 'ngettext', array( $this, 'filter_ngettext' ), 26, 5 );
 
-		add_action( 'template_redirect', array( $this, 'maybe_start_output_buffer' ), 0 );
+		add_action( 'template_redirect', array( $this, 'maybe_start_output_buffer' ), 9999 );
 	}
 
 	/**
@@ -146,19 +147,53 @@ final class Woodmart_Translator {
 	 * @return string
 	 */
 	private function translate_persian_markup_fragments( $html ) {
-		$class_pattern = '(?:wd-tools-text|whb-text-block|wd-info-box|whb-info-box|whb-html-block|wd-header-text|whb-color-dark)';
+		$html = $this->translate_markup_by_class(
+			$html,
+			'wd-tools-text',
+			'html:wd-tools-text:'
+		);
+
+		$class_pattern = '(?:whb-text-block|wd-info-box|whb-info-box|whb-html-block|wd-header-text|whb-info-box-inner|whb-text-element|info-box-inner|wd-text-block)';
+
+		return $this->translate_markup_by_class(
+			$html,
+			$class_pattern,
+			'html:whb:',
+			true
+		);
+	}
+
+	/**
+	 * Replace Persian text in elements whose class attribute matches a pattern.
+	 *
+	 * @param string $html          Full HTML.
+	 * @param string $class_pattern Regex fragment for allowed class names.
+	 * @param string $storage_prefix Runtime cache prefix.
+	 * @param bool   $is_pattern     When true, $class_pattern is a regex alternation.
+	 * @return string
+	 */
+	private function translate_markup_by_class( $html, $class_pattern, $storage_prefix, $is_pattern = false ) {
+		$class_expr = $is_pattern ? $class_pattern : preg_quote( $class_pattern, '/' );
 
 		return (string) preg_replace_callback(
-			'/(<(span|div|p|a|strong|b|em|i)\b[^>]*\bclass=(["\'])[^"\']*\b' . $class_pattern . '\b[^"\']*\3[^>]*>)(.*?)(<\/\2>)/su',
-			function ( array $matches ) {
+			'/(<(span|div|p|a|strong|b|em|i|li|label)\b[^>]*\bclass=(["\'])[^"\']*\b(?:' . $class_expr . ')\b[^"\']*\3[^>]*>)(.*?)(<\/\2>)/su',
+			function ( array $matches ) use ( $storage_prefix ) {
 				$inner = (string) ( $matches[4] ?? '' );
 
 				if ( '' === trim( wp_strip_all_tags( $inner ) ) || ! Persian_Detector::contains_persian( $inner ) ) {
 					return $matches[0];
 				}
 
-				$plain      = trim( preg_replace( '/\s+/u', ' ', wp_strip_all_tags( str_replace( array( '<br>', '<br/>', '<br />' ), "\n", $inner ) ) ) );
-				$translated = $this->resolve_string( $plain, 'html:' . md5( $plain ) );
+				$plain      = trim(
+					preg_replace(
+						'/\s+/u',
+						' ',
+						wp_strip_all_tags(
+							str_replace( array( '<br>', '<br/>', '<br />' ), "\n", $inner )
+						)
+					)
+				);
+				$translated = $this->resolve_string( $plain, $storage_prefix . md5( $plain ) );
 
 				if ( $translated === $plain || '' === trim( $translated ) ) {
 					return $matches[0];
@@ -464,6 +499,30 @@ final class Woodmart_Translator {
 	 * @return string
 	 */
 	private function resolve_string( $value, $storage ) {
+		$value = is_string( $value ) ? trim( $value ) : '';
+
+		if ( '' === $value ) {
+			return $value;
+		}
+
+		$lang = $this->get_active_lang();
+
+		if ( Persian_Detector::contains_persian( $value ) ) {
+			$whb = Woodmart_Header_Integration::resolve_storefront_text( $value, $lang );
+
+			if ( is_string( $whb ) && '' !== trim( $whb ) && $whb !== $value ) {
+				return $whb;
+			}
+
+			foreach ( array( 'whb', '', 'woodmart' ) as $context ) {
+				$from_registry = UI_String_Registry::lookup( $lang, $value, $context );
+
+				if ( null !== $from_registry && '' !== trim( $from_registry ) && $from_registry !== $value ) {
+					return $from_registry;
+				}
+			}
+		}
+
 		$strings = Runtime_String_Translator::get_theme_strings();
 
 		if ( isset( $strings[ $storage ] ) && is_string( $strings[ $storage ] ) && '' !== trim( $strings[ $storage ] ) ) {
