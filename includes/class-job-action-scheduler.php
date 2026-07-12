@@ -372,14 +372,21 @@ final class Job_Action_Scheduler {
 		$slices_done      = 0;
 		$request_start    = time();
 		$any_productive   = false;
+		$job_start        = Activity_Logger::get_job_for_as_debug();
+		$request_budget   = Activity_Logger::should_prioritize_elementor_partial( $job_start )
+			? max( self::REQUEST_BUDGET_SEC, 210 )
+			: self::REQUEST_BUDGET_SEC;
 
 		while (
 			Activity_Logger::is_bulk_job_running()
 			&& $slices_done < self::AS_MAX_STEPS_PER_REQUEST
-			&& ( time() - $request_start ) < ( self::REQUEST_BUDGET_SEC - 5 )
+			&& ( time() - $request_start ) < ( $request_budget - 5 )
 		) {
 			$elapsed          = time() - $request_start;
-			$remaining_budget = min( self::SLICE_BUDGET_SEC, max( 25, self::REQUEST_BUDGET_SEC - $elapsed ) );
+			$slice_cap        = Activity_Logger::should_prioritize_elementor_partial( $job_step )
+				? max( self::SLICE_BUDGET_SEC, 165 )
+				: self::SLICE_BUDGET_SEC;
+			$remaining_budget = min( $slice_cap, max( 25, $request_budget - $elapsed ) );
 			$job_step         = Activity_Logger::get_job_for_as_debug();
 			$steps_before     = absint( $job_step['steps'] ?? 0 );
 			$step_cap         = Activity_Logger::get_elementor_partial_step_cap( $job_step );

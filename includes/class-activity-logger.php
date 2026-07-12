@@ -1959,6 +1959,12 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	private static function elementor_partial_has_remaining( array $job ) {
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( self::job_has_active_elementor_pin( $job, $lang ) ) {
+			return true;
+		}
+
 		if ( 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
 			return false;
 		}
@@ -1973,15 +1979,73 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Whether the job must keep working the pinned post's Elementor JSON to completion.
+	 *
+	 * @param array<string, mixed> $job  Job state.
+	 * @param string               $lang Target language code.
+	 * @return bool
+	 */
+	private static function job_has_active_elementor_pin( array $job, $lang ) {
+		$lang    = sanitize_key( (string) $lang );
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
+
+		if ( $post_id <= 0 || 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
+			return false;
+		}
+
+		return '' !== $lang && Post_Translator::post_needs_elementor_job_work( $post_id, $lang );
+	}
+
+	/**
+	 * Pin the bulk job to one post until Elementor slices finish.
+	 *
+	 * @param array<string, mixed> $job     Job state (by reference).
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Target language code.
+	 * @return void
+	 */
+	private static function pin_job_for_elementor_post( array &$job, $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		$state = Post_Translator::get_job_partial_state( $post_id, $lang );
+		$phase = (string) ( $state['phase'] ?? '' );
+
+		if ( '' === $phase || 'complete' === $phase || 'elementor' !== $phase ) {
+			$state = Post_Translator::build_initial_job_partial_state(
+				$post_id,
+				$lang,
+				get_post( $post_id )
+			);
+
+			if ( Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
+				$state['phase'] = 'elementor';
+				Post_Translator::save_job_partial_state( $post_id, $lang, $state );
+			}
+		}
+
+		$job['partial_post_id']  = $post_id;
+		$job['partial_phase']    = 'elementor';
+		$job['partial_progress'] = self::format_job_partial_progress( $state );
+		$job['step_partial']     = true;
+		$job['current_post_id']  = null;
+		$job['step_started_at']  = null;
+	}
+
+	/**
 	 * Whether the job should keep working the pinned Elementor post to completion.
 	 *
 	 * @param array<string, mixed> $job Job state.
 	 * @return bool
 	 */
 	public static function should_prioritize_elementor_partial( array $job ) {
-		$post_id = absint( $job['partial_post_id'] ?? 0 );
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
-		return $post_id > 0 && self::elementor_partial_has_remaining( $job );
+		return self::job_has_active_elementor_pin( $job, $lang );
 	}
 
 	/**
@@ -2000,7 +2064,7 @@ final class Activity_Logger {
 			? max( 1, $parsed['total'] - $parsed['done'] )
 			: 8;
 
-		return max( 1, min( 8, $left ) );
+		return max( 1, min( 12, $left ) );
 	}
 
 	/**
@@ -2009,7 +2073,7 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	public static function filter_as_elementor_chunk_budget() {
-		return 2;
+		return 3;
 	}
 
 	/**
@@ -4109,6 +4173,25 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		if ( ! empty( $slice['done'] ) && Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
+			self::pin_job_for_elementor_post( $job, $post_id, $lang );
+			Post_Translator::release_translation_lock( $post_id, $lang );
+			self::increment_job_step( $job );
+			self::set_job_last_step(
+				$job,
+				$post_id,
+				'partial',
+				sprintf(
+					/* translators: %s: elementor progress marker */
+					__( 'Elementor — ادامه بخش‌ها (%s)', 'polymart-ai' ),
+					'' !== (string) ( $job['partial_progress'] ?? '' ) ? (string) $job['partial_progress'] : '…'
+				)
+			);
+			self::save_job( $job );
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
 		$job['consecutive_post_id']    = 0;
 		$job['consecutive_post_steps'] = 0;
 		$job['partial_post_id']  = null;
@@ -4131,7 +4214,17 @@ final class Activity_Logger {
 	 * @return array{post_id: int, from_retry: bool}
 	 */
 	private static function pick_next_job_post_id( array &$job, $lang, $cursor ) {
+		$lang       = sanitize_key( (string) $lang );
 		$partial_id = absint( $job['partial_post_id'] ?? 0 );
+
+		if ( $partial_id > 0 && self::job_has_active_elementor_pin( $job, $lang ) ) {
+			if ( ! in_array( $partial_id, self::get_parked_ids( $job ), true ) ) {
+				return array(
+					'post_id'    => $partial_id,
+					'from_retry' => true,
+				);
+			}
+		}
 
 		if ( $partial_id > 0 && self::elementor_partial_has_remaining( $job ) ) {
 			if ( ! in_array( $partial_id, self::get_parked_ids( $job ), true ) ) {
@@ -4484,7 +4577,7 @@ final class Activity_Logger {
 
 		if (
 			absint( $job['partial_post_id'] ?? 0 ) === $post_id
-			&& self::elementor_partial_has_remaining( $job )
+			&& self::job_has_active_elementor_pin( $job, $lang )
 		) {
 			return;
 		}
@@ -5289,22 +5382,38 @@ final class Activity_Logger {
 		} else {
 			self::untrack_succeeded_post( $job, $post_id );
 			self::track_partial_post( $job, $post_id );
-			self::defer_job_post( $job, $post_id, $lang );
 
-			$gaps     = Post_Translator::get_translation_gaps( $post_id, $lang );
-			$attempts = (int) ( $job['retry_attempts'][ $post_id ] ?? 0 );
-			$missing  = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'نامشخص', 'polymart-ai' );
+			if ( Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
+				self::pin_job_for_elementor_post( $job, $post_id, $lang );
 
-			self::log(
-				'warning',
-				sprintf(
-					/* translators: 1: post title, 2: missing fields */
-					__( '«%1$s» هنوز ناقص است — به صف بعدی منتقل شد. باقی‌مانده: %2$s', 'polymart-ai' ),
-					$title_source,
-					$missing
-				),
-				array( 'post_id' => $post_id, 'lang' => $lang )
-			);
+				self::log(
+					'info',
+					sprintf(
+						/* translators: 1: post title, 2: progress marker */
+						__( '«%1$s» — Elementor بخش‌بندی شده؛ ادامه همان مورد (%2$s) تا تکمیل.', 'polymart-ai' ),
+						$title_source,
+						'' !== (string) ( $job['partial_progress'] ?? '' ) ? (string) $job['partial_progress'] : '…'
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+			} else {
+				self::defer_job_post( $job, $post_id, $lang );
+
+				$gaps     = Post_Translator::get_translation_gaps( $post_id, $lang );
+				$attempts = (int) ( $job['retry_attempts'][ $post_id ] ?? 0 );
+				$missing  = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'نامشخص', 'polymart-ai' );
+
+				self::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post title, 2: missing fields */
+						__( '«%1$s» هنوز ناقص است — به صف بعدی منتقل شد. باقی‌مانده: %2$s', 'polymart-ai' ),
+						$title_source,
+						$missing
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+			}
 		}
 
 		self::increment_job_step( $job );
