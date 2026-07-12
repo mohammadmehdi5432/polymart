@@ -646,7 +646,7 @@ final class Activity_Logger {
 		);
 
 		if ( $post_id > 0 && '' !== $lang ) {
-			Post_Translator::release_translation_lock( $post_id, $lang );
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
 		}
 
 		self::release_step_lock();
@@ -1833,17 +1833,10 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	public static function force_unlock_step_now() {
-		$job     = self::get_job_raw();
-		$lang    = sanitize_key( (string) ( $job['lang'] ?? '' ) );
-		$partial = absint( $job['partial_post_id'] ?? 0 );
-		$current = absint( $job['current_post_id'] ?? 0 );
+		$job = self::get_job_raw();
 
-		foreach ( array_unique( array_filter( array( $partial, $current ) ) ) as $post_id ) {
-			if ( $post_id > 0 && '' !== $lang ) {
-				Post_Translator::release_translation_lock( $post_id, $lang );
-			}
-		}
-
+		// Only clear the global step lock. Per-post translation locks are owner-bound
+		// and must not be stolen from a live Elementor slice mid-API-call.
 		self::release_step_lock();
 
 		$job['current_post_id'] = null;
@@ -2339,6 +2332,26 @@ final class Activity_Logger {
 		}
 
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if (
+			$post_id > 0
+			&& '' !== $lang
+			&& ! Post_Translator::owns_translation_lock( $post_id, $lang )
+			&& ! Post_Translator::acquire_translation_lock( $post_id, $lang )
+		) {
+			// Another worker is mid-slice on this Elementor page — do not bypass AS with a second writer.
+			return false;
+		}
+
+		if (
+			$post_id > 0
+			&& '' !== $lang
+			&& Post_Translator::owns_translation_lock( $post_id, $lang )
+		) {
+			Post_Translator::release_translation_lock( $post_id, $lang );
+		}
+
 		$before  = (string) ( $job['partial_progress'] ?? '' );
 
 		if ( $log_stalled || self::is_elementor_progress_stalled( $job ) ) {
@@ -2839,7 +2852,7 @@ final class Activity_Logger {
 		$title   = get_the_title( $post_id ) ?: ( '#' . $post_id );
 
 		Post_Translator::clear_job_partial_state( $post_id, $lang );
-		Post_Translator::release_translation_lock( $post_id, $lang );
+		Post_Translator::release_translation_lock( $post_id, $lang, true );
 
 		$was_new = ! self::job_already_counted_success( $job, $post_id );
 		self::track_succeeded_post( $job, $post_id );
@@ -3414,7 +3427,7 @@ final class Activity_Logger {
 			// but keep partial meta so resume can continue mid-slice.
 			foreach ( array_unique( array_filter( array( $partial_id, $current_id ) ) ) as $post_id ) {
 				if ( $post_id > 0 && '' !== $lang ) {
-					Post_Translator::release_translation_lock( $post_id, $lang );
+					Post_Translator::release_translation_lock( $post_id, $lang, true );
 				}
 			}
 
@@ -3526,7 +3539,7 @@ final class Activity_Logger {
 		}
 
 		Post_Translator::clear_job_partial_state( $post_id, $lang );
-		Post_Translator::release_translation_lock( $post_id, $lang );
+		Post_Translator::release_translation_lock( $post_id, $lang, true );
 		self::release_step_lock();
 
 		$exhausted = self::get_exhausted_job_post_ids( $job );
@@ -3673,7 +3686,7 @@ final class Activity_Logger {
 				Post_Translator::clear_job_partial_state( $post_id, $lang );
 			}
 
-			Post_Translator::release_translation_lock( $post_id, $lang );
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
 		}
 
 		self::release_step_lock();
@@ -3729,7 +3742,7 @@ final class Activity_Logger {
 		}
 
 		foreach ( self::collect_job_post_ids_for_lock_cleanup( $job ) as $post_id ) {
-			Post_Translator::release_translation_lock( $post_id, $lang );
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
 		}
 
 		self::release_step_lock();
@@ -4450,7 +4463,7 @@ final class Activity_Logger {
 
 		if ( $partial_id > 0 ) {
 			if ( in_array( $partial_id, self::get_parked_ids( $job ), true ) ) {
-				Post_Translator::release_translation_lock( $partial_id, $lang );
+				Post_Translator::release_translation_lock( $partial_id, $lang, true );
 				$job['partial_post_id'] = null;
 				$partial_id             = 0;
 			}
@@ -4616,14 +4629,12 @@ final class Activity_Logger {
 					! $elementor_remaining
 					&& self::job_progress_stuck_should_defer( $job, $post_id, $partial_progress )
 				) {
-					Post_Translator::release_translation_lock( $post_id, $lang );
 					self::defer_job_post_stuck_slice( $job, $post_id, $lang, $phase, $partial_progress );
 					self::save_job( $job );
 
 					return self::normalize_job_for_response( $job, false );
 				}
 
-				Post_Translator::release_translation_lock( $post_id, $lang );
 				$job['partial_post_id']   = $post_id;
 				$job['partial_phase']     = $phase;
 				$job['partial_progress']  = $partial_progress;
@@ -4665,7 +4676,6 @@ final class Activity_Logger {
 			}
 
 			Post_Translator::clear_job_partial_state( $post_id, $lang );
-			Post_Translator::release_translation_lock( $post_id, $lang );
 			$job['partial_post_id']   = null;
 			$job['partial_phase']     = null;
 			$job['partial_progress']  = null;
@@ -4723,7 +4733,6 @@ final class Activity_Logger {
 					)
 				)
 			) {
-				Post_Translator::release_translation_lock( $post_id, $lang );
 				self::defer_job_post_stuck_slice(
 					$job,
 					$post_id,
@@ -4796,7 +4805,6 @@ final class Activity_Logger {
 				&& absint( $job['consecutive_post_steps'] ?? 0 ) >= $fairness_threshold;
 
 			if ( $should_rotate_fair ) {
-				Post_Translator::release_translation_lock( $post_id, $lang );
 				self::rotate_job_post_for_fairness( $job, $post_id, $lang, $phase_key, $current_progress );
 				self::increment_job_step( $job );
 				self::set_job_last_step(
@@ -4831,7 +4839,6 @@ final class Activity_Logger {
 
 		if ( ! empty( $slice['done'] ) && Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
 			self::pin_job_for_elementor_post( $job, $post_id, $lang );
-			Post_Translator::release_translation_lock( $post_id, $lang );
 			self::increment_job_step( $job );
 			self::set_job_last_step(
 				$job,

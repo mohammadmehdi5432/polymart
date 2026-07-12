@@ -120,6 +120,18 @@ final class Post_Translator {
 	const TRANSLATION_LOCK_TTL = 240;
 
 	/**
+	 * Option suffix storing the worker token that owns a per-post translation lock.
+	 */
+	const TRANSLATION_LOCK_OWNER_SUFFIX = '_owner';
+
+	/**
+	 * Per-request token identifying the current translation worker.
+	 *
+	 * @var string|null
+	 */
+	private static $translation_lock_token = null;
+
+	/**
 	 * Post meta flag: this post has Persian source content worth translating.
 	 */
 	const PERSIAN_CONTENT_FLAG_META = '_polymart_ai_has_persian';
@@ -3551,7 +3563,8 @@ final class Post_Translator {
 
 		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 		$rebuilt   = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
-		$map     = array_merge( $rebuilt, $state_map );
+		// Saved JSON is authoritative — stale in-memory state must not roll back progress.
+		$map     = array_merge( $state_map, $rebuilt );
 
 		$state['elementor_map'] = $map;
 		$chunk_progress                  = self::get_elementor_chunk_progress( $post_id, $lang, $state );
@@ -3887,7 +3900,6 @@ final class Post_Translator {
 		}
 
 		self::clear_job_partial_state( $post_id, $lang );
-		self::release_translation_lock( $post_id, $lang );
 
 		return array(
 			'done'           => true,
@@ -3898,26 +3910,13 @@ final class Post_Translator {
 	}
 
 	/**
-	 * Refresh the per-post translation lock TTL while a multi-step job slice runs.
+	 * Refresh the per-post translation lock TTL only when this worker already owns it.
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Language code.
 	 * @return bool
 	 */
 	public static function refresh_translation_lock( $post_id, $lang ) {
-		$post_id = absint( $post_id );
-		$lang    = sanitize_key( (string) $lang );
-		$key     = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
-		$claim   = $key . '_claim';
-		$now     = time();
-
-		if ( get_transient( $key ) || get_option( $claim ) ) {
-			update_option( $claim, (string) $now, false );
-			set_transient( $key, $now, self::TRANSLATION_LOCK_TTL );
-
-			return true;
-		}
-
 		return self::acquire_translation_lock( $post_id, $lang );
 	}
 
@@ -4136,7 +4135,7 @@ final class Post_Translator {
 			);
 		}
 
-		if ( ! self::refresh_translation_lock( $post_id, $lang ) ) {
+		if ( ! self::acquire_translation_lock( $post_id, $lang ) ) {
 			return new \WP_Error(
 				'polymart_ai_translation_in_progress',
 				__( 'این مورد در حال ترجمه است. لطفاً چند لحظه صبر کنید.', 'polymart-ai' )
@@ -4147,6 +4146,31 @@ final class Post_Translator {
 			@set_time_limit( 300 );
 		}
 
+		try {
+			return self::run_job_translation_slice_body( $post_id, $lang, $post, $settings );
+		} catch ( \Throwable $e ) {
+			return new \WP_Error(
+				'polymart_ai_job_slice_failed',
+				$e->getMessage()
+			);
+		} finally {
+			self::release_translation_lock( $post_id, $lang );
+		}
+	}
+
+	/**
+	 * Core auto-translate slice body (caller owns acquire/release).
+	 *
+	 * @param int                  $post_id  Post ID.
+	 * @param string               $lang     Target language code.
+	 * @param \WP_Post             $post     Post object.
+	 * @param array<string, mixed> $settings Translation settings.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
+	 */
+	private static function run_job_translation_slice_body( $post_id, $lang, $post, array $settings ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
 		$state = self::get_job_partial_state( $post_id, $lang );
 
 		if ( empty( $state ) || empty( $state['phase'] ) ) {
@@ -4155,7 +4179,6 @@ final class Post_Translator {
 
 		if ( 'complete' === (string) ( $state['phase'] ?? '' ) ) {
 			self::clear_job_partial_state( $post_id, $lang );
-			self::release_translation_lock( $post_id, $lang );
 
 			return array(
 				'done'           => true,
@@ -4172,8 +4195,7 @@ final class Post_Translator {
 			$api_endpoint
 		);
 
-		try {
-			if ( 'fields' === (string) $state['phase'] ) {
+		if ( 'fields' === (string) $state['phase'] ) {
 				$payload    = self::collect_persian_fields( $post, $lang );
 				$chunks     = empty( $payload ) ? array() : self::chunk_payload_for_job_phase( $payload, 'core', $post_id );
 				$total      = count( $chunks );
@@ -4327,7 +4349,6 @@ final class Post_Translator {
 					delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 					delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 					self::clear_job_partial_state( $post_id, $lang );
-					self::release_translation_lock( $post_id, $lang );
 
 					return array(
 						'done'           => true,
@@ -4366,33 +4387,23 @@ final class Post_Translator {
 				}
 
 				self::clear_job_partial_state( $post_id, $lang );
-				self::release_translation_lock( $post_id, $lang );
-
-				return array(
-					'done'           => true,
-					'phase'          => 'complete',
-					'phase_progress' => '',
-					'message'        => __( 'ترجمه Elementor این مورد تکمیل شد.', 'polymart-ai' ),
-				);
-			}
-
-			self::clear_job_partial_state( $post_id, $lang );
-			self::release_translation_lock( $post_id, $lang );
 
 			return array(
 				'done'           => true,
 				'phase'          => 'complete',
 				'phase_progress' => '',
-				'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
-			);
-		} catch ( \Throwable $e ) {
-			self::release_translation_lock( $post_id, $lang );
-
-			return new \WP_Error(
-				'polymart_ai_job_slice_failed',
-				$e->getMessage()
+				'message'        => __( 'ترجمه Elementor این مورد تکمیل شد.', 'polymart-ai' ),
 			);
 		}
+
+		self::clear_job_partial_state( $post_id, $lang );
+
+		return array(
+			'done'           => true,
+			'phase'          => 'complete',
+			'phase_progress' => '',
+			'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
+		);
 	}
 
 	/**
@@ -4439,6 +4450,8 @@ final class Post_Translator {
 		}
 
 		$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$map = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
+		$state['elementor_map'] = $map;
 
 		$payload = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
@@ -4610,6 +4623,7 @@ final class Post_Translator {
 			}
 
 			$map = array_merge( $map, $mapped_chunk );
+			$map = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
 			++$processed;
 
 			if ( ! empty( $mapped_chunk ) ) {
@@ -4955,6 +4969,25 @@ final class Post_Translator {
 	 */
 	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false ) {
 		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
+
+		if ( ! self::owns_translation_lock( $post_id, $lang ) ) {
+			return new \WP_Error(
+				'polymart_ai_translation_in_progress',
+				__( 'این مورد در حال ترجمه است. لطفاً چند لحظه صبر کنید.', 'polymart-ai' )
+			);
+		}
+
+		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+		$chunk_progress = self::get_elementor_chunk_progress(
+			$post_id,
+			$lang,
+			array(
+				'elementor_map'          => $map,
+				'elementor_chunks_total' => max( 1, absint( $total_chunks ) ),
+			)
+		);
+		$done_count  = max( absint( $done_count ), (int) $chunk_progress['done'] );
+		$total_chunks = max( absint( $total_chunks ), (int) $chunk_progress['total'], 1 );
 
 		$tree = self::apply_elementor_translation_payload( $source_data, $map );
 		$json = wp_json_encode( $tree );
@@ -6138,6 +6171,64 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Unique token for the current PHP worker (per-request).
+	 *
+	 * @return string
+	 */
+	private static function get_translation_lock_token() {
+		if ( null === self::$translation_lock_token ) {
+			self::$translation_lock_token = function_exists( 'wp_generate_uuid4' )
+				? wp_generate_uuid4()
+				: uniqid( 'pm_lock_', true );
+		}
+
+		return self::$translation_lock_token;
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return array{key: string, claim: string, owner: string}
+	 */
+	private static function get_translation_lock_keys( $post_id, $lang ) {
+		$key = self::TRANSLATION_LOCK_PREFIX . absint( $post_id ) . '_' . sanitize_key( (string) $lang );
+
+		return array(
+			'key'   => $key,
+			'claim' => $key . '_claim',
+			'owner' => $key . self::TRANSLATION_LOCK_OWNER_SUFFIX,
+		);
+	}
+
+	/**
+	 * Whether this worker currently owns the per-post translation lock.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function owns_translation_lock( $post_id, $lang ) {
+		$keys = self::get_translation_lock_keys( $post_id, $lang );
+
+		return (string) get_option( $keys['owner'], '' ) === self::get_translation_lock_token();
+	}
+
+	/**
+	 * Merge a local Elementor path map with translations already stored in post meta.
+	 *
+	 * @param int                   $post_id     Post ID.
+	 * @param string                $lang        Language code.
+	 * @param array<string, mixed>  $source_data Source Elementor tree.
+	 * @param array<string, string> $map         Local path map for this slice.
+	 * @return array<string, string>
+	 */
+	private static function merge_elementor_path_map( $post_id, $lang, array $source_data, array $map ) {
+		$rebuilt = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
+
+		return array_merge( $rebuilt, $map );
+	}
+
+	/**
 	 * Acquire a per-post lock so duplicate AI requests are rejected.
 	 *
 	 * @param int    $post_id Post ID.
@@ -6152,32 +6243,42 @@ final class Post_Translator {
 			return false;
 		}
 
-		$key   = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
-		$claim = $key . '_claim';
+		$keys  = self::get_translation_lock_keys( $post_id, $lang );
+		$token = self::get_translation_lock_token();
 		$now   = time();
 
-		$existing_claim = absint( get_option( $claim, 0 ) );
-		$existing_lock  = get_transient( $key );
+		$existing_owner = (string) get_option( $keys['owner'], '' );
+		$existing_claim = absint( get_option( $keys['claim'], 0 ) );
+		$existing_lock  = get_transient( $keys['key'] );
 		$stamp          = max( $existing_claim, $existing_lock ? absint( $existing_lock ) : 0 );
 
 		if ( $stamp > 0 && ( $now - $stamp ) < self::TRANSLATION_LOCK_TTL ) {
+			if ( $existing_owner === $token ) {
+				update_option( $keys['claim'], (string) $now, false );
+				set_transient( $keys['key'], $now, self::TRANSLATION_LOCK_TTL );
+
+				return true;
+			}
+
 			if ( ! $existing_lock && $existing_claim > 0 ) {
-				set_transient( $key, $existing_claim, self::TRANSLATION_LOCK_TTL );
+				set_transient( $keys['key'], $existing_claim, self::TRANSLATION_LOCK_TTL );
 			}
 
 			return false;
 		}
 
 		if ( $stamp > 0 ) {
-			delete_option( $claim );
-			delete_transient( $key );
+			delete_option( $keys['claim'] );
+			delete_option( $keys['owner'] );
+			delete_transient( $keys['key'] );
 		}
 
-		if ( ! add_option( $claim, (string) $now, '', 'no' ) ) {
+		if ( ! add_option( $keys['claim'], (string) $now, '', 'no' ) ) {
 			return false;
 		}
 
-		set_transient( $key, $now, self::TRANSLATION_LOCK_TTL );
+		update_option( $keys['owner'], $token, false );
+		set_transient( $keys['key'], $now, self::TRANSLATION_LOCK_TTL );
 
 		return true;
 	}
@@ -6187,9 +6288,10 @@ final class Post_Translator {
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Target language code.
+	 * @param bool   $force   When true, clear the lock regardless of owner.
 	 * @return void
 	 */
-	public static function release_translation_lock( $post_id, $lang ) {
+	public static function release_translation_lock( $post_id, $lang, $force = false ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 
@@ -6197,9 +6299,16 @@ final class Post_Translator {
 			return;
 		}
 
-		$key = self::TRANSLATION_LOCK_PREFIX . $post_id . '_' . $lang;
-		delete_transient( $key );
-		delete_option( $key . '_claim' );
+		$keys           = self::get_translation_lock_keys( $post_id, $lang );
+		$existing_owner = (string) get_option( $keys['owner'], '' );
+
+		if ( ! $force && '' !== $existing_owner && $existing_owner !== self::get_translation_lock_token() ) {
+			return;
+		}
+
+		delete_transient( $keys['key'] );
+		delete_option( $keys['claim'] );
+		delete_option( $keys['owner'] );
 	}
 
 	/**
