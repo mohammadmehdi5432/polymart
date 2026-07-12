@@ -507,6 +507,15 @@ final class Activity_Logger {
 		self::$trusted_job_tick     = true;
 
 		try {
+			$job = self::get_job_raw();
+
+			if ( self::is_job_api_cooldown_active( $job ) ) {
+				$out = self::normalize_job_for_response( $job, false );
+				$out['api_cooldown'] = true;
+
+				return $out;
+			}
+
 			self::bootstrap_job_worker_context();
 			self::force_release_step_lock_if_idle();
 			Job_Action_Scheduler::clear_slice_mutex_if_stale();
@@ -514,8 +523,8 @@ final class Activity_Logger {
 			$job = self::get_job_raw();
 
 			if ( self::should_prioritize_elementor_partial( $job ) ) {
-				$cap    = null === $max_steps ? self::get_elementor_partial_step_cap( $job ) : max( 1, absint( $max_steps ) );
-				$budget = null === $budget_sec ? max( 90, min( 300, $cap * 50 ) ) : max( 30, absint( $budget_sec ) );
+				$cap    = null === $max_steps ? min( 2, self::get_elementor_partial_step_cap( $job ) ) : max( 1, min( 2, absint( $max_steps ) ) );
+				$budget = null === $budget_sec ? max( 60, min( 180, $cap * 40 ) ) : max( 30, absint( $budget_sec ) );
 
 				return self::run_action_scheduler_batch( $cap, $budget );
 			}
@@ -2256,7 +2265,7 @@ final class Activity_Logger {
 			? max( 1, $parsed['total'] - $parsed['done'] )
 			: 8;
 
-		return max( 1, min( 4, $left ) );
+		return max( 1, min( 2, $left ) );
 	}
 
 	/**
@@ -2265,12 +2274,6 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	public static function filter_as_elementor_chunk_budget() {
-		$job = self::get_job_raw();
-
-		if ( self::should_prioritize_elementor_partial( $job ) ) {
-			return 2;
-		}
-
 		return 1;
 	}
 
@@ -3300,7 +3303,7 @@ final class Activity_Logger {
 		Job_Action_Scheduler::cancel_all();
 		self::bootstrap_background_worker( false );
 		// Local/cPanel hosts often never run AS HTTP — kick one bounded slice inline now.
-		self::run_inline_worker_tick( 2, 90 );
+		self::run_inline_worker_tick( 1, 60 );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -3373,7 +3376,7 @@ final class Activity_Logger {
 
 			self::save_job( $job );
 			self::bootstrap_background_worker( false );
-			self::run_inline_worker_tick( 2, 90 );
+			self::run_inline_worker_tick( 1, 60 );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -3889,6 +3892,16 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		if ( self::is_job_api_cooldown_active( $job ) ) {
+			$job['worker_ensured']           = true;
+			$job['api_cooldown']             = true;
+			$job['api_cooldown_remaining']   = self::get_job_api_cooldown_remaining( $job );
+			$job['worker_scheduled_at']      = time();
+			self::save_job( $job );
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
 		if ( self::should_prioritize_elementor_partial( $job ) ) {
 			$last = max(
 				absint( $job['last_cron_at'] ?? 0 ),
@@ -3955,7 +3968,7 @@ final class Activity_Logger {
 			$job['worker_inline_tick'] = true;
 			self::save_job( $job );
 		} elseif ( $should_tick ) {
-			self::run_inline_worker_tick( $worker_dead ? 3 : 2, $worker_dead ? 120 : 90 );
+			self::run_inline_worker_tick( $worker_dead ? 2 : 1, $worker_dead ? 90 : 60 );
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;
 			self::save_job( $job );
@@ -6401,7 +6414,7 @@ final class Activity_Logger {
 	 */
 	public static function wait_for_arvan_api_gap() {
 		$job     = self::get_job_raw();
-		$min_gap = max( 5, (int) apply_filters( 'polymart_ai_arvan_min_api_gap_sec', 10 ) );
+		$min_gap = max( 8, (int) apply_filters( 'polymart_ai_arvan_min_api_gap_sec', 18 ) );
 		$last_at = absint( $job['last_arvan_api_at'] ?? 0 );
 
 		if ( $last_at <= 0 ) {
@@ -6469,7 +6482,18 @@ final class Activity_Logger {
 			return 0;
 		}
 
-		return $until - time();
+		$remaining  = $until - time();
+		$max_remain = (int) apply_filters( 'polymart_ai_arvan_api_cooldown_sec', 600 );
+
+		// Older jobs may still carry a 30-minute cooldown from before the 10-minute policy.
+		if ( $remaining > $max_remain ) {
+			$until                     = time() + $max_remain;
+			$job['api_cooldown_until'] = $until;
+			self::save_job( $job );
+			$remaining = $max_remain;
+		}
+
+		return $remaining;
 	}
 
 	/**
@@ -6518,13 +6542,18 @@ final class Activity_Logger {
 
 			if ( 404 === $status || false !== strpos( $msg, 'blocked' ) || false !== strpos( $msg, 'arvancloud' ) || false !== strpos( $msg, 'آروان' ) ) {
 				$streak       = absint( $job['api_block_streak'] ?? 0 ) + 1;
-				$cooldown_sec = 1800 + min( 900, ( $streak - 1 ) * 300 );
+				$cooldown_sec = (int) apply_filters( 'polymart_ai_arvan_api_cooldown_sec', 600 );
+
+				// Arvan WAF usually lifts after ~10 minutes; only stretch on repeated blocks in one job.
+				if ( $streak >= 3 ) {
+					$cooldown_sec = (int) apply_filters( 'polymart_ai_arvan_api_cooldown_repeat_sec', 900 );
+				}
 			} elseif ( 429 === $status ) {
 				$cooldown_sec = 240;
 			}
 		}
 
-		$cooldown_sec = max( 60, min( 1800, absint( $cooldown_sec ) ) );
+		$cooldown_sec = max( 60, min( 900, absint( $cooldown_sec ) ) );
 		$until        = time() + $cooldown_sec;
 
 		if ( absint( $job['api_cooldown_until'] ?? 0 ) >= $until ) {

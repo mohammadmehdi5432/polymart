@@ -4545,7 +4545,7 @@ final class Post_Translator {
 			}
 
 			if ( $processed < $budget && ! empty( $chunks ) ) {
-				$delay = (int) apply_filters( 'polymart_ai_elementor_inter_request_delay_sec', 6 );
+				$delay = (int) apply_filters( 'polymart_ai_elementor_inter_request_delay_sec', 12 );
 
 				if ( $delay > 0 ) {
 					sleep( max( 2, min( 20, $delay ) ) );

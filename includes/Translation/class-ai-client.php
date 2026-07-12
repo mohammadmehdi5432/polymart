@@ -365,14 +365,24 @@ final class AI_Client {
 	private static function should_retry_rate_limited_error( \WP_Error $error ) {
 		$data   = $error->get_error_data();
 		$status = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
+		$message = strtolower( $error->get_error_message() );
+
+		// Firewall / IP blocks — never retry; each attempt worsens the ban.
+		foreach ( array( 'blocked', 'arvan', 'firewall', 'مسدود', 'آروان', 'captcha', 'forbidden' ) as $keyword ) {
+			if ( false !== strpos( $message, $keyword ) ) {
+				return false;
+			}
+		}
+
+		if ( in_array( $status, array( 403, 404 ), true ) ) {
+			return false;
+		}
 
 		if ( in_array( $status, array( 429, 502, 503, 504 ), true ) ) {
 			return true;
 		}
 
-		$message = strtolower( $error->get_error_message() );
-
-		foreach ( array( '429', 'too many requests', 'rate limit', 'bot', 'ربات', 'captcha' ) as $keyword ) {
+		foreach ( array( '429', 'too many requests', 'rate limit' ) as $keyword ) {
 			if ( false !== strpos( $message, $keyword ) ) {
 				return true;
 			}

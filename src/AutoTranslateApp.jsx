@@ -54,6 +54,10 @@ function isCronHealthy(job) {
       progressAge > 75 &&
       activityAge > 75);
 
+  if (job?.status === 'running' && Number(job?.api_cooldown_remaining || 0) > 0) {
+    return true;
+  }
+
   if (job?.status === 'running' && elementorStalled) {
     return false;
   }
