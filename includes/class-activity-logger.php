@@ -113,7 +113,8 @@ final class Activity_Logger {
 		// Legacy endpoint: nudge AS instead of HTTP/CLI chains.
 		add_action( 'wp_ajax_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
 		add_action( 'wp_ajax_nopriv_' . self::LOOPBACK_ACTION, array( __CLASS__, 'handle_loopback_tick' ) );
-		if ( wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_ajax() ) {
+
+		if ( wp_doing_cron() ) {
 			self::maybe_heal_background_worker();
 		} else {
 			self::maybe_ensure_pulse_quietly();
@@ -259,12 +260,16 @@ final class Activity_Logger {
 			exit( 'forbidden' );
 		}
 
+		self::$trusted_loopback_tick = true;
+
 		if ( ! self::is_bulk_job_running() ) {
 			status_header( 200 );
 			exit( 'idle' );
 		}
 
 		self::keep_alive_as_worker();
+
+		self::$trusted_loopback_tick = false;
 
 		status_header( 200 );
 		exit( 'as' );
@@ -406,6 +411,15 @@ final class Activity_Logger {
 	 * @return array<string, mixed>|null
 	 */
 	public static function keep_alive_as_worker() {
+		if (
+			! wp_doing_cron()
+			&& ! self::$trusted_loopback_tick
+			&& ! self::$trusted_job_tick
+			&& ! self::$trusted_as_tick
+		) {
+			return null;
+		}
+
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
