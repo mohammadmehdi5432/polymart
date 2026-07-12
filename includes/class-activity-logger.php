@@ -89,6 +89,20 @@ final class Activity_Logger {
 	 */
 	private static $trusted_as_tick = false;
 	/**
+	 * When true, run_inline_worker_tick may execute from admin REST (ensure/kick).
+	 *
+	 * @var bool
+	 */
+	private static $trusted_admin_worker = false;
+
+	/**
+	 * Prevent nested Elementor burst recursion (run_queue_inline ↔ run_pinned).
+	 *
+	 * @var bool
+	 */
+	private static $elementor_burst_inflight = false;
+
+	/**
 	 * When true, process_background_step will not re-enqueue (AS handler chains).
 	 *
 	 * @var bool
@@ -416,6 +430,7 @@ final class Activity_Logger {
 			&& ! self::$trusted_loopback_tick
 			&& ! self::$trusted_job_tick
 			&& ! self::$trusted_as_tick
+			&& ! self::$trusted_admin_worker
 		) {
 			return null;
 		}
@@ -477,6 +492,49 @@ final class Activity_Logger {
 	 */
 	public static function keep_alive_cli_worker() {
 		return self::keep_alive_as_worker();
+	}
+
+	/**
+	 * Run one bounded worker batch from admin REST, cron, or AS (trusted context).
+	 *
+	 * @param int|null $max_steps  Optional step cap.
+	 * @param int|null $budget_sec Optional wall-clock budget.
+	 * @return array<string, mixed>
+	 */
+	public static function run_inline_worker_tick( $max_steps = null, $budget_sec = null ) {
+		self::$trusted_admin_worker = true;
+		self::$trusted_as_tick      = true;
+		self::$trusted_job_tick     = true;
+
+		try {
+			self::bootstrap_job_worker_context();
+			self::force_release_step_lock_if_idle();
+			Job_Action_Scheduler::clear_slice_mutex_if_stale();
+
+			$job = self::get_job_raw();
+
+			if ( self::should_prioritize_elementor_partial( $job ) ) {
+				$cap    = null === $max_steps ? self::get_elementor_partial_step_cap( $job ) : max( 1, absint( $max_steps ) );
+				$budget = null === $budget_sec ? max( 90, min( 300, $cap * 50 ) ) : max( 30, absint( $budget_sec ) );
+
+				return self::run_action_scheduler_batch( $cap, $budget );
+			}
+
+			if ( Job_Action_Scheduler::is_available() ) {
+				$processed = Job_Action_Scheduler::run_queue_inline( false );
+
+				if ( $processed > 0 ) {
+					return self::normalize_job_for_response( self::get_job_raw(), false );
+				}
+			}
+
+			$steps  = null === $max_steps ? 2 : max( 1, absint( $max_steps ) );
+			$budget = null === $budget_sec ? self::get_cron_step_budget_sec() : max( 30, absint( $budget_sec ) );
+
+			return self::run_action_scheduler_batch( $steps, $budget );
+		} finally {
+			self::$trusted_admin_worker = false;
+		}
 	}
 
 	/**
@@ -2255,6 +2313,10 @@ final class Activity_Logger {
 	 * @return bool True when work ran.
 	 */
 	public static function run_pinned_elementor_work( $log_stalled = false ) {
+		if ( self::$elementor_burst_inflight ) {
+			return false;
+		}
+
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -2274,27 +2336,7 @@ final class Activity_Logger {
 		}
 
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
-		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 		$before  = (string) ( $job['partial_progress'] ?? '' );
-
-		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::clear_slice_mutex_if_stale();
-			Job_Action_Scheduler::recover_stale_running_actions( 30 );
-
-			$processed = Job_Action_Scheduler::run_queue_inline( true );
-
-			if ( $processed > 0 ) {
-				$pulse = max(
-					self::CRON_FAST_INTERVAL_SEC,
-					(int) apply_filters( 'polymart_ai_elementor_cron_pulse_sec', 28 )
-				);
-				self::schedule_chain_safety_pulse( $pulse );
-
-				return true;
-			}
-		}
-
-		self::force_release_step_lock_if_idle();
 
 		if ( $log_stalled || self::is_elementor_progress_stalled( $job ) ) {
 			self::log(
@@ -2309,10 +2351,16 @@ final class Activity_Logger {
 			);
 		}
 
-		$job    = self::get_job_raw();
-		$cap    = self::get_elementor_partial_step_cap( $job );
-		$budget = max( 90, min( 300, $cap * 50 ) );
-		self::run_action_scheduler_batch( $cap, $budget );
+		self::$elementor_burst_inflight = true;
+
+		try {
+			$job    = self::get_job_raw();
+			$cap    = self::get_elementor_partial_step_cap( $job );
+			$budget = max( 90, min( 300, $cap * 50 ) );
+			self::run_inline_worker_tick( $cap, $budget );
+		} finally {
+			self::$elementor_burst_inflight = false;
+		}
 
 		$pulse = max(
 			self::CRON_FAST_INTERVAL_SEC,
@@ -3250,8 +3298,9 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 		Job_Action_Scheduler::cancel_all();
-		// Fast HTTP response — AS/cron run the first slice; avoid 60–150s inline work here.
 		self::bootstrap_background_worker( false );
+		// Local/cPanel hosts often never run AS HTTP — kick one bounded slice inline now.
+		self::run_inline_worker_tick( 2, 90 );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -3324,6 +3373,7 @@ final class Activity_Logger {
 
 			self::save_job( $job );
 			self::bootstrap_background_worker( false );
+			self::run_inline_worker_tick( 2, 90 );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -3904,15 +3954,11 @@ final class Activity_Logger {
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;
 			self::save_job( $job );
-		} elseif ( $should_tick && Job_Action_Scheduler::is_available() ) {
-			$processed = Job_Action_Scheduler::run_queue_inline( true );
-			if ( $processed > 0 ) {
-				$job = self::get_job_raw();
-				$job['worker_inline_tick'] = true;
-				self::save_job( $job );
-			}
-		} elseif ( $should_tick && ! Job_Action_Scheduler::is_available() ) {
-			self::run_action_scheduler_batch( 2 );
+		} elseif ( $should_tick ) {
+			self::run_inline_worker_tick( $worker_dead ? 3 : 2, $worker_dead ? 120 : 90 );
+			$job = self::get_job_raw();
+			$job['worker_inline_tick'] = true;
+			self::save_job( $job );
 		}
 
 		$next = self::get_next_worker_cron();
@@ -4168,7 +4214,7 @@ final class Activity_Logger {
 		Job_Action_Scheduler::clear_slice_mutex_if_stale();
 		Job_Action_Scheduler::enqueue_next( true, 0 );
 
-		$result = self::keep_alive_as_worker();
+		$result = self::run_inline_worker_tick();
 
 		if ( is_array( $result ) ) {
 			$result['worker_kicked'] = true;

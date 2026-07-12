@@ -3,7 +3,7 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
+import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
@@ -571,7 +571,10 @@ export default function AutoTranslateApp() {
           if (!lockBlocks) {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
-            const recovered = await ensureServerWorker();
+            const recovered =
+              activityAge >= CRON_STALE_SEC
+                ? await jobStep().catch(() => ensureServerWorker())
+                : await ensureServerWorker();
             if (recovered?.worker_direct_tick && isActiveRef.current) {
               appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
             } else if (recovered?.worker_inline_tick && isActiveRef.current) {

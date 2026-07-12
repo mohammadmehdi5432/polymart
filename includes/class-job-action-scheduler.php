@@ -252,9 +252,12 @@ final class Job_Action_Scheduler {
 
 		$job = Activity_Logger::get_job_for_as_debug();
 
-		// Elementor partials are driven by cron/UI inline batches — AS rows often never run.
+		// Elementor partials are driven by cron/UI inline batches — stale AS rows block enqueue.
 		if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
-			if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+			if (
+				! Activity_Logger::is_bulk_worker_lively( 75 )
+				&& self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0
+			) {
 				self::cancel_pending_slices();
 			}
 
@@ -1082,7 +1085,8 @@ final class Job_Action_Scheduler {
 			$job = Activity_Logger::get_job_for_as_debug();
 
 			if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
-				Activity_Logger::run_direct_elementor_burst();
+				$cap = Activity_Logger::get_elementor_partial_step_cap( $job );
+				Activity_Logger::run_action_scheduler_batch( max( 1, $cap ), self::SLICE_BUDGET_SEC );
 			} else {
 				Activity_Logger::run_action_scheduler_batch( 1, self::SLICE_BUDGET_SEC );
 			}
