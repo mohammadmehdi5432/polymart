@@ -250,7 +250,7 @@ final class Translation_Query {
 		self::scan_posts(
 			$query_args,
 			static function ( \WP_Post $post ) use ( $lang, &$count ) {
-				if ( Post_Translator::post_has_persian_content( $post ) && 'translated' !== Post_Translator::get_translation_status( $post->ID, $lang ) ) {
+				if ( Post_Translator::post_needs_translation_work( $post->ID, $lang ) ) {
 					++$count;
 				}
 			}
@@ -550,6 +550,134 @@ final class Translation_Query {
 		}
 
 		return $found;
+	}
+
+	/**
+	 * Collect posts that still look untranslated on the English storefront.
+	 *
+	 * @param string $lang  Target language code.
+	 * @param int    $limit Maximum issues to return.
+	 * @return array<int, array{post_id: int, title: string, type: string, reason: string, status: string}>
+	 */
+	public static function collect_storefront_translation_issues( $lang, $limit = 15 ) {
+		global $wpdb;
+
+		$lang  = sanitize_key( (string) $lang );
+		$limit = max( 1, min( 30, absint( $limit ) ) );
+
+		if ( '' === $lang ) {
+			return array();
+		}
+
+		Post_Translator::reconcile_stale_translation_indexes( $lang, min( 500, $limit * 20 ) );
+		Post_Translator::flush_translation_status_cache();
+
+		$candidates = array();
+		$front      = absint( get_option( 'page_on_front' ) );
+
+		if ( $front > 0 ) {
+			$candidates[] = $front;
+		}
+
+		foreach ( array( 'cms_block', 'woodmart_layout', 'page' ) as $post_type ) {
+			$ids = get_posts(
+				array(
+					'post_type'              => $post_type,
+					'post_status'            => 'publish',
+					'posts_per_page'         => 40,
+					'fields'                 => 'ids',
+					'orderby'                => 'modified',
+					'order'                  => 'DESC',
+					'no_found_rows'          => true,
+					'update_post_meta_cache' => false,
+					'update_post_term_cache' => false,
+				)
+			);
+
+			if ( is_array( $ids ) ) {
+				$candidates = array_merge( $candidates, array_map( 'absint', $ids ) );
+			}
+		}
+
+		$post_types = array_values(
+			array_filter(
+				array_map( 'sanitize_key', Post_Translator::get_supported_post_types() )
+			)
+		);
+
+		if ( ! empty( $post_types ) ) {
+			$placeholders = implode( ', ', array_fill( 0, count( $post_types ), '%s' ) );
+			$status_key   = Post_Translator::get_status_index_meta_key( $lang );
+			$flagged_ids  = $wpdb->get_col(
+				$wpdb->prepare(
+					"SELECT DISTINCT p.ID
+					FROM {$wpdb->posts} p
+					INNER JOIN {$wpdb->postmeta} pm_flag
+						ON p.ID = pm_flag.post_id
+						AND pm_flag.meta_key = %s
+						AND pm_flag.meta_value = '1'
+					LEFT JOIN {$wpdb->postmeta} pm_status
+						ON p.ID = pm_status.post_id
+						AND pm_status.meta_key = %s
+					WHERE p.post_status = 'publish'
+						AND p.post_type IN ( {$placeholders} )
+					ORDER BY ( pm_status.meta_value = 'translated' ) DESC, p.ID ASC
+					LIMIT %d",
+					array_merge(
+						array( Post_Translator::PERSIAN_CONTENT_FLAG_META, $status_key ),
+						$post_types,
+						array( min( 200, $limit * 12 ) )
+					)
+				)
+			);
+
+			if ( is_array( $flagged_ids ) ) {
+				$candidates = array_merge( $candidates, array_map( 'absint', $flagged_ids ) );
+			}
+		}
+
+		$issues = array();
+		$seen   = array();
+
+		foreach ( array_values( array_unique( array_filter( $candidates ) ) ) as $post_id ) {
+			$post_id = absint( $post_id );
+
+			if ( $post_id <= 0 || isset( $seen[ $post_id ] ) ) {
+				continue;
+			}
+
+			$seen[ $post_id ] = true;
+
+			if ( ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+				continue;
+			}
+
+			$post = get_post( $post_id );
+
+			if ( ! $post instanceof \WP_Post ) {
+				continue;
+			}
+
+			if ( Post_Translator::post_has_persian_content( $post ) ) {
+				update_post_meta( $post_id, Post_Translator::PERSIAN_CONTENT_FLAG_META, '1' );
+			}
+
+			Post_Translator::sync_translation_index_meta( $post_id, $lang );
+
+			$issues[] = array(
+				'post_id' => $post_id,
+				'title'   => get_the_title( $post_id ) ?: __( '(بدون عنوان)', 'polymart-ai' ),
+				'type'    => $post->post_type,
+				'reason'  => Post_Translator::describe_translation_gap( $post_id, $lang ),
+				'status'  => Post_Translator::get_translation_status( $post_id, $lang ),
+			);
+
+			if ( count( $issues ) >= $limit ) {
+				break;
+			}
+		}
+
+		return $issues;
 	}
 
 	/**

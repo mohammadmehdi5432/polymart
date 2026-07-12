@@ -1387,7 +1387,10 @@ export default function AutoTranslateApp() {
                         </ul>
                       ) : (
                         <p className="mt-1 text-xs">
-                          {(item.missing ?? []).join('، ') || (item.notes ?? []).join('، ') || 'فیلد نامشخص'}
+                          {item.reason
+                            || (item.missing ?? []).join('، ')
+                            || (item.notes ?? []).join('، ')
+                            || 'فیلد نامشخص'}
                         </p>
                       )}
                     </div>

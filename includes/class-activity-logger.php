@@ -1076,29 +1076,8 @@ final class Activity_Logger {
 			}
 		}
 
-		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) && ! empty( $job['stalled_ids'] ) && is_array( $job['stalled_ids'] ) ) {
-			$job['stalled_details'] = array();
-
-			foreach ( array_slice( array_map( 'absint', $job['stalled_ids'] ), 0, 5 ) as $stalled_id ) {
-				if ( $stalled_id <= 0 ) {
-					continue;
-				}
-
-				$gaps = Post_Translator::get_translation_gaps( $stalled_id, $lang );
-
-				if ( 'translated' === ( $gaps['status'] ?? '' ) ) {
-					continue;
-				}
-
-				$job['stalled_details'][] = array(
-					'post_id' => $stalled_id,
-					'title'   => get_the_title( $stalled_id ),
-					'status'  => $gaps['status'] ?? 'partial',
-					'missing' => $gaps['missing'],
-					'fields'  => $gaps['fields'] ?? array(),
-					'notes'   => $gaps['notes'] ?? array(),
-				);
-			}
+		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) ) {
+			$job = self::attach_stalled_job_details( $job, $lang );
 		}
 
 		return $job;
@@ -1124,29 +1103,59 @@ final class Activity_Logger {
 
 		$job = self::attach_job_metrics( $job, $lang, false );
 
-		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) && ! empty( $job['stalled_ids'] ) && is_array( $job['stalled_ids'] ) ) {
-			$job['stalled_details'] = array();
+		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) ) {
+			$job = self::attach_stalled_job_details( $job, $lang );
+		}
 
-			foreach ( array_slice( array_map( 'absint', $job['stalled_ids'] ), 0, 5 ) as $stalled_id ) {
-				if ( $stalled_id <= 0 ) {
-					continue;
-				}
+		return $job;
+	}
 
-				$gaps = Post_Translator::get_translation_gaps( $stalled_id, $lang );
+	/**
+	 * Attach human-readable details for paused/stalled jobs.
+	 *
+	 * @param array<string, mixed> $job  Job state.
+	 * @param string               $lang Target language code.
+	 * @return array<string, mixed>
+	 */
+	private static function attach_stalled_job_details( array $job, $lang ) {
+		$lang               = sanitize_key( (string) $lang );
+		$job['stalled_details'] = array();
+		$stalled_ids        = is_array( $job['stalled_ids'] ?? null ) ? array_map( 'absint', $job['stalled_ids'] ) : array();
 
-				if ( 'translated' === ( $gaps['status'] ?? '' ) ) {
-					continue;
-				}
+		if ( empty( $stalled_ids ) ) {
+			$stalled_ids = array_values(
+				array_filter(
+					array_map(
+						'absint',
+						wp_list_pluck(
+							Translation_Query::collect_storefront_translation_issues( $lang, 5 ),
+							'post_id'
+						)
+					)
+				)
+			);
+		}
 
-				$job['stalled_details'][] = array(
-					'post_id' => $stalled_id,
-					'title'   => get_the_title( $stalled_id ),
-					'status'  => $gaps['status'] ?? 'partial',
-					'missing' => $gaps['missing'],
-					'fields'  => $gaps['fields'] ?? array(),
-					'notes'   => $gaps['notes'] ?? array(),
-				);
+		foreach ( array_slice( $stalled_ids, 0, 5 ) as $stalled_id ) {
+			if ( $stalled_id <= 0 ) {
+				continue;
 			}
+
+			$gaps = Post_Translator::get_translation_gaps( $stalled_id, $lang );
+
+			if ( 'translated' === ( $gaps['status'] ?? '' ) && ! Post_Translator::storefront_would_show_persian_source( $stalled_id, $lang ) ) {
+				continue;
+			}
+
+			$job['stalled_details'][] = array(
+				'post_id' => $stalled_id,
+				'title'   => get_the_title( $stalled_id ),
+				'status'  => $gaps['status'] ?? 'partial',
+				'missing' => $gaps['missing'],
+				'fields'  => $gaps['fields'] ?? array(),
+				'notes'   => $gaps['notes'] ?? array(),
+				'reason'  => Post_Translator::describe_translation_gap( $stalled_id, $lang ),
+			);
 		}
 
 		return $job;
@@ -2505,11 +2514,18 @@ final class Activity_Logger {
 
 		Post_Translator::reconcile_stale_translation_indexes( $lang, 250 );
 
-		$stats      = Translation_Query::compute_translation_stats( $lang, false );
+		$issues     = Translation_Query::collect_storefront_translation_issues( $lang, 15 );
+		$issue_ids  = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
+		$stats      = Translation_Query::compute_translation_stats( $lang, true );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
-		$probe_ids  = array();
+		$probe_ids  = $issue_ids;
+
+		if ( $total <= 0 && ! empty( $probe_ids ) ) {
+			$needs_work = max( count( $probe_ids ), $menu_needs );
+			$total      = $needs_work;
+		}
 
 		if ( $total <= 0 ) {
 			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12 );
@@ -2531,7 +2547,8 @@ final class Activity_Logger {
 			if ( $probe_post <= 0 && $menu_needs <= 0 ) {
 				return new \WP_Error(
 					'polymart_ai_no_queue',
-					__( 'مورد ترجمه‌نشده‌ای برای این زبان یافت نشد.', 'polymart-ai' )
+					self::format_no_queue_diagnostic( $lang, $issues ),
+					array( 'issues' => $issues )
 				);
 			}
 
@@ -2552,6 +2569,37 @@ final class Activity_Logger {
 				)
 			);
 			$seed_ids = array_slice( $seed_ids, 0, max( $seed_limit, count( $probe_ids ) ) );
+		}
+
+		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
+			return new \WP_Error(
+				'polymart_ai_no_queue',
+				self::format_no_queue_diagnostic( $lang, $issues ),
+				array( 'issues' => $issues )
+			);
+		}
+
+		if ( ! empty( $issues ) ) {
+			$preview = array();
+
+			foreach ( array_slice( $issues, 0, 3 ) as $issue ) {
+				$preview[] = sprintf(
+					'#%1$d %2$s',
+					(int) ( $issue['post_id'] ?? 0 ),
+					(string) ( $issue['title'] ?? '' )
+				);
+			}
+
+			self::log(
+				'info',
+				sprintf(
+					/* translators: 1: count, 2: sample list */
+					__( 'پیش‌بررسی: %1$d مورد ناقص شناسایی شد (%2$s).', 'polymart-ai' ),
+					count( $issues ),
+					implode( '، ', $preview )
+				),
+				array( 'issues' => $issues )
+			);
 		}
 
 		$job = array(
@@ -4190,7 +4238,7 @@ final class Activity_Logger {
 				continue;
 			}
 
-			if ( '' !== $lang && 'translated' === Post_Translator::get_translation_status( $post_id, $lang ) ) {
+			if ( '' !== $lang && ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
 				continue;
 			}
 
@@ -4621,6 +4669,34 @@ final class Activity_Logger {
 				$stalled_ids = Translation_Query::collect_remaining_post_ids( $lang, 10 );
 			}
 
+			if ( empty( $stalled_ids ) ) {
+				$stalled_ids = array_values(
+					array_filter(
+						array_map(
+							'absint',
+							wp_list_pluck(
+								Translation_Query::collect_storefront_translation_issues( $lang, 8 ),
+								'post_id'
+							)
+						)
+					)
+				);
+			}
+
+			if ( ! empty( $stalled_ids ) ) {
+				$job['deferred_queue'] = array_values(
+					array_unique(
+						array_merge( self::get_deferred_queue( $job ), $stalled_ids )
+					)
+				);
+				$job['status']       = 'running';
+				$job['pause_reason'] = null;
+				$job['last_error']   = null;
+				self::save_job( $job );
+
+				return;
+			}
+
 			$job['status']       = 'paused';
 			$job['pause_reason'] = 'stalled';
 			$job['stalled_ids']  = $stalled_ids;
@@ -4661,6 +4737,47 @@ final class Activity_Logger {
 			$lang,
 			$skipped_ids,
 			__( 'ترجمه خودکار تمام شد — %1$d مورد پس از چند تلاش رد شد و بقیه انجام شد: %2$s', 'polymart-ai' )
+		);
+	}
+
+	/**
+	 * Explain why auto-translate cannot start yet.
+	 *
+	 * @param string                             $lang   Target language code.
+	 * @param array<int, array<string, mixed>> $issues Preflight issues.
+	 * @return string
+	 */
+	private static function format_no_queue_diagnostic( $lang, array $issues = array() ) {
+		$lang = sanitize_key( (string) $lang );
+
+		if ( empty( $issues ) ) {
+			$issues = Translation_Query::collect_storefront_translation_issues( $lang, 8 );
+		}
+
+		if ( ! empty( $issues ) ) {
+			$lines = array();
+
+			foreach ( array_slice( $issues, 0, 5 ) as $issue ) {
+				$lines[] = sprintf(
+					'#%1$d %2$s (%3$s): %4$s',
+					(int) ( $issue['post_id'] ?? 0 ),
+					(string) ( $issue['title'] ?? '' ),
+					(string) ( $issue['type'] ?? '' ),
+					(string) ( $issue['reason'] ?? '' )
+				);
+			}
+
+			return sprintf(
+				/* translators: 1: count, 2: details */
+				__( 'پیش‌بررسی %1$d مورد ناقص پیدا کرد اما در صف index نیست — «توقف کامل» بزنید و دوباره «شروع» کنید: %2$s', 'polymart-ai' ),
+				count( $issues ),
+				implode( ' | ', $lines )
+			);
+		}
+
+		return __(
+			'مورد ترجمه‌نشده‌ای در index یافت نشد. اگر صفحه اصلی/فوتر/بلوک HTML هنوز فارسی است، احتمالاً متن در ویجت هدر وودمارت (خارج از پست) است — تب «رشته‌های UI» را اسکن کنید، یا صفحه/بلوک cms_block را در ویرایشگر باز کنید.',
+			'polymart-ai'
 		);
 	}
 
@@ -4729,6 +4846,25 @@ final class Activity_Logger {
 				__( ' … +%d مورد دیگر', 'polymart-ai' ),
 				count( $remaining_ids ) - count( $details )
 			);
+		}
+
+		if ( '' === trim( $summary ) ) {
+			$issues = Translation_Query::collect_storefront_translation_issues( $lang, 5 );
+
+			foreach ( $issues as $issue ) {
+				$details[] = sprintf(
+					'#%1$d: %2$s — %3$s',
+					(int) ( $issue['post_id'] ?? 0 ),
+					(string) ( $issue['title'] ?? '' ),
+					(string) ( $issue['reason'] ?? '' )
+				);
+			}
+
+			$summary = implode( ' | ', $details );
+		}
+
+		if ( '' === trim( $summary ) ) {
+			$summary = __( 'هیچ مورد قابل اجرا در صف پیدا نشد. صفحه اصلی، بلوک HTML (cms_block) یا ویجت هدر را در ویرایشگر باز کنید و دوباره «شروع» بزنید.', 'polymart-ai' );
 		}
 
 		$total_incomplete = max(

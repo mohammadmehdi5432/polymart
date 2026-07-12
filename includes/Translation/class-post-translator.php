@@ -5074,12 +5074,7 @@ final class Post_Translator {
 		}
 
 		// Never decode multi-megabyte Elementor JSON during public page renders.
-		if (
-			! is_admin()
-			&& ! wp_doing_cron()
-			&& ! wp_doing_ajax()
-			&& ! ( defined( 'REST_REQUEST' ) && REST_REQUEST )
-		) {
+		if ( ! self::allows_elementor_audit_decode() ) {
 			self::$elementor_plain_text_cache[ $post_id ] = '';
 
 			return '';
@@ -5177,6 +5172,139 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether the current request may decode Elementor JSON for audits/jobs.
+	 *
+	 * @return bool
+	 */
+	private static function allows_elementor_audit_decode() {
+		if (
+			is_admin()
+			|| wp_doing_cron()
+			|| wp_doing_ajax()
+			|| ( defined( 'REST_REQUEST' ) && REST_REQUEST )
+		) {
+			return true;
+		}
+
+		return \PolymartAI\Activity_Logger::is_trusted_job_worker();
+	}
+
+	/**
+	 * Whether an English storefront URL would still render Persian source content.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function storefront_would_show_persian_source( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post || 'publish' !== $post->post_status ) {
+			return false;
+		}
+
+		if ( ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			return false;
+		}
+
+		if ( self::uses_elementor_builder( $post_id ) && ! self::is_commerce_product_post( $post_id, $post ) ) {
+			if ( self::has_elementor_persian_content( $post_id ) ) {
+				if ( ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+					return true;
+				}
+
+				if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+					return true;
+				}
+
+				return false;
+			}
+		}
+
+		foreach ( array( 'post_title', 'post_excerpt', 'post_content' ) as $source_key ) {
+			if ( 'post_content' === $source_key && self::uses_elementor_builder( $post_id ) ) {
+				continue;
+			}
+
+			$source = self::get_field_source_text( $post, $source_key );
+
+			if ( '' === trim( $source ) || ! Persian_Detector::contains_persian( $source ) ) {
+				continue;
+			}
+
+			if ( ! self::should_serve_stored_translation( $post_id, $source_key, $lang, $post ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Human-readable reason a post still needs translation work.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return string
+	 */
+	public static function describe_translation_gap( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$notes   = array();
+
+		if ( self::uses_elementor_builder( $post_id ) && self::has_elementor_persian_content( $post_id ) ) {
+			if ( ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+				$error = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ) );
+
+				if ( '' !== $error ) {
+					$notes[] = sprintf(
+						/* translators: %s: Elementor error message */
+						__( 'Elementor: %s', 'polymart-ai' ),
+						$error
+					);
+				} else {
+					$notes[] = __( 'ترجمه Elementor روی URL انگلیسی اعمال نمی‌شود', 'polymart-ai' );
+				}
+			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+				$notes[] = __( 'JSON ترجمه Elementor هنوز متن فارسی دارد', 'polymart-ai' );
+			}
+		}
+
+		$gaps = self::get_translation_gaps( $post_id, $lang );
+
+		foreach ( $gaps['fields'] ?? array() as $field ) {
+			if ( empty( $field['translated'] ) && ! empty( $field['label'] ) ) {
+				$notes[] = (string) $field['label'];
+			}
+		}
+
+		if ( empty( $notes ) && ! empty( $gaps['missing'] ) ) {
+			$notes = array_map( 'strval', $gaps['missing'] );
+		}
+
+		if ( empty( $notes ) && ! empty( $gaps['notes'] ) ) {
+			$notes = array_map( 'strval', $gaps['notes'] );
+		}
+
+		if ( empty( $notes ) && self::storefront_would_show_persian_source( $post_id, $lang ) ) {
+			$notes[] = __( 'فروشگاه هنوز متن فارسی نشان می‌دهد', 'polymart-ai' );
+		}
+
+		if ( empty( $notes ) ) {
+			$notes[] = __( 'وضعیت ترجمه نامشخص — بررسی دستی لازم است', 'polymart-ai' );
+		}
+
+		return implode( '؛ ', array_unique( array_filter( $notes ) ) );
+	}
+
+	/**
 	 * Whether a post still needs bulk translation work for a language.
 	 *
 	 * @param int    $post_id Post ID.
@@ -5199,6 +5327,10 @@ final class Post_Translator {
 
 		if ( ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
 			return false;
+		}
+
+		if ( self::storefront_would_show_persian_source( $post_id, $lang ) ) {
+			return true;
 		}
 
 		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
@@ -6602,6 +6734,8 @@ final class Post_Translator {
 			if ( $post instanceof \WP_Post && ! empty( self::collect_persian_fields( $post, $lang ) ) ) {
 				$status = 'partial';
 			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+				$status = 'partial';
+			} elseif ( self::storefront_would_show_persian_source( $post_id, $lang ) ) {
 				$status = 'partial';
 			}
 		}
