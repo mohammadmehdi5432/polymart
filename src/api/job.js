@@ -4,8 +4,8 @@ import api from './settings';
 export const JOB_STEP_TIMEOUT_MS = 240000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
-/** Start/resume/recovery runs one bounded worker slice inline. */
-const JOB_BOOTSTRAP_TIMEOUT_MS = 240000;
+/** Start/stop should return quickly; worker runs on AS/cron. */
+const JOB_START_STOP_TIMEOUT_MS = 90000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
 const JOB_STEP_RETRIES = 1;
@@ -72,9 +72,9 @@ export async function jobAction(action, lang = 'en', extra = {}) {
   }
   const heavyActions = new Set(['resume', 'kick', 'ensure']);
   const timeout = heavyActions.has(action)
-    ? JOB_BOOTSTRAP_TIMEOUT_MS
+    ? JOB_STEP_TIMEOUT_MS
     : action === 'start' || action === 'stop'
-      ? 60000
+      ? JOB_START_STOP_TIMEOUT_MS
       : JOB_FETCH_TIMEOUT_MS;
   const { data } = await withRetries(() =>
     api.post('/translation-job', { action, lang, ...extra }, { timeout })

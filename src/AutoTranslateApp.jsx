@@ -781,7 +781,19 @@ export default function AutoTranslateApp() {
           : 'شروع ترجمه خودکار ناموفق بود.');
 
       if (isTimeout) {
-        const recovered = await loadJob();
+        let recovered = null;
+
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          recovered = await loadJob();
+
+          if (recovered?.status === 'running') {
+            break;
+          }
+
+          await new Promise((resolve) => {
+            window.setTimeout(resolve, 1500 * (attempt + 1));
+          });
+        }
 
         if (recovered?.status === 'running') {
           autoResumedRef.current = true;

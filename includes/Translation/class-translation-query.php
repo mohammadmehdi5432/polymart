@@ -471,16 +471,19 @@ final class Translation_Query {
 	 * @param int    $limit Maximum IDs to return.
 	 * @return int[]
 	 */
-	public static function probe_priority_unfinished_post_ids( $lang, $limit = 15 ) {
+	public static function probe_priority_unfinished_post_ids( $lang, $limit = 15, $light = false ) {
 		$lang  = sanitize_key( (string) $lang );
 		$limit = max( 1, min( 50, absint( $limit ) ) );
+		$light = (bool) $light;
 
 		if ( '' === $lang ) {
 			return array();
 		}
 
-		Post_Translator::reconcile_stale_translation_indexes( $lang, min( 250, $limit * 8 ) );
-		Post_Translator::flush_translation_status_cache();
+		if ( ! $light ) {
+			Post_Translator::reconcile_stale_translation_indexes( $lang, min( 250, $limit * 8 ) );
+			Post_Translator::flush_translation_status_cache();
+		}
 
 		$candidates = array();
 
@@ -523,7 +526,10 @@ final class Translation_Query {
 				update_post_meta( $post_id, Post_Translator::PERSIAN_CONTENT_FLAG_META, '1' );
 			}
 
-			Post_Translator::sync_translation_index_meta( $post_id, $lang );
+			if ( ! $light ) {
+				Post_Translator::sync_translation_index_meta( $post_id, $lang );
+			}
+
 			$found[] = $post_id;
 
 			if ( count( $found ) >= $limit ) {
@@ -531,7 +537,7 @@ final class Translation_Query {
 			}
 		}
 
-		if ( count( $found ) >= $limit ) {
+		if ( count( $found ) >= $limit || $light ) {
 			return $found;
 		}
 
@@ -559,18 +565,21 @@ final class Translation_Query {
 	 * @param int    $limit Maximum issues to return.
 	 * @return array<int, array{post_id: int, title: string, type: string, reason: string, status: string}>
 	 */
-	public static function collect_storefront_translation_issues( $lang, $limit = 15 ) {
+	public static function collect_storefront_translation_issues( $lang, $limit = 15, $light = false ) {
 		global $wpdb;
 
 		$lang  = sanitize_key( (string) $lang );
 		$limit = max( 1, min( 30, absint( $limit ) ) );
+		$light = (bool) $light;
 
 		if ( '' === $lang ) {
 			return array();
 		}
 
-		Post_Translator::reconcile_stale_translation_indexes( $lang, min( 500, $limit * 20 ) );
-		Post_Translator::flush_translation_status_cache();
+		if ( ! $light ) {
+			Post_Translator::reconcile_stale_translation_indexes( $lang, min( 500, $limit * 20 ) );
+			Post_Translator::flush_translation_status_cache();
+		}
 
 		$candidates = array();
 		$front      = absint( get_option( 'page_on_front' ) );
@@ -579,12 +588,14 @@ final class Translation_Query {
 			$candidates[] = $front;
 		}
 
+		$page_limit = $light ? 12 : 40;
+
 		foreach ( array( 'cms_block', 'woodmart_layout', 'page' ) as $post_type ) {
 			$ids = get_posts(
 				array(
 					'post_type'              => $post_type,
 					'post_status'            => 'publish',
-					'posts_per_page'         => 40,
+					'posts_per_page'         => $page_limit,
 					'fields'                 => 'ids',
 					'orderby'                => 'modified',
 					'order'                  => 'DESC',
@@ -662,13 +673,15 @@ final class Translation_Query {
 				update_post_meta( $post_id, Post_Translator::PERSIAN_CONTENT_FLAG_META, '1' );
 			}
 
-			Post_Translator::sync_translation_index_meta( $post_id, $lang );
+			if ( ! $light ) {
+				Post_Translator::sync_translation_index_meta( $post_id, $lang );
+			}
 
 			$issues[] = array(
 				'post_id' => $post_id,
 				'title'   => get_the_title( $post_id ) ?: __( '(بدون عنوان)', 'polymart-ai' ),
 				'type'    => $post->post_type,
-				'reason'  => Post_Translator::describe_translation_gap( $post_id, $lang ),
+				'reason'  => $light ? '' : Post_Translator::describe_translation_gap( $post_id, $lang ),
 				'status'  => Post_Translator::get_translation_status( $post_id, $lang ),
 			);
 

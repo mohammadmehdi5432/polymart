@@ -3449,12 +3449,10 @@ final class Activity_Logger {
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
-		// Heavy index reconcile runs on worker ticks — start must return quickly to the browser.
-		Post_Translator::reconcile_stale_translation_indexes( $lang, 25 );
-
-		$issues     = Translation_Query::collect_storefront_translation_issues( $lang, 15 );
+		// Fast bootstrap: indexed stats + light storefront probe only (heavy reconcile runs on worker ticks).
+		$issues     = Translation_Query::collect_storefront_translation_issues( $lang, 8, true );
 		$issue_ids  = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
-		$stats      = Translation_Query::compute_translation_stats( $lang, true );
+		$stats      = Translation_Query::compute_translation_stats( $lang, false );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
@@ -3466,10 +3464,10 @@ final class Activity_Logger {
 		}
 
 		if ( $total <= 0 ) {
-			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12 );
+			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
 
 			if ( ! empty( $probe_ids ) ) {
-				$stats      = Translation_Query::compute_translation_stats( $lang, true );
+				$stats      = Translation_Query::compute_translation_stats( $lang, false );
 				$needs_work = max(
 					count( $probe_ids ),
 					(int) $stats['untranslated'] + (int) $stats['partial'],
@@ -3514,7 +3512,7 @@ final class Activity_Logger {
 		}
 
 		if ( empty( $seed_ids ) ) {
-			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit );
+			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, true );
 		}
 
 		if ( empty( $seed_ids ) ) {
@@ -3529,25 +3527,12 @@ final class Activity_Logger {
 			array_unique(
 				array_filter(
 					array_map( 'absint', $seed_ids ),
-					static function ( $post_id ) use ( $lang ) {
-						return $post_id > 0 && Post_Translator::post_is_actionable_for_job( $post_id, $lang );
+					static function ( $post_id ) {
+						return $post_id > 0;
 					}
 				)
 			)
 		);
-
-		if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
-			$seed_ids = array_values(
-				array_unique(
-					array_filter(
-						array_map( 'absint', $issue_ids ),
-						static function ( $post_id ) use ( $lang ) {
-							return $post_id > 0 && Post_Translator::post_is_actionable_for_job( $post_id, $lang );
-						}
-					)
-				)
-			);
-		}
 
 		if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
 			$seed_ids = array_values(
@@ -3656,7 +3641,7 @@ final class Activity_Logger {
 
 		Job_Action_Scheduler::cancel_all();
 		self::bootstrap_background_worker( false );
-		self::ping_wp_cron( true );
+		self::ping_wp_cron( false );
 		self::log(
 			'info',
 			sprintf(
