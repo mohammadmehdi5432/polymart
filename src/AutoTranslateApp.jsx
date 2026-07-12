@@ -108,7 +108,7 @@ function isCronHealthy(job) {
   }
 
   // Between elementor chunks the PHP lock is released — nudge ensure sooner than generic idle.
-  if (job?.status === 'running' && !job?.worker_lock && activityAge > (elementorPartial ? 10 : 18)) {
+  if (job?.status === 'running' && !job?.worker_lock && activityAge > (elementorPartial ? 6 : 18)) {
     return false;
   }
 
@@ -638,7 +638,7 @@ export default function AutoTranslateApp() {
         const activityAge = Math.max(0, now - latestWorkerStamp(data));
         const elementorNeedsKick =
           isElementorPartialJob(data) &&
-          activityAge > 14 &&
+          activityAge > 8 &&
           Number(data?.api_cooldown_remaining || 0) <= 0;
 
         if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
@@ -652,6 +652,7 @@ export default function AutoTranslateApp() {
             data.current_post?.title && !data.current_post?.from_last_step
           );
           const lockBlocks =
+            !isElementorPartialJob(data) &&
             Boolean(data.worker_lock) &&
             hasActivePost &&
             lockAge >= 0 &&
@@ -662,10 +663,14 @@ export default function AutoTranslateApp() {
           if (!lockBlocks) {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
-            const recovered =
-              activityAge >= CRON_STALE_SEC || elementorNeedsKick || Boolean(data.elementor_progress_stalled)
-                ? await jobStep().catch(() => ensureServerWorker())
-                : await ensureServerWorker();
+            const useHeavyTick =
+              isElementorPartialJob(data) ||
+              activityAge >= CRON_STALE_SEC ||
+              elementorNeedsKick ||
+              Boolean(data.elementor_progress_stalled);
+            const recovered = useHeavyTick
+              ? await jobStep().catch(() => ensureServerWorker())
+              : await ensureServerWorker();
             if (recovered?.worker_direct_tick && isActiveRef.current) {
               appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
             } else if (recovered?.worker_inline_tick && isActiveRef.current) {

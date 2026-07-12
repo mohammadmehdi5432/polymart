@@ -103,6 +103,13 @@ final class Activity_Logger {
 	private static $elementor_burst_inflight = false;
 
 	/**
+	 * Finish all remaining Elementor API batches for the pinned post in one HTTP request.
+	 *
+	 * @var bool
+	 */
+	private static $elementor_page_burst = false;
+
+	/**
 	 * When true, process_background_step will not re-enqueue (AS handler chains).
 	 *
 	 * @var bool
@@ -531,12 +538,7 @@ final class Activity_Logger {
 			$job = self::get_job_raw();
 
 			if ( self::should_prioritize_elementor_partial( $job ) ) {
-				$cap    = null === $max_steps ? min( 2, self::get_elementor_partial_step_cap( $job ) ) : max( 1, min( 2, absint( $max_steps ) ) );
-				$budget = null === $budget_sec
-					? max( 150, min( 300, $cap * 80 ) )
-					: max( 90, absint( $budget_sec ) );
-
-				return self::run_action_scheduler_batch( $cap, $budget );
+				return self::run_elementor_page_burst();
 			}
 
 			if ( Job_Action_Scheduler::is_available() ) {
@@ -572,12 +574,14 @@ final class Activity_Logger {
 
 		add_filter( 'polymart_ai_job_step_max_elementor_chunks', array( __CLASS__, 'filter_as_elementor_chunk_budget' ) );
 		add_filter( 'polymart_ai_job_stuck_progress_limit', array( __CLASS__, 'filter_elementor_stuck_progress_limit' ), 10, 3 );
+		add_filter( 'polymart_ai_elementor_inter_request_delay_sec', array( __CLASS__, 'filter_elementor_burst_inter_delay' ) );
 
 		try {
 			return self::process_background_step( $max_steps_override, $budget_override );
 		} finally {
 			remove_filter( 'polymart_ai_job_step_max_elementor_chunks', array( __CLASS__, 'filter_as_elementor_chunk_budget' ) );
 			remove_filter( 'polymart_ai_job_stuck_progress_limit', array( __CLASS__, 'filter_elementor_stuck_progress_limit' ), 10 );
+			remove_filter( 'polymart_ai_elementor_inter_request_delay_sec', array( __CLASS__, 'filter_elementor_burst_inter_delay' ) );
 
 			self::$skip_chain_after_tick = false;
 			self::$trusted_as_tick       = false;
@@ -2354,7 +2358,106 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	public static function filter_as_elementor_chunk_budget() {
+		if ( self::$elementor_page_burst ) {
+			return 25;
+		}
+
 		return 1;
+	}
+
+	/**
+	 * Shorter gap between Elementor API calls during a single-page burst.
+	 *
+	 * @param int $delay Default delay seconds.
+	 * @return int
+	 */
+	public static function filter_elementor_burst_inter_delay( $delay ) {
+		if ( self::$elementor_page_burst ) {
+			return 2;
+		}
+
+		return (int) $delay;
+	}
+
+	/**
+	 * Whether the worker is finishing an entire Elementor page in one request.
+	 *
+	 * @return bool
+	 */
+	public static function is_elementor_page_burst() {
+		return self::$elementor_page_burst;
+	}
+
+	/**
+	 * Run every remaining Elementor batch for the pinned post in one admin/cron request.
+	 *
+	 * Root fix for Local Sites / no-AS hosts: no idle gap between chunks 9→10→11.
+	 *
+	 * @param int|null $budget_sec Wall-clock budget.
+	 * @return array<string, mixed>
+	 */
+	public static function run_elementor_page_burst( $budget_sec = null ) {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		if ( self::is_job_api_cooldown_active( $job ) ) {
+			$out = self::normalize_job_for_response( $job, false );
+			$out['api_cooldown'] = true;
+
+			return $out;
+		}
+
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		self::$trusted_admin_worker = true;
+		self::$trusted_as_tick      = true;
+		self::$trusted_job_tick     = true;
+		self::$elementor_page_burst = true;
+
+		try {
+			self::bootstrap_job_worker_context();
+			self::force_release_step_lock_if_idle( 45 );
+			Job_Action_Scheduler::clear_slice_mutex_if_stale();
+			Post_Translator::release_stale_translation_lock( $post_id, $lang );
+
+			$budget = null === $budget_sec
+				? max( 180, (int) apply_filters( 'polymart_ai_elementor_page_burst_budget_sec', 300 ) )
+				: max( 120, absint( $budget_sec ) );
+
+			$result = self::run_action_scheduler_batch( 1, $budget );
+
+			$job = self::get_job_raw();
+			$job['worker_direct_tick'] = true;
+			$job['elementor_burst']  = true;
+			self::save_job( $job );
+
+			if ( is_array( $result ) ) {
+				$result['worker_direct_tick'] = true;
+				$result['elementor_burst']    = true;
+			}
+
+			if (
+				! Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
+				&& ! Post_Translator::should_run_elementor_job_slice( $post_id, $lang )
+			) {
+				return is_array( $result ) ? $result : self::normalize_job_for_response( self::get_job_raw(), false );
+			}
+
+			self::schedule_elementor_partial_follow_up( 4 );
+
+			return is_array( $result ) ? $result : self::normalize_job_for_response( self::get_job_raw(), false );
+		} finally {
+			self::$elementor_page_burst = false;
+			self::$trusted_admin_worker = false;
+		}
 	}
 
 	/**
@@ -2448,21 +2551,28 @@ final class Activity_Logger {
 		}
 
 		self::$elementor_burst_inflight = true;
+		self::log(
+			'info',
+			sprintf(
+				/* translators: 1: post ID, 2: progress marker */
+				__( 'Elementor burst — تکمیل یک‌درخواستی #%1$d (%2$s)', 'polymart-ai' ),
+				$post_id,
+				'' !== $before ? $before : '…'
+			),
+			array( 'post_id' => $post_id )
+		);
 
 		try {
-			$job    = self::get_job_raw();
-			$cap    = self::get_elementor_partial_step_cap( $job );
-			$budget = max( 150, min( 300, $cap * 80 ) );
-			self::run_inline_worker_tick( $cap, $budget );
+			$result = self::run_elementor_page_burst( 300 );
+			$worked = is_array( $result )
+				&& (
+					! empty( $result['elementor_burst'] )
+					|| (string) ( $result['partial_progress'] ?? '' ) !== $before_progress
+					|| absint( $result['last_cron_at'] ?? 0 ) > $before_cron
+				);
 		} finally {
 			self::$elementor_burst_inflight = false;
 		}
-
-		$after = self::get_job_raw();
-		$worked = (string) ( $after['partial_progress'] ?? '' ) !== $before_progress
-			|| absint( $after['last_cron_at'] ?? 0 ) > $before_cron;
-
-		self::schedule_elementor_partial_follow_up( $worked ? 10 : 6 );
 
 		return $worked;
 	}
@@ -4406,6 +4516,11 @@ final class Activity_Logger {
 			if (
 				'running' === ( $last_result['status'] ?? '' )
 				&& self::should_prioritize_elementor_partial( $last_result )
+				&& ! self::$elementor_page_burst
+				&& Post_Translator::elementor_job_api_slices_pending(
+					absint( $last_result['partial_post_id'] ?? 0 ),
+					sanitize_key( (string) ( $last_result['lang'] ?? 'en' ) )
+				)
 			) {
 				self::schedule_elementor_partial_follow_up();
 			}
@@ -4432,7 +4547,19 @@ final class Activity_Logger {
 		self::force_release_step_lock_if_idle();
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::clear_slice_mutex_if_stale();
-		Job_Action_Scheduler::enqueue_next( true, 0 );
+
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			$result = self::run_elementor_page_burst( 300 );
+
+			if ( is_array( $result ) ) {
+				$result['worker_kicked'] = true;
+				$result['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
+
+				return $result;
+			}
+		} else {
+			Job_Action_Scheduler::enqueue_next( true, 0 );
+		}
 
 		$result = self::run_inline_worker_tick();
 
