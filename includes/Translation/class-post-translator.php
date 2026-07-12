@@ -3921,6 +3921,77 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Extend TTL on a per-post lock already owned by this worker.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function touch_translation_lock( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::owns_translation_lock( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$keys = self::get_translation_lock_keys( $post_id, $lang );
+		$now  = time();
+
+		update_option( $keys['claim'], (string) $now, false );
+		set_transient( $keys['key'], $now, self::TRANSLATION_LOCK_TTL );
+
+		return true;
+	}
+
+	/**
+	 * Drop a per-post translation lock left by a killed PHP worker.
+	 *
+	 * @param int      $post_id        Post ID.
+	 * @param string   $lang           Language code.
+	 * @param int|null $max_silent_sec Seconds without worker heartbeat before forcing unlock.
+	 * @return bool True when a stale lock was cleared.
+	 */
+	public static function release_stale_translation_lock( $post_id, $lang, $max_silent_sec = null ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$keys  = self::get_translation_lock_keys( $post_id, $lang );
+		$claim = absint( get_option( $keys['claim'], 0 ) );
+		$lock  = get_transient( $keys['key'] );
+
+		if ( ! $claim && ! $lock ) {
+			return false;
+		}
+
+		if ( self::owns_translation_lock( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$max_silent_sec = null === $max_silent_sec
+			? max( 75, self::ELEMENTOR_JOB_REQUEST_TIMEOUT + 25 )
+			: max( 45, absint( $max_silent_sec ) );
+
+		if ( \PolymartAI\Activity_Logger::is_bulk_worker_lively( $max_silent_sec ) ) {
+			return false;
+		}
+
+		$lock_stamp = max( $claim, $lock ? absint( $lock ) : 0 );
+
+		if ( $lock_stamp > 0 && ( time() - $lock_stamp ) < $max_silent_sec ) {
+			return false;
+		}
+
+		self::release_translation_lock( $post_id, $lang, true );
+
+		return true;
+	}
+
+	/**
 	 * Whether every Elementor field is translated and persisted for a job slice.
 	 *
 	 * @param int                  $post_id Post ID.

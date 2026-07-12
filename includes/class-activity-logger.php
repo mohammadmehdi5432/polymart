@@ -165,6 +165,14 @@ final class Activity_Logger {
 		}
 
 		self::touch_worker_heartbeat();
+
+		$job     = self::get_job_raw();
+		$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::touch_translation_lock( $post_id, $lang );
+		}
 	}
 
 	/**
@@ -1698,6 +1706,13 @@ final class Activity_Logger {
 		$job = self::get_job_raw();
 
 		if ( self::is_elementor_progress_stalled( $job ) ) {
+			$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+			if ( $post_id > 0 && '' !== $lang ) {
+				Post_Translator::release_stale_translation_lock( $post_id, $lang );
+			}
+
 			self::force_unlock_step_now();
 
 			return true;
@@ -2334,22 +2349,8 @@ final class Activity_Logger {
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
 		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
-		if (
-			$post_id > 0
-			&& '' !== $lang
-			&& ! Post_Translator::owns_translation_lock( $post_id, $lang )
-			&& ! Post_Translator::acquire_translation_lock( $post_id, $lang )
-		) {
-			// Another worker is mid-slice on this Elementor page — do not bypass AS with a second writer.
-			return false;
-		}
-
-		if (
-			$post_id > 0
-			&& '' !== $lang
-			&& Post_Translator::owns_translation_lock( $post_id, $lang )
-		) {
-			Post_Translator::release_translation_lock( $post_id, $lang );
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_stale_translation_lock( $post_id, $lang );
 		}
 
 		$before  = (string) ( $job['partial_progress'] ?? '' );
@@ -3463,6 +3464,20 @@ final class Activity_Logger {
 			$job['pick_started_at'] = null;
 
 			self::release_step_lock();
+
+			foreach (
+				array_unique(
+					array_filter(
+						array(
+							absint( $job['partial_post_id'] ?? 0 ),
+							absint( $job['current_post_id'] ?? 0 ),
+						)
+					)
+				) as $locked_post_id
+			) {
+				Post_Translator::release_stale_translation_lock( $locked_post_id, $lang, 30 );
+			}
+
 			self::recover_stalled_job_picker( $job, $lang, true );
 
 			self::save_job( $job );
@@ -4001,16 +4016,20 @@ final class Activity_Logger {
 			$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
 			if ( $age >= self::get_ensure_inline_idle_sec() ) {
-				self::run_pinned_elementor_work( self::is_elementor_progress_stalled( $job ) );
+				$direct_ran = self::run_pinned_elementor_work( self::is_elementor_progress_stalled( $job ) );
+
+				if ( $direct_ran ) {
+					$job = self::get_job_raw();
+					$job['worker_direct_tick'] = true;
+					self::save_job( $job );
+				}
+			}
+		} elseif ( self::is_elementor_progress_stalled( $job ) ) {
+			if ( self::run_direct_elementor_burst() ) {
 				$job = self::get_job_raw();
 				$job['worker_direct_tick'] = true;
 				self::save_job( $job );
 			}
-		} elseif ( self::is_elementor_progress_stalled( $job ) ) {
-			self::run_direct_elementor_burst();
-			$job = self::get_job_raw();
-			$job['worker_direct_tick'] = true;
-			self::save_job( $job );
 		}
 
 		$released_stale_lock = self::force_release_step_lock_if_idle();
@@ -4042,6 +4061,14 @@ final class Activity_Logger {
 		$stale_sec = Job_Action_Scheduler::STALE_RUNNING_SEC;
 
 		if ( $busy && $age >= self::LOCK_FORCE_IDLE_SEC && ! self::is_bulk_worker_lively( $stale_sec ) ) {
+			$job     = self::get_job_raw();
+			$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+			if ( $post_id > 0 && '' !== $lang ) {
+				Post_Translator::release_stale_translation_lock( $post_id, $lang, self::LOCK_FORCE_IDLE_SEC );
+			}
+
 			self::release_step_lock();
 			$busy                = false;
 			$released_stale_lock = true;
@@ -4054,10 +4081,11 @@ final class Activity_Logger {
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
 		if ( $should_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
-			self::run_pinned_elementor_work( self::is_elementor_progress_stalled( self::get_job_raw() ) );
-			$job = self::get_job_raw();
-			$job['worker_inline_tick'] = true;
-			self::save_job( $job );
+			if ( self::run_pinned_elementor_work( self::is_elementor_progress_stalled( self::get_job_raw() ) ) ) {
+				$job = self::get_job_raw();
+				$job['worker_inline_tick'] = true;
+				self::save_job( $job );
+			}
 		} elseif ( $should_tick ) {
 			self::run_inline_worker_tick( $worker_dead ? 2 : 1, $worker_dead ? 90 : 60 );
 			$job = self::get_job_raw();
@@ -4597,6 +4625,21 @@ final class Activity_Logger {
 		}
 
 		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
+
+		if ( is_wp_error( $slice ) && 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
+			if ( Post_Translator::release_stale_translation_lock( $post_id, $lang ) ) {
+				self::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post ID */
+						__( 'قفل ترجمهٔ گیرکرده #%1$d آزاد شد — تلاش مجدد برای ادامه Elementor.', 'polymart-ai' ),
+						$post_id
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+				$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
+			}
+		}
 
 		if ( is_wp_error( $slice ) && 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
 			$job['current_post_id']       = null;
