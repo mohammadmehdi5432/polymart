@@ -186,12 +186,6 @@ final class Activity_Logger {
 		}
 
 		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
-
-		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::run_queue_inline( true );
-			return;
-		}
-
 		self::ping_wp_cron( true );
 	}
 
@@ -2009,11 +2003,16 @@ final class Activity_Logger {
 		$lang    = sanitize_key( (string) $lang );
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
 
-		if ( $post_id <= 0 || 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
+		if ( $post_id <= 0 || '' === $lang ) {
 			return false;
 		}
 
-		return '' !== $lang && Post_Translator::post_needs_elementor_job_work( $post_id, $lang );
+		if ( 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
+			return false;
+		}
+
+		return Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+			|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
 	}
 
 	/**
@@ -2043,6 +2042,9 @@ final class Activity_Logger {
 			);
 
 			if ( Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
+				$state['phase'] = 'elementor';
+				Post_Translator::save_job_partial_state( $post_id, $lang, $state );
+			} elseif ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
 				$state['phase'] = 'elementor';
 				Post_Translator::save_job_partial_state( $post_id, $lang, $state );
 			}
@@ -5511,7 +5513,10 @@ final class Activity_Logger {
 			self::untrack_succeeded_post( $job, $post_id );
 			self::track_partial_post( $job, $post_id );
 
-			if ( Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
+			if (
+				Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			) {
 				self::pin_job_for_elementor_post( $job, $post_id, $lang );
 
 				self::log(

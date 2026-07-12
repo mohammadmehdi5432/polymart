@@ -40,7 +40,14 @@ final class Job_Action_Scheduler {
 	const AS_MAX_STEPS_PER_REQUEST = 18;
 
 	/** Guard against run_queue_inline recursion blowing the PHP time limit. */
-	const MAX_INLINE_CHAIN_DEPTH = 3;
+	const MAX_INLINE_CHAIN_DEPTH = 1;
+
+	/**
+	 * Prevents nested chain_next_slice_immediately calls in one request.
+	 *
+	 * @var bool
+	 */
+	private static $chaining_next = false;
 
 	/** When another slice is in-flight, defer this action by this many seconds. */
 	const CONCURRENCY_DEFER_SEC = 45;
@@ -654,84 +661,27 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function chain_next_slice_immediately() {
-		if ( ! Activity_Logger::is_bulk_job_running() ) {
+		if ( ! Activity_Logger::is_bulk_job_running() || self::$chaining_next ) {
 			return;
 		}
 
-		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 330 );
-		}
+		self::$chaining_next = true;
 
-		$job          = Activity_Logger::get_job_for_as_debug();
-		$chain_start  = time();
-		$chain_budget = Activity_Logger::should_prioritize_elementor_partial( $job ) ? 280 : 120;
-
-		if (
-			Activity_Logger::should_prioritize_elementor_partial( $job )
-			&& self::$inline_chain_depth < self::MAX_INLINE_CHAIN_DEPTH
-		) {
-			$iterations     = 0;
-			$max_iterations = max( 2, min( 8, Activity_Logger::get_elementor_partial_step_cap( $job ) ) );
-
-			while (
-				Activity_Logger::is_bulk_job_running()
-				&& Activity_Logger::should_prioritize_elementor_partial( Activity_Logger::get_job_for_as_debug() )
-				&& ( time() - $chain_start ) < $chain_budget
-				&& $iterations < $max_iterations
-				&& self::$inline_chain_depth < self::MAX_INLINE_CHAIN_DEPTH
-			) {
-				++self::$inline_chain_depth;
-
-				try {
-					Activity_Logger::release_step_lock();
-					self::clear_slice_mutex();
-
-					$live             = Activity_Logger::get_job_for_as_debug();
-					$cap              = Activity_Logger::get_elementor_partial_step_cap( $live );
-					$remaining_budget = max( 45, $chain_budget - ( time() - $chain_start ) );
-
-					Activity_Logger::run_action_scheduler_batch(
-						max( 1, min( 15, $cap ) ),
-						$remaining_budget
-					);
-
-					if ( ! Activity_Logger::should_prioritize_elementor_partial( Activity_Logger::get_job_for_as_debug() ) ) {
-						return;
-					}
-				} catch ( \Throwable $e ) {
-					Activity_Logger::log(
-						'warning',
-						sprintf(
-							/* translators: %s: error message */
-							__( 'زنجیره inline Elementor ناموفق بود — AS دوباره صف می‌کند: %s', 'polymart-ai' ),
-							$e->getMessage()
-						)
-					);
-					break;
-				} finally {
-					--self::$inline_chain_depth;
-				}
-
-				++$iterations;
+		try {
+			if ( function_exists( 'set_time_limit' ) ) {
+				@set_time_limit( 330 );
 			}
-		}
 
-		if ( self::$inline_chain_depth >= self::MAX_INLINE_CHAIN_DEPTH ) {
 			$action_id = self::enqueue_next( true, 0 );
-			if ( $action_id > 0 ) {
-				self::run_queue_inline( true );
+
+			if ( $action_id <= 0 ) {
+				return;
 			}
 
-			return;
+			self::run_queue_inline( false );
+		} finally {
+			self::$chaining_next = false;
 		}
-
-		$action_id = self::enqueue_next( true, 0 );
-
-		if ( $action_id <= 0 ) {
-			return;
-		}
-
-		self::run_queue_inline( true );
 	}
 
 	/**

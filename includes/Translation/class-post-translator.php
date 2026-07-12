@@ -3303,7 +3303,10 @@ final class Post_Translator {
 			}
 		}
 
-		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+		if (
+			self::post_needs_elementor_job_work( $post_id, $lang )
+			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
 			$state = array_merge( $base, array( 'phase' => 'elementor' ) );
 			$raw   = get_post_meta( $post_id, '_elementor_data', true );
 
@@ -3692,7 +3695,10 @@ final class Post_Translator {
 	private static function finalize_job_field_phases( $post_id, $lang, array &$state ) {
 		unset( $state['field_translations'] );
 
-		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+		if (
+			self::post_needs_elementor_job_work( $post_id, $lang )
+			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
 			$state['phase']                  = 'elementor';
 			$state['elementor_map']          = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 			$state['elementor_chunk_index']  = 0;
@@ -3743,6 +3749,57 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether Elementor JSON still has untranslated fields for a job resume.
+	 *
+	 * Uses the same path map logic as job slices — partial saves with a current
+	 * source hash must still return true until every Persian field is covered.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function elementor_job_has_remaining_payload( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! self::should_require_elementor_translation( $post_id ) ) {
+			return false;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+
+		$state   = self::get_job_partial_state( $post_id, $lang );
+		$map     = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+
+		if ( empty( $map ) ) {
+			$map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
+		}
+
+		$remaining = self::filter_remaining_elementor_payload(
+			self::collect_elementor_translation_payload( $data ),
+			$map,
+			$skipped
+		);
+
+		return ! empty( $remaining );
+	}
+
+	/**
 	 * Whether Elementor JSON still needs work during an auto-translate job.
 	 *
 	 * @param int    $post_id Post ID.
@@ -3776,13 +3833,17 @@ final class Post_Translator {
 				return true;
 			}
 
+			if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+				return true;
+			}
+
 			$previous_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
 
 			if ( self::is_elementor_progress_message( $previous_error ) ) {
 				delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 				delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 
-				return false;
+				return self::elementor_job_has_remaining_payload( $post_id, $lang );
 			}
 
 			if ( '' !== trim( $previous_error ) ) {
@@ -5353,7 +5414,10 @@ final class Post_Translator {
 			return true;
 		}
 
-		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+		if (
+			self::post_needs_elementor_job_work( $post_id, $lang )
+			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
 			return true;
 		}
 
@@ -6850,7 +6914,8 @@ final class Post_Translator {
 					'meta_key'   => self::get_elementor_meta_key( $lang ),
 					'has_source' => true,
 					'translated' => self::has_stored_elementor_translation( $post_id, $lang )
-						&& ! self::stored_elementor_translation_has_persian( $post_id, $lang ),
+						&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+						&& ! self::elementor_job_has_remaining_payload( $post_id, $lang ),
 				);
 			} else {
 				$html_source = self::extract_elementor_html_persian_excerpt( $post->post_content );
