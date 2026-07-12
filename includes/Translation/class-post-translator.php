@@ -4236,6 +4236,7 @@ final class Post_Translator {
 		$ai_options   = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
 		$processed    = 0;
 		$failures     = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+		$map_before   = count( $map );
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
 			$chunk = array_shift( $chunks );
@@ -4313,8 +4314,70 @@ final class Post_Translator {
 				}
 			}
 
+			if ( empty( $mapped_chunk ) && ! empty( $chunk ) ) {
+				$recovered = self::translate_job_chunk_with_single_field_fallback(
+					$aliased_payload,
+					$api_key,
+					$api_endpoint,
+					$ai_model,
+					$lang,
+					1,
+					$ai_options
+				);
+
+				if ( ! is_wp_error( $recovered ) ) {
+					$mapped_chunk = self::unmap_elementor_aliases(
+						self::collapse_payload_parts( $recovered ),
+						$alias_to_path
+					);
+
+					foreach ( $mapped_chunk as $path => $translated ) {
+						$translated = trim( (string) $translated );
+						$path       = (string) $path;
+
+						if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+							unset( $mapped_chunk[ $path ] );
+						}
+					}
+				}
+			}
+
 			$map = array_merge( $map, $mapped_chunk );
 			++$processed;
+		}
+
+		if ( count( $map ) <= $map_before && ! empty( $payload ) ) {
+			$retry_path = (string) array_key_first( $payload );
+
+			if ( '' !== $retry_path && ! isset( $failures[ $retry_path ] ) ) {
+				$single = array( $retry_path => (string) $payload[ $retry_path ] );
+				list( $aliased_single, $alias_to_path ) = self::alias_elementor_payload_keys( $single );
+				$recovered = self::translate_job_chunk_with_single_field_fallback(
+					$aliased_single,
+					$api_key,
+					$api_endpoint,
+					$ai_model,
+					$lang,
+					2,
+					$ai_options
+				);
+
+				if ( ! is_wp_error( $recovered ) ) {
+					$mapped_single = self::unmap_elementor_aliases(
+						self::collapse_payload_parts( $recovered ),
+						$alias_to_path
+					);
+
+					foreach ( $mapped_single as $path => $translated ) {
+						$translated = trim( (string) $translated );
+						$path       = (string) $path;
+
+						if ( '' !== $translated && ! Persian_Detector::contains_persian( $translated ) ) {
+							$map[ $path ] = $translated;
+						}
+					}
+				}
+			}
 		}
 
 		$state['elementor_map']          = $map;

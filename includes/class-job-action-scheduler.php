@@ -250,16 +250,20 @@ final class Job_Action_Scheduler {
 			);
 		}
 
-		// Pending follow-up already waiting — run direct burst if Elementor stalled.
-		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
-			$job = Activity_Logger::get_job_for_as_debug();
+		$job = Activity_Logger::get_job_for_as_debug();
 
-			if ( Activity_Logger::is_elementor_progress_stalled( $job ) ) {
-				Activity_Logger::run_direct_elementor_burst();
-			} elseif (
-				Activity_Logger::should_prioritize_elementor_partial( $job )
-				&& ! Activity_Logger::is_bulk_worker_lively( 75 )
-			) {
+		// Elementor partials are driven by cron/UI inline batches — AS rows often never run.
+		if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
+			if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+				self::cancel_pending_slices();
+			}
+
+			return 0;
+		}
+
+		// Pending follow-up already waiting — nudge the queue runner.
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+			if ( ! Activity_Logger::is_bulk_worker_lively( 75 ) ) {
 				self::recover_stale_running_actions( 60 );
 				Activity_Logger::release_stale_locks_for_as( 60 );
 				Activity_Logger::release_step_lock();
@@ -298,6 +302,53 @@ final class Job_Action_Scheduler {
 			: false;
 
 		return false !== $next && null !== $next;
+	}
+
+	/**
+	 * Drop pending slice actions so cron/UI can run Elementor work inline.
+	 *
+	 * On Local/cPanel hosts the AS HTTP runner often never executes our hook;
+	 * pending rows then block enqueue_next and nothing advances.
+	 *
+	 * @return int Number of cancelled actions.
+	 */
+	public static function cancel_pending_slices() {
+		if ( ! self::is_available() || ! class_exists( 'ActionScheduler' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		$cancelled = 0;
+
+		try {
+			$store = \ActionScheduler::store();
+			$ids   = $store->query_actions(
+				array(
+					'hook'     => self::HOOK,
+					'group'    => self::GROUP,
+					'status'   => \ActionScheduler_Store::STATUS_PENDING,
+					'per_page' => 50,
+					'orderby'  => 'none',
+				)
+			);
+
+			if ( ! is_array( $ids ) ) {
+				return 0;
+			}
+
+			foreach ( $ids as $action_id ) {
+				$action_id = absint( $action_id );
+
+				if ( $action_id <= 0 ) {
+					continue;
+				}
+
+				$store->cancel_action( $action_id );
+				++$cancelled;
+			}
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
+		return $cancelled;
 	}
 
 	/**
@@ -581,6 +632,13 @@ final class Job_Action_Scheduler {
 		self::release_slice_mutex();
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
+			$job_after_chain = Activity_Logger::get_job_for_as_debug();
+
+			if ( Activity_Logger::should_prioritize_elementor_partial( $job_after_chain ) ) {
+				// Cron/UI owns the Elementor chain — avoid enqueueing AS rows that stall.
+				return;
+			}
+
 			if ( $any_productive ) {
 				self::chain_next_slice_immediately();
 			} else {

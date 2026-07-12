@@ -419,8 +419,17 @@ final class Activity_Logger {
 
 		$job = self::get_job_raw();
 
-		if ( self::is_elementor_progress_stalled( $job ) ) {
-			self::run_direct_elementor_burst();
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			self::run_pinned_elementor_work();
+
+			self::schedule_chain_safety_pulse( self::CRON_FAST_INTERVAL_SEC );
+
+			$out = self::normalize_job_for_response( self::get_job_raw(), false );
+			$out['as_processed']   = 1;
+			$out['worker_mode']    = 'cron';
+			$out['elementor_direct'] = true;
+
+			return $out;
 		}
 
 		if ( Job_Action_Scheduler::is_available() ) {
@@ -2132,40 +2141,71 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Run translation work inline when Action Scheduler only queued but never executed.
+	 * Run Elementor slice batches inline (cron/UI path — bypasses AS queue runner).
 	 *
-	 * @return bool True when a direct burst ran.
+	 * @param bool $log_stalled When true, log when progress was silent before this burst.
+	 * @return bool True when work ran.
 	 */
-	public static function run_direct_elementor_burst() {
+	public static function run_pinned_elementor_work( $log_stalled = false ) {
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) || ! self::should_prioritize_elementor_partial( $job ) ) {
 			return false;
 		}
 
-		self::release_step_lock();
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$before  = (string) ( $job['partial_progress'] ?? '' );
 
 		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::cancel_pending_slices();
 			Job_Action_Scheduler::clear_slice_mutex();
 			Job_Action_Scheduler::recover_stale_running_actions( 30 );
 		}
 
+		self::release_step_lock();
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_translation_lock( $post_id, $lang );
+		}
+
+		if ( $log_stalled || self::is_elementor_progress_stalled( $job ) ) {
+			self::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: progress marker */
+					__( 'اجرای مستقیم Elementor (صف AS اجرا نشد) — #%1$d (%2$s)', 'polymart-ai' ),
+					$post_id,
+					'' !== $before ? $before : '…'
+				),
+				array( 'post_id' => $post_id )
+			);
+		}
+
 		$cap = self::get_elementor_partial_step_cap( $job );
+		self::run_action_scheduler_batch( max( 4, min( 20, $cap ) ), 280 );
 
-		self::log(
-			'warning',
-			sprintf(
-				/* translators: 1: post ID, 2: progress marker */
-				__( 'اجرای مستقیم Elementor (صف AS اجرا نشد) — #%1$d (%2$s)', 'polymart-ai' ),
-				absint( $job['partial_post_id'] ?? 0 ),
-				(string) ( $job['partial_progress'] ?? '…' )
-			),
-			array( 'post_id' => absint( $job['partial_post_id'] ?? 0 ) )
-		);
+		$after = self::get_job_raw();
 
-		self::run_action_scheduler_batch( max( 1, min( 20, $cap ) ), 280 );
+		if (
+			self::should_prioritize_elementor_partial( $after )
+			&& (string) ( $after['partial_progress'] ?? '' ) === $before
+		) {
+			self::run_action_scheduler_batch( 2, 120 );
+		}
+
+		self::schedule_chain_safety_pulse( self::CRON_FAST_INTERVAL_SEC );
 
 		return true;
+	}
+
+	/**
+	 * Run translation work inline when Action Scheduler only queued but never executed.
+	 *
+	 * @return bool True when a direct burst ran.
+	 */
+	public static function run_direct_elementor_burst() {
+		return self::run_pinned_elementor_work( true );
 	}
 
 	/**
@@ -3541,7 +3581,20 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( self::is_elementor_progress_stalled( $job ) ) {
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			$last = max(
+				absint( $job['last_cron_at'] ?? 0 ),
+				absint( $job['worker_heartbeat_at'] ?? 0 )
+			);
+			$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+			if ( $age >= self::get_ensure_inline_idle_sec() ) {
+				self::run_pinned_elementor_work( self::is_elementor_progress_stalled( $job ) );
+				$job = self::get_job_raw();
+				$job['worker_direct_tick'] = true;
+				self::save_job( $job );
+			}
+		} elseif ( self::is_elementor_progress_stalled( $job ) ) {
 			self::run_direct_elementor_burst();
 			$job = self::get_job_raw();
 			$job['worker_direct_tick'] = true;
@@ -3588,7 +3641,12 @@ final class Activity_Logger {
 		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
-		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
+		if ( $should_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
+			self::run_pinned_elementor_work( self::is_elementor_progress_stalled( self::get_job_raw() ) );
+			$job = self::get_job_raw();
+			$job['worker_inline_tick'] = true;
+			self::save_job( $job );
+		} elseif ( $should_tick && Job_Action_Scheduler::is_available() ) {
 			$processed = Job_Action_Scheduler::run_queue_inline( true );
 			if ( $processed > 0 ) {
 				$job = self::get_job_raw();
