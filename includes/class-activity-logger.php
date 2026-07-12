@@ -456,9 +456,15 @@ final class Activity_Logger {
 
 		self::bootstrap_job_worker_context();
 
+		add_filter( 'polymart_ai_job_step_max_elementor_chunks', array( __CLASS__, 'filter_as_elementor_chunk_budget' ) );
+		add_filter( 'polymart_ai_job_stuck_progress_limit', array( __CLASS__, 'filter_elementor_stuck_progress_limit' ), 10, 3 );
+
 		try {
 			return self::process_background_step( $max_steps_override, $budget_override );
 		} finally {
+			remove_filter( 'polymart_ai_job_step_max_elementor_chunks', array( __CLASS__, 'filter_as_elementor_chunk_budget' ) );
+			remove_filter( 'polymart_ai_job_stuck_progress_limit', array( __CLASS__, 'filter_elementor_stuck_progress_limit' ), 10 );
+
 			self::$skip_chain_after_tick = false;
 			self::$trusted_as_tick       = false;
 			self::$trusted_job_tick      = false;
@@ -1925,6 +1931,106 @@ final class Activity_Logger {
 		$index = absint( $state['field_chunk_index'] ?? 0 );
 
 		return $index > 0 ? (string) $index : '';
+	}
+
+	/**
+	 * Parse a job progress marker like "3/8".
+	 *
+	 * @param string $progress Progress marker.
+	 * @return array{done: int, total: int}|null
+	 */
+	private static function parse_job_phase_progress( $progress ) {
+		$progress = trim( (string) $progress );
+
+		if ( ! preg_match( '/^(\d+)\/(\d+)$/', $progress, $matches ) ) {
+			return null;
+		}
+
+		return array(
+			'done'  => absint( $matches[1] ),
+			'total' => absint( $matches[2] ),
+		);
+	}
+
+	/**
+	 * Whether an in-progress Elementor slice still has batches left.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return bool
+	 */
+	private static function elementor_partial_has_remaining( array $job ) {
+		if ( 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
+			return false;
+		}
+
+		$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
+
+		if ( ! is_array( $parsed ) || $parsed['total'] <= 0 ) {
+			return true;
+		}
+
+		return $parsed['done'] < $parsed['total'];
+	}
+
+	/**
+	 * Whether the job should keep working the pinned Elementor post to completion.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return bool
+	 */
+	public static function should_prioritize_elementor_partial( array $job ) {
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
+
+		return $post_id > 0 && self::elementor_partial_has_remaining( $job );
+	}
+
+	/**
+	 * How many job steps an AS batch may run while an Elementor page is mid-slice.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return int
+	 */
+	public static function get_elementor_partial_step_cap( array $job ) {
+		if ( ! self::should_prioritize_elementor_partial( $job ) ) {
+			return 1;
+		}
+
+		$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
+		$left   = is_array( $parsed ) && $parsed['total'] > 0
+			? max( 1, $parsed['total'] - $parsed['done'] )
+			: 8;
+
+		return max( 1, min( 8, $left ) );
+	}
+
+	/**
+	 * More Elementor batches per step when Action Scheduler is driving the job.
+	 *
+	 * @return int
+	 */
+	public static function filter_as_elementor_chunk_budget() {
+		return 2;
+	}
+
+	/**
+	 * Give Elementor partials more retries before rotating away.
+	 *
+	 * @param int                  $limit   Default stuck limit.
+	 * @param array<string, mixed> $job     Job state.
+	 * @param int                  $post_id Post ID.
+	 * @return int
+	 */
+	public static function filter_elementor_stuck_progress_limit( $limit, $job, $post_id ) {
+		unset( $post_id );
+
+		if (
+			'elementor' === sanitize_key( (string) ( $job['partial_phase'] ?? '' ) )
+			|| self::elementor_partial_has_remaining( $job )
+		) {
+			return 20;
+		}
+
+		return (int) $limit;
 	}
 
 	/**
@@ -3800,8 +3906,17 @@ final class Activity_Logger {
 			) {
 				$partial_progress = self::format_job_partial_progress( $partial_state );
 				$phase            = (string) ( $partial_state['phase'] ?? 'elementor' );
+				$parsed_progress  = self::parse_job_phase_progress( $partial_progress );
+				$elementor_remaining = 'elementor' === $phase
+					&& (
+						! is_array( $parsed_progress )
+						|| $parsed_progress['done'] < $parsed_progress['total']
+					);
 
-				if ( self::job_progress_stuck_should_defer( $job, $post_id, $partial_progress ) ) {
+				if (
+					! $elementor_remaining
+					&& self::job_progress_stuck_should_defer( $job, $post_id, $partial_progress )
+				) {
 					Post_Translator::release_translation_lock( $post_id, $lang );
 					self::defer_job_post_stuck_slice( $job, $post_id, $lang, $phase, $partial_progress );
 					self::save_job( $job );
@@ -3860,14 +3975,28 @@ final class Activity_Logger {
 			$current_progress  = (string) ( $slice['phase_progress'] ?? '' );
 			$made_progress     = self::job_slice_made_progress( $job, $current_progress );
 			$stuck_should_defer = ! $made_progress && self::job_progress_stuck_should_defer( $job, $post_id, $current_progress );
+			$phase_key         = (string) ( $slice['phase'] ?? '' );
+			$parsed_progress   = self::parse_job_phase_progress( $current_progress );
+			$elementor_remaining = 'elementor' === $phase_key
+				&& (
+					! is_array( $parsed_progress )
+					|| $parsed_progress['done'] < $parsed_progress['total']
+				);
+
+			if ( $elementor_remaining ) {
+				$stuck_should_defer = false;
+			}
 
 			if (
-				$stuck_should_defer
-				|| (
-					! $made_progress
-					&& (
-						absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive )
-						|| $steps_on_post >= max( 1, $max_steps_per_run )
+				! $elementor_remaining
+				&& (
+					$stuck_should_defer
+					|| (
+						! $made_progress
+						&& (
+							absint( $job['consecutive_post_steps'] ?? 0 ) >= max( 1, $max_consecutive )
+							|| $steps_on_post >= max( 1, $max_steps_per_run )
+						)
 					)
 				)
 			) {
@@ -3895,8 +4024,6 @@ final class Activity_Logger {
 				unset( $job['recoverable'] );
 			}
 
-			$phase_key = (string) ( $slice['phase'] ?? '' );
-
 			if ( $made_progress ) {
 				$job['stuck_progress_steps'] = 0;
 
@@ -3904,15 +4031,15 @@ final class Activity_Logger {
 					unset( $job['defer_rounds'][ $post_id ] );
 				}
 
-				// Keep consecutive count growing on heavy phases so fairness rotation can fire.
-				if ( ! in_array( $phase_key, array( 'variations', 'elementor' ), true ) ) {
+				// Keep consecutive count growing on variable products so fairness rotation can fire.
+				if ( 'variations' !== $phase_key ) {
 					$job['consecutive_post_steps'] = 1;
 				}
 			}
 
 			$fairness_threshold = max( 12, (int) floor( max( 1, $max_consecutive ) / 4 ) );
 			$should_rotate_fair = $made_progress
-				&& in_array( $phase_key, array( 'variations', 'elementor' ), true )
+				&& 'variations' === $phase_key
 				&& absint( $job['consecutive_post_steps'] ?? 0 ) >= $fairness_threshold;
 
 			if ( $should_rotate_fair ) {
@@ -3963,9 +4090,7 @@ final class Activity_Logger {
 	}
 
 	/**
-	 * Pick the next post to translate: forward scan first, then deferred partials, then hard retries.
-	 *
-	 * Heavy Elementor pages stay in deferred_queue so the rest of the site keeps moving.
+	 * Pick the next post to translate: pinned Elementor partials first, then deferred, then forward scan.
 	 *
 	 * @param array<string, mixed> $job    Current job state.
 	 * @param string               $lang   Target language code.
@@ -3973,6 +4098,17 @@ final class Activity_Logger {
 	 * @return array{post_id: int, from_retry: bool}
 	 */
 	private static function pick_next_job_post_id( array &$job, $lang, $cursor ) {
+		$partial_id = absint( $job['partial_post_id'] ?? 0 );
+
+		if ( $partial_id > 0 && self::elementor_partial_has_remaining( $job ) ) {
+			if ( ! in_array( $partial_id, self::get_parked_ids( $job ), true ) ) {
+				return array(
+					'post_id'    => $partial_id,
+					'from_retry' => true,
+				);
+			}
+		}
+
 		$exclude_ids = self::get_forward_scan_exclude_ids( $job );
 
 		self::touch_worker_heartbeat();
@@ -4310,6 +4446,13 @@ final class Activity_Logger {
 		$lang    = sanitize_key( (string) $lang );
 
 		if ( $post_id <= 0 ) {
+			return;
+		}
+
+		if (
+			absint( $job['partial_post_id'] ?? 0 ) === $post_id
+			&& self::elementor_partial_has_remaining( $job )
+		) {
 			return;
 		}
 

@@ -380,10 +380,13 @@ final class Job_Action_Scheduler {
 		) {
 			$elapsed          = time() - $request_start;
 			$remaining_budget = min( self::SLICE_BUDGET_SEC, max( 25, self::REQUEST_BUDGET_SEC - $elapsed ) );
-			$steps_before     = absint( Activity_Logger::get_job_for_as_debug()['steps'] ?? 0 );
+			$job_step         = Activity_Logger::get_job_for_as_debug();
+			$steps_before     = absint( $job_step['steps'] ?? 0 );
+			$step_cap         = Activity_Logger::get_elementor_partial_step_cap( $job_step );
+			$step_cap         = min( $step_cap, self::AS_MAX_STEPS_PER_REQUEST - $slices_done );
 
 			try {
-				$step_result = Activity_Logger::run_action_scheduler_batch( 1, $remaining_budget );
+				$step_result = Activity_Logger::run_action_scheduler_batch( max( 1, $step_cap ), $remaining_budget );
 			} catch ( \Throwable $e ) {
 				Activity_Logger::log(
 					'error',
