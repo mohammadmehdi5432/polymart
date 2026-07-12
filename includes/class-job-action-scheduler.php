@@ -28,13 +28,16 @@ final class Job_Action_Scheduler {
 	const STALE_RUNNING_SEC = 150;
 
 	/** Wall-clock budget for one AS slice callback (shared-host safe). */
-	const SLICE_BUDGET_SEC = 90;
+	const SLICE_BUDGET_SEC = 120;
+
+	/** Total wall-clock budget per AS HTTP request (many products back-to-back). */
+	const REQUEST_BUDGET_SEC = 150;
 
 	/** Default delay when chaining via shutdown only (0 = ASAP). */
 	const CHAIN_DELAY_SEC = 0;
 
-	/** Max translation steps per single AS callback (same HTTP request). */
-	const AS_MAX_STEPS_PER_ACTION = 5;
+	/** Hard cap on translation steps per single AS HTTP request. */
+	const AS_MAX_STEPS_PER_REQUEST = 18;
 
 	/** Guard against run_queue_inline recursion blowing the PHP time limit. */
 	const MAX_INLINE_CHAIN_DEPTH = 3;
@@ -308,6 +311,10 @@ final class Job_Action_Scheduler {
 
 		Activity_Logger::on_ai_http_heartbeat();
 
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 200 );
+		}
+
 		self::$handler_clean_exit = false;
 		self::$current_action_id  = self::resolve_current_action_id();
 		self::register_handler_shutdown();
@@ -360,15 +367,16 @@ final class Job_Action_Scheduler {
 			)
 		);
 
-		$slices_done = 0;
-		$batch_start = time();
+		$slices_done   = 0;
+		$request_start = time();
 
 		while (
 			Activity_Logger::is_bulk_job_running()
-			&& $slices_done < self::AS_MAX_STEPS_PER_ACTION
-			&& ( time() - $batch_start ) < ( self::SLICE_BUDGET_SEC - 3 )
+			&& $slices_done < self::AS_MAX_STEPS_PER_REQUEST
+			&& ( time() - $request_start ) < ( self::REQUEST_BUDGET_SEC - 5 )
 		) {
-			$remaining_budget = max( 20, self::SLICE_BUDGET_SEC - ( time() - $batch_start ) );
+			$elapsed          = time() - $request_start;
+			$remaining_budget = min( self::SLICE_BUDGET_SEC, max( 25, self::REQUEST_BUDGET_SEC - $elapsed ) );
 
 			try {
 				$step_result = Activity_Logger::run_action_scheduler_batch( 1, $remaining_budget );
@@ -446,6 +454,7 @@ final class Job_Action_Scheduler {
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
 			self::chain_next_slice_immediately();
+			Activity_Logger::nudge_as_queue_runner();
 		}
 	}
 
@@ -854,7 +863,10 @@ final class Job_Action_Scheduler {
 		}
 
 		// Strictly sequential — never process two translation slices in one runner pass.
-		$time_limit = (int) apply_filters( 'polymart_ai_as_queue_time_limit', 55 );
+		$time_limit = (int) apply_filters(
+			'polymart_ai_as_queue_time_limit',
+			Activity_Logger::is_bulk_job_running() ? 120 : 55
+		);
 		$batch_size = (int) apply_filters( 'polymart_ai_as_queue_batch_size', 1 );
 
 		$time_filter = static function () use ( $time_limit ) {

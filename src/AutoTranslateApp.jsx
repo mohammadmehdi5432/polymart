@@ -7,8 +7,8 @@ import { fetchJob, jobAction, refreshJobStats, abortJobStep, testTranslationApi 
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
-/** AS keep-alive is ~60s; treat worker stale only after a missed pulse. */
-const CRON_STALE_SEC = 150;
+/** Between-batch idle before the monitor kicks ensure (seconds). */
+const CRON_STALE_SEC = 45;
 /**
  * Lock alone is trusted this long without a completed tick.
  * Must stay above max AI HTTP timeout (~165s) so the monitor does not steal a living worker.
@@ -17,7 +17,7 @@ const LOCK_HEALTHY_SEC = 200;
 /** Between-item lock with no progress — force ensure. */
 const LOCK_IDLE_STALE_SEC = 30;
 /** Do not hammer ensure more than once per this interval. */
-const ENSURE_MIN_INTERVAL_MS = 5000;
+const ENSURE_MIN_INTERVAL_MS = 3000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
@@ -46,13 +46,13 @@ function isCronHealthy(job) {
   const lockAge = Number(job?.worker_lock_age || 0);
   const hasActivePost = Boolean(job?.current_post?.title && !job?.current_post?.from_last_step);
 
-  // AS action queued but worker silent — don't wait 150s for the monitor kick.
-  if (job?.status === 'running' && job?.as_pending && activityAge > 15) {
+  // AS action queued but worker silent — wake the queue quickly.
+  if (job?.status === 'running' && job?.as_pending && activityAge > 10) {
     return false;
   }
 
-  // Between batches without an active lock — nudge ensure after ~45s idle.
-  if (job?.status === 'running' && !job?.worker_lock && activityAge > 45) {
+  // Between batches without an active lock — nudge ensure after ~18s idle.
+  if (job?.status === 'running' && !job?.worker_lock && activityAge > 18) {
     return false;
   }
 
@@ -908,11 +908,13 @@ export default function AutoTranslateApp() {
       ? job?.worker_lock && cronAgeSec != null && cronAgeSec < LOCK_HEALTHY_SEC
         ? `در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
         : cronAgeSec != null
-          ? job?.as_pending && cronAgeSec >= 15 && cronAgeSec < CRON_STALE_SEC
-            ? `در صف Action Scheduler — تیک بعدی تا ${Math.max(0, 60 - cronAgeSec)}ث`
+          ? job?.as_pending && cronAgeSec >= 10 && cronAgeSec < CRON_STALE_SEC
+            ? `در صف — بیدار کردن کارگر (${cronAgeSec}ث)`
             : cronAgeSec < CRON_STALE_SEC
-              ? `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
-              : cronAgeSec < 20
+              ? cronAgeSec >= 18
+                ? `بین دو batch — تیک بازیابی (${cronAgeSec}ث)`
+                : `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
+              : cronAgeSec < 25
                 ? `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`
                 : `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`
           : job?.cron_scheduled

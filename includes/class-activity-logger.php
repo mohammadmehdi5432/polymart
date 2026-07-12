@@ -49,7 +49,9 @@ final class Activity_Logger {
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
 	const CRON_SAFETY_SEC      = 120;
 	/** Faster AS fallback when inline chaining does not start the next slice. */
-	const AS_CRON_SAFETY_SEC   = 8;
+	const AS_CRON_SAFETY_SEC   = 3;
+	/** Self-rescheduling keep-alive between AS batches (when wp-cron is available). */
+	const CRON_FAST_INTERVAL_SEC = 12;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per Action Scheduler / cron batch. */
 	const CRON_STEP_BUDGET_SEC = 55;
@@ -168,6 +170,8 @@ final class Activity_Logger {
 		$job['last_worker']         = 'as';
 		$job['updated_at']          = time();
 		update_option( self::JOB_OPTION, $job, false );
+
+		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
 	}
 
 	/**
@@ -180,6 +184,7 @@ final class Activity_Logger {
 			return;
 		}
 
+		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
 		self::ping_wp_cron( true );
 	}
 
@@ -367,6 +372,8 @@ final class Activity_Logger {
 		if ( Job_Action_Scheduler::is_available() ) {
 			Job_Action_Scheduler::ensure_scheduled();
 			$processed = Job_Action_Scheduler::run_queue_inline( true );
+
+			self::schedule_chain_safety_pulse( self::CRON_FAST_INTERVAL_SEC );
 
 			$out = self::normalize_job_for_response( self::get_job_raw(), false );
 			$out['as_processed'] = $processed;
@@ -2922,6 +2929,35 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Schedule the soonest keep-alive tick without pushing an already-soon event later.
+	 *
+	 * @param int|null $delay_sec Seconds until CRON_HOOK should fire.
+	 * @return void
+	 */
+	private static function schedule_chain_safety_pulse( $delay_sec = null ) {
+		if ( ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		$delay_sec = null === $delay_sec
+			? ( self::$trusted_as_tick ? self::AS_CRON_SAFETY_SEC : self::CRON_SAFETY_SEC )
+			: max( 2, absint( $delay_sec ) );
+
+		$due_at = time() + $delay_sec;
+		$next   = wp_next_scheduled( self::CRON_HOOK );
+
+		if ( $next && $next <= $due_at ) {
+			return;
+		}
+
+		if ( $next ) {
+			wp_unschedule_event( (int) $next, self::CRON_HOOK );
+		}
+
+		wp_schedule_single_event( $due_at, self::CRON_HOOK );
+	}
+
+	/**
 	 * Ensure the keep-alive pulse exists and enqueue the next AS action.
 	 *
 	 * @param int $delay_sec Unused (signature kept for callers).
@@ -3067,7 +3103,7 @@ final class Activity_Logger {
 
 		$as_pending = Job_Action_Scheduler::has_pending_or_running();
 		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
-		$should_tick = $worker_dead || $as_pending || $age >= 30;
+		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
 		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
 			$processed = Job_Action_Scheduler::run_queue_inline( true );
@@ -3190,12 +3226,8 @@ final class Activity_Logger {
 		self::save_job( $job );
 
 		// Fatal-recovery chain only — never clear the recurring pulse here.
-		// Real fast chain is scheduled AFTER work; pulse covers closed-tab gaps.
-		self::clear_chain_events();
 		self::ensure_recurring_pulse();
 		// Do not ping here — mid-tick ping spawned nested cron workers and froze the site.
-		$safety_sec = self::$trusted_as_tick ? self::AS_CRON_SAFETY_SEC : self::CRON_SAFETY_SEC;
-		wp_schedule_single_event( time() + $safety_sec, self::CRON_HOOK );
 
 		$started   = time();
 		$budget    = null !== $budget_override
@@ -3210,7 +3242,7 @@ final class Activity_Logger {
 		$last_result = null;
 
 		if ( function_exists( 'set_time_limit' ) ) {
-			$limit = self::$trusted_as_tick ? min( 120, $budget + 15 ) : max( 300, $budget + 180 );
+			$limit = self::$trusted_as_tick ? 210 : max( 300, $budget + 180 );
 			@set_time_limit( $limit );
 		}
 
@@ -3271,9 +3303,13 @@ final class Activity_Logger {
 		}
 
 		// Enqueue next Action Scheduler action (or pulse-only if AS unavailable).
-		self::clear_chain_events();
 		if ( 'running' === ( self::get_job_raw()['status'] ?? '' ) ) {
-			self::continue_job_chain( 0, ! $end_deferred_busy );
+			if ( self::$skip_chain_after_tick ) {
+				self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
+			} else {
+				self::clear_chain_events();
+				self::continue_job_chain( 0, ! $end_deferred_busy );
+			}
 		} else {
 			self::unschedule_background_worker();
 		}
