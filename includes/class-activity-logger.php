@@ -2282,8 +2282,37 @@ final class Activity_Logger {
 		$left   = is_array( $parsed ) && $parsed['total'] > 0
 			? max( 1, $parsed['total'] - $parsed['done'] )
 			: 8;
+		$max    = self::is_elementor_progress_stalled( $job ) ? 4 : 2;
 
-		return max( 1, min( 2, $left ) );
+		return max( 1, min( $max, $left ) );
+	}
+
+	/**
+	 * Queue a fast follow-up tick while an Elementor page is mid-slice.
+	 *
+	 * @param int|null $delay_sec Seconds until the next pulse/action.
+	 * @return void
+	 */
+	public static function schedule_elementor_partial_follow_up( $delay_sec = null ) {
+		if ( ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		$job = self::get_job_raw();
+
+		if ( ! self::should_prioritize_elementor_partial( $job ) ) {
+			return;
+		}
+
+		$delay_sec = null === $delay_sec
+			? max( 5, (int) apply_filters( 'polymart_ai_elementor_follow_up_delay_sec', 8 ) )
+			: max( 0, absint( $delay_sec ) );
+
+		self::schedule_chain_safety_pulse( $delay_sec );
+
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::enqueue_next( true, $delay_sec );
+		}
 	}
 
 	/**
@@ -2384,14 +2413,21 @@ final class Activity_Logger {
 
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
 		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$stalled = $log_stalled || self::is_elementor_progress_stalled( $job );
+		$before_progress = (string) ( $job['partial_progress'] ?? '' );
+		$before_cron     = absint( $job['last_cron_at'] ?? 0 );
 
 		if ( $post_id > 0 && '' !== $lang ) {
 			Post_Translator::release_stale_translation_lock( $post_id, $lang );
 		}
 
-		$before  = (string) ( $job['partial_progress'] ?? '' );
+		if ( $stalled ) {
+			self::force_release_step_lock_if_idle( 45 );
+		}
 
-		if ( $log_stalled || self::is_elementor_progress_stalled( $job ) ) {
+		$before  = $before_progress;
+
+		if ( $stalled ) {
 			self::log(
 				'warning',
 				sprintf(
@@ -2415,13 +2451,13 @@ final class Activity_Logger {
 			self::$elementor_burst_inflight = false;
 		}
 
-		$pulse = max(
-			self::CRON_FAST_INTERVAL_SEC,
-			(int) apply_filters( 'polymart_ai_elementor_cron_pulse_sec', 28 )
-		);
-		self::schedule_chain_safety_pulse( $pulse );
+		$after = self::get_job_raw();
+		$worked = (string) ( $after['partial_progress'] ?? '' ) !== $before_progress
+			|| absint( $after['last_cron_at'] ?? 0 ) > $before_cron;
 
-		return true;
+		self::schedule_elementor_partial_follow_up( $worked ? 10 : 6 );
+
+		return $worked;
 	}
 
 	/**
@@ -4359,6 +4395,13 @@ final class Activity_Logger {
 			$last_result['next_cron_at']        = self::get_next_worker_cron() ?: null;
 			$last_result['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
 			self::$trusted_job_tick = false;
+
+			if (
+				'running' === ( $last_result['status'] ?? '' )
+				&& self::should_prioritize_elementor_partial( $last_result )
+			) {
+				self::schedule_elementor_partial_follow_up();
+			}
 
 			return $last_result;
 		}

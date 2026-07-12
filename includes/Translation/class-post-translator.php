@@ -4566,57 +4566,81 @@ final class Post_Translator {
 			is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array()
 		);
 
-		if ( empty( $payload ) ) {
-			if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
-				$state['elementor_skipped'] = array();
-				$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
-				$progress_total             = max( 1, absint( $state['elementor_chunks_total'] ?? 1 ) );
-				$done_count                 = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+		$chunk_queue     = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+		$chunks          = $chunk_queue['pending'];
+		$slice_cursor    = $chunk_queue['cursor'];
+		$progress_total  = max( $chunk_queue['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+		$state['elementor_chunks_total'] = $progress_total;
 
-				if ( $done_count > 0 ) {
-					$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $state['elementor_map'], $done_count, $progress_total );
-
-					if ( is_wp_error( $persisted ) ) {
-						return $persisted;
-					}
-				}
-
-				self::save_job_partial_state( $post_id, $lang, $state );
-
-				return array(
-					'done'           => false,
-					'phase'          => 'elementor',
-					'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-					'message'        => sprintf(
-						/* translators: 1: completed widgets, 2: total widgets */
-						__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
-						$done_count,
-						$progress_total
-					),
-				);
+		if ( empty( $chunks ) ) {
+			if ( ! empty( $payload ) ) {
+				$chunks = self::chunk_elementor_payload_for_job( $payload );
 			}
 
-			self::save_elementor_source_hash( $post_id, $lang );
-			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+			if ( empty( $chunks ) ) {
+				if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: progress marker */
+							__( 'Elementor — #%1$d: صف بخش‌ها خالی است ولی ترجمه کامل نشده (%2$s) — بازسازی وضعیت…', 'polymart-ai' ),
+							$post_id,
+							self::format_elementor_job_progress_marker( $post_id, $lang, $state )
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
 
-			return array(
-				'done'           => true,
-				'phase'          => 'elementor',
-				'phase_progress' => '',
-				'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
-			);
+					$state['elementor_skipped'] = array();
+					$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+					$chunk_queue                = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+					$chunks                     = $chunk_queue['pending'];
+					$slice_cursor               = $chunk_queue['cursor'];
+					$progress_total             = max( $chunk_queue['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+					$state['elementor_chunks_total'] = $progress_total;
+				}
+
+				if ( empty( $chunks ) ) {
+					if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+						$done_count = self::resolve_elementor_done_count(
+							$state,
+							self::get_elementor_chunk_progress( $post_id, $lang, $state )['done']
+						);
+
+						self::save_job_partial_state( $post_id, $lang, $state );
+
+						return array(
+							'done'           => false,
+							'phase'          => 'elementor',
+							'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+							'message'        => sprintf(
+								/* translators: 1: completed widgets, 2: total widgets */
+								__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+								$done_count,
+								$progress_total
+							),
+						);
+					}
+
+					self::save_elementor_source_hash( $post_id, $lang );
+					delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+
+					return array(
+						'done'           => true,
+						'phase'          => 'elementor',
+						'phase_progress' => '',
+						'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+					);
+				}
+			}
 		}
 
 		$source_total    = max( 1, absint( $state['elementor_chunks_total'] ?? 0 ) );
-		$chunks          = self::chunk_elementor_payload_for_job( $payload );
 		$budget          = self::get_job_step_max_elementor_chunks();
 		$ai_options      = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
 		$processed       = 0;
 		$failures        = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 		$skipped_list    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$chunk_progress  = self::get_elementor_chunk_progress( $post_id, $lang, $state );
-		$progress_total  = $chunk_progress['total'];
-		$state['elementor_chunks_total'] = $progress_total;
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
 			$chunk = array_shift( $chunks );
@@ -4628,12 +4652,13 @@ final class Post_Translator {
 				$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
 				unset( $failures[ $first_key ] );
 				++$processed;
+				++$slice_cursor;
 				continue;
 			}
 
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 
-			$attempt_index = $chunk_progress['done'] + $processed + 1;
+			$attempt_index = $slice_cursor + 1;
 			$title         = get_the_title( $post_id );
 			$post_label    = '' !== $title
 				? sprintf( '#%d «%s»', $post_id, $title )
@@ -4723,7 +4748,7 @@ final class Post_Translator {
 						/* translators: 1: post ID, 2: chunk index, 3: field path */
 						__( 'Elementor — #%1$d: بخش %2$d پاسخ خالی یا فارسی از API (%3$s)', 'polymart-ai' ),
 						$post_id,
-						$chunk_progress['done'] + $processed + 1,
+						$attempt_index,
 						'' !== $first_path ? $first_path : '…'
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
@@ -4744,6 +4769,7 @@ final class Post_Translator {
 			$map = array_merge( $map, $mapped_chunk );
 			$map = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
 			++$processed;
+			++$slice_cursor;
 
 			if ( ! empty( $mapped_chunk ) ) {
 				$state['elementor_slices_completed'] = max(
@@ -4794,8 +4820,9 @@ final class Post_Translator {
 		$progress_total                    = max( 1, (int) $chunk_progress['total'] );
 		$done_count                        = self::resolve_elementor_done_count( $state, $chunk_progress['done'] );
 		$state['elementor_chunk_index']    = $done_count;
+		$has_more_slices                   = $done_count < $progress_total;
 
-		if ( ! empty( $remaining ) ) {
+		if ( ! empty( $remaining ) || ( $has_more_slices && ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) ) {
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
 
 			if ( is_wp_error( $persisted ) ) {
@@ -5010,6 +5037,37 @@ final class Post_Translator {
 			$payload,
 			self::ELEMENTOR_JOB_FIELD_CHUNK_SIZE,
 			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
+		);
+	}
+
+	/**
+	 * Pending Elementor API chunks using the monotonic slice cursor.
+	 *
+	 * Uses the full source payload (not filter_remaining alone) so recovery can
+	 * continue after slice 4/11 even when the remaining-field map is stale.
+	 *
+	 * @param int                  $post_id     Post ID.
+	 * @param string               $lang        Language code.
+	 * @param array<string, mixed> $source_data Source Elementor tree.
+	 * @param array<string, mixed> $state       Hydrated partial state.
+	 * @return array{all: array<int, array<string, string>>, pending: array<int, array<string, string>>, total: int, cursor: int}
+	 */
+	private static function build_elementor_job_chunk_queue( $post_id, $lang, array $source_data, array $state ) {
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$all_chunks     = self::chunk_elementor_payload_for_job( $source_payload );
+		$total          = max( 1, count( $all_chunks ) );
+		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$cursor         = min(
+			self::resolve_elementor_done_count( $state, $chunk_progress['done'] ),
+			count( $all_chunks )
+		);
+		$pending        = array_slice( $all_chunks, $cursor );
+
+		return array(
+			'all'     => $all_chunks,
+			'pending' => $pending,
+			'total'   => $total,
+			'cursor'  => $cursor,
 		);
 	}
 

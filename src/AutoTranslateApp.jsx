@@ -638,7 +638,7 @@ export default function AutoTranslateApp() {
         const activityAge = Math.max(0, now - latestWorkerStamp(data));
         const elementorNeedsKick =
           isElementorPartialJob(data) &&
-          activityAge > 28 &&
+          activityAge > 14 &&
           Number(data?.api_cooldown_remaining || 0) <= 0;
 
         if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
