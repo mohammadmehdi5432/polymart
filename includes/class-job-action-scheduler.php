@@ -243,11 +243,13 @@ final class Job_Action_Scheduler {
 			);
 		}
 
-		// Pending follow-up already waiting — nudge if Elementor pin stalled.
+		// Pending follow-up already waiting — run direct burst if Elementor stalled.
 		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
 			$job = Activity_Logger::get_job_for_as_debug();
 
-			if (
+			if ( Activity_Logger::is_elementor_progress_stalled( $job ) ) {
+				Activity_Logger::run_direct_elementor_burst();
+			} elseif (
 				Activity_Logger::should_prioritize_elementor_partial( $job )
 				&& ! Activity_Logger::is_bulk_worker_lively( 75 )
 			) {
@@ -1009,7 +1011,13 @@ final class Job_Action_Scheduler {
 
 		if ( $done <= 0 && $force_inline && Activity_Logger::is_bulk_job_running() ) {
 			self::clear_slice_mutex_if_stale();
-			Activity_Logger::run_action_scheduler_batch( 1, self::SLICE_BUDGET_SEC );
+			$job = Activity_Logger::get_job_for_as_debug();
+
+			if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
+				Activity_Logger::run_direct_elementor_burst();
+			} else {
+				Activity_Logger::run_action_scheduler_batch( 1, self::SLICE_BUDGET_SEC );
+			}
 
 			return 1;
 		}

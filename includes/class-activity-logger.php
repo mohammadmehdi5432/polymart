@@ -168,7 +168,6 @@ final class Activity_Logger {
 		$job = self::get_job_raw();
 		$job['chain_enqueued_at']   = time();
 		$job['chain_action_id']     = $action_id;
-		$job['worker_heartbeat_at'] = time();
 		$job['last_worker']         = 'as';
 		$job['updated_at']          = time();
 		update_option( self::JOB_OPTION, $job, false );
@@ -417,6 +416,12 @@ final class Activity_Logger {
 		self::ensure_recurring_pulse();
 		self::maybe_release_stale_step_lock();
 		self::force_release_step_lock_if_idle();
+
+		$job = self::get_job_raw();
+
+		if ( self::is_elementor_progress_stalled( $job ) ) {
+			self::run_direct_elementor_burst();
+		}
 
 		if ( Job_Action_Scheduler::is_available() ) {
 			Job_Action_Scheduler::ensure_scheduled();
@@ -1506,6 +1511,7 @@ final class Activity_Logger {
 		$job['as_available']   = ! empty( $as_status['available'] );
 		$job['as_pending']     = ! empty( $as_status['pending'] );
 		$job['worker_mode']    = ! empty( $as_status['available'] ) ? 'as' : 'cron';
+		$job['elementor_progress_stalled'] = self::is_elementor_progress_stalled( $job );
 		$job['cli_alive']      = false;
 		$job['cli_spawn_ok']   = false;
 		$job['recent_logs']    = self::get_recent_job_logs( $job, 60 );
@@ -1579,6 +1585,14 @@ final class Activity_Logger {
 
 		if ( ! $lock && $claim <= 0 ) {
 			return false;
+		}
+
+		$job = self::get_job_raw();
+
+		if ( self::is_elementor_progress_stalled( $job ) ) {
+			self::force_unlock_step_now();
+
+			return true;
 		}
 
 		$lock_stamp = $lock ? absint( $lock ) : $claim;
@@ -2031,6 +2045,7 @@ final class Activity_Logger {
 		$job['partial_post_id']  = $post_id;
 		$job['partial_phase']    = 'elementor';
 		$job['partial_progress'] = self::format_job_partial_progress( $state );
+		self::touch_partial_progress_tracker( $job );
 		$job['step_partial']     = true;
 		$job['current_post_id']  = null;
 		$job['step_started_at']  = null;
@@ -2074,6 +2089,96 @@ final class Activity_Logger {
 	 */
 	public static function filter_as_elementor_chunk_budget() {
 		return 4;
+	}
+
+	/**
+	 * Whether a pinned Elementor post stopped advancing (AS queue not running).
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return bool
+	 */
+	public static function is_elementor_progress_stalled( array $job ) {
+		if ( ! self::should_prioritize_elementor_partial( $job ) ) {
+			return false;
+		}
+
+		$now          = time();
+		$progress_at  = absint( $job['partial_progress_at'] ?? 0 );
+		$last_cron    = absint( $job['last_cron_at'] ?? 0 );
+		$step_started = absint( $job['step_started_at'] ?? 0 );
+		$stall_sec    = (int) apply_filters( 'polymart_ai_elementor_progress_stall_sec', 75, $job );
+
+		if ( $step_started > 0 && ( $now - $step_started ) < 180 ) {
+			return false;
+		}
+
+		if ( $progress_at > 0 && ( $now - $progress_at ) < max( 45, $stall_sec ) ) {
+			return false;
+		}
+
+		if ( $last_cron > 0 && ( $now - $last_cron ) < max( 45, $stall_sec ) ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Run translation work inline when Action Scheduler only queued but never executed.
+	 *
+	 * @return bool True when a direct burst ran.
+	 */
+	public static function run_direct_elementor_burst() {
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) || ! self::should_prioritize_elementor_partial( $job ) ) {
+			return false;
+		}
+
+		self::release_step_lock();
+
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::clear_slice_mutex();
+			Job_Action_Scheduler::recover_stale_running_actions( 30 );
+		}
+
+		$cap = self::get_elementor_partial_step_cap( $job );
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: progress marker */
+				__( 'اجرای مستقیم Elementor (صف AS اجرا نشد) — #%1$d (%2$s)', 'polymart-ai' ),
+				absint( $job['partial_post_id'] ?? 0 ),
+				(string) ( $job['partial_progress'] ?? '…' )
+			),
+			array( 'post_id' => absint( $job['partial_post_id'] ?? 0 ) )
+		);
+
+		self::run_action_scheduler_batch( max( 1, min( 20, $cap ) ), 280 );
+
+		return true;
+	}
+
+	/**
+	 * Record when Elementor slice progress last advanced.
+	 *
+	 * @param array<string, mixed> $job Job state (by reference).
+	 * @return void
+	 */
+	private static function touch_partial_progress_tracker( array &$job ) {
+		$progress = (string) ( $job['partial_progress'] ?? '' );
+
+		if ( '' === $progress ) {
+			return;
+		}
+
+		$tracked = (string) ( $job['partial_progress_marker'] ?? '' );
+
+		if ( $progress !== $tracked ) {
+			$job['partial_progress_marker'] = $progress;
+			$job['partial_progress_at']     = time();
+		}
 	}
 
 	/**
@@ -3428,6 +3533,13 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		if ( self::is_elementor_progress_stalled( $job ) ) {
+			self::run_direct_elementor_burst();
+			$job = self::get_job_raw();
+			$job['worker_direct_tick'] = true;
+			self::save_job( $job );
+		}
+
 		$released_stale_lock = self::force_release_step_lock_if_idle();
 		$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
 
@@ -4122,6 +4234,7 @@ final class Activity_Logger {
 			$job['partial_post_id']   = $post_id;
 			$job['partial_phase']     = (string) ( $slice['phase'] ?? '' );
 			$job['partial_progress']  = (string) ( $slice['phase_progress'] ?? '' );
+			self::touch_partial_progress_tracker( $job );
 
 			if ( ! empty( $slice['recoverable'] ) ) {
 				$job['recoverable'] = true;

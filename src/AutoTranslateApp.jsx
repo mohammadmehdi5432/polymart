@@ -45,6 +45,18 @@ function isCronHealthy(job) {
   const activityAge = lastActivity > 0 ? now - lastActivity : Number.POSITIVE_INFINITY;
   const lockAge = Number(job?.worker_lock_age || 0);
   const hasActivePost = Boolean(job?.current_post?.title && !job?.current_post?.from_last_step);
+  const progressAt = Number(job?.partial_progress_at || 0);
+  const progressAge = progressAt > 0 ? now - progressAt : Number.POSITIVE_INFINITY;
+  const elementorStalled =
+    Boolean(job?.elementor_progress_stalled) ||
+    (job?.partial_phase === 'elementor' &&
+      job?.partial_post_id &&
+      progressAge > 75 &&
+      activityAge > 75);
+
+  if (job?.status === 'running' && elementorStalled) {
+    return false;
+  }
 
   // AS action queued but worker silent — wake the queue quickly.
   if (job?.status === 'running' && job?.as_pending && activityAge > 10) {
@@ -544,13 +556,16 @@ export default function AutoTranslateApp() {
             hasActivePost &&
             lockAge >= 0 &&
             lockAge < LOCK_HEALTHY_SEC &&
-            activityAge < LOCK_HEALTHY_SEC;
+            activityAge < LOCK_HEALTHY_SEC &&
+            !Boolean(data.elementor_progress_stalled);
 
           if (!lockBlocks) {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
             const recovered = await ensureServerWorker();
-            if (recovered?.worker_inline_tick && isActiveRef.current) {
+            if (recovered?.worker_direct_tick && isActiveRef.current) {
+              appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
+            } else if (recovered?.worker_inline_tick && isActiveRef.current) {
               appendLog('تیک بازیابی اجرا شد — صف دوباره جلو می‌رود.', 'success');
             } else if (recovered?.lock_recovered && isActiveRef.current) {
               appendLog('قفل گیرکرده آزاد شد — تیک بعدی شروع می‌شود…', 'warning');
