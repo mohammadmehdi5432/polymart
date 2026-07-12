@@ -3384,9 +3384,11 @@ final class Post_Translator {
 		$phase = sanitize_key( (string) ( $state['phase'] ?? '' ) );
 
 		if ( 'elementor' === $phase ) {
-			$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+			if ( absint( $state['elementor_chunk_index'] ?? 0 ) > 0 ) {
+				return true;
+			}
 
-			return ! empty( $map ) || absint( $state['elementor_chunk_index'] ?? 0 ) > 0;
+			return (bool) get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
 		}
 
 		if ( in_array( $phase, array( 'core', 'commerce', 'variations', 'fields' ), true ) ) {
@@ -3440,7 +3442,14 @@ final class Post_Translator {
 	 * @return void
 	 */
 	public static function save_job_partial_state( $post_id, $lang, array $state ) {
-		update_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ), $state );
+		$persist = $state;
+
+		// Translations live in `_elementor_data_{lang}` — keep partial meta lightweight.
+		if ( 'elementor' === sanitize_key( (string) ( $persist['phase'] ?? '' ) ) ) {
+			unset( $persist['elementor_map'] );
+		}
+
+		update_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ), $persist );
 	}
 
 	/**
@@ -3540,11 +3549,9 @@ final class Post_Translator {
 			return $state;
 		}
 
-		$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
-
-		if ( empty( $map ) ) {
-			$map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
-		}
+		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$rebuilt   = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
+		$map       = array_merge( $rebuilt, $state_map );
 
 		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$payload = self::collect_elementor_translation_payload( $data );
@@ -3862,6 +3869,31 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether every Elementor field is translated and persisted for a job slice.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Optional partial state.
+	 * @return bool
+	 */
+	public static function elementor_job_slice_is_truly_complete( $post_id, $lang, array $state = array() ) {
+		unset( $state );
+
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return true;
+		}
+
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return false;
+		}
+
+		return ! self::elementor_job_has_remaining_payload( $post_id, $lang );
+	}
+
+	/**
 	 * Whether Elementor JSON still has untranslated fields for a job resume.
 	 *
 	 * Uses the same path map logic as job slices — partial saves with a current
@@ -3895,13 +3927,13 @@ final class Post_Translator {
 			return false;
 		}
 
-		$state   = self::get_job_partial_state( $post_id, $lang );
-		$map     = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$state     = self::get_job_partial_state( $post_id, $lang );
+		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$map       = array_merge(
+			self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data ),
+			$state_map
+		);
 		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-
-		if ( empty( $map ) ) {
-			$map = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
-		}
 
 		$remaining = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
@@ -4260,6 +4292,26 @@ final class Post_Translator {
 					return $elementor_slice;
 				}
 
+				if (
+					self::post_needs_elementor_job_work( $post_id, $lang )
+					|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+				) {
+					$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, self::get_job_partial_state( $post_id, $lang ) );
+					self::save_job_partial_state( $post_id, $lang, $state );
+
+					return array(
+						'done'           => false,
+						'phase'          => 'elementor',
+						'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+						'message'        => sprintf(
+							/* translators: 1: completed widgets, 2: total widgets */
+							__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+							count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() ),
+							max( 1, absint( $state['elementor_chunks_total'] ?? 1 ) )
+						),
+					);
+				}
+
 				self::clear_job_partial_state( $post_id, $lang );
 				self::release_translation_lock( $post_id, $lang );
 
@@ -4342,6 +4394,35 @@ final class Post_Translator {
 		);
 
 		if ( empty( $payload ) ) {
+			if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+				$state['elementor_skipped'] = array();
+				$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+				$progress_total             = max( 1, absint( $state['elementor_chunks_total'] ?? 1 ) );
+				$done_count                 = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+
+				if ( $done_count > 0 ) {
+					$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $state['elementor_map'], $done_count, $progress_total );
+
+					if ( is_wp_error( $persisted ) ) {
+						return $persisted;
+					}
+				}
+
+				self::save_job_partial_state( $post_id, $lang, $state );
+
+				return array(
+					'done'           => false,
+					'phase'          => 'elementor',
+					'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+					'message'        => sprintf(
+						/* translators: 1: completed widgets, 2: total widgets */
+						__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+						$done_count,
+						$progress_total
+					),
+				);
+			}
+
 			self::save_elementor_source_hash( $post_id, $lang );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 
@@ -4462,6 +4543,7 @@ final class Post_Translator {
 
 		$state['elementor_map']          = $map;
 		$state['elementor_chunk_index']  = count( $map );
+		$skipped_list                    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$remaining                       = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
 			$map,
@@ -4491,6 +4573,35 @@ final class Post_Translator {
 					/* translators: 1: completed widgets, 2: total widgets */
 					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
 					count( $map ),
+					$progress_total
+				),
+			);
+		}
+
+		if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+			$state['elementor_skipped'] = array();
+			$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+			$progress_total             = max( 1, (int) $state['elementor_chunks_total'] );
+			$done_count                 = count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+
+			if ( $done_count > 0 ) {
+				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $state['elementor_map'], $done_count, $progress_total );
+
+				if ( is_wp_error( $persisted ) ) {
+					return $persisted;
+				}
+			}
+
+			self::save_job_partial_state( $post_id, $lang, $state );
+
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+				'message'        => sprintf(
+					/* translators: 1: completed widgets, 2: total widgets */
+					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+					$done_count,
 					$progress_total
 				),
 			);
