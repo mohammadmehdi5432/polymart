@@ -29,6 +29,39 @@ function latestWorkerStamp(job, includeScheduled = false) {
   );
 }
 
+function isElementorPartialJob(job) {
+  return (
+    job?.status === 'running' &&
+    job?.partial_phase === 'elementor' &&
+    Boolean(job?.partial_post_id)
+  );
+}
+
+/** Top status line while Elementor chunks are in flight (lock is only held a few seconds per tick). */
+function formatElementorPartialStatus(job, cronAgeSec, workerLabel) {
+  const progress = job?.partial_progress || '';
+  const suffix = progress ? ` — ${progress}` : '';
+  const who = workerLabel ? ` (${workerLabel})` : '';
+
+  if (job?.worker_lock) {
+    return `در حال ترجمه Elementor${suffix}${who}`;
+  }
+
+  if (cronAgeSec == null) {
+    return `ادامه Elementor${suffix}`;
+  }
+
+  if (cronAgeSec < 12) {
+    return `ادامه Elementor${suffix} — آماده‌سازی بخش بعدی`;
+  }
+
+  if (cronAgeSec < CRON_STALE_SEC) {
+    return `ادامه Elementor${suffix} — منتظر تیک کارگر (${cronAgeSec}ث)`;
+  }
+
+  return null;
+}
+
 function stepLogSignature(step) {
   if (!step) {
     return '';
@@ -54,6 +87,8 @@ function isCronHealthy(job) {
       progressAge > 75 &&
       activityAge > 75);
 
+  const elementorPartial = isElementorPartialJob(job);
+
   if (job?.status === 'running' && Number(job?.api_cooldown_remaining || 0) > 0) {
     return true;
   }
@@ -67,8 +102,8 @@ function isCronHealthy(job) {
     return false;
   }
 
-  // Between batches without an active lock — nudge ensure after ~18s idle.
-  if (job?.status === 'running' && !job?.worker_lock && activityAge > 18) {
+  // Between elementor chunks the PHP lock is released — nudge ensure sooner than generic idle.
+  if (job?.status === 'running' && !job?.worker_lock && activityAge > (elementorPartial ? 10 : 18)) {
     return false;
   }
 
@@ -958,21 +993,38 @@ export default function AutoTranslateApp() {
   const statusLabel = actionPendingLabel
     ? actionPendingLabel
     : isRunning
-      ? job?.worker_lock && cronAgeSec != null && cronAgeSec < LOCK_HEALTHY_SEC
-        ? `در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`
-        : cronAgeSec != null
-          ? job?.as_pending && cronAgeSec >= 10 && cronAgeSec < CRON_STALE_SEC
-            ? `در صف — بیدار کردن کارگر (${cronAgeSec}ث)`
-            : cronAgeSec < CRON_STALE_SEC
-              ? cronAgeSec >= 18
-                ? `بین دو batch — تیک بازیابی (${cronAgeSec}ث)`
-                : `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`
-              : cronAgeSec < 25
-                ? `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`
-                : `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`
-          : job?.cron_scheduled
+      ? (() => {
+          if (Number(job?.api_cooldown_remaining || 0) <= 0 && isElementorPartialJob(job)) {
+            const elementorStatus = formatElementorPartialStatus(job, cronAgeSec, workerLabel);
+            if (elementorStatus) {
+              return elementorStatus;
+            }
+          }
+
+          if (job?.worker_lock && cronAgeSec != null && cronAgeSec < LOCK_HEALTHY_SEC) {
+            return `در حال ترجمه${workerLabel ? ` (${workerLabel})` : ''}`;
+          }
+
+          if (cronAgeSec != null) {
+            if (job?.as_pending && cronAgeSec >= 10 && cronAgeSec < CRON_STALE_SEC) {
+              return `در صف — بیدار کردن کارگر (${cronAgeSec}ث)`;
+            }
+            if (cronAgeSec < CRON_STALE_SEC) {
+              if (cronAgeSec >= 18) {
+                return `بین دو batch — تیک بازیابی (${cronAgeSec}ث)`;
+              }
+              return `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`;
+            }
+            if (cronAgeSec < 25) {
+              return `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`;
+            }
+            return `کارگر متوقف شد (${cronAgeSec}ث) — اجرای تیک بازیابی…`;
+          }
+
+          return job?.cron_scheduled
             ? 'زمان‌بندی شده — شروع زنجیره پس‌زمینه'
-            : 'در حال اجرا روی سرور'
+            : 'در حال اجرا روی سرور';
+        })()
       : isPaused
         ? isOutdated
           ? 'نیاز به اجرای مجدد'

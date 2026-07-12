@@ -774,7 +774,7 @@ final class Activity_Logger {
 	 */
 	private static function get_ensure_inline_idle_sec() {
 		$job     = self::get_job_raw();
-		$default = self::should_prioritize_elementor_partial( $job ) ? 28 : 12;
+		$default = self::should_prioritize_elementor_partial( $job ) ? 14 : 12;
 
 		return max( 8, min( 90, (int) apply_filters( 'polymart_ai_job_ensure_inline_idle_sec', $default ) ) );
 	}
