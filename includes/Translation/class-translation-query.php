@@ -281,7 +281,7 @@ final class Translation_Query {
 					return;
 				}
 
-				if ( Post_Translator::post_has_persian_content( $post ) && 'translated' !== Post_Translator::get_translation_status( $post->ID, $lang ) ) {
+				if ( Post_Translator::post_needs_translation_work( $post->ID, $lang ) ) {
 					$post_ids[] = (int) $post->ID;
 				}
 			}
@@ -457,6 +457,94 @@ final class Translation_Query {
 			$cursor  = $next;
 
 			if ( count( $found ) >= 3 ) {
+				break;
+			}
+		}
+
+		return $found;
+	}
+
+	/**
+	 * Probe high-priority posts/layout blocks that may still need work despite a "translated" index.
+	 *
+	 * @param string $lang  Target language code.
+	 * @param int    $limit Maximum IDs to return.
+	 * @return int[]
+	 */
+	public static function probe_priority_unfinished_post_ids( $lang, $limit = 15 ) {
+		$lang  = sanitize_key( (string) $lang );
+		$limit = max( 1, min( 50, absint( $limit ) ) );
+
+		if ( '' === $lang ) {
+			return array();
+		}
+
+		Post_Translator::reconcile_stale_translation_indexes( $lang, min( 250, $limit * 8 ) );
+		Post_Translator::flush_translation_status_cache();
+
+		$candidates = array();
+
+		$front = absint( get_option( 'page_on_front' ) );
+
+		if ( $front > 0 ) {
+			$candidates[] = $front;
+		}
+
+		foreach ( array( 'cms_block', 'woodmart_layout' ) as $post_type ) {
+			$block_ids = get_posts(
+				array(
+					'post_type'              => $post_type,
+					'post_status'            => 'publish',
+					'posts_per_page'         => 50,
+					'fields'                 => 'ids',
+					'orderby'                => 'modified',
+					'order'                  => 'DESC',
+					'no_found_rows'          => true,
+					'update_post_meta_cache' => false,
+					'update_post_term_cache' => false,
+				)
+			);
+
+			if ( is_array( $block_ids ) ) {
+				$candidates = array_merge( $candidates, array_map( 'absint', $block_ids ) );
+			}
+		}
+
+		$found = array();
+
+		foreach ( array_values( array_unique( array_filter( $candidates ) ) ) as $post_id ) {
+			if ( ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+				continue;
+			}
+
+			$post = get_post( $post_id );
+
+			if ( $post instanceof \WP_Post && Post_Translator::post_has_persian_content( $post ) ) {
+				update_post_meta( $post_id, Post_Translator::PERSIAN_CONTENT_FLAG_META, '1' );
+			}
+
+			Post_Translator::sync_translation_index_meta( $post_id, $lang );
+			$found[] = $post_id;
+
+			if ( count( $found ) >= $limit ) {
+				break;
+			}
+		}
+
+		if ( count( $found ) >= $limit ) {
+			return $found;
+		}
+
+		foreach ( self::collect_remaining_post_ids( $lang, $limit ) as $post_id ) {
+			$post_id = absint( $post_id );
+
+			if ( $post_id <= 0 || in_array( $post_id, $found, true ) ) {
+				continue;
+			}
+
+			$found[] = $post_id;
+
+			if ( count( $found ) >= $limit ) {
 				break;
 			}
 		}

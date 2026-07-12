@@ -171,6 +171,13 @@ final class Post_Translator {
 	private static $elementor_plain_text_cache = array();
 
 	/**
+	 * Per-request cache for Persian text left in stored Elementor companions.
+	 *
+	 * @var array<string, string>
+	 */
+	private static $stored_elementor_persian_cache = array();
+
+	/**
 	 * Per-request cache for stored `_elementor_data_{lang}` companions.
 	 *
 	 * @var array<string, string|false>
@@ -3764,6 +3771,10 @@ final class Post_Translator {
 		}
 
 		if ( self::is_elementor_translation_current( $post_id, $lang ) ) {
+			if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+				return true;
+			}
+
 			$previous_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
 
 			if ( self::is_elementor_progress_message( $previous_error ) ) {
@@ -5104,6 +5115,107 @@ final class Post_Translator {
 		);
 
 		return self::$elementor_plain_text_cache[ $post_id ];
+	}
+
+	/**
+	 * Whether a stored Elementor companion still contains Persian widget text.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function stored_elementor_translation_has_persian( $post_id, $lang ) {
+		return '' !== self::collect_stored_elementor_persian_plain_text( $post_id, $lang );
+	}
+
+	/**
+	 * Extract Persian plain text from a stored Elementor companion JSON document.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return string
+	 */
+	public static function collect_stored_elementor_persian_plain_text( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$key     = $post_id . ':' . $lang;
+
+		if ( array_key_exists( $key, self::$stored_elementor_persian_cache ) ) {
+			return self::$stored_elementor_persian_cache[ $key ];
+		}
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			self::$stored_elementor_persian_cache[ $key ] = '';
+
+			return '';
+		}
+
+		$stored = self::get_stored_elementor_json( $post_id, $lang );
+
+		if ( ! is_string( $stored ) || '' === trim( $stored ) ) {
+			self::$stored_elementor_persian_cache[ $key ] = '';
+
+			return '';
+		}
+
+		$data = json_decode( $stored, true );
+
+		if ( ! is_array( $data ) ) {
+			self::$stored_elementor_persian_cache[ $key ] = '';
+
+			return '';
+		}
+
+		$payload = self::collect_elementor_translation_payload( $data );
+
+		self::$stored_elementor_persian_cache[ $key ] = implode(
+			"\n\n",
+			array_unique( array_filter( array_values( $payload ) ) )
+		);
+
+		return self::$stored_elementor_persian_cache[ $key ];
+	}
+
+	/**
+	 * Whether a post still needs bulk translation work for a language.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function post_needs_translation_work( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post || 'publish' !== $post->post_status ) {
+			return false;
+		}
+
+		if ( ! in_array( $post->post_type, self::get_supported_post_types(), true ) ) {
+			return false;
+		}
+
+		if ( self::post_needs_elementor_job_work( $post_id, $lang ) ) {
+			return true;
+		}
+
+		if ( ! self::post_has_persian_content( $post ) ) {
+			return false;
+		}
+
+		self::flush_translation_status_cache( $post_id );
+
+		if ( 'translated' !== self::get_translation_status( $post_id, $lang ) ) {
+			return true;
+		}
+
+		return ! empty( self::collect_persian_fields( $post, $lang ) );
 	}
 
 	/**
@@ -6489,6 +6601,8 @@ final class Post_Translator {
 
 			if ( $post instanceof \WP_Post && ! empty( self::collect_persian_fields( $post, $lang ) ) ) {
 				$status = 'partial';
+			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+				$status = 'partial';
 			}
 		}
 
@@ -6581,7 +6695,8 @@ final class Post_Translator {
 					'label'      => __( 'Elementor (JSON)', 'polymart-ai' ),
 					'meta_key'   => self::get_elementor_meta_key( $lang ),
 					'has_source' => true,
-					'translated' => self::has_stored_elementor_translation( $post_id, $lang ),
+					'translated' => self::has_stored_elementor_translation( $post_id, $lang )
+						&& ! self::stored_elementor_translation_has_persian( $post_id, $lang ),
 				);
 			} else {
 				$html_source = self::extract_elementor_html_persian_excerpt( $post->post_content );
@@ -7151,6 +7266,12 @@ final class Post_Translator {
 				self::$elementor_source_hash_cache[ $post_id ],
 				self::$elementor_plain_text_cache[ $post_id ]
 			);
+
+			foreach ( array_keys( self::$stored_elementor_persian_cache ) as $cache_key ) {
+				if ( 0 === strpos( $cache_key, $post_id . ':' ) ) {
+					unset( self::$stored_elementor_persian_cache[ $cache_key ] );
+				}
+			}
 
 			foreach ( array_keys( self::$translation_status_cache ) as $cache_key ) {
 				if ( 0 === strpos( $cache_key, $post_id . ':' ) ) {

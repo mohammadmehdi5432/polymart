@@ -2503,10 +2503,27 @@ final class Activity_Logger {
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
+		Post_Translator::reconcile_stale_translation_indexes( $lang, 250 );
+
 		$stats      = Translation_Query::compute_translation_stats( $lang, false );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
+		$probe_ids  = array();
+
+		if ( $total <= 0 ) {
+			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12 );
+
+			if ( ! empty( $probe_ids ) ) {
+				$stats      = Translation_Query::compute_translation_stats( $lang, true );
+				$needs_work = max(
+					count( $probe_ids ),
+					(int) $stats['untranslated'] + (int) $stats['partial'],
+					$menu_needs
+				);
+				$total      = $needs_work;
+			}
+		}
 
 		if ( $total <= 0 ) {
 			$probe_post = Translation_Query::find_next_actionable_post_id( $lang, 0 );
@@ -2527,6 +2544,15 @@ final class Activity_Logger {
 
 		$seed_limit = min( 8, max( 3, $needs_work ) );
 		$seed_ids   = Translation_Query::seed_actionable_post_ids( $lang, $seed_limit );
+
+		if ( ! empty( $probe_ids ) ) {
+			$seed_ids = array_values(
+				array_unique(
+					array_merge( $probe_ids, $seed_ids )
+				)
+			);
+			$seed_ids = array_slice( $seed_ids, 0, max( $seed_limit, count( $probe_ids ) ) );
+		}
 
 		$job = array(
 			'status'             => 'running',

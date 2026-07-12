@@ -108,6 +108,70 @@ final class Woodmart_Translator {
 		add_filter( 'gettext', array( $this, 'filter_gettext' ), 26, 3 );
 		add_filter( 'gettext_with_context', array( $this, 'filter_gettext_with_context' ), 26, 4 );
 		add_filter( 'ngettext', array( $this, 'filter_ngettext' ), 26, 5 );
+
+		add_action( 'template_redirect', array( $this, 'maybe_start_output_buffer' ), 0 );
+	}
+
+	/**
+	 * Capture storefront HTML so Woodmart header/footer inline Persian can be translated.
+	 *
+	 * @return void
+	 */
+	public function maybe_start_output_buffer() {
+		if ( ! $this->should_intercept() ) {
+			return;
+		}
+
+		ob_start( array( $this, 'filter_buffered_html' ) );
+	}
+
+	/**
+	 * Translate known Woodmart markup fragments that bypass theme options/gettext.
+	 *
+	 * @param string $html Full page HTML.
+	 * @return string
+	 */
+	public function filter_buffered_html( $html ) {
+		if ( ! is_string( $html ) || '' === $html || ! Persian_Detector::contains_persian( $html ) ) {
+			return $html;
+		}
+
+		return $this->translate_persian_markup_fragments( $html );
+	}
+
+	/**
+	 * Replace Persian text inside common Woodmart header/footer markup hooks.
+	 *
+	 * @param string $html Full page HTML.
+	 * @return string
+	 */
+	private function translate_persian_markup_fragments( $html ) {
+		$class_pattern = '(?:wd-tools-text|whb-text-block|wd-info-box|whb-info-box|whb-html-block|wd-header-text|whb-color-dark)';
+
+		return (string) preg_replace_callback(
+			'/(<(span|div|p|a|strong|b|em|i)\b[^>]*\bclass=(["\'])[^"\']*\b' . $class_pattern . '\b[^"\']*\3[^>]*>)(.*?)(<\/\2>)/su',
+			function ( array $matches ) {
+				$inner = (string) ( $matches[4] ?? '' );
+
+				if ( '' === trim( wp_strip_all_tags( $inner ) ) || ! Persian_Detector::contains_persian( $inner ) ) {
+					return $matches[0];
+				}
+
+				$plain      = trim( preg_replace( '/\s+/u', ' ', wp_strip_all_tags( str_replace( array( '<br>', '<br/>', '<br />' ), "\n", $inner ) ) ) );
+				$translated = $this->resolve_string( $plain, 'html:' . md5( $plain ) );
+
+				if ( $translated === $plain || '' === trim( $translated ) ) {
+					return $matches[0];
+				}
+
+				if ( $inner === wp_strip_all_tags( $inner ) ) {
+					return $matches[1] . esc_html( $translated ) . $matches[5];
+				}
+
+				return $matches[1] . nl2br( esc_html( $translated ) ) . $matches[5];
+			},
+			$html
+		);
 	}
 
 	/**
