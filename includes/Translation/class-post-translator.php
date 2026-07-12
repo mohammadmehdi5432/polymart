@@ -4307,6 +4307,16 @@ final class Post_Translator {
 		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		$raw     = get_post_meta( $post_id, '_elementor_data', true );
 
+		if ( \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
+			return self::make_recoverable_partial_slice_response(
+				'elementor',
+				self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+				\PolymartAI\Activity_Logger::format_api_cooldown_message(
+					\PolymartAI\Activity_Logger::get_job_api_cooldown_remaining()
+				)
+			);
+		}
+
 		if ( ! is_string( $raw ) || '' === $raw ) {
 			return new \WP_Error(
 				'polymart_ai_elementor_source_missing',
@@ -4368,6 +4378,8 @@ final class Post_Translator {
 
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 
+			\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
+
 			$chunk_result = AI_Client::translate_fields(
 				$aliased_payload,
 				$api_key,
@@ -4376,6 +4388,8 @@ final class Post_Translator {
 				$lang,
 				$ai_options
 			);
+
+			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
 
 			if ( is_wp_error( $chunk_result ) ) {
 				$state['elementor_failures'] = $failures;
@@ -4432,6 +4446,18 @@ final class Post_Translator {
 
 			$map = array_merge( $map, $mapped_chunk );
 			++$processed;
+
+			if ( ! empty( $mapped_chunk ) ) {
+				\PolymartAI\Activity_Logger::touch_successful_api_call();
+			}
+
+			if ( $processed < $budget && ! empty( $chunks ) ) {
+				$delay = (int) apply_filters( 'polymart_ai_elementor_inter_request_delay_sec', 6 );
+
+				if ( $delay > 0 ) {
+					sleep( max( 2, min( 20, $delay ) ) );
+				}
+			}
 		}
 
 		$state['elementor_map']          = $map;
@@ -4499,7 +4525,14 @@ final class Post_Translator {
 	 */
 	private static function handle_elementor_job_slice_failure( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, \WP_Error $error, array $failed_keys = array() ) {
 		\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $error );
-		$short_error = \PolymartAI\Activity_Logger::truncate_api_error_message( $error->get_error_message() );
+
+		if ( \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
+			$short_error = \PolymartAI\Activity_Logger::format_api_cooldown_message(
+				\PolymartAI\Activity_Logger::get_job_api_cooldown_remaining()
+			);
+		} else {
+			$short_error = \PolymartAI\Activity_Logger::humanize_api_error_message( $error->get_error_message() );
+		}
 
 		$state['elementor_map'] = $map;
 		$state                  = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
@@ -4529,9 +4562,10 @@ final class Post_Translator {
 					'elementor',
 					$progress,
 					sprintf(
-						/* translators: 1: saved widget count, 2: error message */
-						__( 'Elementor — %1$d بخش ذخیره شد. API موقتاً قطع شد: %2$s', 'polymart-ai' ),
+						/* translators: 1: saved widget count, 2: total widgets, 3: error hint */
+						__( 'Elementor — %1$d از %2$d بخش ذخیره شد. %3$s', 'polymart-ai' ),
 						count( $map ),
+						$progress_total,
 						$short_error
 					)
 				);
@@ -4544,11 +4578,7 @@ final class Post_Translator {
 			return self::make_recoverable_partial_slice_response(
 				'elementor',
 				$progress,
-				sprintf(
-					/* translators: %s: error message */
-					__( 'Elementor — API موقتاً قطع شد (ادامه در مرحله بعد): %s', 'polymart-ai' ),
-					$short_error
-				)
+				$short_error
 			);
 		}
 
@@ -5575,6 +5605,41 @@ final class Post_Translator {
 		}
 
 		return ! empty( self::collect_persian_fields( $post, $lang ) );
+	}
+
+	/**
+	 * Whether a post should be enqueued when starting/resuming a bulk job.
+	 *
+	 * Broader than post_needs_translation_work — includes Elementor partials the index may mark done.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function post_is_actionable_for_job( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( self::post_needs_translation_work( $post_id, $lang ) ) {
+			return true;
+		}
+
+		if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+			return true;
+		}
+
+		if ( self::should_run_elementor_job_slice( $post_id, $lang ) ) {
+			return true;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		return 'elementor' === sanitize_key( (string) ( $state['phase'] ?? '' ) )
+			&& self::job_partial_state_has_progress( $post_id, $lang, $state );
 	}
 
 	/**

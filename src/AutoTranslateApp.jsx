@@ -101,6 +101,15 @@ function isCronHealthy(job) {
 }
 
 function jobStepHeadline(lastStepStatus, displayPost, job) {
+  const cooldownRemaining = Number(job?.api_cooldown_remaining || 0);
+
+  if (cooldownRemaining > 0 && job?.status === 'running') {
+    if (cooldownRemaining >= 60) {
+      return `API آروان محدود — ${Math.ceil(cooldownRemaining / 60)} دقیقه تا ادامه`;
+    }
+    return `API آروان محدود — ${cooldownRemaining} ثانیه تا ادامه`;
+  }
+
   const lockAge = Number(job?.worker_lock_age || 0);
   const now = Math.floor(Date.now() / 1000);
   const activityAge = Math.max(
@@ -1224,9 +1233,21 @@ export default function AutoTranslateApp() {
                       <p className="font-medium">
                         #{displayPost.post_id} — {displayPost.title}
                       </p>
-                      {displayPost.step_message ? (
-                        <p className="mt-1 text-xs opacity-90">{displayPost.step_message}</p>
-                      ) : null}
+                      {(() => {
+                        const cooldownRemaining = Number(job?.api_cooldown_remaining || 0);
+                        if (cooldownRemaining > 0 && job?.status === 'running') {
+                          return (
+                            <p className="mt-1 text-xs opacity-90">
+                              {cooldownRemaining >= 60
+                                ? `API آروان محدود — ${Math.ceil(cooldownRemaining / 60)} دقیقه تا ادامه (بدون مصرف توکن)`
+                                : `API آروان محدود — ${cooldownRemaining} ثانیه تا ادامه`}
+                            </p>
+                          );
+                        }
+                        return displayPost.step_message ? (
+                          <p className="mt-1 text-xs opacity-90">{displayPost.step_message}</p>
+                        ) : null;
+                      })()}
                     </>
                   ) : (
                     <p className="mt-1 text-xs opacity-80">

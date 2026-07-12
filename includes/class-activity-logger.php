@@ -706,7 +706,10 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	private static function get_ensure_inline_idle_sec() {
-		return max( 8, min( 60, (int) apply_filters( 'polymart_ai_job_ensure_inline_idle_sec', 12 ) ) );
+		$job     = self::get_job_raw();
+		$default = self::should_prioritize_elementor_partial( $job ) ? 28 : 12;
+
+		return max( 8, min( 90, (int) apply_filters( 'polymart_ai_job_ensure_inline_idle_sec', $default ) ) );
 	}
 
 	/**
@@ -1551,6 +1554,7 @@ final class Activity_Logger {
 		$cooldown_remaining = self::get_job_api_cooldown_remaining( $job );
 		if ( $cooldown_remaining > 0 ) {
 			$job['api_cooldown_remaining'] = $cooldown_remaining;
+			$job                         = self::apply_api_cooldown_job_presentation( $job, $cooldown_remaining );
 		}
 
 		return $job;
@@ -1886,7 +1890,7 @@ final class Activity_Logger {
 	private static function set_job_last_step( array &$job, $post_id, $status, $message = '' ) {
 		$post_id = absint( $post_id );
 		$status  = sanitize_key( (string) $status );
-		$message = sanitize_text_field( (string) $message );
+		$message = sanitize_text_field( self::humanize_api_error_message( (string) $message ) );
 
 		if ( 'partial' === $status && $post_id > 0 && '' !== (string) ( $job['lang'] ?? '' ) ) {
 			$message = self::enrich_partial_step_message( $post_id, (string) $job['lang'], $message );
@@ -2292,10 +2296,14 @@ final class Activity_Logger {
 			);
 		}
 
-		$cap = min( 2, self::get_elementor_partial_step_cap( $job ) );
-		self::run_action_scheduler_batch( max( 1, $cap ), 90 );
+		$cap = 1;
+		self::run_action_scheduler_batch( 1, 60 );
 
-		self::schedule_chain_safety_pulse( self::CRON_FAST_INTERVAL_SEC );
+		$pulse = max(
+			self::CRON_FAST_INTERVAL_SEC,
+			(int) apply_filters( 'polymart_ai_elementor_cron_pulse_sec', 28 )
+		);
+		self::schedule_chain_safety_pulse( $pulse );
 
 		return true;
 	}
@@ -3014,14 +3022,15 @@ final class Activity_Logger {
 			self::unschedule_background_worker();
 			self::release_step_lock();
 			if ( Job_Action_Scheduler::is_available() ) {
+				Job_Action_Scheduler::cancel_all();
 				Job_Action_Scheduler::clear_slice_mutex();
 			}
-			self::cleanup_job_translation_locks( $existing );
+			self::release_all_job_translation_locks( $existing );
 			self::save_job( self::empty_job() );
 		}
 
-		// Drop leftover locks / partial meta from a previous paused/completed run.
-		self::cleanup_job_translation_locks( $existing );
+		// Drop leftover locks from a previous paused/completed run (keep post partial meta).
+		self::release_all_job_translation_locks( $existing );
 
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
@@ -3102,13 +3111,54 @@ final class Activity_Logger {
 		}
 
 		$seed_ids = array_values(
-			array_filter(
-				array_map( 'absint', $seed_ids ),
-				static function ( $post_id ) use ( $lang ) {
-					return $post_id > 0 && Post_Translator::post_needs_translation_work( $post_id, $lang );
-				}
+			array_unique(
+				array_filter(
+					array_map( 'absint', $seed_ids ),
+					static function ( $post_id ) use ( $lang ) {
+						return $post_id > 0 && Post_Translator::post_is_actionable_for_job( $post_id, $lang );
+					}
+				)
 			)
 		);
+
+		if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
+			$seed_ids = array_values(
+				array_unique(
+					array_filter(
+						array_map( 'absint', $issue_ids ),
+						static function ( $post_id ) use ( $lang ) {
+							return $post_id > 0 && Post_Translator::post_is_actionable_for_job( $post_id, $lang );
+						}
+					)
+				)
+			);
+		}
+
+		if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
+			$seed_ids = array_values(
+				array_unique(
+					array_filter(
+						array_map( 'absint', $issue_ids ),
+						static function ( $post_id ) {
+							return $post_id > 0;
+						}
+					)
+				)
+			);
+		}
+
+		if ( empty( $seed_ids ) && ! empty( $probe_ids ) ) {
+			$seed_ids = array_values(
+				array_unique(
+					array_filter(
+						array_map( 'absint', $probe_ids ),
+						static function ( $post_id ) {
+							return $post_id > 0;
+						}
+					)
+				)
+			);
+		}
 
 		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
 			return new \WP_Error(
@@ -3156,6 +3206,7 @@ final class Activity_Logger {
 			'initial_needs_work' => $needs_work,
 			'needs_work'         => $needs_work,
 			'site_resolved'      => 0,
+			'api_cooldown_until' => null,
 			'live_stats'         => array(
 				'total'        => (int) $stats['total'],
 				'untranslated' => (int) $stats['untranslated'],
@@ -3278,15 +3329,19 @@ final class Activity_Logger {
 		self::release_step_lock();
 
 		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::cancel_all();
 			Job_Action_Scheduler::clear_slice_mutex();
 		}
 
 		if ( 'idle' !== ( $job['status'] ?? '' ) ) {
-			self::cleanup_job_translation_locks( $job, true );
+			self::release_all_job_translation_locks( $job );
 			self::log( 'warning', __( 'ترجمه خودکار توسط کاربر متوقف شد.', 'polymart-ai' ) );
 		}
 
-		return self::save_job( self::empty_job() );
+		$cleared = self::empty_job();
+		$cleared['updated_at'] = time();
+
+		return self::save_job( $cleared );
 	}
 
 	/**
@@ -3461,11 +3516,9 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	private static function cleanup_job_translation_locks( array $job, $clear_partial = true ) {
-		$lang       = sanitize_key( (string) ( $job['lang'] ?? '' ) );
-		$partial_id = absint( $job['partial_post_id'] ?? 0 );
-		$current_id = absint( $job['current_post_id'] ?? 0 );
+		$lang = sanitize_key( (string) ( $job['lang'] ?? '' ) );
 
-		foreach ( array_unique( array_filter( array( $partial_id, $current_id ) ) ) as $post_id ) {
+		foreach ( self::collect_job_post_ids_for_lock_cleanup( $job ) as $post_id ) {
 			if ( $post_id <= 0 || '' === $lang ) {
 				continue;
 			}
@@ -3474,6 +3527,62 @@ final class Activity_Logger {
 				Post_Translator::clear_job_partial_state( $post_id, $lang );
 			}
 
+			Post_Translator::release_translation_lock( $post_id, $lang );
+		}
+
+		self::release_step_lock();
+	}
+
+	/**
+	 * Post IDs that may hold translation locks during a job run.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return int[]
+	 */
+	private static function collect_job_post_ids_for_lock_cleanup( array $job ) {
+		$ids = array_merge(
+			is_array( $job['deferred_queue'] ?? null ) ? $job['deferred_queue'] : array(),
+			is_array( $job['partial_ids'] ?? null ) ? $job['partial_ids'] : array(),
+			is_array( $job['retry_queue'] ?? null ) ? $job['retry_queue'] : array(),
+			is_array( $job['parked_ids'] ?? null ) ? $job['parked_ids'] : array(),
+			array(
+				absint( $job['partial_post_id'] ?? 0 ),
+				absint( $job['current_post_id'] ?? 0 ),
+				absint( $job['last_post_id'] ?? 0 ),
+			)
+		);
+
+		if ( is_array( $job['last_step'] ?? null ) ) {
+			$ids[] = absint( $job['last_step']['post_id'] ?? 0 );
+		}
+
+		return array_values(
+			array_unique(
+				array_filter(
+					array_map( 'absint', $ids ),
+					static function ( $post_id ) {
+						return $post_id > 0;
+					}
+				)
+			)
+		);
+	}
+
+	/**
+	 * Release per-post translation locks without wiping resume/progress meta.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return void
+	 */
+	private static function release_all_job_translation_locks( array $job ) {
+		$lang = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+
+		if ( '' === $lang ) {
+			self::release_step_lock();
+			return;
+		}
+
+		foreach ( self::collect_job_post_ids_for_lock_cleanup( $job ) as $post_id ) {
 			Post_Translator::release_translation_lock( $post_id, $lang );
 		}
 
@@ -4370,7 +4479,29 @@ final class Activity_Logger {
 				$job['partial_progress']  = $partial_progress;
 				$job['current_post_id']   = null;
 				$job['step_started_at']   = null;
-				$job['last_error']        = self::truncate_api_error_message( $slice->get_error_message() );
+				self::maybe_apply_api_throttle_cooldown( $slice );
+				$job = self::get_job_raw();
+
+				if ( self::is_job_api_cooldown_active( $job ) ) {
+					$remaining                      = self::get_job_api_cooldown_remaining( $job );
+					$job['step_deferred']           = true;
+					$job['step_deferred_reason']    = 'api_cooldown';
+					$job['step_deferred_message']   = self::format_api_cooldown_message( $remaining );
+					$job['api_cooldown_remaining']  = $remaining;
+					$job['last_error']              = self::format_api_cooldown_message( $remaining );
+					self::increment_job_step( $job );
+					self::set_job_last_step(
+						$job,
+						$post_id,
+						'partial',
+						self::format_api_cooldown_message( $remaining )
+					);
+					self::save_job( $job );
+
+					return self::normalize_job_for_response( $job, false );
+				}
+
+				$job['last_error'] = self::humanize_api_error_message( $slice->get_error_message() );
 				self::increment_job_step( $job );
 				self::set_job_last_step(
 					$job,
@@ -4470,6 +4601,28 @@ final class Activity_Logger {
 						new \WP_Error( 'polymart_ai_api_error', $err_msg )
 					);
 				}
+
+				$job = self::get_job_raw();
+
+				if ( self::is_job_api_cooldown_active( $job ) ) {
+					$remaining                      = self::get_job_api_cooldown_remaining( $job );
+					$job['step_deferred']           = true;
+					$job['step_deferred_reason']    = 'api_cooldown';
+					$job['step_deferred_message']   = self::format_api_cooldown_message( $remaining );
+					$job['api_cooldown_remaining']  = $remaining;
+					$job['current_post_id']         = null;
+					$job['step_started_at']         = null;
+					self::increment_job_step( $job );
+					self::set_job_last_step(
+						$job,
+						$post_id,
+						'partial',
+						self::format_api_cooldown_message( $remaining )
+					);
+					self::save_job( $job );
+
+					return self::normalize_job_for_response( $job, false );
+				}
 			} else {
 				unset( $job['recoverable'] );
 			}
@@ -4519,7 +4672,7 @@ final class Activity_Logger {
 				$job,
 				$post_id,
 				'partial',
-				self::truncate_api_error_message( (string) ( $slice['message'] ?? __( 'ادامه در مرحله بعد…', 'polymart-ai' ) ) )
+				self::humanize_api_error_message( (string) ( $slice['message'] ?? __( 'ادامه در مرحله بعد…', 'polymart-ai' ) ) )
 			);
 			self::save_job( $job );
 
@@ -6110,6 +6263,7 @@ final class Activity_Logger {
 	 */
 	public static function truncate_api_error_message( $message, $max = 160 ) {
 		$message = trim( wp_strip_all_tags( (string) $message ) );
+		$message = preg_replace( '/\s+/', ' ', $message );
 		$max     = max( 40, absint( $max ) );
 
 		if ( mb_strlen( $message ) <= $max ) {
@@ -6117,6 +6271,124 @@ final class Activity_Logger {
 		}
 
 		return mb_substr( $message, 0, $max - 1 ) . '…';
+	}
+
+	/**
+	 * User-facing API error text (Arvan/WAF aware).
+	 *
+	 * @param string $message Raw error message.
+	 * @return string
+	 */
+	public static function humanize_api_error_message( $message ) {
+		$message = (string) $message;
+		$lower   = strtolower( $message );
+
+		if (
+			false !== strpos( $lower, 'blocked from your ip' )
+			|| false !== strpos( $lower, 'blocked your ip' )
+			|| false !== strpos( $lower, 'has blocked your ip' )
+			|| false !== strpos( $lower, 'arvancloud' )
+			|| false !== strpos( $lower, 'آروان' )
+			|| false !== strpos( $lower, 'arvan' )
+			|| ( false !== strpos( $lower, '404' ) && false !== strpos( $lower, 'blocked' ) )
+			|| ( false !== strpos( $lower, '404' ) && false !== strpos( $lower, 'برگرداند' ) )
+		) {
+			return __( 'IP موقتاً توسط فایروال آروان مسدود شد — چند دقیقه صبر کنید', 'polymart-ai' );
+		}
+
+		if (
+			false !== strpos( $lower, '429' )
+			|| false !== strpos( $lower, 'rate limit' )
+			|| false !== strpos( $lower, 'too many requests' )
+		) {
+			return __( 'محدودیت نرخ API — چند دقیقه صبر کنید', 'polymart-ai' );
+		}
+
+		return self::truncate_api_error_message( $message, 100 );
+	}
+
+	/**
+	 * Replace noisy API error text in job payloads while cooldown is active.
+	 *
+	 * @param array<string, mixed> $job                Job state.
+	 * @param int                  $cooldown_remaining Seconds remaining.
+	 * @return array<string, mixed>
+	 */
+	private static function apply_api_cooldown_job_presentation( array $job, $cooldown_remaining ) {
+		$cooldown_message = self::format_api_cooldown_message( $cooldown_remaining );
+
+		$job['step_deferred']         = true;
+		$job['step_deferred_reason']  = 'api_cooldown';
+		$job['step_deferred_message'] = $cooldown_message;
+		$job['last_error']            = $cooldown_message;
+
+		if ( is_array( $job['last_step'] ?? null ) ) {
+			$job['last_step']['message'] = $cooldown_message;
+		}
+
+		if ( is_array( $job['current_post'] ?? null ) ) {
+			$job['current_post']['step_message'] = $cooldown_message;
+		}
+
+		return $job;
+	}
+
+	/**
+	 * Respect Arvan rate limits by spacing bulk Elementor API calls.
+	 *
+	 * @return void
+	 */
+	public static function wait_for_arvan_api_gap() {
+		$job     = self::get_job_raw();
+		$min_gap = max( 5, (int) apply_filters( 'polymart_ai_arvan_min_api_gap_sec', 10 ) );
+		$last_at = absint( $job['last_arvan_api_at'] ?? 0 );
+
+		if ( $last_at <= 0 ) {
+			return;
+		}
+
+		$wait = $min_gap - ( time() - $last_at );
+
+		if ( $wait > 0 ) {
+			sleep( min( 45, $wait ) );
+		}
+	}
+
+	/**
+	 * Record the last Arvan API attempt for spacing follow-up calls.
+	 *
+	 * @return void
+	 */
+	public static function touch_arvan_api_attempt() {
+		$job                      = self::get_job_raw();
+		$job['last_arvan_api_at'] = time();
+		self::save_job( $job );
+	}
+
+	/**
+	 * @param int $remaining_seconds Seconds until retry.
+	 * @return string
+	 */
+	public static function format_api_cooldown_message( $remaining_seconds ) {
+		$remaining_seconds = max( 0, absint( $remaining_seconds ) );
+
+		if ( $remaining_seconds <= 0 ) {
+			return __( 'API آماده تلاش مجدد است', 'polymart-ai' );
+		}
+
+		if ( $remaining_seconds >= 60 ) {
+			return sprintf(
+				/* translators: %d: minutes remaining */
+				__( 'API آروان محدود — %d دقیقه تا ادامه (بدون مصرف توکن)', 'polymart-ai' ),
+				(int) ceil( $remaining_seconds / 60 )
+			);
+		}
+
+		return sprintf(
+			/* translators: %d: seconds remaining */
+			__( 'API آروان محدود — %d ثانیه تا ادامه', 'polymart-ai' ),
+			$remaining_seconds
+		);
 	}
 
 	/**
@@ -6150,6 +6422,20 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Clear Arvan block streak after a successful API response.
+	 *
+	 * @return void
+	 */
+	public static function touch_successful_api_call() {
+		$job = self::get_job_raw();
+
+		if ( absint( $job['api_block_streak'] ?? 0 ) > 0 ) {
+			$job['api_block_streak'] = 0;
+			self::save_job( $job );
+		}
+	}
+
+	/**
 	 * Apply a cooldown after Arvan/WAF throttling so we do not burn tokens retrying.
 	 *
 	 * @param \WP_Error $error       API error.
@@ -6164,29 +6450,34 @@ final class Activity_Logger {
 		$data   = $error->get_error_data();
 		$status = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
 		$msg    = strtolower( $error->get_error_message() );
+		$job    = self::get_job_raw();
 
 		if ( null === $cooldown_sec ) {
 			$cooldown_sec = 120;
 
-			if ( 404 === $status || false !== strpos( $msg, 'blocked' ) || false !== strpos( $msg, 'arvancloud' ) ) {
-				$cooldown_sec = 900;
+			if ( 404 === $status || false !== strpos( $msg, 'blocked' ) || false !== strpos( $msg, 'arvancloud' ) || false !== strpos( $msg, 'آروان' ) ) {
+				$streak       = absint( $job['api_block_streak'] ?? 0 ) + 1;
+				$cooldown_sec = 1800 + min( 900, ( $streak - 1 ) * 300 );
 			} elseif ( 429 === $status ) {
-				$cooldown_sec = 180;
+				$cooldown_sec = 240;
 			}
 		}
 
 		$cooldown_sec = max( 60, min( 1800, absint( $cooldown_sec ) ) );
-		$job          = self::get_job_raw();
 		$until        = time() + $cooldown_sec;
 
 		if ( absint( $job['api_cooldown_until'] ?? 0 ) >= $until ) {
 			return true;
 		}
 
-		$short = self::truncate_api_error_message( $error->get_error_message() );
+		if ( 404 === $status || false !== strpos( $msg, 'blocked' ) || false !== strpos( $msg, 'arvancloud' ) || false !== strpos( $msg, 'آروان' ) ) {
+			$job['api_block_streak'] = absint( $job['api_block_streak'] ?? 0 ) + 1;
+		}
+
+		$short = self::humanize_api_error_message( $error->get_error_message() );
 
 		$job['api_cooldown_until'] = $until;
-		$job['last_error']         = $short;
+		$job['last_error']         = self::format_api_cooldown_message( $cooldown_sec );
 		self::save_job( $job );
 
 		self::log(
@@ -6198,6 +6489,8 @@ final class Activity_Logger {
 				$short
 			)
 		);
+
+		self::schedule_chain_safety_pulse( max( self::CRON_FAST_INTERVAL_SEC, min( 180, (int) ceil( $cooldown_sec / 3 ) ) ) );
 
 		return true;
 	}
