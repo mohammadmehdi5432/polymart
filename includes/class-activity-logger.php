@@ -4525,8 +4525,6 @@ final class Activity_Logger {
 				Post_Translator::is_recoverable_job_slice_error( $slice )
 				&& Post_Translator::job_partial_state_has_progress( $post_id, $lang, $partial_state )
 			) {
-				self::maybe_apply_api_throttle_cooldown( $slice );
-
 				$partial_progress = self::format_job_partial_progress( $partial_state, $post_id, $lang );
 				$phase            = (string) ( $partial_state['phase'] ?? 'elementor' );
 				$parsed_progress  = self::parse_job_phase_progress( $partial_progress );
@@ -4670,7 +4668,7 @@ final class Activity_Logger {
 				$job['recoverable'] = true;
 				$err_msg            = (string) ( $slice['message'] ?? '' );
 
-				if ( '' !== $err_msg ) {
+				if ( '' !== $err_msg && ! self::is_synthetic_api_throttle_message( $err_msg ) ) {
 					self::maybe_apply_api_throttle_cooldown(
 						new \WP_Error( 'polymart_ai_api_error', $err_msg )
 					);
@@ -6291,7 +6289,12 @@ final class Activity_Logger {
 	 */
 	public static function is_rate_limit_or_bot_error( \WP_Error $error ) {
 		$message = strtolower( $error->get_error_message() );
-		$data    = $error->get_error_data();
+
+		if ( self::is_synthetic_api_throttle_message( $message ) ) {
+			return false;
+		}
+
+		$data   = $error->get_error_data();
 		$status  = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
 
 		if ( in_array( $status, array( 403, 404, 429, 502, 503, 504 ), true ) ) {
@@ -6316,7 +6319,6 @@ final class Activity_Logger {
 			'ربات',
 			'تشخیص',
 			'مسدود',
-			'محدود',
 		);
 
 		foreach ( $keywords as $keyword ) {
@@ -6507,15 +6509,94 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Whether an error message is our own cooldown/deferred text (not a live API response).
+	 *
+	 * @param string $message Error or status message.
+	 * @return bool
+	 */
+	public static function is_synthetic_api_throttle_message( $message ) {
+		$message = strtolower( (string) $message );
+
+		if ( '' === $message ) {
+			return false;
+		}
+
+		return false !== strpos( $message, 'تا ادامه' )
+			|| false !== strpos( $message, 'بدون مصرف توکن' )
+			|| false !== strpos( $message, 'api آماده تلاش مجدد' )
+			|| false !== strpos( $message, 'api موقتاً محدود است' );
+	}
+
+	/**
+	 * Clear an active Arvan cooldown after a confirmed live API success.
+	 *
+	 * @param bool $kick_worker When true, run one inline worker tick for a running job.
+	 * @return bool True when cooldown state was cleared.
+	 */
+	public static function clear_job_api_cooldown( $kick_worker = false ) {
+		$job = self::get_job_raw();
+
+		$had_cooldown = self::is_job_api_cooldown_active( $job )
+			|| absint( $job['api_block_streak'] ?? 0 ) > 0
+			|| 'api_cooldown' === (string) ( $job['step_deferred_reason'] ?? '' );
+
+		if ( ! $had_cooldown ) {
+			return false;
+		}
+
+		$job['api_cooldown_until'] = null;
+		$job['api_block_streak']   = 0;
+
+		if ( self::is_synthetic_api_throttle_message( (string) ( $job['last_error'] ?? '' ) ) ) {
+			$job['last_error'] = null;
+		}
+
+		if ( 'api_cooldown' === (string) ( $job['step_deferred_reason'] ?? '' ) ) {
+			$job['step_deferred']         = false;
+			$job['step_deferred_reason']  = null;
+			$job['step_deferred_message'] = null;
+		}
+
+		self::save_job( $job );
+
+		if ( $kick_worker && 'running' === ( $job['status'] ?? '' ) ) {
+			self::run_inline_worker_tick( 1, 60 );
+		}
+
+		return true;
+	}
+
+	/**
 	 * Clear Arvan block streak after a successful API response.
 	 *
 	 * @return void
 	 */
 	public static function touch_successful_api_call() {
-		$job = self::get_job_raw();
+		$job     = self::get_job_raw();
+		$changed = false;
 
 		if ( absint( $job['api_block_streak'] ?? 0 ) > 0 ) {
 			$job['api_block_streak'] = 0;
+			$changed                 = true;
+		}
+
+		if ( absint( $job['api_cooldown_until'] ?? 0 ) > time() ) {
+			$job['api_cooldown_until'] = null;
+
+			if ( self::is_synthetic_api_throttle_message( (string) ( $job['last_error'] ?? '' ) ) ) {
+				$job['last_error'] = null;
+			}
+
+			if ( 'api_cooldown' === (string) ( $job['step_deferred_reason'] ?? '' ) ) {
+				$job['step_deferred']         = false;
+				$job['step_deferred_reason']  = null;
+				$job['step_deferred_message'] = null;
+			}
+
+			$changed = true;
+		}
+
+		if ( $changed ) {
 			self::save_job( $job );
 		}
 	}
@@ -6528,6 +6609,10 @@ final class Activity_Logger {
 	 * @return bool True when a cooldown was set.
 	 */
 	public static function maybe_apply_api_throttle_cooldown( \WP_Error $error, $cooldown_sec = null ) {
+		if ( self::is_synthetic_api_throttle_message( $error->get_error_message() ) ) {
+			return false;
+		}
+
 		if ( ! self::is_rate_limit_or_bot_error( $error ) ) {
 			return false;
 		}
@@ -6536,6 +6621,11 @@ final class Activity_Logger {
 		$status = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
 		$msg    = strtolower( $error->get_error_message() );
 		$job    = self::get_job_raw();
+
+		// Do not push the cooldown window forward while one is already active.
+		if ( self::is_job_api_cooldown_active( $job ) ) {
+			return true;
+		}
 
 		if ( null === $cooldown_sec ) {
 			$cooldown_sec = 120;

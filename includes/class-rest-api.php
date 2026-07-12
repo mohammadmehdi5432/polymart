@@ -1553,6 +1553,17 @@ final class REST_API {
 
 		$result = AI_Client::test_sample_translation( $text, $lang, $api_key, $endpoint, $model );
 
+		if ( ! empty( $result['success'] ) ) {
+			$result['cooldown_cleared'] = Activity_Logger::clear_job_api_cooldown( true );
+
+			if ( ! empty( $result['cooldown_cleared'] ) ) {
+				Activity_Logger::log(
+					'info',
+					__( 'تست API موفق — توقف خودکار آروان برداشته شد و کار ادامه می‌یابد.', 'polymart-ai' )
+				);
+			}
+		}
+
 		return rest_ensure_response( $result );
 	}
 

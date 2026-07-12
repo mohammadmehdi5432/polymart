@@ -861,6 +861,12 @@ export default function AutoTranslateApp() {
           `تست آروان موفق (${data.elapsed_ms}ms): «${data.source}» → «${data.translated}»`,
           'success'
         );
+
+        if (data?.cooldown_cleared) {
+          appendLog('تست موفق — توقف API برداشته شد، کار ادامه می‌یابد.', 'success');
+          const refreshed = await fetchJob();
+          setJob(refreshed);
+        }
       } else {
         appendLog(`تست آروان ناموفق (${data?.elapsed_ms ?? '?'}ms): ${data?.error || 'خطای نامشخص'}`, 'error');
       }
