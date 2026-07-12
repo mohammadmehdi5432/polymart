@@ -4240,6 +4240,13 @@ final class Post_Translator {
 		$ai_options   = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
 		$processed    = 0;
 		$failures     = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+		$skipped_list = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$effective_total = max(
+			1,
+			$source_total,
+			count( $map ) + count( $payload )
+		);
+		$state['elementor_chunks_total'] = $effective_total;
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
 			$chunk = array_shift( $chunks );
@@ -4324,17 +4331,21 @@ final class Post_Translator {
 
 		$state['elementor_map']          = $map;
 		$state['elementor_chunk_index']  = count( $map );
-		$state['elementor_chunks_total'] = max( 1, $source_total );
-		$state['elementor_failures']     = $failures;
-
-		$remaining = self::filter_remaining_elementor_payload(
+		$remaining                       = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
 			$map,
-			is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array()
+			$skipped_list
 		);
+		$state['elementor_chunks_total'] = max(
+			1,
+			$source_total,
+			count( $map ) + count( $remaining )
+		);
+		$state['elementor_failures']     = $failures;
+		$progress_total                  = max( 1, (int) $state['elementor_chunks_total'] );
 
 		if ( ! empty( $remaining ) ) {
-			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), max( 1, $source_total ) );
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), $progress_total );
 
 			if ( is_wp_error( $persisted ) ) {
 				return $persisted;
@@ -4345,17 +4356,17 @@ final class Post_Translator {
 			return array(
 				'done'           => false,
 				'phase'          => 'elementor',
-				'phase_progress' => count( $map ) . '/' . max( 1, $source_total ),
+				'phase_progress' => count( $map ) . '/' . $progress_total,
 				'message'        => sprintf(
 					/* translators: 1: completed widgets, 2: total widgets */
 					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
 					count( $map ),
-					max( 1, $source_total )
+					$progress_total
 				),
 			);
 		}
 
-		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), max( 1, $source_total ), true );
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, count( $map ), $progress_total, true );
 
 		if ( is_wp_error( $persisted ) ) {
 			return $persisted;
@@ -4364,7 +4375,7 @@ final class Post_Translator {
 		return array(
 			'done'           => true,
 			'phase'          => 'elementor',
-			'phase_progress' => count( $map ) . '/' . max( 1, $source_total ),
+			'phase_progress' => count( $map ) . '/' . $progress_total,
 			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
 		);
 	}

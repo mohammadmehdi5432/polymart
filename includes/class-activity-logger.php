@@ -2049,12 +2049,83 @@ final class Activity_Logger {
 			return false;
 		}
 
-		if ( 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
+		$job_phase  = sanitize_key( (string) ( $job['partial_phase'] ?? '' ) );
+		$post_state = Post_Translator::get_job_partial_state( $post_id, $lang );
+		$post_phase = sanitize_key( (string) ( $post_state['phase'] ?? '' ) );
+
+		if ( 'elementor' !== $job_phase && 'elementor' !== $post_phase ) {
 			return false;
 		}
 
 		return Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
 			|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
+	}
+
+	/**
+	 * Whether a post still has an in-progress Elementor job slice (post meta state).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function post_has_elementor_job_state( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+			return true;
+		}
+
+		$state = Post_Translator::get_job_partial_state( $post_id, $lang );
+
+		if ( 'elementor' !== sanitize_key( (string) ( $state['phase'] ?? '' ) ) ) {
+			return false;
+		}
+
+		return Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+			|| Post_Translator::job_partial_state_has_progress( $post_id, $lang, $state );
+	}
+
+	/**
+	 * Pin the next deferred Elementor partial when the job lost its inline pin after a defer.
+	 *
+	 * @param array<string, mixed> $job Job state (by reference).
+	 * @return bool True when a post was pinned.
+	 */
+	private static function maybe_restore_elementor_pin_from_queue( array &$job ) {
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( '' === $lang || self::job_has_active_elementor_pin( $job, $lang ) ) {
+			return false;
+		}
+
+		$candidates = array();
+
+		foreach ( array( absint( $job['partial_post_id'] ?? 0 ), absint( $job['current_post_id'] ?? 0 ) ) as $candidate_id ) {
+			if ( $candidate_id > 0 ) {
+				$candidates[] = $candidate_id;
+			}
+		}
+
+		foreach ( self::get_actionable_deferred_queue( $job, $lang ) as $deferred_id ) {
+			$candidates[] = absint( $deferred_id );
+		}
+
+		foreach ( array_unique( array_filter( $candidates ) ) as $post_id ) {
+			if ( ! self::post_has_elementor_job_state( $post_id, $lang ) ) {
+				continue;
+			}
+
+			self::pin_job_for_elementor_post( $job, $post_id, $lang );
+
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -2110,7 +2181,23 @@ final class Activity_Logger {
 	public static function should_prioritize_elementor_partial( array $job ) {
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
-		return self::job_has_active_elementor_pin( $job, $lang );
+		if ( self::job_has_active_elementor_pin( $job, $lang ) ) {
+			return true;
+		}
+
+		$active_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+
+		if ( $active_id > 0 && self::post_has_elementor_job_state( $active_id, $lang ) ) {
+			return true;
+		}
+
+		$deferred = self::get_actionable_deferred_queue( $job, $lang );
+
+		if ( ! empty( $deferred[0] ) && self::post_has_elementor_job_state( (int) $deferred[0], $lang ) ) {
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -2182,7 +2269,15 @@ final class Activity_Logger {
 	public static function run_pinned_elementor_work( $log_stalled = false ) {
 		$job = self::get_job_raw();
 
-		if ( 'running' !== ( $job['status'] ?? '' ) || ! self::should_prioritize_elementor_partial( $job ) ) {
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return false;
+		}
+
+		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {
+			self::save_job( $job );
+		}
+
+		if ( ! self::should_prioritize_elementor_partial( $job ) ) {
 			return false;
 		}
 
@@ -2325,6 +2420,39 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	private static function defer_job_post_stuck_slice( array &$job, $post_id, $lang, $phase, $progress ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$phase   = sanitize_key( (string) $phase );
+
+		if (
+			'elementor' === $phase
+			&& $post_id > 0
+			&& (
+				Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+				|| Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+			)
+		) {
+			self::pin_job_for_elementor_post( $job, $post_id, $lang );
+			$job['stuck_progress_steps']   = 0;
+			$job['consecutive_post_id']    = $post_id;
+			$job['consecutive_post_steps'] = 0;
+			$job['current_post_id']        = null;
+			$job['step_started_at']        = null;
+			self::increment_job_step( $job );
+			self::set_job_last_step(
+				$job,
+				$post_id,
+				'partial',
+				sprintf(
+					/* translators: %s: elementor progress marker */
+					__( 'Elementor — ادامه بخش‌ها (%s)', 'polymart-ai' ),
+					'' !== $progress ? $progress : '…'
+				)
+			);
+
+			return;
+		}
+
 		self::defer_job_post( $job, $post_id, $lang );
 		$job['partial_post_id']        = null;
 		$job['partial_phase']          = null;
@@ -4211,6 +4339,15 @@ final class Activity_Logger {
 
 		self::save_job( $job );
 
+		if (
+			Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+			|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			|| self::post_has_elementor_job_state( $post_id, $lang )
+		) {
+			self::pin_job_for_elementor_post( $job, $post_id, $lang );
+			self::save_job( $job );
+		}
+
 		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
 
 		if ( is_wp_error( $slice ) && 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
@@ -4308,16 +4445,18 @@ final class Activity_Logger {
 			$parsed_progress   = self::parse_job_phase_progress( $current_progress );
 			$elementor_remaining = 'elementor' === $phase_key
 				&& (
-					! is_array( $parsed_progress )
+					Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+					|| ! is_array( $parsed_progress )
 					|| $parsed_progress['done'] < $parsed_progress['total']
 				);
 
-			if ( $elementor_remaining ) {
+			if ( $elementor_remaining || 'elementor' === $phase_key ) {
 				$stuck_should_defer = false;
 			}
 
 			if (
 				! $elementor_remaining
+				&& 'elementor' !== $phase_key
 				&& (
 					$stuck_should_defer
 					|| (
