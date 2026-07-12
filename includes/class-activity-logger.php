@@ -281,8 +281,7 @@ final class Activity_Logger {
 			return true;
 		}
 
-		if (
-			wp_doing_ajax()
+		if ( wp_doing_ajax()
 			&& isset( $_REQUEST['action'] ) // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			&& self::LOOPBACK_ACTION === sanitize_key( wp_unslash( (string) $_REQUEST['action'] ) )
 		) {
@@ -290,6 +289,54 @@ final class Activity_Logger {
 		}
 
 		return false;
+	}
+
+	/**
+	 * Ensure pluggable auth exists and impersonate an admin during background jobs.
+	 *
+	 * Elementor, Rank Math, and other plugins call wp_get_current_user() while we
+	 * save translated meta from Action Scheduler where no interactive user exists.
+	 *
+	 * @return void
+	 */
+	public static function bootstrap_job_worker_context() {
+		if ( ! function_exists( 'wp_get_current_user' ) ) {
+			require_once ABSPATH . WPINC . '/pluggable.php';
+		}
+
+		if ( ! function_exists( 'wp_get_current_user' ) ) {
+			return;
+		}
+
+		if ( get_current_user_id() > 0 ) {
+			return;
+		}
+
+		if ( ! self::is_trusted_job_worker() && ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		$user_id = absint( get_option( 'polymart_ai_job_worker_user_id', 0 ) );
+
+		if ( $user_id <= 0 || ! get_userdata( $user_id ) ) {
+			$admins = get_users(
+				array(
+					'role'   => 'administrator',
+					'number' => 1,
+					'fields' => 'ID',
+				)
+			);
+
+			$user_id = ! empty( $admins ) ? absint( $admins[0] ) : 0;
+
+			if ( $user_id > 0 ) {
+				update_option( 'polymart_ai_job_worker_user_id', $user_id, false );
+			}
+		}
+
+		if ( $user_id > 0 ) {
+			wp_set_current_user( $user_id );
+		}
 	}
 
 	/**
@@ -406,6 +453,8 @@ final class Activity_Logger {
 		self::$trusted_as_tick        = true;
 		self::$trusted_job_tick       = true;
 		self::$skip_chain_after_tick  = true;
+
+		self::bootstrap_job_worker_context();
 
 		try {
 			return self::process_background_step( $max_steps_override, $budget_override );

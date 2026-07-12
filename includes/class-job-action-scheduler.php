@@ -315,6 +315,8 @@ final class Job_Action_Scheduler {
 			@set_time_limit( 200 );
 		}
 
+		self::bootstrap_job_worker_context();
+
 		self::$handler_clean_exit = false;
 		self::$current_action_id  = self::resolve_current_action_id();
 		self::register_handler_shutdown();

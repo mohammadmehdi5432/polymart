@@ -78,6 +78,7 @@ final class Post_Translator {
 	 * @return void
 	 */
 	public static function begin_persisting_translations() {
+		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
 		self::$is_persisting_translations = true;
 	}
 
@@ -3812,17 +3813,26 @@ final class Post_Translator {
 			return true;
 		}
 
-		if ( defined( 'REST_REQUEST' ) && REST_REQUEST && current_user_can( REST_API::required_admin_capability() ) ) {
+		if ( ! function_exists( 'wp_get_current_user' ) ) {
+			require_once ABSPATH . WPINC . '/pluggable.php';
+		}
+
+		if ( defined( 'REST_REQUEST' ) && REST_REQUEST && function_exists( 'current_user_can' ) && current_user_can( REST_API::required_admin_capability() ) ) {
 			return true;
 		}
 
 		// Site admins running the bulk job may translate any queued post,
 		// even when they lack per-post edit caps (custom types / other authors).
 		if (
-			current_user_can( REST_API::required_admin_capability() )
+			function_exists( 'current_user_can' )
+			&& current_user_can( REST_API::required_admin_capability() )
 			&& \PolymartAI\Activity_Logger::is_bulk_job_running()
 		) {
 			return true;
+		}
+
+		if ( ! function_exists( 'current_user_can' ) ) {
+			return \PolymartAI\Activity_Logger::is_bulk_job_running();
 		}
 
 		return current_user_can( 'edit_post', $post_id );
@@ -4515,6 +4525,8 @@ final class Post_Translator {
 	 * @return true|\WP_Error
 	 */
 	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false ) {
+		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
+
 		$tree = self::apply_elementor_translation_payload( $source_data, $map );
 		$json = wp_json_encode( $tree );
 
