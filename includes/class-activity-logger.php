@@ -2121,13 +2121,17 @@ final class Activity_Logger {
 			return false;
 		}
 
-		$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
 
-		if ( ! is_array( $parsed ) || $parsed['total'] <= 0 ) {
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( Post_Translator::elementor_job_api_slices_pending( $post_id, $lang ) ) {
 			return true;
 		}
 
-		return $parsed['done'] < $parsed['total'];
+		return Post_Translator::should_run_elementor_job_slice( $post_id, $lang );
 	}
 
 	/**
@@ -2153,8 +2157,7 @@ final class Activity_Logger {
 			return false;
 		}
 
-		return Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
-			|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
+		return Post_Translator::elementor_job_api_slices_pending( $post_id, $lang );
 	}
 
 	/**
@@ -2252,15 +2255,19 @@ final class Activity_Logger {
 			return true;
 		}
 
+		if ( self::elementor_partial_has_remaining( $job ) ) {
+			return true;
+		}
+
 		$active_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
 
-		if ( $active_id > 0 && self::post_has_elementor_job_state( $active_id, $lang ) ) {
+		if ( $active_id > 0 && Post_Translator::elementor_job_api_slices_pending( $active_id, $lang ) ) {
 			return true;
 		}
 
 		$deferred = self::get_actionable_deferred_queue( $job, $lang );
 
-		if ( ! empty( $deferred[0] ) && self::post_has_elementor_job_state( (int) $deferred[0], $lang ) ) {
+		if ( ! empty( $deferred[0] ) && Post_Translator::elementor_job_api_slices_pending( (int) $deferred[0], $lang ) ) {
 			return true;
 		}
 
@@ -4971,7 +4978,11 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( ! empty( $slice['done'] ) && Post_Translator::post_needs_elementor_job_work( $post_id, $lang ) ) {
+		if (
+			! empty( $slice['done'] )
+			&& 'elementor' !== sanitize_key( (string) ( $slice['phase'] ?? '' ) )
+			&& Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+		) {
 			self::pin_job_for_elementor_post( $job, $post_id, $lang );
 			self::increment_job_step( $job );
 			self::set_job_last_step(
