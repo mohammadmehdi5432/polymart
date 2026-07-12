@@ -1935,6 +1935,43 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Push live Elementor slice progress to the bulk job option (SPA monitor polls this).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return void
+	 */
+	public static function sync_elementor_partial_progress( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return;
+		}
+
+		$marker = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang );
+
+		if ( '' === $marker || ! preg_match( '/^\d+\/\d+$/', $marker ) ) {
+			return;
+		}
+
+		$job['partial_post_id']  = $post_id;
+		$job['partial_phase']    = 'elementor';
+		$job['partial_progress'] = $marker;
+		$job['step_partial']     = true;
+		self::touch_partial_progress_tracker( $job );
+		$job['worker_heartbeat_at'] = time();
+		$job['last_cron_at']        = time();
+		self::save_job( $job );
+	}
+
+	/**
 	 * Persist a lightweight heartbeat while a tick is in flight.
 	 *
 	 * @return void
