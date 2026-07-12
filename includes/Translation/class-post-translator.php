@@ -3901,6 +3901,26 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Human-readable Elementor slice status using durable chunk/cursor progress.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Optional partial state.
+	 * @return string
+	 */
+	private static function format_elementor_job_slice_status_message( $post_id, $lang, array $state = array() ) {
+		$state    = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		$progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+
+		return sprintf(
+			/* translators: 1: completed batches, 2: total batches */
+			__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+			(int) $progress['done'],
+			max( 1, (int) $progress['total'] )
+		);
+	}
+
+	/**
 	 * Ordered field phases for auto-translate job slices.
 	 *
 	 * @return string[]
@@ -4709,19 +4729,40 @@ final class Post_Translator {
 					|| self::elementor_job_has_remaining_payload( $post_id, $lang )
 				) {
 					$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, self::get_job_partial_state( $post_id, $lang ) );
+					$state['phase'] = 'elementor';
 					self::save_job_partial_state( $post_id, $lang, $state );
 
-					return array(
-						'done'           => false,
-						'phase'          => 'elementor',
-						'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-						'message'        => sprintf(
-							/* translators: 1: completed widgets, 2: total widgets */
-							__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
-							count( is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() ),
-							max( 1, absint( $state['elementor_chunks_total'] ?? 1 ) )
-						),
+					$retry_slice = self::process_elementor_job_slice(
+						$post_id,
+						$lang,
+						$state,
+						$api_key,
+						$api_endpoint,
+						$ai_model
 					);
+
+					if ( is_wp_error( $retry_slice ) ) {
+						return $retry_slice;
+					}
+
+					if ( empty( $retry_slice['done'] ) ) {
+						return $retry_slice;
+					}
+
+					if (
+						self::post_needs_elementor_job_work( $post_id, $lang )
+						|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+					) {
+						$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, self::get_job_partial_state( $post_id, $lang ) );
+						self::save_job_partial_state( $post_id, $lang, $state );
+
+						return array(
+							'done'           => false,
+							'phase'          => 'elementor',
+							'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+							'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
+						);
+					}
 				}
 
 				self::clear_job_partial_state( $post_id, $lang );
@@ -4850,12 +4891,7 @@ final class Post_Translator {
 							'done'           => false,
 							'phase'          => 'elementor',
 							'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-							'message'        => sprintf(
-								/* translators: 1: completed widgets, 2: total widgets */
-								__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
-								$done_count_pre,
-								$progress_total
-							),
+							'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
 						);
 					} else {
 						self::save_elementor_source_hash( $post_id, $lang );
@@ -4885,18 +4921,40 @@ final class Post_Translator {
 				$map,
 				$skipped_list
 			);
+			$truly_complete  = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
 
-			if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) && ! empty( $remaining ) ) {
-				\PolymartAI\Activity_Logger::log(
-					'info',
-					sprintf(
-						/* translators: 1: post ID, 2: completed batches, 3: total batches */
-						__( 'Elementor — #%1$d: همه %2$d از %3$d بخش API انجام شد — در حال نهایی‌سازی…', 'polymart-ai' ),
-						$post_id,
-						$done_count,
-						$progress_total
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang )
+			if ( ! $truly_complete ) {
+				if ( ! empty( $remaining ) && $done_count >= $progress_total ) {
+					\PolymartAI\Activity_Logger::log(
+						'info',
+						sprintf(
+							/* translators: 1: post ID, 2: completed batches, 3: total batches */
+							__( 'Elementor — #%1$d: همه %2$d از %3$d بخش API انجام شد — در حال نهایی‌سازی…', 'polymart-ai' ),
+							$post_id,
+							$done_count,
+							$progress_total
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+				}
+
+				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
+
+				if ( is_wp_error( $persisted ) ) {
+					return $persisted;
+				}
+
+				$state['elementor_map']              = $map;
+				$state['elementor_chunk_index']      = $done_count;
+				$state['elementor_slices_completed'] = $done_count;
+				$state['elementor_chunks_total']     = $progress_total;
+				self::save_job_partial_state( $post_id, $lang, $state );
+
+				return array(
+					'done'           => false,
+					'phase'          => 'elementor',
+					'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+					'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
 				);
 			}
 
@@ -5064,20 +5122,38 @@ final class Post_Translator {
 			$map = array_merge( $map, $mapped_chunk );
 			$map = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
 			++$processed;
-			++$slice_cursor;
 
-			if ( ! empty( $mapped_chunk ) ) {
+			$chunk_satisfied = self::elementor_chunk_is_satisfied( $chunk, $map, $source_payload );
+
+			if ( $chunk_satisfied ) {
+				++$slice_cursor;
 				$state['elementor_slices_completed'] = max(
 					absint( $state['elementor_slices_completed'] ?? 0 ),
 					$attempt_index
 				);
 				self::write_elementor_slice_cursor( $post_id, $lang, $attempt_index, $progress_total );
+
+				if ( ! empty( $mapped_chunk ) ) {
+					\PolymartAI\Activity_Logger::touch_successful_api_call();
+					\PolymartAI\Activity_Logger::log(
+						'info',
+						sprintf(
+							/* translators: 1: post label, 2: chunk index, 3: field count */
+							__( 'Elementor — %1$s: بخش %2$d — %3$d فیلد از API دریافت شد', 'polymart-ai' ),
+							$post_label,
+							$attempt_index,
+							count( $mapped_chunk )
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+				}
+			} elseif ( ! empty( $mapped_chunk ) ) {
 				\PolymartAI\Activity_Logger::touch_successful_api_call();
 				\PolymartAI\Activity_Logger::log(
 					'info',
 					sprintf(
 						/* translators: 1: post label, 2: chunk index, 3: field count */
-						__( 'Elementor — %1$s: بخش %2$d — %3$d فیلد از API دریافت شد', 'polymart-ai' ),
+						__( 'Elementor — %1$s: بخش %2$d — %3$d فیلد از API دریافت شد (ادامه در تیک بعد)', 'polymart-ai' ),
 						$post_label,
 						$attempt_index,
 						count( $mapped_chunk )
@@ -5123,9 +5199,9 @@ final class Post_Translator {
 		$state['elementor_chunk_index']    = $done_count;
 		$state['elementor_slices_completed'] = $done_count;
 		self::write_elementor_slice_cursor( $post_id, $lang, $done_count, $progress_total );
-		$api_slices_complete               = $done_count >= $progress_total;
+		$truly_complete                    = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
 
-		if ( ! $api_slices_complete && ( ! empty( $remaining ) || ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) ) {
+		if ( ! $truly_complete ) {
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
 
 			if ( is_wp_error( $persisted ) ) {
@@ -5138,16 +5214,11 @@ final class Post_Translator {
 				'done'           => false,
 				'phase'          => 'elementor',
 				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-				'message'        => sprintf(
-					/* translators: 1: completed widgets, 2: total widgets */
-					__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
-					$done_count,
-					$progress_total
-				),
+				'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
 			);
 		}
 
-		if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) && ! empty( $remaining ) ) {
+		if ( ! empty( $remaining ) ) {
 			\PolymartAI\Activity_Logger::log(
 				'info',
 				sprintf(
@@ -5221,7 +5292,9 @@ final class Post_Translator {
 		$state['elementor_failures'] = $failures;
 
 		if ( ! empty( $map ) ) {
-			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, count( $map ), $progress_total );
+			$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+			$done_count     = self::resolve_elementor_done_count( $state, $chunk_progress['done'], $post_id, $lang );
+			$persisted      = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
 
 			if ( ! is_wp_error( $persisted ) ) {
 				self::save_job_partial_state( $post_id, $lang, $state );
@@ -5230,9 +5303,9 @@ final class Post_Translator {
 					'elementor',
 					$progress,
 					sprintf(
-						/* translators: 1: saved widget count, 2: total widgets, 3: error hint */
+						/* translators: 1: saved batch count, 2: total batches, 3: error hint */
 						__( 'Elementor — %1$d از %2$d بخش ذخیره شد. %3$s', 'polymart-ai' ),
-						count( $map ),
+						$done_count,
 						$progress_total,
 						$short_error
 					)
@@ -5461,6 +5534,7 @@ final class Post_Translator {
 	 */
 	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false ) {
 		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
+		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 
 		if ( ! self::ensure_translation_lock_for_persist( $post_id, $lang ) ) {
 			\PolymartAI\Activity_Logger::log(
@@ -5498,6 +5572,7 @@ final class Post_Translator {
 		$total_chunks = max( absint( $total_chunks ), (int) $chunk_progress['total'], 1 );
 
 		$tree = self::apply_elementor_translation_payload( $source_data, $map );
+		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 		$json = wp_json_encode( $tree );
 
 		if ( false === $json || '' === $json ) {
@@ -5518,6 +5593,7 @@ final class Post_Translator {
 		}
 
 		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), $json );
+		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 
 		if ( $complete ) {
 			self::save_elementor_source_hash( $post_id, $lang );

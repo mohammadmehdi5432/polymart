@@ -1788,6 +1788,12 @@ final class Activity_Logger {
 
 		$job     = self::get_job_raw();
 		$current = absint( $job['current_post_id'] ?? 0 );
+		$partial = absint( $job['partial_post_id'] ?? 0 );
+
+		// Elementor burst can run many API calls in one request — allow a longer silence window.
+		if ( $partial > 0 && self::should_prioritize_elementor_partial( $job ) ) {
+			$idle_sec = max( $idle_sec, (int) apply_filters( 'polymart_ai_elementor_burst_lock_idle_sec', 150 ) );
+		}
 
 		// Actively translating a known post — never force-unlock before full TTL.
 		if ( $current > 0 ) {
@@ -1917,6 +1923,15 @@ final class Activity_Logger {
 		);
 
 		return true;
+	}
+
+	/**
+	 * Persist a lightweight heartbeat while a tick is in flight.
+	 *
+	 * @return void
+	 */
+	public static function touch_job_worker_heartbeat() {
+		self::touch_worker_heartbeat();
 	}
 
 	/**
@@ -2424,6 +2439,7 @@ final class Activity_Logger {
 
 		try {
 			self::bootstrap_job_worker_context();
+			self::touch_job_worker_heartbeat();
 			self::force_release_step_lock_if_idle( 45 );
 			Job_Action_Scheduler::clear_slice_mutex_if_stale();
 			Post_Translator::release_stale_translation_lock( $post_id, $lang );
@@ -2477,15 +2493,21 @@ final class Activity_Logger {
 		$step_started = absint( $job['step_started_at'] ?? 0 );
 		$stall_sec    = (int) apply_filters( 'polymart_ai_elementor_progress_stall_sec', 75, $job );
 
-		if ( $step_started > 0 && ( $now - $step_started ) < 90 ) {
+		if ( $step_started > 0 && ( $now - $step_started ) < 150 ) {
 			return false;
 		}
 
-		if ( $progress_at > 0 && ( $now - $progress_at ) < max( 45, $stall_sec ) ) {
+		if ( $progress_at > 0 && ( $now - $progress_at ) < max( 60, $stall_sec ) ) {
 			return false;
 		}
 
-		if ( $last_cron > 0 && ( $now - $last_cron ) < max( 45, $stall_sec ) ) {
+		if ( $last_cron > 0 && ( $now - $last_cron ) < max( 60, $stall_sec ) ) {
+			return false;
+		}
+
+		$heartbeat = absint( $job['worker_heartbeat_at'] ?? 0 );
+
+		if ( $heartbeat > 0 && ( $now - $heartbeat ) < max( 60, $stall_sec ) ) {
 			return false;
 		}
 
@@ -4234,7 +4256,7 @@ final class Activity_Logger {
 		);
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		if ( $released_stale_lock || $age >= self::PICK_STALL_SEC ) {
+		if ( $released_stale_lock || ( $age >= self::PICK_STALL_SEC && ! self::should_prioritize_elementor_partial( $job ) ) ) {
 			if ( self::recover_stalled_job_picker( $job, $lang, $released_stale_lock ) ) {
 				self::save_job( $job );
 			}
@@ -5283,7 +5305,8 @@ final class Activity_Logger {
 			return false;
 		}
 
-		$changed = false;
+		$changed               = false;
+		$prioritize_elementor  = self::should_prioritize_elementor_partial( $job );
 
 		if ( get_transient( self::STEP_LOCK_KEY ) || get_option( self::STEP_LOCK_CLAIM_KEY ) ) {
 			self::release_step_lock();
@@ -5295,6 +5318,24 @@ final class Activity_Logger {
 			$job['step_started_at']  = null;
 			$job['pick_started_at']  = null;
 			$changed                 = true;
+		}
+
+		if ( $prioritize_elementor ) {
+			if ( in_array( (string) ( $job['pause_reason'] ?? '' ), array( 'pick_stalled', 'stalled' ), true ) ) {
+				$job['status']       = 'running';
+				$job['pause_reason'] = null;
+				$job['last_error']   = null;
+				$changed             = true;
+			}
+
+			if ( $log && $changed ) {
+				self::log(
+					'warning',
+					__( 'قفل کارگر آزاد شد — ادامه ترجمه Elementor در همان مورد.', 'polymart-ai' )
+				);
+			}
+
+			return $changed;
 		}
 
 		$parked = self::get_parked_ids( $job );

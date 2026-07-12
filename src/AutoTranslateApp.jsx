@@ -89,8 +89,8 @@ function isCronHealthy(job) {
     Boolean(job?.elementor_progress_stalled) ||
     (job?.partial_phase === 'elementor' &&
       job?.partial_post_id &&
-      progressAge > 75 &&
-      activityAge > 75);
+      progressAge > 90 &&
+      activityAge > 90);
 
   const elementorPartial = isElementorPartialJob(job);
 
