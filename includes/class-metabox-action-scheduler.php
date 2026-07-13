@@ -25,7 +25,12 @@ final class Metabox_Action_Scheduler {
 	const REQUEST_BUDGET_SEC = 120;
 	const MAX_SLICES         = 3;
 	const STALE_RUNNING_SEC  = 90;
-	const CHAIN_DELAY_SEC    = 1;
+	// IMPORTANT: metabox translation relies on the inline queue runner to keep
+	// progressing even when WP-Cron/AS runners are not reliably firing on the site.
+	// If we schedule the next slice in the future (even +1s), the queue runner that
+	// is already executing inside this request will not pick it up, and progress
+	// may stall indefinitely.
+	const CHAIN_DELAY_SEC    = 0;
 
 	const STATUS_META_PREFIX = '_polymart_ai_metabox_as_';
 	const BATCH_META_KEY     = '_polymart_ai_metabox_as_batch';
