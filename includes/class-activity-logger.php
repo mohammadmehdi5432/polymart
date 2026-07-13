@@ -2675,6 +2675,25 @@ final class Activity_Logger {
 				! Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
 				&& ! Post_Translator::should_run_elementor_job_slice( $post_id, $lang )
 			) {
+				$job = self::get_job_raw();
+
+				if ( absint( $job['partial_post_id'] ?? 0 ) === $post_id ) {
+					$job['partial_post_id']  = null;
+					$job['partial_phase']    = null;
+					$job['partial_progress'] = null;
+					unset( $job['step_partial'] );
+				}
+
+				$job['last_cron_at']        = time();
+				$job['worker_heartbeat_at'] = time();
+				self::save_job( $job );
+
+				self::continue_job_chain( 0, true );
+
+				if ( is_array( $result ) ) {
+					$result['elementor_page_complete'] = true;
+				}
+
 				return is_array( $result ) ? $result : self::normalize_job_for_response( self::get_job_raw(), false );
 			}
 
@@ -4385,7 +4404,12 @@ final class Activity_Logger {
 
 		if ( $as_ok ) {
 			Job_Action_Scheduler::clear_slice_mutex();
-			Job_Action_Scheduler::enqueue_next( true, 0 );
+
+			if ( self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
+				Job_Action_Scheduler::cancel_pending_slices();
+			} else {
+				Job_Action_Scheduler::enqueue_next( true, 0 );
+			}
 
 			if ( $run_inline ) {
 				Job_Action_Scheduler::run_queue_inline( true );
@@ -6582,9 +6606,15 @@ final class Activity_Logger {
 			self::untrack_succeeded_post( $job, $post_id );
 			self::track_partial_post( $job, $post_id );
 
+			$elementor_api_done = ! Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
+				&& ! Post_Translator::should_run_elementor_job_slice( $post_id, $lang );
+
 			if (
-				Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
-				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+				! $elementor_api_done
+				&& (
+					Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+					|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+				)
 			) {
 				self::pin_job_for_elementor_post( $job, $post_id, $lang );
 
@@ -6595,6 +6625,21 @@ final class Activity_Logger {
 						__( '«%1$s» — Elementor بخش‌بندی شده؛ ادامه همان مورد (%2$s) تا تکمیل.', 'polymart-ai' ),
 						$title_source,
 						'' !== (string) ( $job['partial_progress'] ?? '' ) ? (string) $job['partial_progress'] : '…'
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+			} elseif ( $elementor_api_done ) {
+				$job['partial_post_id']  = null;
+				$job['partial_phase']    = null;
+				$job['partial_progress'] = null;
+				unset( $job['step_partial'] );
+
+				self::log(
+					'info',
+					sprintf(
+						/* translators: 1: post title */
+						__( '«%1$s» — همه بخش‌های Elementor API انجام شد؛ ادامه با مورد بعدی صف.', 'polymart-ai' ),
+						$title_source
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);

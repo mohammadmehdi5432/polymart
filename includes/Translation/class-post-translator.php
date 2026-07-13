@@ -6661,22 +6661,29 @@ final class Post_Translator {
 				array( 'elementor_map' => $map )
 			)
 		);
-		$state['elementor_chunk_index']      = (int) $chunk_progress['done'];
-		$state['elementor_chunks_total']   = (int) $chunk_progress['total'];
-		$state['elementor_slices_completed'] = (int) $chunk_progress['done'];
-		$skipped_list                      = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-		$remaining                         = self::filter_remaining_elementor_payload(
+		$progress_total         = max( 1, absint( $progress_total ), (int) $chunk_progress['total'] );
+		$done_count             = min(
+			$progress_total,
+			max(
+				(int) $chunk_progress['done'],
+				absint( $slice_cursor ),
+				self::read_elementor_slice_cursor( $post_id, $lang ),
+				absint( $state['elementor_slices_completed'] ?? 0 )
+			)
+		);
+		$state['elementor_chunk_index']      = $done_count;
+		$state['elementor_chunks_total']     = $progress_total;
+		$state['elementor_slices_completed'] = $done_count;
+		$skipped_list                        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining                           = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
 			$map,
 			$skipped_list
 		);
-		$state['elementor_failures']       = $failures;
-		$progress_total                    = max( 1, (int) $chunk_progress['total'] );
-		$done_count                        = (int) $chunk_progress['done'];
-		$state['elementor_chunk_index']    = $done_count;
-		$state['elementor_slices_completed'] = $done_count;
-		$truly_complete          = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
-		$api_schedule_complete   = self::elementor_job_api_schedule_complete( $post_id, $lang, $done_count, $progress_total );
+		$state['elementor_failures']         = $failures;
+		$truly_complete                      = self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state );
+		$api_schedule_complete               = self::elementor_job_api_schedule_complete( $post_id, $lang, $done_count, $progress_total )
+			|| $done_count >= $progress_total;
 
 		if ( ! $truly_complete && $api_schedule_complete ) {
 			return self::finalize_elementor_job_slice( $post_id, $lang, $data, $map, $state, $done_count, $progress_total, $remaining );

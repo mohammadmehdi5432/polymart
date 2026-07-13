@@ -190,6 +190,10 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
 
   if (lastStepStatus === 'partial' && phase) {
     const label = jobPhaseLabel(phase);
+    const parsed = progress && /^(\d+)\/(\d+)$/.exec(progress);
+    if (parsed && Number(parsed[1]) >= Number(parsed[2])) {
+      return `Elementor تمام شد (${parsed[2]}/${parsed[2]}) — مورد بعدی…`;
+    }
     return progress ? `ادامه ترجمه (${label} — ${progress})` : `ادامه ترجمه (${label})`;
   }
 
