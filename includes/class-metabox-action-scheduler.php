@@ -35,6 +35,7 @@ final class Metabox_Action_Scheduler {
 	const STATUS_META_PREFIX = '_polymart_ai_metabox_as_';
 	const BATCH_META_KEY     = '_polymart_ai_metabox_as_batch';
 	const FALLBACK_IDLE_SEC  = 20;
+	const TOXIC_META_PREFIX  = '_polymart_ai_elementor_toxic_payload_';
 
 	/**
 	 * @var int
@@ -422,6 +423,32 @@ final class Metabox_Action_Scheduler {
 		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
 
 		if ( is_wp_error( $slice ) ) {
+			// For metabox polling, never hard-fail on transport timeouts/recoverable slice errors.
+			// Let the next poll attempt continue and/or skip poisoned chunks.
+			if (
+				Post_Translator::is_recoverable_job_slice_error( $slice )
+				|| Post_Translator::is_api_transport_timeout_error( $slice )
+			) {
+				self::update_status(
+					$post_id,
+					$lang,
+					array(
+						'status'   => 'running',
+						'phase'    => 'elementor',
+						'message'  => $slice->get_error_message(),
+						'error'    => '',
+						'fallback' => $reason ? $reason : 'inline',
+					)
+				);
+
+				return array(
+					'done'        => false,
+					'phase'       => 'elementor',
+					'message'     => $slice->get_error_message(),
+					'recoverable' => true,
+				);
+			}
+
 			if ( 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
 				self::update_status(
 					$post_id,
@@ -966,6 +993,7 @@ final class Metabox_Action_Scheduler {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$status  = self::get_status( $post_id, $lang );
+		$worker_mode = ! empty( $status['fallback'] ) ? 'poll_inline' : 'as';
 		$state   = (string) ( $status['status'] ?? 'idle' );
 		$running = self::has_pending_or_running( $post_id, $lang ) || 'running' === $state;
 
@@ -990,6 +1018,7 @@ final class Metabox_Action_Scheduler {
 			'done'           => $done,
 			'failed'         => 'failed' === $state,
 			'status'         => $state,
+			'worker_mode'    => $worker_mode,
 			'phase'          => $phase,
 			'phase_progress' => $progress,
 			'message'        => (string) ( $status['message'] ?? '' ),

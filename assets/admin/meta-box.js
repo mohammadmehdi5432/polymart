@@ -522,6 +522,7 @@
 		const scan = (data && data.scan) || {};
 		const elementor = scan.elementor || {};
 		const parts = [];
+		const workerMode = data && data.worker_mode ? String(data.worker_mode) : '';
 
 		if (data && data.message) {
 			parts.push(data.message);
@@ -551,7 +552,11 @@
 		}
 
 		if (attempt > 0) {
-			parts.push((config.strings.translatePoll || 'بررسی') + ' #' + attempt);
+			let suffix = (config.strings.translatePoll || 'بررسی') + ' #' + attempt;
+			if (workerMode) {
+				suffix += ' [Mode: ' + workerMode + ']';
+			}
+			parts.push(suffix);
 		}
 
 		return parts.join(' — ');

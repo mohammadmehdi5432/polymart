@@ -415,7 +415,7 @@ final class Post_Translator {
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
 	 * Keep under shared-host / AS runner limits so actions cannot hang In-progress.
 	 */
-	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 50;
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 45;
 
 	/**
 	 * Minimum HTTP timeout (seconds) for auto-translate job AI calls.
@@ -6183,6 +6183,37 @@ final class Post_Translator {
 
 			\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
 
+			// Toxic payload logging (metabox/inline debugging): store a small, safe preview of what we send.
+			// This helps identify which Elementor paths trigger long hangs / transport timeouts.
+			if ( 1 === $attempt_index ) {
+				$toxic_preview = array();
+				$preview_i     = 0;
+				foreach ( $aliased_payload as $k => $v ) {
+					$k = (string) $k;
+					$v = (string) $v;
+					$toxic_preview[] = array(
+						'key'   => $k,
+						'chars' => function_exists( 'mb_strlen' ) ? mb_strlen( $v, 'UTF-8' ) : strlen( $v ),
+						'preview' => wp_trim_words( wp_strip_all_tags( html_entity_decode( $v, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ), 28, '…' ),
+					);
+					++$preview_i;
+					if ( $preview_i >= 6 ) {
+						break;
+					}
+				}
+				update_post_meta(
+					$post_id,
+					\PolymartAI\Metabox_Action_Scheduler::TOXIC_META_PREFIX . $lang,
+					array(
+						'at'     => time(),
+						'chunk'  => $attempt_index,
+						'total'  => $progress_total,
+						'count'  => count( $aliased_payload ),
+						'sample' => $toxic_preview,
+					)
+				);
+			}
+
 			$chunk_result = AI_Client::translate_fields(
 				$aliased_payload,
 				$api_key,
@@ -6195,6 +6226,20 @@ final class Post_Translator {
 			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
 
 			if ( is_wp_error( $chunk_result ) ) {
+				// Capture the exact transport error and which fields were in-flight.
+				$failed_paths = array_keys( $chunk );
+				update_post_meta(
+					$post_id,
+					'_polymart_ai_elementor_error_' . $lang,
+					sprintf(
+						/* translators: 1: chunk index, 2: total chunks, 3: error */
+						__( 'Elementor toxic probe — chunk %1$d/%2$d failed: %3$s', 'polymart-ai' ),
+						$attempt_index,
+						$progress_total,
+						\PolymartAI\Activity_Logger::humanize_api_error_message( $chunk_result->get_error_message() )
+					)
+				);
+
 				$state['elementor_failures'] = $failures;
 
 				\PolymartAI\Activity_Logger::log(
@@ -6217,7 +6262,7 @@ final class Post_Translator {
 					$map,
 					$progress_total,
 					$chunk_result,
-					array_keys( $chunk )
+					$failed_paths
 				);
 			}
 
