@@ -36,6 +36,7 @@ final class Metabox_Action_Scheduler {
 	const BATCH_META_KEY     = '_polymart_ai_metabox_as_batch';
 	const FALLBACK_IDLE_SEC  = 20;
 	const TOXIC_META_PREFIX  = '_polymart_ai_elementor_toxic_payload_';
+	const LIVE_RUNNING_MAX_AGE_SEC = 75;
 
 	/**
 	 * @var int
@@ -378,7 +379,53 @@ final class Metabox_Action_Scheduler {
 	}
 
 	/**
+	 * Whether a metabox AS action in "running" status is still actively executing.
+	 *
+	 * Zombie rows stay In-progress after PHP/worker death — treat them as not live
+	 * so poll fallback can take over.
+	 *
+	 * @param int    $action_id   Action Scheduler action ID.
+	 * @param int    $post_id     Post ID.
+	 * @param string $lang        Language code.
+	 * @param int    $max_age_sec Maximum age before the row is considered stale.
+	 * @return bool
+	 */
+	private static function is_metabox_as_running_action_live( $action_id, $post_id, $lang, $max_age_sec = null ) {
+		$action_id   = absint( $action_id );
+		$post_id     = absint( $post_id );
+		$lang        = sanitize_key( (string) $lang );
+		$max_age_sec = null === $max_age_sec ? self::LIVE_RUNNING_MAX_AGE_SEC : max( 30, absint( $max_age_sec ) );
+
+		if ( $action_id <= 0 || $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$due = 0;
+
+		if ( class_exists( 'ActionScheduler_Store' ) ) {
+			try {
+				$date = \ActionScheduler_Store::instance()->get_date( $action_id );
+				$due  = $date ? absint( $date->getTimestamp() ) : 0;
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+				$due = 0;
+			}
+		}
+
+		$status = self::get_status( $post_id, $lang );
+		$beat   = absint( $status['updated_at'] ?? 0 );
+		$stamp  = max( $due, $beat );
+
+		if ( $stamp <= 0 ) {
+			return false;
+		}
+
+		return ( time() - $stamp ) < $max_age_sec;
+	}
+
+	/**
 	 * Whether Action Scheduler has a live pending or in-progress metabox action for this post/lang.
+	 *
+	 * In-progress rows older than {@see LIVE_RUNNING_MAX_AGE_SEC} are ignored (zombie workers).
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Language code.
@@ -413,9 +460,19 @@ final class Metabox_Action_Scheduler {
 
 				$args = $action->get_args();
 
-				if ( absint( $args['post_id'] ?? 0 ) === $post_id && sanitize_key( (string) ( $args['lang'] ?? '' ) ) === $lang ) {
-					return true;
+				if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
+					continue;
 				}
+
+				if ( \ActionScheduler_Store::STATUS_RUNNING === $store_status ) {
+					$action_id = method_exists( $action, 'get_id' ) ? absint( $action->get_id() ) : 0;
+
+					if ( ! self::is_metabox_as_running_action_live( $action_id, $post_id, $lang ) ) {
+						continue;
+					}
+				}
+
+				return true;
 			}
 		}
 
