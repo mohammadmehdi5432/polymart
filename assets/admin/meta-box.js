@@ -307,6 +307,19 @@
 				html += '<p class="polymart-ai-metabox__warning">' + (config.strings.bulkJobOnPost || '') + '</p>';
 			}
 
+			if (elementor.api_cooldown_active && elementor.bulk_job_running) {
+				html += '<p class="polymart-ai-metabox__warning">';
+				html += (config.strings.apiCooldownBulk || 'توقف API از ترجمه خودکار فعال است');
+				if (elementor.api_cooldown_remaining > 0) {
+					html += ' — ' + Math.ceil(elementor.api_cooldown_remaining / 60) + ' دقیقه';
+				}
+				html += '</p>';
+			}
+
+			if (elementor.stale_api_cursor) {
+				html += '<p class="polymart-ai-metabox__warning">' + (config.strings.staleElementorCursor || 'پیشرفت API با ترجمه‌های ذخیره‌شده هم‌خوان نیست — با «ترجمه و تکمیل» دوباره تلاش می‌شود.') + '</p>';
+			}
+
 			if (elementor.error) {
 				html += '<p class="polymart-ai-metabox__warning">' + elementor.error + '</p>';
 			}

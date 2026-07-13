@@ -273,6 +273,11 @@ final class Ajax_Handler {
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		}
 
+		// Metabox translation is manual — do not inherit a stale bulk-job Arvan cooldown.
+		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			\PolymartAI\Activity_Logger::clear_job_api_cooldown( false );
+		}
+
 		if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
 			wp_send_json_error(
 				array(

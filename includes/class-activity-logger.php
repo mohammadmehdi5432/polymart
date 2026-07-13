@@ -6721,6 +6721,47 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Whether an error message indicates an explicit Arvan/WAF IP block (not a generic HTTP failure).
+	 *
+	 * @param string $message Raw or lowercased error message.
+	 * @return bool
+	 */
+	public static function is_explicit_arvan_ip_block_message( $message ) {
+		$message = strtolower( (string) $message );
+
+		if ( '' === $message ) {
+			return false;
+		}
+
+		foreach ( array(
+			'blocked from your ip',
+			'blocked your ip',
+			'has blocked your ip',
+			'ip has been blocked',
+			'access denied',
+		) as $needle ) {
+			if ( false !== strpos( $message, $needle ) ) {
+				return true;
+			}
+		}
+
+		// 404 only when the body clearly describes a WAF block, not a missing model/route.
+		if (
+			false !== strpos( $message, '404' )
+			&& (
+				false !== strpos( $message, 'blocked' )
+				|| false !== strpos( $message, 'forbidden' )
+				|| false !== strpos( $message, 'firewall' )
+				|| false !== strpos( $message, 'برگرداند' )
+			)
+		) {
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
 	 * Whether an API error looks like rate limiting or bot/WAF challenge.
 	 *
 	 * @param \WP_Error $error Error object.
@@ -6734,33 +6775,17 @@ final class Activity_Logger {
 		}
 
 		$data   = $error->get_error_data();
-		$status  = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
+		$status = is_array( $data ) ? absint( $data['status'] ?? 0 ) : 0;
 
-		if ( in_array( $status, array( 403, 404, 429, 502, 503, 504 ), true ) ) {
+		if ( 429 === $status ) {
 			return true;
 		}
 
-		$keywords = array(
-			'429',
-			'404',
-			'too many requests',
-			'rate limit',
-			'rate-limit',
-			'blocked from your ip',
-			'blocked your ip',
-			'has blocked your ip',
-			'arvancloud',
-			'firewall',
-			'bot',
-			'captcha',
-			'cf-ray',
-			'cloudflare',
-			'ربات',
-			'تشخیص',
-			'مسدود',
-		);
+		if ( self::is_explicit_arvan_ip_block_message( $message ) ) {
+			return true;
+		}
 
-		foreach ( $keywords as $keyword ) {
+		foreach ( array( 'too many requests', 'rate limit', 'rate-limit' ) as $keyword ) {
 			if ( false !== strpos( $message, $keyword ) ) {
 				return true;
 			}
@@ -6798,16 +6823,7 @@ final class Activity_Logger {
 		$message = (string) $message;
 		$lower   = strtolower( $message );
 
-		if (
-			false !== strpos( $lower, 'blocked from your ip' )
-			|| false !== strpos( $lower, 'blocked your ip' )
-			|| false !== strpos( $lower, 'has blocked your ip' )
-			|| false !== strpos( $lower, 'arvancloud' )
-			|| false !== strpos( $lower, 'آروان' )
-			|| false !== strpos( $lower, 'arvan' )
-			|| ( false !== strpos( $lower, '404' ) && false !== strpos( $lower, 'blocked' ) )
-			|| ( false !== strpos( $lower, '404' ) && false !== strpos( $lower, 'برگرداند' ) )
-		) {
+		if ( self::is_explicit_arvan_ip_block_message( $lower ) ) {
 			return __( 'IP موقتاً توسط فایروال آروان مسدود شد — چند دقیقه صبر کنید', 'polymart-ai' );
 		}
 
@@ -7090,7 +7106,7 @@ final class Activity_Logger {
 		if ( null === $cooldown_sec ) {
 			$cooldown_sec = 120;
 
-			if ( 404 === $status || false !== strpos( $msg, 'blocked' ) || false !== strpos( $msg, 'arvancloud' ) || false !== strpos( $msg, 'آروان' ) ) {
+			if ( self::is_explicit_arvan_ip_block_message( $msg ) ) {
 				$streak       = absint( $job['api_block_streak'] ?? 0 ) + 1;
 				$cooldown_sec = (int) apply_filters( 'polymart_ai_arvan_api_cooldown_sec', 600 );
 
@@ -7110,7 +7126,7 @@ final class Activity_Logger {
 			return true;
 		}
 
-		if ( 404 === $status || false !== strpos( $msg, 'blocked' ) || false !== strpos( $msg, 'arvancloud' ) || false !== strpos( $msg, 'آروان' ) ) {
+		if ( self::is_explicit_arvan_ip_block_message( $msg ) ) {
 			$job['api_block_streak'] = absint( $job['api_block_streak'] ?? 0 ) + 1;
 		}
 
