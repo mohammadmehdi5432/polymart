@@ -170,6 +170,13 @@ final class Post_Translator {
 	private static $elementor_source_hash_cache = array();
 
 	/**
+	 * Previous `_elementor_data` value captured before meta updates (hash compare).
+	 *
+	 * @var array<int, mixed>
+	 */
+	private static $elementor_data_prev_values = array();
+
+	/**
 	 * Per-request cache for whether a stored Elementor translation is current.
 	 *
 	 * @var array<string, bool>
@@ -271,27 +278,83 @@ final class Post_Translator {
 	 * @var array<string, true>
 	 */
 	private static $elementor_text_keys = array(
-		'story_text'         => true,
-		'button_text'        => true,
-		'customer_label'     => true,
-		'partner_label'      => true,
-		'search_placeholder' => true,
-		'search_brand_name'  => true,
-		'no_results_message' => true,
-		'title'              => true,
-		'editor'             => true,
-		'text'               => true,
-		'heading'            => true,
-		'subtitle'           => true,
-		'btn_text'           => true,
-		'link_text'          => true,
-		'placeholder'        => true,
-		'html'               => true,
-		'label_description'  => true,
-		'label_attributes'   => true,
-		'label_video'        => true,
+		'story_text'          => true,
+		'button_text'         => true,
+		'customer_label'      => true,
+		'partner_label'       => true,
+		'search_placeholder'  => true,
+		'search_brand_name'   => true,
+		'no_results_message'  => true,
+		'title'               => true,
+		'editor'              => true,
+		'text'                => true,
+		'heading'             => true,
+		'subtitle'            => true,
+		'btn_text'            => true,
+		'link_text'           => true,
+		'placeholder'         => true,
+		'html'                => true,
+		'label_description'   => true,
+		'label_attributes'    => true,
+		'label_video'         => true,
 		'label_customer_home' => true,
-		'label_satisfaction' => true,
+		'label_satisfaction'  => true,
+		'content'             => true,
+		'description'         => true,
+		'message'             => true,
+		'caption'             => true,
+		'alt'                 => true,
+		'alt_text'            => true,
+		'image_alt'           => true,
+		'image_url'           => true,
+		'image_link'          => true,
+		'tab_title'           => true,
+		'tab_content'         => true,
+		'tab_description'     => true,
+		'accordion_title'     => true,
+		'accordion_content'   => true,
+		'accordion_description' => true,
+		'list_title'          => true,
+		'list_content'        => true,
+		'item_title'          => true,
+		'item_description'    => true,
+		'item_text'           => true,
+		'banner_title'        => true,
+		'banner_subtitle'     => true,
+		'banner_content'      => true,
+		'banner_text'         => true,
+		'label'               => true,
+		'prefix'              => true,
+		'suffix'              => true,
+		'after_text'          => true,
+		'before_text'         => true,
+		'button_label'        => true,
+		'read_more_text'      => true,
+		'view_more_text'      => true,
+		'price_text'          => true,
+		'sale_text'           => true,
+		'hotspot_label'       => true,
+		'tooltip_content'     => true,
+		'popup_title'         => true,
+		'popup_content'       => true,
+		'form_title'          => true,
+		'form_description'    => true,
+		'field_label'         => true,
+		'field_placeholder'   => true,
+		'counter_title'       => true,
+		'counter_text'        => true,
+		'testimonial_content' => true,
+		'testimonial_name'    => true,
+		'testimonial_title'   => true,
+		'team_member_name'    => true,
+		'team_member_position' => true,
+		'team_member_bio'     => true,
+		'icon_text'           => true,
+		'info_box_title'      => true,
+		'info_box_description' => true,
+		'wd_title'            => true,
+		'wd_subtitle'         => true,
+		'wd_text'             => true,
 	);
 
 	/**
@@ -2611,6 +2674,7 @@ final class Post_Translator {
 		add_action( 'pre_post_update', array( $this, 'maybe_begin_admin_translation_persist' ), 1, 1 );
 		add_action( 'save_post', array( $this, 'save_manual_translations' ), 99, 3 );
 		add_action( 'save_post', array( $this, 'sync_translation_index_on_save' ), 99, 1 );
+		add_filter( 'update_post_metadata', array( $this, 'capture_elementor_data_prev_value' ), 10, 5 );
 		add_action( 'updated_post_meta', array( $this, 'maybe_invalidate_elementor_on_source_change' ), 10, 4 );
 		add_action( 'shutdown', array( __CLASS__, 'end_persisting_translations' ), 999 );
 	}
@@ -2634,7 +2698,32 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Remember the previous `_elementor_data` payload before WordPress writes the new row.
+	 *
+	 * @param mixed  $check      Short-circuit return value.
+	 * @param int    $post_id    Post ID.
+	 * @param string $meta_key   Meta key.
+	 * @param mixed  $meta_value New meta value.
+	 * @param mixed  $prev_value Previous meta value.
+	 * @return mixed
+	 */
+	public function capture_elementor_data_prev_value( $check, $post_id, $meta_key, $meta_value, $prev_value ) {
+		unset( $check, $meta_value );
+
+		if ( '_elementor_data' !== $meta_key ) {
+			return $check;
+		}
+
+		self::$elementor_data_prev_values[ absint( $post_id ) ] = $prev_value;
+
+		return $check;
+	}
+
+	/**
 	 * Drop stored Elementor companions when the Persian source document changes.
+	 *
+	 * Only runs when the MD5 fingerprint of `_elementor_data` actually changed so
+	 * Elementor autosaves with identical JSON do not wipe in-progress translations.
 	 *
 	 * @param int    $meta_id    Meta row ID.
 	 * @param int    $post_id    Post ID.
@@ -2643,13 +2732,48 @@ final class Post_Translator {
 	 * @return void
 	 */
 	public function maybe_invalidate_elementor_on_source_change( $meta_id, $post_id, $meta_key, $meta_value ) {
-		unset( $meta_id, $meta_value );
+		unset( $meta_id );
 
 		if ( '_elementor_data' !== $meta_key ) {
 			return;
 		}
 
-		self::invalidate_elementor_translations( absint( $post_id ) );
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			return;
+		}
+
+		if ( self::is_persisting_translations() ) {
+			return;
+		}
+
+		if ( ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) || wp_is_post_autosave( $post_id ) || wp_is_post_revision( $post_id ) ) {
+			return;
+		}
+
+		$new_raw  = is_string( $meta_value ) ? $meta_value : '';
+		$new_hash = '' !== $new_raw ? md5( $new_raw ) : '';
+
+		$had_capture = array_key_exists( $post_id, self::$elementor_data_prev_values );
+		$prev_raw    = $had_capture ? self::$elementor_data_prev_values[ $post_id ] : null;
+
+		unset( self::$elementor_data_prev_values[ $post_id ] );
+
+		$prev_hash = is_string( $prev_raw ) && '' !== $prev_raw ? md5( $prev_raw ) : '';
+
+		if ( '' !== $new_hash && '' !== $prev_hash && hash_equals( $prev_hash, $new_hash ) ) {
+			return;
+		}
+
+		if ( '' === $new_hash && '' === $prev_hash ) {
+			return;
+		}
+
+		self::$elementor_source_hash_cache[ $post_id ] = $new_hash;
+		unset( self::$elementor_current_cache );
+
+		self::invalidate_elementor_translations( $post_id );
 	}
 
 	/**
@@ -3052,7 +3176,7 @@ final class Post_Translator {
 
 		foreach ( $payload as $key => $value ) {
 			$value = (string) $value;
-			$size  = strlen( (string) $key ) + strlen( $value );
+			$size  = self::utf8_strlen( (string) $key ) + self::utf8_strlen( $value );
 
 			if (
 				! empty( $current )
@@ -3078,6 +3202,40 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Multibyte-safe string length for Elementor / Persian text payloads.
+	 *
+	 * @param mixed $text Text value.
+	 * @return int
+	 */
+	private static function utf8_strlen( $text ) {
+		$text = (string) $text;
+
+		if ( function_exists( 'mb_strlen' ) ) {
+			return mb_strlen( $text, 'UTF-8' );
+		}
+
+		return strlen( $text );
+	}
+
+	/**
+	 * Multibyte-safe substring for Elementor / Persian text payloads.
+	 *
+	 * @param mixed $text   Text value.
+	 * @param int   $start  Start offset (characters).
+	 * @param int   $length Segment length (characters).
+	 * @return string
+	 */
+	private static function utf8_substr( $text, $start, $length ) {
+		$text = (string) $text;
+
+		if ( function_exists( 'mb_substr' ) ) {
+			return mb_substr( $text, $start, $length, 'UTF-8' );
+		}
+
+		return substr( $text, $start, $length );
+	}
+
+	/**
 	 * Split oversized field values so each API request stays within safe limits.
 	 *
 	 * @param array<string, string> $payload Field map.
@@ -3089,18 +3247,19 @@ final class Post_Translator {
 		foreach ( $payload as $key => $value ) {
 			$value = (string) $value;
 
-			if ( strlen( $value ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
+			if ( self::utf8_strlen( $value ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
 				$expanded[ $key ] = $value;
 				continue;
 			}
 
 			$offset = 0;
 			$part   = 1;
+			$length = self::utf8_strlen( $value );
 
-			while ( $offset < strlen( $value ) ) {
-				$slice = substr( $value, $offset, self::AI_MAX_SINGLE_FIELD_CHARS );
+			while ( $offset < $length ) {
+				$slice = self::utf8_substr( $value, $offset, self::AI_MAX_SINGLE_FIELD_CHARS );
 				$expanded[ $key . '::__part' . $part ] = $slice;
-				$offset += strlen( $slice );
+				$offset += self::utf8_strlen( $slice );
 				++$part;
 			}
 		}
@@ -4048,6 +4207,129 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Reasons Elementor job finalization must not mark the post complete yet.
+	 *
+	 * @param int                   $post_id     Post ID.
+	 * @param string                $lang        Language code.
+	 * @param array<string, mixed>  $source_data Source Elementor tree.
+	 * @param array<string, string> $map         Translation path map.
+	 * @param array<string, mixed>  $state       Partial state.
+	 * @return array<string, mixed>|null Blocker details, or null when safe to finalize.
+	 */
+	private static function get_elementor_job_finalize_blockers( $post_id, $lang, array $source_data, array $map, array $state ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$skipped = is_array( $state['elementor_skipped'] ?? null )
+			? array_values( array_filter( array_map( 'strval', $state['elementor_skipped'] ) ) )
+			: array();
+
+		if ( ! empty( $skipped ) ) {
+			return array(
+				'code'    => 'skipped_fields',
+				'message' => sprintf(
+					/* translators: 1: post ID, 2: skipped field count */
+					__( 'Elementor — #%1$d: %2$d فیلد پس از خطای API رد شد — ترجمه ناقص است.', 'polymart-ai' ),
+					$post_id,
+					count( $skipped )
+				),
+				'skipped' => $skipped,
+			);
+		}
+
+		$remaining = self::filter_remaining_elementor_payload(
+			self::collect_elementor_translation_payload( $source_data ),
+			$map,
+			array()
+		);
+
+		if ( ! empty( $remaining ) ) {
+			return array(
+				'code'      => 'untranslated_fields',
+				'message'   => sprintf(
+					/* translators: 1: post ID, 2: remaining field count */
+					__( 'Elementor — #%1$d: %2$d فیلد هنوز ترجمه نشده — نهایی‌سازی متوقف شد.', 'polymart-ai' ),
+					$post_id,
+					count( $remaining )
+				),
+				'remaining' => count( $remaining ),
+			);
+		}
+
+		$preview_tree     = self::apply_elementor_translation_payload( $source_data, $map );
+		$preview_persian  = self::collect_elementor_translation_payload( $preview_tree );
+
+		if ( ! empty( $preview_persian ) ) {
+			return array(
+				'code'    => 'stored_persian',
+				'message' => sprintf(
+					/* translators: 1: post ID, 2: remaining Persian field count */
+					__( 'Elementor — #%1$d: %2$d فیلد هنوز فارسی در JSON نهایی دارد — نهایی‌سازی متوقف شد.', 'polymart-ai' ),
+					$post_id,
+					count( $preview_persian )
+				),
+			);
+		}
+
+		return null;
+	}
+
+	/**
+	 * Persist partial Elementor progress and keep the job resumable after a blocked finalize.
+	 *
+	 * @param int                   $post_id      Post ID.
+	 * @param string                $lang         Language code.
+	 * @param array<string, mixed>  $source_data  Source Elementor tree.
+	 * @param array<string, string> $map          Translation path map.
+	 * @param array<string, mixed>  $state        Partial state (by reference).
+	 * @param int                   $done_count   Completed batches.
+	 * @param int                   $total_chunks Total batches.
+	 * @param array<string, mixed>  $blocker      Blocker payload from get_elementor_job_finalize_blockers().
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}|\WP_Error
+	 */
+	private static function respond_elementor_blocked_finalize( $post_id, $lang, array $source_data, array $map, array &$state, $done_count, $total_chunks, array $blocker ) {
+		$post_id      = absint( $post_id );
+		$lang         = sanitize_key( (string) $lang );
+		$done_count   = max( 0, absint( $done_count ) );
+		$total_chunks = max( 1, absint( $total_chunks ) );
+		$message      = (string) ( $blocker['message'] ?? __( 'ترجمه Elementor ناقص است.', 'polymart-ai' ) );
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			$message,
+			array(
+				'post_id' => $post_id,
+				'lang'    => $lang,
+				'code'    => (string) ( $blocker['code'] ?? 'elementor_incomplete' ),
+			)
+		);
+
+		update_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, $message );
+
+		$batch_progress = self::compute_elementor_api_batch_progress( $source_data, $map, $state );
+		$done_count     = max( $done_count, (int) $batch_progress['done'] );
+		$total_chunks   = max( $total_chunks, (int) $batch_progress['total'], 1 );
+
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $total_chunks );
+
+		if ( is_wp_error( $persisted ) ) {
+			return $persisted;
+		}
+
+		unset( $state['elementor_skipped'], $state['elementor_failures'] );
+		$state['phase'] = 'elementor';
+		self::save_job_partial_state( $post_id, $lang, $state );
+		self::flush_translation_status_cache( $post_id );
+
+		return array(
+			'done'           => false,
+			'phase'          => 'elementor',
+			'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+			'message'        => $message,
+			'recoverable'    => true,
+		);
+	}
+
+	/**
 	 * Finalize Elementor job slice after all API batches (best-effort when minor fields remain).
 	 *
 	 * @param int                   $post_id      Post ID.
@@ -4093,6 +4375,12 @@ final class Post_Translator {
 				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
 				'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
 			);
+		}
+
+		$blocker = self::get_elementor_job_finalize_blockers( $post_id, $lang, $source_data, $map, $state );
+
+		if ( null !== $blocker ) {
+			return self::respond_elementor_blocked_finalize( $post_id, $lang, $source_data, $map, $state, $done_count, $total_chunks, $blocker );
 		}
 
 		\PolymartAI\Activity_Logger::log(
@@ -5796,6 +6084,12 @@ final class Post_Translator {
 				);
 			}
 
+			$blocker = self::get_elementor_job_finalize_blockers( $post_id, $lang, $data, $map, $state );
+
+			if ( null !== $blocker ) {
+				return self::respond_elementor_blocked_finalize( $post_id, $lang, $data, $map, $state, $done_count, $progress_total, $blocker );
+			}
+
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total, true );
 
 			if ( is_wp_error( $persisted ) ) {
@@ -6131,6 +6425,12 @@ final class Post_Translator {
 			);
 		}
 
+		$blocker = self::get_elementor_job_finalize_blockers( $post_id, $lang, $data, $map, $state );
+
+		if ( null !== $blocker ) {
+			return self::respond_elementor_blocked_finalize( $post_id, $lang, $data, $map, $state, $done_count, $progress_total, $blocker );
+		}
+
 		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total, true );
 
 		if ( is_wp_error( $persisted ) ) {
@@ -6314,7 +6614,7 @@ final class Post_Translator {
 		$path = (string) $path;
 		$text = (string) $text;
 
-		if ( strlen( $text ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
+		if ( self::utf8_strlen( $text ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
 			return isset( $map[ $path ] )
 				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] );
 		}
@@ -6324,13 +6624,13 @@ final class Post_Translator {
 
 			if (
 				self::elementor_map_value_is_valid_translation( $path, $text, $translated )
-				&& strlen( $translated ) >= (int) floor( strlen( $text ) * 0.85 )
+				&& self::utf8_strlen( $translated ) >= (int) floor( self::utf8_strlen( $text ) * 0.85 )
 			) {
 				return true;
 			}
 		}
 
-		$parts = (int) ceil( strlen( $text ) / self::AI_MAX_SINGLE_FIELD_CHARS );
+		$parts = (int) ceil( self::utf8_strlen( $text ) / self::AI_MAX_SINGLE_FIELD_CHARS );
 
 		for ( $part = 1; $part <= $parts; $part++ ) {
 			$part_key = $path . '::__part' . $part;
@@ -6954,7 +7254,7 @@ final class Post_Translator {
 
 		foreach ( $payload as $key => $value ) {
 			$value = (string) $value;
-			$size  = strlen( (string) $key ) + strlen( $value );
+			$size  = self::utf8_strlen( (string) $key ) + self::utf8_strlen( $value );
 
 			if (
 				! empty( $current )
@@ -7182,6 +7482,31 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether a URL-like Elementor setting should be translated (Persian slug/path in media URLs).
+	 *
+	 * @param string $key   Setting key.
+	 * @param string $value Setting value.
+	 * @return bool
+	 */
+	private static function is_elementor_translatable_url_key( $key, $value ) {
+		$key = strtolower( (string) $key );
+
+		if ( self::is_elementor_user_text_setting_key( $key ) ) {
+			return false;
+		}
+
+		if ( ! Persian_Detector::contains_persian( $value ) ) {
+			return false;
+		}
+
+		if ( preg_match( '/(?:^|_)(?:image|img|photo|banner|gallery|media|thumb)(?:_)?(?:url|link|src|path|file)$/i', $key ) ) {
+			return true;
+		}
+
+		return in_array( $key, array( 'image_url', 'image_link', 'image_src', 'image_path', 'image_file' ), true );
+	}
+
+	/**
 	 * Whether an Elementor setting key/value pair should be excluded from AI translation.
 	 *
 	 * @param string $key   Setting key.
@@ -7206,30 +7531,30 @@ final class Post_Translator {
 			'url'        => true,
 			'link'       => true,
 			'src'        => true,
-			'href'      => true,
+			'href'       => true,
 		);
 
-		if ( isset( $blocked_keys[ $key ] ) ) {
+		if ( isset( $blocked_keys[ $key ] ) && ! self::is_elementor_translatable_url_key( $key, $value ) ) {
 			return true;
 		}
 
-		if ( preg_match( '/(_url|_link|_id|_css|_class|_icon|_image|_img|_media|_src|_size|_color|_width|_height|_align|typography|animation|custom_css|z_index|motion_fx|background|overlay|mask|_json|editor_data|html_cache)/i', $key ) ) {
+		if (
+			preg_match( '/(_url|_link|_id|_css|_class|_icon|_image|_img|_media|_src|_size|_color|_width|_height|_align|typography|animation|custom_css|z_index|motion_fx|background|overlay|mask|_json|editor_data|html_cache)/i', $key )
+			&& ! self::is_elementor_translatable_url_key( $key, $value )
+			&& ! $is_user_text
+		) {
 			return true;
 		}
 
 		// Embedded JSON/config blobs — not human-readable text.
 		$trimmed = ltrim( $value );
-		if ( '{' === $trimmed || '[' === $trimmed ) {
+		if ( ( '{' === $trimmed || '[' === $trimmed ) && ! $is_user_text ) {
 			return true;
 		}
 
-		// Rich-text widget fields (editor/html/text) may contain HTML — still translate Persian inside tags.
+		// Skip raw markup/config blobs, but allow rich Elementor widget HTML to pass through.
 		if ( ! $is_user_text ) {
-			if ( preg_match( '/^\s*<(?:html|body|div|span|section|style|script|svg|table|ul|ol|p|h[1-6]|!DOCTYPE)/i', $value ) ) {
-				return true;
-			}
-
-			if ( substr_count( $value, '<' ) >= 3 && substr_count( $value, '>' ) >= 3 ) {
+			if ( preg_match( '/^\s*<(?:style|script|svg|!DOCTYPE)/i', $value ) ) {
 				return true;
 			}
 		}
@@ -7248,8 +7573,8 @@ final class Post_Translator {
 			return true;
 		}
 
-		// Mostly media/path content with only incidental Persian.
-		if ( preg_match( '/\.(jpe?g|png|gif|webp|svg|mp4|webm|pdf)(\?|$)/i', $value ) ) {
+		// Mostly media/path content without Persian text.
+		if ( preg_match( '/\.(jpe?g|png|gif|webp|svg|mp4|webm|pdf)(\?|$)/i', $value ) && ! Persian_Detector::contains_persian( $value ) ) {
 			return true;
 		}
 
