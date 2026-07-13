@@ -644,7 +644,15 @@ final class Activity_Logger {
 			$job = self::get_job_raw();
 
 			if ( self::should_prioritize_elementor_partial( $job ) ) {
-				return self::run_elementor_page_burst();
+				$burst_job = self::get_job_raw();
+
+				if ( self::maybe_restore_elementor_pin_from_queue( $burst_job ) ) {
+					self::save_job( $burst_job );
+				}
+
+				if ( absint( self::get_job_raw()['partial_post_id'] ?? 0 ) > 0 ) {
+					return self::run_elementor_page_burst();
+				}
 			}
 
 			if ( Job_Action_Scheduler::is_available() ) {
@@ -2434,13 +2442,15 @@ final class Activity_Logger {
 
 		$active_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
 
-		if ( $active_id > 0 && Post_Translator::elementor_job_api_slices_pending( $active_id, $lang ) ) {
+		// Only bypass the normal queue when Elementor slices are actually runnable now
+		// (field phases done). API-slice counters alone are true while title/body still need work.
+		if ( $active_id > 0 && Post_Translator::should_run_elementor_job_slice( $active_id, $lang ) ) {
 			return true;
 		}
 
 		$deferred = self::get_actionable_deferred_queue( $job, $lang );
 
-		if ( ! empty( $deferred[0] ) && Post_Translator::elementor_job_api_slices_pending( (int) $deferred[0], $lang ) ) {
+		if ( ! empty( $deferred[0] ) && Post_Translator::should_run_elementor_job_slice( (int) $deferred[0], $lang ) ) {
 			return true;
 		}
 
@@ -2577,6 +2587,11 @@ final class Activity_Logger {
 			$out['api_cooldown'] = true;
 
 			return $out;
+		}
+
+		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {
+			self::save_job( $job );
+			$job = self::get_job_raw();
 		}
 
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
@@ -4439,16 +4454,21 @@ final class Activity_Logger {
 		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
-		if ( $should_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
-			if ( self::run_pinned_elementor_work( self::is_elementor_progress_stalled( self::get_job_raw() ) ) ) {
-				$job = self::get_job_raw();
-				$job['worker_inline_tick'] = true;
-				self::save_job( $job );
-			}
-		} elseif ( $should_tick ) {
-			$inline_steps = $worker_dead || $age >= self::PICK_STALL_SEC ? 2 : 1;
+		if ( $should_tick ) {
+			$inline_steps  = $worker_dead || $age >= self::PICK_STALL_SEC ? 2 : 1;
 			$inline_budget = $worker_dead || $age >= self::PICK_STALL_SEC ? 90 : 60;
-			self::run_inline_worker_tick( $inline_steps, $inline_budget );
+			$ran_work      = false;
+
+			if ( self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
+				$ran_work = self::run_pinned_elementor_work(
+					self::is_elementor_progress_stalled( self::get_job_raw() )
+				);
+			}
+
+			if ( ! $ran_work ) {
+				self::run_inline_worker_tick( $inline_steps, $inline_budget );
+			}
+
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;
 			self::save_job( $job );
@@ -4717,7 +4737,15 @@ final class Activity_Logger {
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::clear_slice_mutex_if_stale();
 
-		if ( self::should_prioritize_elementor_partial( $job ) ) {
+		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {
+			self::save_job( $job );
+			$job = self::get_job_raw();
+		}
+
+		if (
+			self::should_prioritize_elementor_partial( $job )
+			&& absint( $job['partial_post_id'] ?? 0 ) > 0
+		) {
 			$result = self::run_elementor_page_burst( 300 );
 
 			if ( is_array( $result ) ) {
@@ -4764,7 +4792,13 @@ final class Activity_Logger {
 	 */
 	public static function process_job_step() {
 		if ( function_exists( 'set_time_limit' ) ) {
-			$limit = self::$trusted_as_tick ? 120 : 1200;
+			if ( self::$elementor_page_burst ) {
+				$limit = 330;
+			} elseif ( self::$trusted_as_tick ) {
+				$limit = 120;
+			} else {
+				$limit = 1200;
+			}
 			@set_time_limit( $limit );
 		}
 
