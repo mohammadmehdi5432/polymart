@@ -5195,13 +5195,15 @@ final class Post_Translator {
 			? max( 75, self::ELEMENTOR_JOB_REQUEST_TIMEOUT + 25 )
 			: max( 45, absint( $max_silent_sec ) );
 
-		if ( \PolymartAI\Activity_Logger::is_bulk_worker_lively( $max_silent_sec ) ) {
+		$lock_stamp = max( $claim, $lock ? absint( $lock ) : 0 );
+		$lock_age   = $lock_stamp > 0 ? ( time() - $lock_stamp ) : PHP_INT_MAX;
+
+		// Fresh lock: only steal when the whole worker is silent (not after recovery heartbeats).
+		if ( $lock_age < $max_silent_sec && \PolymartAI\Activity_Logger::is_bulk_worker_lively( $max_silent_sec ) ) {
 			return false;
 		}
 
-		$lock_stamp = max( $claim, $lock ? absint( $lock ) : 0 );
-
-		if ( $lock_stamp > 0 && ( time() - $lock_stamp ) < $max_silent_sec ) {
+		if ( $lock_age < $max_silent_sec ) {
 			return false;
 		}
 

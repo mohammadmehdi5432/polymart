@@ -540,13 +540,8 @@ final class Job_Action_Scheduler {
 		}
 
 		if ( $elementor_burst ) {
-			$elementor_slices_cap = max(
-				1,
-				min(
-					self::AS_MAX_STEPS_PER_REQUEST,
-					Activity_Logger::get_elementor_partial_step_cap( $job_step )
-				)
-			);
+			// One AS action = one batch of up to 3 Elementor chunks (prevents PHP/AS timeout).
+			$elementor_slices_cap = 1;
 
 			while (
 				Activity_Logger::is_bulk_job_running()
@@ -731,10 +726,24 @@ final class Job_Action_Scheduler {
 				self::chain_next_slice_immediately();
 			} elseif (
 				Activity_Logger::should_prioritize_elementor_partial( $job_after_chain )
-				&& ! self::has_pending_or_running()
 			) {
-				// Elementor still in flight but this batch was idle — queue one follow-up only.
-				self::enqueue_next( false, 0 );
+				$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
+				$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
+
+				if (
+					! empty( $job_after['step_deferred'] )
+					&& 'translation_in_progress' === (string) ( $job_after['step_deferred_reason'] ?? '' )
+					&& $post_id > 0
+					&& '' !== $lang
+				) {
+					Post_Translator::release_stale_translation_lock( $post_id, $lang, 25 );
+				}
+
+				if ( ! self::has_pending_or_running() ) {
+					self::chain_next_after_recovery();
+				} else {
+					self::run_queue_inline( true );
+				}
 			} else {
 				Activity_Logger::nudge_as_queue_runner();
 			}
@@ -865,12 +874,21 @@ final class Job_Action_Scheduler {
 			);
 
 			if ( Activity_Logger::is_bulk_job_running() ) {
-				self::enqueue_next( true, 0 );
+				self::chain_next_after_recovery();
 			}
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
 
 		self::$current_action_id = 0;
+	}
+
+	/**
+	 * Enqueue the next slice and run due AS actions in-process (no wp-cron wait).
+	 *
+	 * @return void
+	 */
+	public static function chain_next_after_recovery() {
+		self::chain_next_slice_immediately();
 	}
 
 	/**

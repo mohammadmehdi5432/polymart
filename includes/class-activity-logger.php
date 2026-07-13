@@ -827,15 +827,46 @@ final class Activity_Logger {
 			$context
 		);
 
+		$job     = self::get_job_raw();
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $context['post_id'] ?? 0 );
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		}
+
+		$force_release = ! empty( $context['fatal'] )
+			|| in_array(
+				(string) ( $context['source'] ?? '' ),
+				array( 'as_shutdown', 'as_fatal', 'as_elementor_burst' ),
+				true
+			);
+
+		if ( $force_release ) {
+			Job_Action_Scheduler::clear_slice_mutex();
+
+			if ( $post_id > 0 && '' !== $lang ) {
+				Post_Translator::release_translation_lock( $post_id, $lang, true );
+			}
+		}
+
 		self::force_unlock_step_now();
 
 		$job = self::get_job_raw();
 
 		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			if ( $force_release ) {
+				unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
+			}
+
 			$job['worker_heartbeat_at'] = time();
 			$job['last_cron_at']        = time();
 			$job['last_worker']         = self::$trusted_as_tick ? 'as' : self::resolve_last_worker_label();
 			self::save_job( $job );
+		}
+
+		if ( $force_release && self::is_bulk_job_running() && Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::chain_next_after_recovery();
 		}
 
 		return self::normalize_job_for_response( $job, false );
@@ -2606,9 +2637,7 @@ final class Activity_Logger {
 		}
 
 		if ( self::$trusted_as_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
-			$cap = self::get_elementor_partial_step_cap( self::get_job_raw() );
-
-			return max( 3, min( 5, $cap ) );
+			return 3;
 		}
 
 		return 1;
@@ -4534,6 +4563,25 @@ final class Activity_Logger {
 
 		$as_pending  = Job_Action_Scheduler::has_pending_or_running();
 		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
+
+		if ( $worker_dead && self::should_prioritize_elementor_partial( $job ) ) {
+			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+			if ( $post_id > 0 && '' !== $lang ) {
+				$lock_status = Post_Translator::get_translation_lock_status( $post_id, $lang );
+
+				if ( ! empty( $lock_status['held'] ) && empty( $lock_status['owned_by_self'] ) ) {
+					if ( ! Post_Translator::release_stale_translation_lock( $post_id, $lang, min( $age, 60 ) ) && $age >= $stale_sec ) {
+						Post_Translator::release_translation_lock( $post_id, $lang, true );
+					}
+
+					unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
+					self::save_job( $job );
+					$job = self::get_job_raw();
+				}
+			}
+		}
+
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
 		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
@@ -5116,7 +5164,9 @@ final class Activity_Logger {
 		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
 
 		if ( is_wp_error( $slice ) && 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
-			if ( Post_Translator::release_stale_translation_lock( $post_id, $lang ) ) {
+			$stale_sec = self::$trusted_as_tick ? 30 : null;
+
+			if ( Post_Translator::release_stale_translation_lock( $post_id, $lang, $stale_sec ) ) {
 				self::log(
 					'warning',
 					sprintf(
