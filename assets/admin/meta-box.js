@@ -437,12 +437,13 @@
 
 	function requestTranslateComplete(postId, lang, options) {
 		options = options || {};
+		const timeout = shouldUseChunkedTranslation() ? 30000 : 300000;
 
 		return $.ajax({
 			url: config.ajaxUrl,
 			method: 'POST',
 			dataType: 'json',
-			timeout: 300000,
+			timeout: timeout,
 			data: {
 				action: 'polymart_translate_post_complete',
 				nonce: config.nonce,
@@ -451,6 +452,24 @@
 				force: options.force ? 1 : 0,
 				unlock: options.unlock ? 1 : 0,
 				continue_job: options.continueJob ? 1 : 0,
+			},
+		});
+	}
+
+	function requestTranslationStatus(postId, lang, options) {
+		options = options || {};
+
+		return $.ajax({
+			url: config.ajaxUrl,
+			method: 'POST',
+			dataType: 'json',
+			timeout: 20000,
+			data: {
+				action: 'polymart_metabox_translation_status',
+				nonce: config.nonce,
+				post_id: postId,
+				lang: lang,
+				unlock: options.unlock ? 1 : 0,
 			},
 		});
 	}
@@ -538,67 +557,89 @@
 		return parts.join(' — ');
 	}
 
-	function pollTranslateComplete(postId, lang, attempt, unlockNext) {
-		attempt = attempt || 0;
-		unlockNext = unlockNext || false;
+	function applyTranslateProgressResponse(postId, lang, data) {
+		if (data.fields) {
+			populateFields(data.fields);
+		}
 
-		if (attempt > 180) {
+		if (data.scan) {
+			renderScanResults(data.scan);
+			updateStatusBadge(lang, data.scan.status);
+		}
+	}
+
+	function pollTranslateComplete(postId, lang, attempt) {
+		attempt = attempt || 0;
+
+		if (attempt > 360) {
 			setGlobalStatus(config.strings.translateTimeout || config.strings.error, 'error');
 			setWorkflowLoading($('.polymart-ai-translate-complete-btn'), false, '', config.strings.translateCompleteLabel || '');
+			setRetranslateLoading($('.polymart-ai-retranslate-all-btn'), false);
 			return;
 		}
 
-		requestTranslateComplete(postId, lang, { force: false, unlock: true, continueJob: true })
+		const pollRequest = shouldUseChunkedTranslation()
+			? requestTranslationStatus(postId, lang, { unlock: attempt > 0 && attempt % 6 === 0 })
+			: requestTranslateComplete(postId, lang, { force: false, unlock: true, continueJob: true });
+
+		pollRequest
 			.done(function (response) {
 				if (!response || !response.success) {
 					if (response && response.data && response.data.locked && attempt < 24) {
 						setGlobalStatus((response.data.message || config.strings.translating) + ' — ' + (config.strings.lockRetry || 'تلاش مجدد…'), '');
 						window.setTimeout(function () {
-							pollTranslateComplete(postId, lang, attempt + 1, true);
+							pollTranslateComplete(postId, lang, attempt + 1);
 						}, 1500);
 						return;
 					}
 
 					handleTranslateError(postId, lang, response);
+					setRetranslateLoading($('.polymart-ai-retranslate-all-btn'), false);
 					return;
 				}
 
 				const data = response.data || {};
-
-				if (data.fields) {
-					populateFields(data.fields);
-				}
-
-				if (data.scan) {
-					renderScanResults(data.scan);
-					updateStatusBadge(lang, data.scan.status);
-				}
+				applyTranslateProgressResponse(postId, lang, data);
 
 				if (data.done) {
 					setGlobalStatus(data.message || config.strings.translateCompleteSuccess, 'success');
 					setLangStatus(lang, data.message || config.strings.translateCompleteSuccess, 'success');
 					setWorkflowLoading($('.polymart-ai-translate-complete-btn'), false, '', config.strings.translateCompleteLabel || '');
+					setRetranslateLoading($('.polymart-ai-retranslate-all-btn'), false);
 					return;
 				}
 
 				const progressMessage = formatTranslateProgressMessage(data, attempt + 1);
-				setGlobalStatus(progressMessage || config.strings.translating, '');
-				setLangStatus(lang, progressMessage || config.strings.translating, '');
+				const backgroundHint = shouldUseChunkedTranslation()
+					? (config.strings.backgroundTranslating || 'پس‌زمینه')
+					: '';
+				const statusLine = [progressMessage || config.strings.translating, backgroundHint].filter(Boolean).join(' — ');
+
+				setGlobalStatus(statusLine, '');
+				setLangStatus(lang, statusLine, '');
 
 				window.setTimeout(function () {
-					pollTranslateComplete(postId, lang, attempt + 1, unlockNext);
-				}, 2000);
+					pollTranslateComplete(postId, lang, attempt + 1);
+				}, shouldUseChunkedTranslation() ? 3000 : 2000);
 			})
 			.fail(function (xhr) {
 				if (xhr && xhr.status === 409 && attempt < 24) {
 					setGlobalStatus((config.strings.lockRetry || 'قفل موقت — تلاش مجدد…'), '');
 					window.setTimeout(function () {
-						pollTranslateComplete(postId, lang, attempt + 1, true);
+						pollTranslateComplete(postId, lang, attempt + 1);
 					}, 1500);
 					return;
 				}
 
+				if (shouldUseChunkedTranslation() && attempt < 48) {
+					window.setTimeout(function () {
+						pollTranslateComplete(postId, lang, attempt + 1);
+					}, 3000);
+					return;
+				}
+
 				handleTranslateError(postId, lang, null, xhr);
+				setRetranslateLoading($('.polymart-ai-retranslate-all-btn'), false);
 			});
 	}
 
@@ -690,7 +731,12 @@
 			}
 
 			setWorkflowLoading($btn, true, config.strings.translating, config.strings.translateCompleteLabel || '');
-			setGlobalStatus((config.strings.translating || '') + ' — ' + (config.strings.waitingServer || 'منتظر پاسخ سرور…'), '');
+			setGlobalStatus(
+				shouldUseChunkedTranslation()
+					? ((config.strings.translating || '') + ' — ' + (config.strings.backgroundQueued || 'در حال افزودن به صف پس‌زمینه…'))
+					: ((config.strings.translating || '') + ' — ' + (config.strings.waitingServer || 'منتظر پاسخ سرور…')),
+				''
+			);
 			setLangStatus(lang, '', '');
 
 			requestTranslateComplete(postId, lang, { force: force, unlock: true })
@@ -805,7 +851,7 @@
 
 						if (!data.done) {
 							setLangStatus(lang, data.message || config.strings.translating, '');
-							pollTranslateComplete(postId, lang, 0, true);
+							pollTranslateComplete(postId, lang, 0);
 							setGenerateLoading($btn, false);
 							return;
 						}
@@ -890,6 +936,7 @@
 				url: config.ajaxUrl,
 				method: 'POST',
 				dataType: 'json',
+				timeout: shouldUseChunkedTranslation() ? 30000 : 300000,
 				data: {
 					action: 'polymart_retranslate_product',
 					nonce: config.nonce,
@@ -903,6 +950,7 @@
 								? response.data.message
 								: config.strings.error;
 						setGlobalStatus(message, 'error');
+						setRetranslateLoading($btn, false);
 						return;
 					}
 
@@ -910,10 +958,21 @@
 						populateFields(response.data.fields);
 					}
 
+					if (response.data && response.data.queued && shouldUseChunkedTranslation()) {
+						const lang = getActiveLang();
+						setGlobalStatus(
+							response.data.message || config.strings.retranslating,
+							''
+						);
+						pollTranslateComplete(postId, lang, 0);
+						return;
+					}
+
 					setGlobalStatus(
 						response.data.message || config.strings.retranslateSuccess,
 						'success'
 					);
+					setRetranslateLoading($btn, false);
 				})
 				.fail(function (xhr) {
 					let message = config.strings.error;

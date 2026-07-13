@@ -8,6 +8,7 @@
 namespace PolymartAI\Admin;
 
 use PolymartAI\Language_Registry;
+use PolymartAI\Metabox_Action_Scheduler;
 use PolymartAI\Translation\Post_Translator;
 
 defined( 'ABSPATH' ) || exit;
@@ -30,6 +31,7 @@ final class Ajax_Handler {
 		add_action( 'wp_ajax_polymart_retranslate_product', array( $this, 'handle_retranslate_product' ) );
 		add_action( 'wp_ajax_polymart_scan_translation_gaps', array( $this, 'handle_scan_translation_gaps' ) );
 		add_action( 'wp_ajax_polymart_translate_post_complete', array( $this, 'handle_translate_post_complete' ) );
+		add_action( 'wp_ajax_polymart_metabox_translation_status', array( $this, 'handle_metabox_translation_status' ) );
 		add_action( 'wp_ajax_polymart_release_translation_lock', array( $this, 'handle_release_translation_lock' ) );
 	}
 
@@ -134,6 +136,48 @@ final class Ajax_Handler {
 		}
 
 		$languages = Language_Registry::get_translation_target_languages();
+		$lang_codes = array();
+
+		foreach ( $languages as $language ) {
+			$lang = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+			if ( '' === $lang || ! self::is_valid_target_language( $lang ) ) {
+				continue;
+			}
+
+			$lang_codes[] = $lang;
+		}
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) && Metabox_Action_Scheduler::is_available() ) {
+			Metabox_Action_Scheduler::force_unlock_post( $post_id );
+
+			$queued = Metabox_Action_Scheduler::start_batch_translations(
+				$post_id,
+				$lang_codes,
+				array(
+					'force'  => true,
+					'unlock' => true,
+				)
+			);
+
+			if ( is_wp_error( $queued ) ) {
+				wp_send_json_error(
+					array( 'message' => $queued->get_error_message() ),
+					500
+				);
+			}
+
+			wp_send_json_success(
+				array(
+					'queued'  => true,
+					'done'    => false,
+					'message' => __( 'ترجمه مجدد همه زبان‌ها در پس‌زمینه شروع شد — پیشرفت را در همین صفحه می‌بینید.', 'polymart-ai' ),
+					'scan'    => self::build_scan_response( $post_id, sanitize_key( (string) ( $lang_codes[0] ?? 'en' ) ) ),
+					'batch'   => get_post_meta( $post_id, Metabox_Action_Scheduler::BATCH_META_KEY, true ),
+				)
+			);
+		}
+
 		$fields    = array();
 		$errors    = array();
 		$successes = array();
@@ -271,19 +315,79 @@ final class Ajax_Handler {
 			);
 		}
 
+		if ( $unlock ) {
+			Metabox_Action_Scheduler::force_unlock_post( $post_id, $lang );
+		}
+
+		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
+		Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) && Metabox_Action_Scheduler::is_available() ) {
+			if ( $force ) {
+				Post_Translator::clear_post_language_translations( $post_id, $lang );
+				Post_Translator::clear_job_partial_state( $post_id, $lang );
+				delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+				delete_post_meta( $post_id, Metabox_Action_Scheduler::BATCH_META_KEY );
+			}
+
+			if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
+				wp_send_json_error(
+					array(
+						'message' => self::format_lock_blocked_message( $post_id, $lang ),
+						'scan'    => self::build_scan_response( $post_id, $lang ),
+						'locked'  => true,
+					),
+					409
+				);
+			}
+
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+
+			$queued = Metabox_Action_Scheduler::start_translation(
+				$post_id,
+				$lang,
+				array(
+					'force'  => $force,
+					'unlock' => $unlock,
+				)
+			);
+
+			if ( is_wp_error( $queued ) ) {
+				wp_send_json_error(
+					array(
+						'message' => $queued->get_error_message(),
+						'scan'    => self::build_scan_response( $post_id, $lang ),
+					),
+					500
+				);
+			}
+
+			$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
+			$scan = self::build_scan_response( $post_id, $lang );
+
+			wp_send_json_success(
+				array(
+					'queued'         => true,
+					'done'           => false,
+					'background'     => true,
+					'phase'          => (string) ( $poll['phase'] ?? '' ),
+					'phase_progress' => (string) ( $poll['phase_progress'] ?? '' ),
+					'message'        => __( 'ترجمه Elementor در پس‌زمینه شروع شد — وضعیت هر چند ثانیه به‌روز می‌شود.', 'polymart-ai' ),
+					'scan'           => $scan,
+					'fields'         => self::collect_meta_fields_for_response( $post_id, $lang ),
+				)
+			);
+		}
+
 		if ( $force ) {
 			Post_Translator::clear_post_language_translations( $post_id, $lang );
 			Post_Translator::clear_job_partial_state( $post_id, $lang );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		}
 
-		// Metabox translation is manual — do not inherit a stale bulk-job Arvan cooldown.
 		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			\PolymartAI\Activity_Logger::clear_job_api_cooldown( false );
 		}
-
-		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
-		Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
 
 		if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
 			wp_send_json_error(
@@ -312,9 +416,7 @@ final class Ajax_Handler {
 			);
 		}
 
-		$language   = Language_Registry::get_language( $lang );
-		$lang_label = $language ? $language['native_name'] : $lang;
-		$scan       = self::build_scan_response( $post_id, $lang );
+		$scan = self::build_scan_response( $post_id, $lang );
 
 		wp_send_json_success(
 			array_merge(
@@ -324,6 +426,87 @@ final class Ajax_Handler {
 					'scan'    => $scan,
 					'message' => self::format_metabox_translate_response_message( $post_id, $lang, $result, $scan ),
 				)
+			)
+		);
+	}
+
+	/**
+	 * Lightweight metabox progress poll (reads post meta only — no AI work).
+	 *
+	 * @return void
+	 */
+	public function handle_metabox_translation_status() {
+		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
+
+		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
+		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
+		$unlock  = ! empty( $_POST['unlock'] );
+
+		if ( ! $post_id ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شناسه مطلب معتبر الزامی است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شما اجازه بررسی این مورد را ندارید.', 'polymart-ai' ) ),
+				403
+			);
+		}
+
+		if ( ! self::is_valid_target_language( $lang ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'زبان مقصد نامعتبر است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		if ( $unlock ) {
+			Post_Translator::release_stale_translation_lock( $post_id, $lang, 90 );
+		}
+
+		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
+
+		$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
+		$scan = self::build_scan_response( $post_id, $lang );
+
+		if ( ! empty( $poll['failed'] ) ) {
+			wp_send_json_error(
+				array(
+					'message' => ! empty( $poll['error'] )
+						? (string) $poll['error']
+						: (string) ( $poll['message'] ?? __( 'ترجمه در پس‌زمینه ناموفق بود.', 'polymart-ai' ) ),
+					'scan'    => $scan,
+					'done'    => false,
+					'queued'  => false,
+				),
+				500
+			);
+		}
+
+		wp_send_json_success(
+			array(
+				'done'           => ! empty( $poll['done'] ),
+				'queued'         => ! empty( $poll['queued'] ),
+				'background'     => true,
+				'phase'          => (string) ( $poll['phase'] ?? '' ),
+				'phase_progress' => (string) ( $poll['phase_progress'] ?? '' ),
+				'message'        => self::format_metabox_translate_response_message(
+					$post_id,
+					$lang,
+					array(
+						'done'           => ! empty( $poll['done'] ),
+						'phase_progress' => (string) ( $poll['phase_progress'] ?? '' ),
+						'message'        => (string) ( $poll['message'] ?? '' ),
+					),
+					$scan
+				),
+				'scan'           => $scan,
+				'fields'         => self::collect_meta_fields_for_response( $post_id, $lang ),
+				'batch'          => $poll['batch'] ?? null,
+				'updated_at'     => absint( $poll['updated_at'] ?? 0 ),
 			)
 		);
 	}
@@ -354,6 +537,9 @@ final class Ajax_Handler {
 		}
 
 		Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true );
+		Metabox_Action_Scheduler::force_unlock_post( $post_id, $lang );
+		Metabox_Action_Scheduler::cancel_pending( $post_id, $lang );
+		Metabox_Action_Scheduler::clear_status( $post_id, $lang );
 
 		wp_send_json_success(
 			array(

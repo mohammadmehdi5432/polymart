@@ -117,7 +117,7 @@ final class Post_Translator {
 	 * Must stay above one AI call, but not so long that a killed PHP worker
 	 * blocks the queue for a quarter hour.
 	 */
-	const TRANSLATION_LOCK_TTL = 240;
+	const TRANSLATION_LOCK_TTL = 180;
 
 	/**
 	 * Option suffix storing the worker token that owns a per-post translation lock.
@@ -5047,7 +5047,7 @@ final class Post_Translator {
 		}
 
 		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
-			self::release_stale_translation_lock( $post_id, $lang, 35 );
+			self::release_stale_translation_lock( $post_id, $lang, 90 );
 		}
 
 		$status = self::get_translation_lock_status( $post_id, $lang );

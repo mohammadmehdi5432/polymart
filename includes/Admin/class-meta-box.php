@@ -622,6 +622,14 @@ final class Meta_Box {
 					'releaseLock'          => __( 'آزاد کردن قفل ترجمه', 'polymart-ai' ),
 					'releaseLockSuccess'   => __( 'قفل آزاد شد — دوباره «ترجمه و تکمیل» را بزنید.', 'polymart-ai' ),
 					'releasingLock'        => __( 'در حال آزاد کردن قفل…', 'polymart-ai' ),
+					'backgroundQueued'     => __( 'در حال افزودن به صف پس‌زمینه…', 'polymart-ai' ),
+					'backgroundTranslating' => __( 'پردازش پس‌زمینه', 'polymart-ai' ),
+					'waitingServer'        => __( 'منتظر پاسخ سرور…', 'polymart-ai' ),
+					'translatePoll'        => __( 'بررسی', 'polymart-ai' ),
+					'translateTimeout'     => __( 'زمان انتظار ترجمه تمام شد — صفحه را رفرش کنید یا «آزاد کردن قفل» را بزنید.', 'polymart-ai' ),
+					'lockRetry'            => __( 'تلاش مجدد…', 'polymart-ai' ),
+					'elementorFieldsShort' => __( 'فیلد JSON', 'polymart-ai' ),
+					'elementorPendingChunks' => __( 'بخش API در صف', 'polymart-ai' ),
 				),
 			)
 		);

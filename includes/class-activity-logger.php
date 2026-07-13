@@ -123,6 +123,7 @@ final class Activity_Logger {
 	 */
 	public static function init() {
 		Job_Action_Scheduler::init();
+		Metabox_Action_Scheduler::init();
 
 		add_filter( 'cron_schedules', array( __CLASS__, 'register_cron_schedules' ) );
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
