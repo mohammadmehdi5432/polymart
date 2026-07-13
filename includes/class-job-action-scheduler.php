@@ -391,21 +391,36 @@ final class Job_Action_Scheduler {
 			@set_time_limit( 200 );
 		}
 
-		self::bootstrap_job_worker_context();
-
 		self::$handler_clean_exit = false;
-		self::$current_action_id  = self::resolve_current_action_id();
-		self::register_handler_shutdown();
+		self::$current_action_id  = 0;
 
-		self::clear_slice_mutex_if_stale();
+		try {
+			Activity_Logger::bootstrap_job_worker_context();
 
-		if ( ! self::try_claim_slice_mutex( self::$current_action_id ) ) {
-			self::defer_slice_action( self::$current_action_id );
-			self::$handler_clean_exit = true;
+			self::$current_action_id = self::resolve_current_action_id();
+			self::register_handler_shutdown();
 
-			return;
+			self::clear_slice_mutex_if_stale();
+
+			if ( ! self::try_claim_slice_mutex( self::$current_action_id ) ) {
+				self::defer_slice_action( self::$current_action_id );
+				self::$handler_clean_exit = true;
+
+				return;
+			}
+
+			self::run_slice_action_batch();
+		} catch ( \Throwable $e ) {
+			self::handle_slice_action_exception( $e );
 		}
+	}
 
+	/**
+	 * Core AS batch body (separated so fatal mis-calls surface as catchable throwables where possible).
+	 *
+	 * @return void
+	 */
+	private static function run_slice_action_batch() {
 		$job     = Activity_Logger::get_job_for_as_debug();
 		$queued  = is_array( $job['deferred_queue'] ?? null ) ? count( $job['deferred_queue'] ) : 0;
 		$next_hint = 0;
@@ -651,6 +666,64 @@ final class Job_Action_Scheduler {
 	}
 
 	/**
+	 * Log a slice exception and keep the bulk job chain alive.
+	 *
+	 * @param \Throwable $e Uncaught worker error.
+	 * @return void
+	 */
+	private static function handle_slice_action_exception( \Throwable $e ) {
+		self::$handler_clean_exit = true;
+		self::release_slice_mutex();
+
+		$job     = Activity_Logger::get_job_for_as_debug();
+		$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$message = sprintf(
+			'%s in %s:%d',
+			$e->getMessage(),
+			$e->getFile(),
+			$e->getLine()
+		);
+
+		Activity_Logger::log(
+			'error',
+			sprintf(
+				/* translators: 1: AS action ID, 2: PHP error message */
+				__( 'AS #%1$d: خطای PHP در worker — %2$s', 'polymart-ai' ),
+				self::$current_action_id,
+				$message
+			),
+			array(
+				'as_action_id' => self::$current_action_id,
+				'post_id'      => $post_id,
+				'exception'    => get_class( $e ),
+			)
+		);
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			update_post_meta(
+				$post_id,
+				'_polymart_ai_elementor_error_' . $lang,
+				$message
+			);
+		}
+
+		Activity_Logger::recover_job_item_failure(
+			$message,
+			$post_id,
+			array(
+				'source'       => 'as_handle_slice',
+				'as_action_id' => self::$current_action_id,
+				'exception'    => get_class( $e ),
+			)
+		);
+
+		if ( Activity_Logger::is_bulk_job_running() ) {
+			self::enqueue_next( true, 0 );
+		}
+	}
+
+	/**
 	 * Fatal/timeout shutdown: fail the AS action, release locks, keep the chain moving.
 	 *
 	 * @return void
@@ -697,12 +770,20 @@ final class Job_Action_Scheduler {
 			$job     = Activity_Logger::get_job_for_as_debug();
 			$post_id = absint( $job['current_post_id'] ?? 0 ) ?: absint( $job['partial_post_id'] ?? 0 );
 
+			if ( $post_id > 0 ) {
+				$lang = sanitize_key( (string) ( Activity_Logger::get_job_for_as_debug()['lang'] ?? 'en' ) );
+
+				if ( '' !== $lang ) {
+					update_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, $message );
+				}
+			}
+
 			Activity_Logger::recover_worker_infrastructure_failure(
 				$message,
-				$post_id,
 				array(
 					'source'       => 'as_shutdown',
 					'as_action_id' => $action_id,
+					'post_id'      => $post_id,
 					'fatal'        => 1,
 				)
 			);
