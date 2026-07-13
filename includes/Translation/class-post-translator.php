@@ -339,9 +339,9 @@ final class Post_Translator {
 	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 2500;
 
 	/**
-	 * One widget/field per job step — avoids ArvanCloud gateway timeouts on heavy pages.
+	 * Elementor job batches: 1 field for bulk (timeout-safe), more for manual metabox.
 	 */
-	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 1;
+	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 6;
 
 	/**
 	 * Maximum characters per Elementor job-step API call.
@@ -3202,12 +3202,14 @@ final class Post_Translator {
 	 * @return int
 	 */
 	public static function get_job_step_max_elementor_chunks() {
+		$default = \PolymartAI\Activity_Logger::is_bulk_job_running() ? 1 : 4;
+
 		/**
 		 * Filter how many Elementor AI batches one auto-translate step may run.
 		 *
-		 * @param int $chunks Default 1 (keeps heavy pages under typical proxy timeouts).
+		 * @param int $chunks Default 1 for bulk jobs, 4 for manual metabox runs.
 		 */
-		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_elementor_chunks', 1 ) );
+		return max( 1, (int) apply_filters( 'polymart_ai_job_step_max_elementor_chunks', $default ) );
 	}
 
 	/**
@@ -3822,7 +3824,9 @@ final class Post_Translator {
 		unset( $post_id, $lang );
 
 		$source_payload = self::collect_elementor_translation_payload( $source_data );
-		$all_chunks     = self::chunk_elementor_payload_for_job( $source_payload );
+		$all_chunks     = self::chunk_elementor_payload_for_job(
+			self::collapse_duplicate_elementor_payload( $source_payload )['payload']
+		);
 
 		foreach ( $all_chunks as $index => $chunk ) {
 			if ( ! self::elementor_chunk_is_satisfied( $chunk, $map, $source_payload ) ) {
@@ -3895,7 +3899,9 @@ final class Post_Translator {
 		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
 
 		$all_chunks = self::chunk_elementor_payload_for_job(
-			self::collect_elementor_translation_payload( $source_data )
+			self::collapse_duplicate_elementor_payload(
+				self::collect_elementor_translation_payload( $source_data )
+			)['payload']
 		);
 		$total = max( 1, count( $all_chunks ) );
 
@@ -4101,8 +4107,10 @@ final class Post_Translator {
 					$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 					$payload   = self::collect_elementor_translation_payload( $data );
 					$remaining = self::filter_remaining_elementor_payload( $payload, $map, $skipped );
-					$all_chunks = self::chunk_elementor_payload_for_job( $payload );
-					$left_chunks = self::chunk_elementor_payload_for_job( $remaining );
+					$collapsed_remaining = self::collapse_duplicate_elementor_payload( $remaining )['payload'];
+					$collapsed_all       = self::collapse_duplicate_elementor_payload( $payload )['payload'];
+					$all_chunks          = self::chunk_elementor_payload_for_job( $collapsed_all );
+					$left_chunks         = self::chunk_elementor_payload_for_job( $collapsed_remaining );
 
 					$payload_done = max( 0, count( $all_chunks ) - count( $left_chunks ) );
 					$total        = max( count( $all_chunks ), 1 );
@@ -4797,10 +4805,26 @@ final class Post_Translator {
 
 		$api_cooldown_remaining = \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining();
 		$stale_cursor           = (int) $progress['done'] > max( 0, count( $source ) - count( $remaining ) ) && count( $remaining ) > 0;
+		$collapsed              = self::collapse_duplicate_elementor_payload( $source );
+		$api_batches            = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
+		$api_payload_samples    = array();
+		$sample_index           = 0;
+
+		foreach ( array_slice( $collapsed['payload'], 0, 4, true ) as $path => $text ) {
+			$api_payload_samples[] = array(
+				'key'     => 'el_' . $sample_index,
+				'preview' => wp_trim_words( wp_strip_all_tags( html_entity_decode( (string) $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ), 16, '…' ),
+			);
+			++$sample_index;
+		}
 
 		return array(
 			'active'                 => true,
 			'source_field_count'     => count( $source ),
+			'unique_text_count'      => count( $collapsed['payload'] ),
+			'duplicate_field_count'  => max( 0, count( $source ) - count( $collapsed['payload'] ) ),
+			'api_batch_count'        => max( 1, count( $api_batches ) ),
+			'api_payload_samples'    => $api_payload_samples,
 			'remaining_field_count'  => count( $remaining ),
 			'translated_field_count' => max( 0, count( $source ) - count( $remaining ) ),
 			'state_map_field_count'  => $state_map_count,
@@ -5344,7 +5368,6 @@ final class Post_Translator {
 
 		$map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 		$map = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
-		$state['elementor_map'] = $map;
 
 		$payload = self::filter_remaining_elementor_payload(
 			self::collect_elementor_translation_payload( $data ),
@@ -5352,6 +5375,9 @@ final class Post_Translator {
 			is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array()
 		);
 		$source_payload = self::collect_elementor_translation_payload( $data );
+		$text_mirrors   = self::get_elementor_text_mirror_paths( $source_payload );
+		$map            = self::expand_elementor_map_mirrors( $map, $text_mirrors );
+		$state['elementor_map'] = $map;
 
 		$chunk_queue     = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
 		$chunks          = $chunk_queue['pending'];
@@ -5670,6 +5696,7 @@ final class Post_Translator {
 			}
 
 			$map = array_merge( $map, $mapped_chunk );
+			$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 			$map = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
 			$state['elementor_map'] = $map;
 			++$processed;
@@ -5724,14 +5751,17 @@ final class Post_Translator {
 			}
 
 			if ( $processed < $budget && ! empty( $chunks ) ) {
-				$delay = (int) apply_filters( 'polymart_ai_elementor_inter_request_delay_sec', 12 );
+				$delay = \PolymartAI\Activity_Logger::is_bulk_job_running()
+					? (int) apply_filters( 'polymart_ai_elementor_inter_request_delay_sec', 12 )
+					: (int) apply_filters( 'polymart_ai_metabox_elementor_inter_request_delay_sec', 0 );
 
 				if ( $delay > 0 ) {
-					\PolymartAI\Activity_Logger::sleep_with_worker_heartbeat( max( 2, min( 20, $delay ) ) );
+					\PolymartAI\Activity_Logger::sleep_with_worker_heartbeat( max( 1, min( 20, $delay ) ) );
 				}
 			}
 		}
 
+		$map                    = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$state['elementor_map'] = $map;
 		$chunk_progress         = self::get_elementor_chunk_progress(
 			$post_id,
@@ -5964,11 +5994,105 @@ final class Post_Translator {
 	 * @return array<int, array<string, string>>
 	 */
 	private static function chunk_elementor_payload_for_job( array $payload ) {
+		$chunk_size = \PolymartAI\Activity_Logger::is_bulk_job_running()
+			? 1
+			: self::ELEMENTOR_JOB_FIELD_CHUNK_SIZE;
+
+		/**
+		 * Filter Elementor fields per API batch in job slices.
+		 *
+		 * @param int                   $chunk_size Fields per batch.
+		 * @param array<string, string> $payload    Source field map.
+		 */
+		$chunk_size = max( 1, (int) apply_filters( 'polymart_ai_elementor_job_field_chunk_size', $chunk_size, $payload ) );
+
 		return self::chunk_payload_with_limits(
 			$payload,
-			self::ELEMENTOR_JOB_FIELD_CHUNK_SIZE,
+			$chunk_size,
 			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
 		);
+	}
+
+	/**
+	 * Collapse Elementor fields that share identical Persian source text.
+	 *
+	 * @param array<string, string> $payload Path => source text.
+	 * @return array{payload: array<string, string>, mirrors: array<string, string[]>}
+	 */
+	private static function collapse_duplicate_elementor_payload( array $payload ) {
+		$text_paths = array();
+
+		foreach ( $payload as $path => $text ) {
+			$path = (string) $path;
+			$text = trim( (string) $text );
+
+			if ( '' === $path || '' === $text ) {
+				continue;
+			}
+
+			if ( ! isset( $text_paths[ $text ] ) ) {
+				$text_paths[ $text ] = array();
+			}
+
+			$text_paths[ $text ][] = $path;
+		}
+
+		$collapsed = array();
+		$mirrors   = array();
+
+		foreach ( $text_paths as $text => $paths ) {
+			$canonical = (string) $paths[0];
+
+			$collapsed[ $canonical ] = $text;
+
+			if ( count( $paths ) > 1 ) {
+				$mirrors[ $canonical ] = array_map( 'strval', array_slice( $paths, 1 ) );
+			}
+		}
+
+		return array(
+			'payload' => $collapsed,
+			'mirrors' => $mirrors,
+		);
+	}
+
+	/**
+	 * Copy canonical Elementor translations onto duplicate source paths.
+	 *
+	 * @param array<string, string> $map     Path map.
+	 * @param array<string, string[]> $mirrors Canonical path => duplicate paths.
+	 * @return array<string, string>
+	 */
+	private static function expand_elementor_map_mirrors( array $map, array $mirrors ) {
+		foreach ( $mirrors as $canonical => $paths ) {
+			$canonical = (string) $canonical;
+
+			if ( ! isset( $map[ $canonical ] ) || '' === trim( (string) $map[ $canonical ] ) ) {
+				continue;
+			}
+
+			$value = (string) $map[ $canonical ];
+
+			foreach ( (array) $paths as $path ) {
+				$path = (string) $path;
+
+				if ( '' !== $path ) {
+					$map[ $path ] = $value;
+				}
+			}
+		}
+
+		return $map;
+	}
+
+	/**
+	 * Build mirror lookup for identical Elementor source strings.
+	 *
+	 * @param array<string, string> $payload Full source field map.
+	 * @return array<string, string[]>
+	 */
+	private static function get_elementor_text_mirror_paths( array $payload ) {
+		return self::collapse_duplicate_elementor_payload( $payload )['mirrors'];
 	}
 
 	/**
@@ -5985,7 +6109,8 @@ final class Post_Translator {
 	 */
 	private static function build_elementor_job_chunk_queue( $post_id, $lang, array $source_data, array $state ) {
 		$source_payload = self::collect_elementor_translation_payload( $source_data );
-		$all_chunks     = self::chunk_elementor_payload_for_job( $source_payload );
+		$collapsed      = self::collapse_duplicate_elementor_payload( $source_payload );
+		$all_chunks     = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
 		$total          = max( 1, count( $all_chunks ) );
 		$cursor         = self::resolve_elementor_slice_cursor( $post_id, $lang, $source_data, $state );
 		$pending        = array_slice( $all_chunks, $cursor );
@@ -5995,6 +6120,7 @@ final class Post_Translator {
 			'pending' => $pending,
 			'total'   => $total,
 			'cursor'  => $cursor,
+			'mirrors' => $collapsed['mirrors'],
 		);
 	}
 

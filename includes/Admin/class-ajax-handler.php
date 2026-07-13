@@ -382,8 +382,8 @@ final class Ajax_Handler {
 		}
 
 		$started_at  = microtime( true );
-		$budget_sec  = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 45, $post_id, $lang );
-		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 12, $post_id, $lang );
+		$budget_sec  = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 90, $post_id, $lang );
+		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 20, $post_id, $lang );
 		$slices_run  = 0;
 		$last_slice  = array();
 		$lock_retried = $unlock;

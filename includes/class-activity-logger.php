@@ -6870,7 +6870,25 @@ final class Activity_Logger {
 	 * @return void
 	 */
 	public static function wait_for_arvan_api_gap() {
-		$job     = self::get_job_raw();
+		$job = self::get_job_raw();
+
+		if ( ! self::is_bulk_job_running() ) {
+			$min_gap = max( 0, (int) apply_filters( 'polymart_ai_metabox_arvan_min_api_gap_sec', 1 ) );
+			$last_at = absint( $job['last_arvan_api_at'] ?? 0 );
+
+			if ( $last_at <= 0 || $min_gap <= 0 ) {
+				return;
+			}
+
+			$wait = $min_gap - ( time() - $last_at );
+
+			if ( $wait > 0 ) {
+				sleep( min( 3, $wait ) );
+			}
+
+			return;
+		}
+
 		$default = self::is_elementor_progress_stalled( $job ) ? 6 : 18;
 		$min_gap = max( 4, (int) apply_filters( 'polymart_ai_arvan_min_api_gap_sec', $default ) );
 		$last_at = absint( $job['last_arvan_api_at'] ?? 0 );

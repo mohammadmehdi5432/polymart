@@ -291,7 +291,14 @@
 			html += '<div class="polymart-ai-metabox__elementor-diag">';
 			html += '<p><strong>' + (config.strings.elementorHeading || 'Elementor') + '</strong></p>';
 			html += '<ul class="polymart-ai-metabox__scan-list">';
-			html += '<li>' + (config.strings.elementorFields || '') + ': ' + (elementor.source_field_count || 0) + '</li>';
+			html += '<li>' + (config.strings.elementorFields || '') + ': ' + (elementor.source_field_count || 0);
+			if (elementor.unique_text_count != null && elementor.unique_text_count !== elementor.source_field_count) {
+				html += ' (' + (config.strings.elementorUniqueTexts || 'متن یکتا') + ': ' + elementor.unique_text_count + ')';
+			}
+			html += '</li>';
+			if (elementor.api_batch_count != null) {
+				html += '<li>' + (config.strings.elementorApiBatches || 'درخواست API') + ': ' + elementor.api_batch_count + '</li>';
+			}
 			html += '<li>' + (config.strings.elementorTranslated || '') + ': ' + (elementor.translated_field_count || 0) + '</li>';
 			html += '<li>' + (config.strings.elementorRemaining || '') + ': ' + (elementor.remaining_field_count || 0) + '</li>';
 			if (elementor.chunk_progress) {
@@ -329,6 +336,15 @@
 				html += '<ul class="polymart-ai-metabox__scan-list polymart-ai-metabox__scan-list--missing">';
 				elementor.remaining_samples.forEach(function (sample) {
 					html += '<li><code class="polymart-ai-metabox__path">' + sample.path + '</code> — ' + sample.preview + '</li>';
+				});
+				html += '</ul>';
+			}
+
+			if ((elementor.api_payload_samples || []).length) {
+				html += '<p class="description">' + (config.strings.elementorApiPayloadHint || 'نمونه متنی که به آروان می‌رود (نه JSON Elementor خام):') + '</p>';
+				html += '<ul class="polymart-ai-metabox__scan-list">';
+				elementor.api_payload_samples.forEach(function (sample) {
+					html += '<li><code>' + sample.key + '</code> — ' + sample.preview + '</li>';
 				});
 				html += '</ul>';
 			}
