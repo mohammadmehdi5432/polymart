@@ -6368,6 +6368,7 @@ final class Post_Translator {
 
 			if ( self::elementor_chunk_paths_translated( $chunk, $map ) ) {
 				++$processed;
+				++$slice_cursor;
 				$state['elementor_map'] = $map;
 				$committed              = self::commit_elementor_chunk_progress_to_site(
 					$post_id,
@@ -6375,13 +6376,19 @@ final class Post_Translator {
 					$data,
 					$state,
 					$map,
-					0,
+					$slice_cursor,
 					$progress_total
 				);
 
 				if ( is_wp_error( $committed ) ) {
 					return $committed;
 				}
+
+				self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $progress_total );
+				$state['elementor_chunk_index']      = $slice_cursor;
+				$state['elementor_slices_completed'] = $slice_cursor;
+				self::save_job_partial_state( $post_id, $lang, $state );
+				\PolymartAI\Activity_Logger::sync_elementor_partial_progress( $post_id, $lang );
 
 				continue;
 			}
@@ -6585,13 +6592,18 @@ final class Post_Translator {
 			++$processed;
 
 			$chunk_satisfied = self::elementor_chunk_paths_translated( $chunk, $map );
-			$committed       = self::commit_elementor_chunk_progress_to_site(
+
+			if ( $chunk_satisfied ) {
+				++$slice_cursor;
+			}
+
+			$committed = self::commit_elementor_chunk_progress_to_site(
 				$post_id,
 				$lang,
 				$data,
 				$state,
 				$map,
-				0,
+				$slice_cursor,
 				$progress_total
 			);
 
@@ -6602,7 +6614,6 @@ final class Post_Translator {
 			self::touch_translation_lock( $post_id, $lang );
 
 			if ( $chunk_satisfied ) {
-				++$slice_cursor;
 				self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $progress_total );
 				$state['elementor_chunk_index']      = $slice_cursor;
 				$state['elementor_slices_completed'] = $slice_cursor;
@@ -7331,10 +7342,15 @@ final class Post_Translator {
 		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$skipped_lookup = array_flip( array_map( 'strval', $skipped ) );
 
-		$pending = array();
+		$stored_cursor  = self::read_elementor_slice_cursor( $post_id, $lang );
+		$pending        = array();
 
-		foreach ( $all_chunks as $chunk ) {
+		foreach ( $all_chunks as $idx => $chunk ) {
 			if ( ! is_array( $chunk ) || empty( $chunk ) ) {
+				continue;
+			}
+
+			if ( $idx < $stored_cursor ) {
 				continue;
 			}
 
@@ -7358,14 +7374,8 @@ final class Post_Translator {
 			}
 		}
 
-		$cursor = max( 0, $total - count( $pending ) );
-
-		// Drop stale cursor meta when it overshot real field progress (common after failed runs).
-		$stored_cursor = self::read_elementor_slice_cursor( $post_id, $lang );
-
-		if ( $stored_cursor > $cursor && ! empty( $pending ) ) {
-			self::clear_elementor_slice_cursor( $post_id, $lang );
-		}
+		$computed = max( 0, $total - count( $pending ) );
+		$cursor   = max( $stored_cursor, $computed );
 
 		return array(
 			'all'     => $all_chunks,

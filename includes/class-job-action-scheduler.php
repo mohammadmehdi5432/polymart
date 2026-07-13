@@ -252,6 +252,14 @@ final class Job_Action_Scheduler {
 
 		$job = Activity_Logger::get_job_for_as_debug();
 
+		// Never stack a second action while one is actively running.
+		if (
+			self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0
+			&& Activity_Logger::is_bulk_worker_lively( 120 )
+		) {
+			return 0;
+		}
+
 		// Elementor partials use the same AS chain as metabox (inline queue runner + delay 0).
 		if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
 			if ( ! Activity_Logger::is_bulk_worker_lively( self::STALE_RUNNING_SEC ) ) {
@@ -348,6 +356,53 @@ final class Job_Action_Scheduler {
 			if ( ! is_array( $ids ) ) {
 				return 0;
 			}
+
+			foreach ( $ids as $action_id ) {
+				$action_id = absint( $action_id );
+
+				if ( $action_id <= 0 ) {
+					continue;
+				}
+
+				$store->cancel_action( $action_id );
+				++$cancelled;
+			}
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
+		return $cancelled;
+	}
+
+	/**
+	 * Keep a single pending slice — stacked rows stall Local Sites hosts.
+	 *
+	 * @return int Number of cancelled duplicate actions.
+	 */
+	public static function prune_duplicate_pending_slices() {
+		if ( ! self::is_available() || ! class_exists( 'ActionScheduler' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		$cancelled = 0;
+
+		try {
+			$store = \ActionScheduler::store();
+			$ids   = $store->query_actions(
+				array(
+					'hook'     => self::HOOK,
+					'group'    => self::GROUP,
+					'status'   => \ActionScheduler_Store::STATUS_PENDING,
+					'orderby'  => 'date',
+					'order'    => 'ASC',
+					'per_page' => 20,
+				)
+			);
+
+			if ( ! is_array( $ids ) || count( $ids ) <= 1 ) {
+				return 0;
+			}
+
+			array_shift( $ids );
 
 			foreach ( $ids as $action_id ) {
 				$action_id = absint( $action_id );
@@ -662,10 +717,15 @@ final class Job_Action_Scheduler {
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
 			$job_after_chain = Activity_Logger::get_job_for_as_debug();
-			$elementor_left  = Activity_Logger::should_prioritize_elementor_partial( $job_after_chain );
 
-			if ( $any_productive || $elementor_left ) {
+			if ( $any_productive ) {
 				self::chain_next_slice_immediately();
+			} elseif (
+				Activity_Logger::should_prioritize_elementor_partial( $job_after_chain )
+				&& ! self::has_pending_or_running()
+			) {
+				// Elementor still in flight but this batch was idle — queue one follow-up only.
+				self::enqueue_next( false, 0 );
 			} else {
 				Activity_Logger::nudge_as_queue_runner();
 			}
@@ -1121,6 +1181,7 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
+		self::prune_duplicate_pending_slices();
 		self::ensure_scheduled();
 
 		if ( ! class_exists( 'ActionScheduler_QueueRunner' ) ) {

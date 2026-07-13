@@ -1399,7 +1399,19 @@ final class Activity_Logger {
 			return $job;
 		}
 
-		if ( (string) ( $job['partial_progress'] ?? '' ) === $marker ) {
+		$current   = (string) ( $job['partial_progress'] ?? '' );
+		$new_parsed = self::parse_job_phase_progress( $marker );
+		$old_parsed = self::parse_job_phase_progress( $current );
+
+		if (
+			is_array( $new_parsed )
+			&& is_array( $old_parsed )
+			&& $old_parsed['done'] > $new_parsed['done']
+		) {
+			$marker = $old_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+		}
+
+		if ( $current === $marker ) {
 			return $job;
 		}
 
@@ -2086,6 +2098,18 @@ final class Activity_Logger {
 			return;
 		}
 
+		$current    = (string) ( $job['partial_progress'] ?? '' );
+		$new_parsed = self::parse_job_phase_progress( $marker );
+		$old_parsed = self::parse_job_phase_progress( $current );
+
+		if (
+			is_array( $new_parsed )
+			&& is_array( $old_parsed )
+			&& $old_parsed['done'] > $new_parsed['done']
+		) {
+			$marker = $old_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+		}
+
 		$job['partial_post_id']  = $post_id;
 		$job['partial_phase']    = 'elementor';
 		$job['partial_progress'] = $marker;
@@ -2510,6 +2534,11 @@ final class Activity_Logger {
 
 		// Same pattern as metabox AS: enqueue ASAP + run the queue inline in this request.
 		if ( Job_Action_Scheduler::is_available() ) {
+			if ( Job_Action_Scheduler::has_pending_or_running() ) {
+				Job_Action_Scheduler::run_queue_inline( false );
+				return;
+			}
+
 			Job_Action_Scheduler::enqueue_next( false, 0 );
 			Job_Action_Scheduler::run_queue_inline( false );
 		}
@@ -2551,6 +2580,10 @@ final class Activity_Logger {
 			return 25;
 		}
 
+		if ( self::$trusted_as_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
+			return max( 3, min( 20, self::get_elementor_partial_step_cap( self::get_job_raw() ) ) );
+		}
+
 		return 1;
 	}
 
@@ -2561,7 +2594,7 @@ final class Activity_Logger {
 	 * @return int
 	 */
 	public static function filter_elementor_burst_inter_delay( $delay ) {
-		if ( self::$elementor_page_burst ) {
+		if ( self::$elementor_page_burst || self::$trusted_as_tick ) {
 			return 2;
 		}
 
@@ -3574,7 +3607,10 @@ final class Activity_Logger {
 		$existing_status = (string) ( $existing['status'] ?? 'idle' );
 
 		if ( in_array( $existing_status, array( 'running', 'paused' ), true ) ) {
-			if ( 'running' === $existing_status && self::is_bulk_worker_lively( 90 ) ) {
+			$elementor_active = absint( $existing['partial_post_id'] ?? 0 ) > 0
+				&& 'elementor' === sanitize_key( (string) ( $existing['partial_phase'] ?? '' ) );
+
+			if ( 'running' === $existing_status && ( self::is_bulk_worker_lively( 180 ) || $elementor_active ) ) {
 				return new \WP_Error(
 					'polymart_ai_job_running',
 					__( 'یک فرآیند ترجمه خودکار در حال اجراست. ابتدا آن را متوقف یا از سرگیری کنید.', 'polymart-ai' )
