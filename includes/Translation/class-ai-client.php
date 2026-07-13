@@ -85,9 +85,25 @@ final class AI_Client {
 		}
 
 		$timeout = (int) self::$active_curl_timeout;
+		$timeout_ms = max( 1000, $timeout * 1000 );
 
 		curl_setopt( $handle, CURLOPT_TIMEOUT, $timeout );
+		// Millisecond-level hard stop (prevents some keep-alive edge cases).
+		if ( defined( 'CURLOPT_TIMEOUT_MS' ) ) {
+			curl_setopt( $handle, CURLOPT_TIMEOUT_MS, $timeout_ms );
+		}
 		curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, min( 15, max( 5, (int) ceil( $timeout / 3 ) ) ) );
+		if ( defined( 'CURLOPT_CONNECTTIMEOUT_MS' ) ) {
+			curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT_MS, min( 15000, max( 3000, (int) ceil( $timeout_ms / 3 ) ) ) );
+		}
+
+		// Never let persistent sockets keep the request alive beyond our timeout.
+		if ( defined( 'CURLOPT_FORBID_REUSE' ) ) {
+			curl_setopt( $handle, CURLOPT_FORBID_REUSE, true );
+		}
+		if ( defined( 'CURLOPT_FRESH_CONNECT' ) ) {
+			curl_setopt( $handle, CURLOPT_FRESH_CONNECT, true );
+		}
 
 		// Keep the auto-translate worker heartbeat alive while Arvan is thinking.
 		if ( $timeout >= 20 && function_exists( 'curl_setopt' ) ) {
@@ -480,7 +496,7 @@ final class AI_Client {
 
 		$max_transport_retries = self::MAX_TRANSPORT_RETRIES;
 
-		// Elementor/AS slices cap at 50s — never chain multi-minute transport retries.
+		// Elementor/AS/metabox slices cap at ~45s — never chain transport retries.
 		if ( ! empty( $options['max_timeout'] ) && absint( $options['max_timeout'] ) <= 50 ) {
 			$max_transport_retries = 0;
 		}
@@ -498,8 +514,12 @@ final class AI_Client {
 			array(
 				'timeout'     => $timeout,
 				'connect_timeout' => min( 15, max( 5, (int) ceil( $timeout / 3 ) ) ),
+				'redirection' => 0,
 				'httpversion' => '1.1',
-				'headers'     => self::build_request_headers( $api_key ),
+				'headers'     => array_merge(
+					self::build_request_headers( $api_key ),
+					array( 'Connection' => 'close' )
+				),
 				'body'        => $encoded_body,
 			)
 		);

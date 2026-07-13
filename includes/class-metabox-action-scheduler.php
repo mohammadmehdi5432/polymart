@@ -91,6 +91,97 @@ final class Metabox_Action_Scheduler {
 	}
 
 	/**
+	 * Aggressively kill stale running metabox actions for a post/lang pair.
+	 *
+	 * Used by the metabox polling loop when Action Scheduler is jammed and actions
+	 * stay In-progress for minutes.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @param int    $max_age_sec Maximum age for "running" (seconds).
+	 * @return int Number of killed actions.
+	 */
+	public static function kill_stale_running_now( $post_id, $lang, $max_age_sec = 75 ) {
+		$post_id     = absint( $post_id );
+		$lang        = sanitize_key( (string) $lang );
+		$max_age_sec = max( 30, absint( $max_age_sec ) );
+
+		if ( $post_id <= 0 || '' === $lang || ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		$store  = \ActionScheduler_Store::instance();
+		$killed = 0;
+		$now    = time();
+
+		$running = as_get_scheduled_actions(
+			array(
+				'hook'     => self::HOOK,
+				'group'    => self::GROUP,
+				'status'   => \ActionScheduler_Store::STATUS_RUNNING,
+				'per_page' => 20,
+			)
+		);
+
+		foreach ( $running as $action ) {
+			if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) || ! method_exists( $action, 'get_id' ) ) {
+				continue;
+			}
+
+			$args = $action->get_args();
+			if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
+				continue;
+			}
+
+			$action_id = absint( $action->get_id() );
+			if ( $action_id <= 0 ) {
+				continue;
+			}
+
+			// We cannot reliably read "started_at" from AS, so use scheduled date as a floor,
+			// and also consider our own status heartbeat.
+			$due = 0;
+			try {
+				$date = $store->get_date( $action_id );
+				$due  = $date ? absint( $date->getTimestamp() ) : 0;
+			} catch ( \Throwable $e ) {
+				$due = 0;
+			}
+
+			$status = self::get_status( $post_id, $lang );
+			$beat   = absint( $status['updated_at'] ?? 0 );
+			$stamp  = max( $due, $beat );
+
+			if ( $stamp > 0 && ( $now - $stamp ) < $max_age_sec ) {
+				continue;
+			}
+
+			try {
+				$store->mark_failure( $action_id );
+				++$killed;
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			}
+		}
+
+		if ( $killed > 0 ) {
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+			self::update_status(
+				$post_id,
+				$lang,
+				array(
+					'status'  => 'running',
+					'phase'   => 'elementor',
+					'message' => __( 'اکشن پس‌زمینه بیش از حد طول کشید — لغو شد. ادامه با Polling…', 'polymart-ai' ),
+					'error'   => '',
+					'fallback' => 'stale_killed',
+				)
+			);
+		}
+
+		return $killed;
+	}
+
+	/**
 	 * @return bool
 	 */
 	public static function is_available() {

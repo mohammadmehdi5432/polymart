@@ -33,6 +33,7 @@ final class Ajax_Handler {
 		add_action( 'wp_ajax_polymart_translate_post_complete', array( $this, 'handle_translate_post_complete' ) );
 		add_action( 'wp_ajax_polymart_metabox_translation_status', array( $this, 'handle_metabox_translation_status' ) );
 		add_action( 'wp_ajax_polymart_release_translation_lock', array( $this, 'handle_release_translation_lock' ) );
+		add_action( 'wp_ajax_polymart_debug_elementor_toxic', array( $this, 'handle_debug_elementor_toxic' ) );
 	}
 
 	/**
@@ -511,6 +512,10 @@ final class Ajax_Handler {
 			Post_Translator::release_stale_translation_lock( $post_id, $lang, 90 );
 		}
 
+		// Browser polling is the execution supervisor: kill stuck AS actions early.
+		// If a metabox AS action stays In-progress too long, fail it so inline polling can continue.
+		Metabox_Action_Scheduler::kill_stale_running_now( $post_id, $lang, 75 );
+
 		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
 		Metabox_Action_Scheduler::recover_stale_and_nudge( $post_id, $lang );
 
@@ -576,6 +581,34 @@ final class Ajax_Handler {
 				'fields'         => self::collect_meta_fields_for_response( $post_id, $lang ),
 				'batch'          => $poll['batch'] ?? null,
 				'updated_at'     => absint( $poll['updated_at'] ?? 0 ),
+			)
+		);
+	}
+
+	/**
+	 * Expose Elementor toxic payload + last error meta (admin-only).
+	 *
+	 * @return void
+	 */
+	public function handle_debug_elementor_toxic() {
+		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
+
+		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
+		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
+
+		if ( ! $post_id || ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( array( 'message' => __( 'شما اجازه این عملیات را ندارید.', 'polymart-ai' ) ), 403 );
+		}
+
+		$toxic = get_post_meta( $post_id, \PolymartAI\Metabox_Action_Scheduler::TOXIC_META_PREFIX . $lang, true );
+		$error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
+
+		wp_send_json_success(
+			array(
+				'post_id' => $post_id,
+				'lang'    => $lang,
+				'toxic'   => $toxic,
+				'error'   => $error,
 			)
 		);
 	}
