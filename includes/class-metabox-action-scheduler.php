@@ -78,7 +78,6 @@ final class Metabox_Action_Scheduler {
 
 		if ( $recovered > 0 ) {
 			self::chain_next( $post_id, $lang );
-			self::run_queue_inline( true );
 		}
 
 		return $recovered;
@@ -364,8 +363,6 @@ final class Metabox_Action_Scheduler {
 			),
 			array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
 		);
-
-		self::run_queue_inline( true );
 
 		return true;
 	}

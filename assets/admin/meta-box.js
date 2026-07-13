@@ -593,6 +593,14 @@
 						return;
 					}
 
+					if (shouldUseChunkedTranslation() && attempt < 3) {
+						setGlobalStatus((config.strings.translating || '') + ' — ' + (config.strings.lockRetry || 'تلاش مجدد…'), '');
+						window.setTimeout(function () {
+							pollTranslateComplete(postId, lang, attempt + 1);
+						}, 5000);
+						return;
+					}
+
 					handleTranslateError(postId, lang, response);
 					setRetranslateLoading($('.polymart-ai-retranslate-all-btn'), false);
 					return;
@@ -739,9 +747,43 @@
 			);
 			setLangStatus(lang, '', '');
 
+			function retryStartStatus(attempt) {
+				attempt = attempt || 0;
+
+				if (!shouldUseChunkedTranslation()) {
+					return;
+				}
+
+				if (attempt >= 3) {
+					handleTranslateError(postId, lang, null);
+					return;
+				}
+
+				window.setTimeout(function () {
+					requestTranslationStatus(postId, lang, { unlock: attempt > 0 })
+						.done(function (statusResponse) {
+							if (statusResponse && statusResponse.success && statusResponse.data) {
+								applyTranslateProgressResponse(postId, lang, statusResponse.data);
+								pollTranslateComplete(postId, lang, 0);
+								return;
+							}
+
+							retryStartStatus(attempt + 1);
+						})
+						.fail(function () {
+							retryStartStatus(attempt + 1);
+						});
+				}, 5000);
+			}
+
 			requestTranslateComplete(postId, lang, { force: force, unlock: true })
 				.done(function (response) {
 					if (!response || !response.success) {
+						if (shouldUseChunkedTranslation()) {
+							retryStartStatus(0);
+							return;
+						}
+
 						handleTranslateError(postId, lang, response);
 						return;
 					}
@@ -768,9 +810,14 @@
 					setGlobalStatus(progressMessage || config.strings.translating, '');
 					setLangStatus(lang, progressMessage || config.strings.translating, '');
 
-					pollTranslateComplete(postId, lang, 0, true);
+					pollTranslateComplete(postId, lang, 0);
 				})
 				.fail(function (xhr) {
+					if (shouldUseChunkedTranslation()) {
+						retryStartStatus(0);
+						return;
+					}
+
 					handleTranslateError(postId, lang, null, xhr);
 				});
 		});

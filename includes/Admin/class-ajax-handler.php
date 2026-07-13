@@ -286,6 +286,10 @@ final class Ajax_Handler {
 	 * @return void
 	 */
 	public function handle_translate_post_complete() {
+		if ( ! headers_sent() && function_exists( 'ob_start' ) ) {
+			@ob_start();
+		}
+
 		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
 
 		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
@@ -295,6 +299,9 @@ final class Ajax_Handler {
 		$unlock   = ! empty( $_POST['unlock'] ) || $force || $continue;
 
 		if ( ! $post_id ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array( 'message' => __( 'شناسه مطلب معتبر الزامی است.', 'polymart-ai' ) ),
 				400
@@ -302,6 +309,9 @@ final class Ajax_Handler {
 		}
 
 		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array( 'message' => __( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' ) ),
 				403
@@ -309,6 +319,9 @@ final class Ajax_Handler {
 		}
 
 		if ( ! self::is_valid_target_language( $lang ) ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array( 'message' => __( 'زبان مقصد نامعتبر است.', 'polymart-ai' ) ),
 				400
@@ -331,6 +344,9 @@ final class Ajax_Handler {
 			}
 
 			if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
+				if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+					@ob_clean();
+				}
 				wp_send_json_error(
 					array(
 						'message' => self::format_lock_blocked_message( $post_id, $lang ),
@@ -353,6 +369,9 @@ final class Ajax_Handler {
 			);
 
 			if ( is_wp_error( $queued ) ) {
+				if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+					@ob_clean();
+				}
 				wp_send_json_error(
 					array(
 						'message' => $queued->get_error_message(),
@@ -365,6 +384,9 @@ final class Ajax_Handler {
 			$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
 			$scan = self::build_scan_response( $post_id, $lang );
 
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_success(
 				array(
 					'queued'         => true,
@@ -390,6 +412,9 @@ final class Ajax_Handler {
 		}
 
 		if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array(
 					'message' => self::format_lock_blocked_message( $post_id, $lang ),
@@ -404,6 +429,9 @@ final class Ajax_Handler {
 
 		if ( is_wp_error( $result ) ) {
 			$error_data = $result->get_error_data();
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array(
 					'message' => $result->get_error_message(),
@@ -418,6 +446,9 @@ final class Ajax_Handler {
 
 		$scan = self::build_scan_response( $post_id, $lang );
 
+		if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+			@ob_clean();
+		}
 		wp_send_json_success(
 			array_merge(
 				$result,
@@ -436,6 +467,10 @@ final class Ajax_Handler {
 	 * @return void
 	 */
 	public function handle_metabox_translation_status() {
+		if ( ! headers_sent() && function_exists( 'ob_start' ) ) {
+			@ob_start();
+		}
+
 		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
 
 		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
@@ -443,6 +478,9 @@ final class Ajax_Handler {
 		$unlock  = ! empty( $_POST['unlock'] );
 
 		if ( ! $post_id ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array( 'message' => __( 'شناسه مطلب معتبر الزامی است.', 'polymart-ai' ) ),
 				400
@@ -450,6 +488,9 @@ final class Ajax_Handler {
 		}
 
 		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array( 'message' => __( 'شما اجازه بررسی این مورد را ندارید.', 'polymart-ai' ) ),
 				403
@@ -457,6 +498,9 @@ final class Ajax_Handler {
 		}
 
 		if ( ! self::is_valid_target_language( $lang ) ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array( 'message' => __( 'زبان مقصد نامعتبر است.', 'polymart-ai' ) ),
 				400
@@ -474,6 +518,9 @@ final class Ajax_Handler {
 		$scan = self::build_scan_response( $post_id, $lang );
 
 		if ( ! empty( $poll['failed'] ) ) {
+			if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+				@ob_clean();
+			}
 			wp_send_json_error(
 				array(
 					'message' => ! empty( $poll['error'] )
@@ -487,6 +534,9 @@ final class Ajax_Handler {
 			);
 		}
 
+		if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+			@ob_clean();
+		}
 		wp_send_json_success(
 			array(
 				'done'           => ! empty( $poll['done'] ),
