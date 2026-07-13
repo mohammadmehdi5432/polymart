@@ -628,6 +628,7 @@ final class Meta_Box {
 					'translatePoll'        => __( 'بررسی', 'polymart-ai' ),
 					'translateTimeout'     => __( 'زمان انتظار ترجمه تمام شد — صفحه را رفرش کنید یا «آزاد کردن قفل» را بزنید.', 'polymart-ai' ),
 					'lockRetry'            => __( 'تلاش مجدد…', 'polymart-ai' ),
+					'serverBusy'           => __( 'سرور مشغول است — ترجمه در پس‌زمینه ادامه می‌یابد، لطفاً صبر کنید…', 'polymart-ai' ),
 					'elementorFieldsShort' => __( 'فیلد JSON', 'polymart-ai' ),
 					'elementorPendingChunks' => __( 'بخش API در صف', 'polymart-ai' ),
 				),

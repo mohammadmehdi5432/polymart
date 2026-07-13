@@ -36,7 +36,11 @@ final class Metabox_Action_Scheduler {
 	const BATCH_META_KEY     = '_polymart_ai_metabox_as_batch';
 	const FALLBACK_IDLE_SEC  = 20;
 	const TOXIC_META_PREFIX  = '_polymart_ai_elementor_toxic_payload_';
-	const LIVE_RUNNING_MAX_AGE_SEC = 75;
+	const LIVE_RUNNING_MAX_AGE_SEC   = 75;
+	const POLL_NUDGE_COOLDOWN_SEC    = 25;
+	const POLL_FALLBACK_COOLDOWN_SEC = 60;
+	const POLL_RECOVERY_LOCK_TTL     = 120;
+	const POLL_QUEUE_LITE_SEC        = 15;
 
 	/**
 	 * @var int
@@ -558,6 +562,8 @@ final class Metabox_Action_Scheduler {
 	/**
 	 * Self-healing steps invoked by the metabox status poll (kill zombies, nudge AS, inline fallback).
 	 *
+	 * Lightweight on most polls — heavy AI/AS work is throttled to avoid admin-ajax stampedes.
+	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Language code.
 	 * @return void
@@ -574,17 +580,262 @@ final class Metabox_Action_Scheduler {
 			return;
 		}
 
-		self::kill_stale_running_now( $post_id, $lang, 75 );
-
-		$meta_state = (string) ( self::get_status( $post_id, $lang )['status'] ?? '' );
-
-		if ( 'running' === $meta_state ) {
-			self::recover_stale_and_nudge( $post_id, $lang );
+		if ( self::is_poll_recovery_locked( $post_id, $lang ) ) {
+			return;
 		}
 
-		if ( self::is_job_stalled( $post_id, $lang ) ) {
-			self::resolve_ghost_job( $post_id, $lang );
-			self::run_inline_fallback_slice( $post_id, $lang, 'poll_stall' );
+		$status     = self::get_status( $post_id, $lang );
+		$meta_state = (string) ( $status['status'] ?? '' );
+		$updated_at = absint( $status['updated_at'] ?? 0 );
+		$now        = time();
+
+		if ( self::has_stale_running_action( $post_id, $lang ) ) {
+			self::kill_stale_running_now( $post_id, $lang, self::LIVE_RUNNING_MAX_AGE_SEC );
+		}
+
+		if ( self::has_live_as_actions( $post_id, $lang ) ) {
+			if ( 'running' === $meta_state && $updated_at > 0 && ( $now - $updated_at ) >= 30 ) {
+				self::maybe_nudge_queue_lite( $post_id, $lang );
+			}
+
+			return;
+		}
+
+		if ( 'running' !== $meta_state || ! self::is_job_stalled( $post_id, $lang ) ) {
+			return;
+		}
+
+		if ( self::should_run_poll_fallback( $post_id, $lang ) ) {
+			self::set_poll_recovery_lock( $post_id, $lang );
+
+			try {
+				self::resolve_ghost_job( $post_id, $lang );
+				self::run_inline_fallback_slice( $post_id, $lang, 'poll_stall' );
+				self::touch_poll_fallback_cooldown( $post_id, $lang );
+			} finally {
+				self::clear_poll_recovery_lock( $post_id, $lang );
+			}
+
+			return;
+		}
+
+		self::maybe_nudge_stalled_job( $post_id, $lang );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function is_poll_recovery_locked( $post_id, $lang ) {
+		return (bool) get_transient( self::get_poll_recovery_lock_key( $post_id, $lang ) );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function set_poll_recovery_lock( $post_id, $lang ) {
+		set_transient(
+			self::get_poll_recovery_lock_key( $post_id, $lang ),
+			1,
+			self::POLL_RECOVERY_LOCK_TTL
+		);
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function clear_poll_recovery_lock( $post_id, $lang ) {
+		delete_transient( self::get_poll_recovery_lock_key( $post_id, $lang ) );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return string
+	 */
+	private static function get_poll_recovery_lock_key( $post_id, $lang ) {
+		return 'polymart_ai_mas_poll_busy_' . absint( $post_id ) . '_' . sanitize_key( (string) $lang );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function should_run_poll_fallback( $post_id, $lang ) {
+		$status = self::get_status( $post_id, $lang );
+		$last   = absint( $status['last_fallback_at'] ?? 0 );
+
+		return $last <= 0 || ( time() - $last ) >= self::POLL_FALLBACK_COOLDOWN_SEC;
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function touch_poll_fallback_cooldown( $post_id, $lang ) {
+		self::update_status(
+			$post_id,
+			$lang,
+			array(
+				'last_fallback_at' => time(),
+			)
+		);
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function should_nudge_queue( $post_id, $lang ) {
+		$status = self::get_status( $post_id, $lang );
+		$last   = absint( $status['last_nudge_at'] ?? 0 );
+
+		return $last <= 0 || ( time() - $last ) >= self::POLL_NUDGE_COOLDOWN_SEC;
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function touch_nudge_cooldown( $post_id, $lang ) {
+		self::update_status(
+			$post_id,
+			$lang,
+			array(
+				'last_nudge_at' => time(),
+			)
+		);
+	}
+
+	/**
+	 * Whether any in-progress metabox AS row for this post/lang is past the live age threshold.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function has_stale_running_action( $post_id, $lang ) {
+		if ( ! function_exists( 'as_get_scheduled_actions' ) ) {
+			return false;
+		}
+
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		$running = as_get_scheduled_actions(
+			array(
+				'hook'     => self::HOOK,
+				'group'    => self::GROUP,
+				'status'   => \ActionScheduler_Store::STATUS_RUNNING,
+				'per_page' => 10,
+			)
+		);
+
+		foreach ( $running as $action ) {
+			if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) || ! method_exists( $action, 'get_id' ) ) {
+				continue;
+			}
+
+			$args = $action->get_args();
+
+			if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
+				continue;
+			}
+
+			if ( ! self::is_metabox_as_running_action_live( absint( $action->get_id() ), $post_id, $lang ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Bounded AS queue nudge for poll requests (no direct AI slice).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function maybe_nudge_queue_lite( $post_id, $lang ) {
+		if ( ! self::should_nudge_queue( $post_id, $lang ) ) {
+			return;
+		}
+
+		self::touch_nudge_cooldown( $post_id, $lang );
+
+		try {
+			self::run_queue_inline_lite();
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+	}
+
+	/**
+	 * Re-enqueue and nudge when stalled but heavy fallback is on cooldown.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function maybe_nudge_stalled_job( $post_id, $lang ) {
+		if ( ! self::should_nudge_queue( $post_id, $lang ) ) {
+			return;
+		}
+
+		self::touch_nudge_cooldown( $post_id, $lang );
+
+		$action_id = self::schedule_slice( $post_id, $lang, 0 );
+
+		if ( $action_id <= 0 ) {
+			return;
+		}
+
+		try {
+			self::run_queue_inline_lite();
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+	}
+
+	/**
+	 * Short AS runner pass suitable for admin-ajax poll (avoids 90s queue runner blocks).
+	 *
+	 * @return int Actions processed.
+	 */
+	private static function run_queue_inline_lite() {
+		if ( ! self::is_available() || ! class_exists( 'ActionScheduler_QueueRunner' ) ) {
+			return 0;
+		}
+
+		$time_limit = (int) apply_filters( 'polymart_ai_metabox_poll_queue_time_limit', self::POLL_QUEUE_LITE_SEC );
+
+		$time_filter = static function () use ( $time_limit ) {
+			return max( 8, min( 30, $time_limit ) );
+		};
+		$batch_filter = static function () {
+			return 1;
+		};
+
+		add_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
+		add_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
+
+		try {
+			$runner = \ActionScheduler_QueueRunner::instance();
+
+			return (int) $runner->run( 'PolymartAI-Metabox-Poll' );
+		} catch ( \Throwable $e ) {
+			return 0;
+		} finally {
+			remove_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
+			remove_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
 		}
 	}
 
@@ -810,10 +1061,29 @@ final class Metabox_Action_Scheduler {
 			return new \WP_Error( 'polymart_ai_invalid_request', __( 'شناسه مطلب یا زبان نامعتبر است.', 'polymart-ai' ) );
 		}
 
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 'poll_stall' === $reason ? 90 : 200 );
+		}
+
 		// First try: let AS queue runner process due actions; if it processes nothing,
 		// force one direct pending metabox action inline.
 		try {
-			self::run_queue_inline( true );
+			if ( 'poll_stall' === $reason ) {
+				self::run_queue_inline_lite();
+
+				if ( self::has_live_as_actions( $post_id, $lang ) ) {
+					return array(
+						'done'        => false,
+						'phase'       => 'elementor',
+						'message'     => __( 'صف پس‌زمینه فعال شد — ادامه در Action Scheduler…', 'polymart-ai' ),
+						'recoverable' => true,
+					);
+				}
+
+				self::run_metabox_batch_inline_fallback();
+			} else {
+				self::run_queue_inline( true );
+			}
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
 
