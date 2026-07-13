@@ -1081,6 +1081,28 @@ final class Job_Action_Scheduler {
 	}
 
 	/**
+	 * Whether another bulk slice mutex holder is actively working.
+	 *
+	 * @return bool
+	 */
+	public static function is_slice_execution_active() {
+		$held = get_transient( self::SLICE_MUTEX_KEY );
+
+		if ( false !== $held && Activity_Logger::is_bulk_worker_lively( 180 ) ) {
+			return true;
+		}
+
+		if (
+			self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0
+			&& Activity_Logger::is_bulk_worker_lively( 120 )
+		) {
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
 	 * @return void
 	 */
 	private static function release_slice_mutex() {
@@ -1230,7 +1252,17 @@ final class Job_Action_Scheduler {
 		remove_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
 
 		if ( $done <= 0 && $force_inline && Activity_Logger::is_bulk_job_running() ) {
+			// Never spawn a parallel inline batch while AS or the slice mutex owns the job.
+			if ( self::is_slice_execution_active() && self::$current_action_id <= 0 ) {
+				return $done;
+			}
+
 			self::clear_slice_mutex_if_stale();
+
+			if ( self::is_slice_execution_active() && self::$current_action_id <= 0 ) {
+				return $done;
+			}
+
 			$job = Activity_Logger::get_job_for_as_debug();
 
 			if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
@@ -1252,11 +1284,15 @@ final class Job_Action_Scheduler {
 	 * @return array{available: bool, pending: bool, group: string, hook: string}
 	 */
 	public static function status_payload() {
+		$running = self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0;
+
 		return array(
-			'available' => self::is_available(),
-			'pending'   => self::has_pending_or_running(),
-			'group'     => self::GROUP,
-			'hook'      => self::HOOK,
+			'available'        => self::is_available(),
+			'pending'          => self::has_pending_or_running(),
+			'running'          => $running,
+			'slice_active'     => self::is_slice_execution_active(),
+			'group'            => self::GROUP,
+			'hook'             => self::HOOK,
 		);
 	}
 }

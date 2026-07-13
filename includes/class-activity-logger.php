@@ -626,16 +626,25 @@ final class Activity_Logger {
 			}
 
 			self::bootstrap_job_worker_context();
-			self::force_release_step_lock_if_idle();
+
+			if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {
+				self::force_release_step_lock_if_idle();
+			}
+
 			Job_Action_Scheduler::clear_slice_mutex_if_stale();
 
 			if ( Job_Action_Scheduler::is_available() ) {
 				Job_Action_Scheduler::ensure_scheduled();
-				$processed = Job_Action_Scheduler::run_queue_inline( true );
+				$slice_active = Job_Action_Scheduler::is_slice_execution_active();
+				$processed    = Job_Action_Scheduler::run_queue_inline( ! $slice_active );
 
-				if ( $processed > 0 ) {
+				if ( $processed > 0 || $slice_active ) {
 					return self::normalize_job_for_response( self::get_job_raw(), false );
 				}
+			}
+
+			if ( Job_Action_Scheduler::is_slice_execution_active() ) {
+				return self::normalize_job_for_response( self::get_job_raw(), false );
 			}
 
 			$limits = self::get_inline_worker_tick_limits( self::get_job_raw() );
@@ -1762,6 +1771,8 @@ final class Activity_Logger {
 		$as_status             = Job_Action_Scheduler::status_payload();
 		$job['as_available']   = ! empty( $as_status['available'] );
 		$job['as_pending']     = ! empty( $as_status['pending'] );
+		$job['as_running']     = ! empty( $as_status['running'] );
+		$job['as_slice_active'] = ! empty( $as_status['slice_active'] );
 		$job['worker_mode']    = ! empty( $as_status['available'] ) ? 'as' : 'cron';
 		$job['elementor_priority'] = self::should_prioritize_elementor_partial( $job );
 		$job['elementor_progress_stalled'] = self::is_elementor_progress_stalled( $job );
@@ -2446,9 +2457,23 @@ final class Activity_Logger {
 		$state = Post_Translator::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		Post_Translator::save_job_partial_state( $post_id, $lang, $state );
 
+		$marker   = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state );
+		$existing = (string) ( $job['partial_progress'] ?? '' );
+		$new_p    = self::parse_job_phase_progress( $marker );
+		$old_p    = self::parse_job_phase_progress( $existing );
+
+		if (
+			absint( $job['partial_post_id'] ?? 0 ) === $post_id
+			&& is_array( $new_p )
+			&& is_array( $old_p )
+			&& $old_p['done'] > $new_p['done']
+		) {
+			$marker = $old_p['done'] . '/' . max( $old_p['total'], $new_p['total'] );
+		}
+
 		$job['partial_post_id']  = $post_id;
 		$job['partial_phase']    = 'elementor';
-		$job['partial_progress'] = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state );
+		$job['partial_progress'] = $marker;
 		self::touch_partial_progress_tracker( $job );
 		$job['step_partial']     = true;
 		$job['current_post_id']  = null;
@@ -4462,8 +4487,14 @@ final class Activity_Logger {
 			self::save_job( $job );
 		}
 
-		$released_stale_lock = self::force_release_step_lock_if_idle();
-		$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
+		$slice_active = Job_Action_Scheduler::is_slice_execution_active();
+
+		if ( ! $slice_active ) {
+			$released_stale_lock = self::force_release_step_lock_if_idle();
+			$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
+		} else {
+			$released_stale_lock = false;
+		}
 
 		$job  = self::get_job_raw();
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
@@ -4504,12 +4535,13 @@ final class Activity_Logger {
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
 		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::run_queue_inline( true );
+			$force_inline = ! $slice_active && ( $worker_dead || $age >= self::PICK_STALL_SEC );
+			Job_Action_Scheduler::run_queue_inline( $force_inline );
 
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;
 			self::save_job( $job );
-		} elseif ( $should_tick ) {
+		} elseif ( $should_tick && ! $slice_active ) {
 			self::run_inline_worker_tick( 2, 90 );
 
 			$job = self::get_job_raw();
@@ -4776,7 +4808,10 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		self::force_release_step_lock_if_idle();
+		if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {
+			self::force_release_step_lock_if_idle();
+		}
+
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::clear_slice_mutex_if_stale();
 
@@ -4784,7 +4819,7 @@ final class Activity_Logger {
 			self::save_job( $job );
 		}
 
-		if ( Job_Action_Scheduler::is_available() ) {
+		if ( Job_Action_Scheduler::is_available() && ! Job_Action_Scheduler::is_slice_execution_active() ) {
 			Job_Action_Scheduler::enqueue_next( true, 0 );
 		}
 

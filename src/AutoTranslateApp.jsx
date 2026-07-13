@@ -97,6 +97,10 @@ function isCronHealthy(job) {
     return true;
   }
 
+  if (job?.status === 'running' && (job?.as_slice_active || job?.as_running) && activityAge < 180) {
+    return true;
+  }
+
   if (job?.status === 'running' && elementorStalled) {
     return false;
   }
@@ -706,6 +710,8 @@ export default function AutoTranslateApp() {
         const activityAge = Math.max(0, now - latestWorkerStamp(data));
         const elementorNeedsKick =
           isElementorPartialJob(data) &&
+          !data?.as_slice_active &&
+          !data?.as_running &&
           activityAge > 8 &&
           Number(data?.api_cooldown_remaining || 0) <= 0;
 
@@ -732,10 +738,12 @@ export default function AutoTranslateApp() {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
             const useHeavyTick =
-              isElementorPartialJob(data) ||
+              !data?.as_slice_active &&
+              !data?.as_running &&
+              (isElementorPartialJob(data) ||
               activityAge >= CRON_STALE_SEC ||
               elementorNeedsKick ||
-              Boolean(data.elementor_progress_stalled);
+              Boolean(data.elementor_progress_stalled));
             const recovered = useHeavyTick
               ? await jobStep().catch(() => ensureServerWorker())
               : await ensureServerWorker();
