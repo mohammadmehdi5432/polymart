@@ -4458,6 +4458,206 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Read whether a per-post translation lock is currently held.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return array{held: bool, age_sec: int, owned_by_self: bool}
+	 */
+	public static function get_translation_lock_status( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return array(
+				'held'          => false,
+				'age_sec'       => 0,
+				'owned_by_self' => false,
+			);
+		}
+
+		$keys  = self::get_translation_lock_keys( $post_id, $lang );
+		$claim = absint( get_option( $keys['claim'], 0 ) );
+		$lock  = get_transient( $keys['key'] );
+		$stamp = max( $claim, $lock ? absint( $lock ) : 0 );
+		$age   = $stamp > 0 ? max( 0, time() - $stamp ) : 0;
+
+		return array(
+			'held'          => $stamp > 0 && $age < self::TRANSLATION_LOCK_TTL,
+			'age_sec'       => $age,
+			'owned_by_self' => self::owns_translation_lock( $post_id, $lang ),
+		);
+	}
+
+	/**
+	 * Prepare the per-post lock for an explicit admin metabox translate action.
+	 *
+	 * Metabox requests may take over stale locks; they must not fight a live bulk
+	 * worker that is actively translating the same post.
+	 *
+	 * @param int  $post_id      Post ID.
+	 * @param string $lang       Language code.
+	 * @param bool $force_unlock When true, always clear the lock.
+	 * @return bool True when the metabox may acquire the lock.
+	 */
+	public static function prepare_admin_metabox_translation_lock( $post_id, $lang, $force_unlock = false ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( $force_unlock ) {
+			self::release_translation_lock( $post_id, $lang, true );
+
+			return true;
+		}
+
+		$status = self::get_translation_lock_status( $post_id, $lang );
+
+		if ( ! $status['held'] || $status['owned_by_self'] ) {
+			return true;
+		}
+
+		$bulk_on_post = false;
+
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			$job    = \PolymartAI\Activity_Logger::get_job( false );
+			$pinned = absint( $job['partial_post_id'] ?? 0 );
+
+			if ( $pinned <= 0 ) {
+				$pinned = absint( $job['current_post_id'] ?? 0 );
+			}
+
+			$bulk_on_post = ( $pinned === $post_id );
+		}
+
+		if (
+			$bulk_on_post
+			&& (int) $status['age_sec'] < 30
+			&& \PolymartAI\Activity_Logger::is_bulk_worker_lively( 30 )
+		) {
+			return false;
+		}
+
+		self::release_translation_lock( $post_id, $lang, true );
+
+		return true;
+	}
+
+	/**
+	 * Elementor diagnostics for the page edit metabox scan panel.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return array<string, mixed>
+	 */
+	public static function get_elementor_scan_diagnostics( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$empty   = array(
+			'active'                 => false,
+			'source_field_count'     => 0,
+			'remaining_field_count'  => 0,
+			'translated_field_count' => 0,
+			'chunk_done'             => 0,
+			'chunk_total'            => 0,
+			'chunk_progress'         => '',
+			'partial_phase'          => '',
+			'has_saved_json'         => false,
+			'saved_json_has_persian' => false,
+			'remaining_samples'      => array(),
+			'lock'                   => self::get_translation_lock_status( $post_id, $lang ),
+			'bulk_job_running'       => \PolymartAI\Activity_Logger::is_bulk_job_running(),
+			'bulk_job_on_post'       => false,
+		);
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return $empty;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return array_merge(
+				$empty,
+				array(
+					'active' => true,
+					'error'  => __( 'داده Elementor (_elementor_data) خالی است.', 'polymart-ai' ),
+				)
+			);
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return array_merge(
+				$empty,
+				array(
+					'active' => true,
+					'error'  => __( 'JSON Elementor نامعتبر است.', 'polymart-ai' ),
+				)
+			);
+		}
+
+		$state       = self::get_job_partial_state( $post_id, $lang );
+		$state       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		$state_map   = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$map         = array_merge(
+			self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data ),
+			$state_map
+		);
+		$skipped     = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$source      = self::collect_elementor_translation_payload( $data );
+		$remaining   = self::filter_remaining_elementor_payload( $source, $map, $skipped );
+		$chunk_queue = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+		$progress    = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$samples     = array();
+
+		foreach ( array_slice( $remaining, 0, 8, true ) as $path => $text ) {
+			$samples[] = array(
+				'path'    => (string) $path,
+				'preview' => wp_trim_words( wp_strip_all_tags( html_entity_decode( (string) $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ), 14, '…' ),
+			);
+		}
+
+		$bulk_on_post = false;
+
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			$job    = \PolymartAI\Activity_Logger::get_job( false );
+			$pinned = absint( $job['partial_post_id'] ?? 0 );
+
+			if ( $pinned <= 0 ) {
+				$pinned = absint( $job['current_post_id'] ?? 0 );
+			}
+
+			$bulk_on_post = ( $pinned === $post_id );
+		}
+
+		$saved_raw = get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
+
+		return array(
+			'active'                 => true,
+			'source_field_count'     => count( $source ),
+			'remaining_field_count'  => count( $remaining ),
+			'translated_field_count' => max( 0, count( $source ) - count( $remaining ) ),
+			'chunk_done'             => (int) $progress['done'],
+			'chunk_total'            => max( 1, (int) $progress['total'], (int) $chunk_queue['total'] ),
+			'chunk_progress'         => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+			'partial_phase'          => (string) ( $state['phase'] ?? '' ),
+			'pending_api_chunks'     => count( $chunk_queue['pending'] ),
+			'has_saved_json'         => is_string( $saved_raw ) && '' !== trim( $saved_raw ),
+			'saved_json_has_persian' => self::stored_elementor_translation_has_persian( $post_id, $lang ),
+			'remaining_samples'      => $samples,
+			'lock'                   => self::get_translation_lock_status( $post_id, $lang ),
+			'bulk_job_running'       => \PolymartAI\Activity_Logger::is_bulk_job_running(),
+			'bulk_job_on_post'       => $bulk_on_post,
+			'error'                  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
+		);
+	}
+
+	/**
 	 * Whether every Elementor field is translated and persisted for a job slice.
 	 *
 	 * @param int                  $post_id Post ID.

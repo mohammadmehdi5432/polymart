@@ -30,6 +30,7 @@ final class Ajax_Handler {
 		add_action( 'wp_ajax_polymart_retranslate_product', array( $this, 'handle_retranslate_product' ) );
 		add_action( 'wp_ajax_polymart_scan_translation_gaps', array( $this, 'handle_scan_translation_gaps' ) );
 		add_action( 'wp_ajax_polymart_translate_post_complete', array( $this, 'handle_translate_post_complete' ) );
+		add_action( 'wp_ajax_polymart_release_translation_lock', array( $this, 'handle_release_translation_lock' ) );
 	}
 
 	/**
@@ -243,6 +244,7 @@ final class Ajax_Handler {
 		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
 		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
 		$force   = ! empty( $_POST['force'] );
+		$unlock  = ! empty( $_POST['unlock'] ) || $force;
 
 		if ( ! $post_id ) {
 			wp_send_json_error(
@@ -271,13 +273,28 @@ final class Ajax_Handler {
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		}
 
-		$result = self::run_translation_slices_until_done( $post_id, $lang );
+		if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
+			wp_send_json_error(
+				array(
+					'message' => self::format_lock_blocked_message( $post_id, $lang ),
+					'scan'    => self::build_scan_response( $post_id, $lang ),
+					'locked'  => true,
+				),
+				409
+			);
+		}
+
+		$result = self::run_translation_slices_until_done( $post_id, $lang, $unlock );
 
 		if ( is_wp_error( $result ) ) {
+			$error_data = $result->get_error_data();
 			wp_send_json_error(
 				array(
 					'message' => $result->get_error_message(),
-					'scan'    => self::build_scan_response( $post_id, $lang ),
+					'scan'    => is_array( $error_data ) && ! empty( $error_data['scan'] )
+						? $error_data['scan']
+						: self::build_scan_response( $post_id, $lang ),
+					'locked'  => is_array( $error_data ) && ! empty( $error_data['locked'] ),
 				),
 				$this->error_status_code( $result )
 			);
@@ -305,13 +322,49 @@ final class Ajax_Handler {
 	}
 
 	/**
+	 * Force-release a stale per-post translation lock from the edit screen.
+	 *
+	 * @return void
+	 */
+	public function handle_release_translation_lock() {
+		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
+
+		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
+		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
+
+		if ( ! $post_id || ! current_user_can( 'edit_post', $post_id ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شما اجازه این عملیات را ندارید.', 'polymart-ai' ) ),
+				403
+			);
+		}
+
+		if ( ! self::is_valid_target_language( $lang ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'زبان مقصد نامعتبر است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true );
+
+		wp_send_json_success(
+			array(
+				'message' => __( 'قفل ترجمه آزاد شد — دوباره «ترجمه و تکمیل» را بزنید.', 'polymart-ai' ),
+				'scan'    => self::build_scan_response( $post_id, $lang ),
+			)
+		);
+	}
+
+	/**
 	 * Execute bounded translation slices for one post/language pair.
 	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Target language code.
+	 * @param bool   $unlock  Whether stale locks were already cleared.
 	 * @return array<string, mixed>|\WP_Error
 	 */
-	private static function run_translation_slices_until_done( $post_id, $lang ) {
+	private static function run_translation_slices_until_done( $post_id, $lang, $unlock = false ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 
@@ -324,13 +377,42 @@ final class Ajax_Handler {
 		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 40, $post_id, $lang );
 		$slices_run  = 0;
 		$last_slice  = array();
+		$lock_retried = $unlock;
 
 		while ( $slices_run < $max_slices && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
+			if ( $slices_run > 0 ) {
+				Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, false );
+			}
+
 			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
 			++$slices_run;
 			$last_slice = is_array( $slice ) ? $slice : array();
 
+			if (
+				is_wp_error( $slice )
+				&& 'polymart_ai_translation_in_progress' === $slice->get_error_code()
+				&& ! $lock_retried
+			) {
+				if ( Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true ) ) {
+					$lock_retried = true;
+					$slice        = Post_Translator::process_job_translation_slice( $post_id, $lang );
+					++$slices_run;
+					$last_slice   = is_array( $slice ) ? $slice : array();
+				}
+			}
+
 			if ( is_wp_error( $slice ) ) {
+				if ( 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
+					return new \WP_Error(
+						'polymart_ai_translation_in_progress',
+						self::format_lock_blocked_message( $post_id, $lang ),
+						array(
+							'locked' => true,
+							'scan'   => self::build_scan_response( $post_id, $lang ),
+						)
+					);
+				}
+
 				if (
 					Post_Translator::is_recoverable_job_slice_error( $slice )
 					&& Post_Translator::job_partial_state_has_progress( $post_id, $lang )
@@ -412,19 +494,45 @@ final class Ajax_Handler {
 			}
 		}
 
+		$elementor = Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang );
+		$lock      = Post_Translator::get_translation_lock_status( $post_id, $lang );
+
 		return array(
-			'lang'             => $lang,
-			'lang_label'       => $lang_label,
-			'status'           => $status,
-			'status_label'     => self::get_status_label_for_scan( $status ),
-			'fields'           => $fields,
-			'missing'          => array_values( array_map( 'strval', (array) ( $gaps['missing'] ?? array() ) ) ),
-			'notes'            => array_values( array_map( 'strval', (array) ( $gaps['notes'] ?? array() ) ) ),
-			'uses_elementor'   => Post_Translator::uses_elementor_builder( $post_id ),
-			'elementor_error'  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
+			'lang'               => $lang,
+			'lang_label'         => $lang_label,
+			'status'             => $status,
+			'status_label'       => self::get_status_label_for_scan( $status ),
+			'fields'             => $fields,
+			'missing'            => array_values( array_map( 'strval', (array) ( $gaps['missing'] ?? array() ) ) ),
+			'notes'              => array_values( array_map( 'strval', (array) ( $gaps['notes'] ?? array() ) ) ),
+			'uses_elementor'     => Post_Translator::uses_elementor_builder( $post_id ),
+			'elementor_error'    => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
 			'elementor_progress' => $progress,
-			'needs_work'       => 'translated' !== $status || ! empty( $gaps['missing'] ),
+			'elementor'          => $elementor,
+			'lock'               => $lock,
+			'needs_work'         => 'translated' !== $status || ! empty( $gaps['missing'] ),
 		);
+	}
+
+	/**
+	 * Explain why a metabox translate action is blocked by a lock.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return string
+	 */
+	private static function format_lock_blocked_message( $post_id, $lang ) {
+		$diag = Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang );
+
+		if ( ! empty( $diag['bulk_job_on_post'] ) ) {
+			return __( 'ترجمه خودکار همین برگه را روی سرور در حال پردازش است — چند لحظه صبر کنید یا ترجمه خودکار را موقتاً متوقف کنید.', 'polymart-ai' );
+		}
+
+		if ( ! empty( $diag['bulk_job_running'] ) ) {
+			return __( 'یک ترجمه خودکار در حال اجراست و قفل این برگه را نگه داشته — «آزاد کردن قفل» را بزنید یا ترجمه خودکار را متوقف کنید.', 'polymart-ai' );
+		}
+
+		return __( 'قفل ترجمه گیر کرده — دکمه «آزاد کردن قفل» را بزنید و دوباره تلاش کنید.', 'polymart-ai' );
 	}
 
 	/**
@@ -499,10 +607,19 @@ final class Ajax_Handler {
 			'polymart_ai_invalid_post',
 			'polymart_ai_missing_credentials',
 			'polymart_ai_empty_source',
+			'polymart_ai_translation_in_progress',
 		);
 
 		if ( in_array( $error->get_error_code(), $client_errors, true ) ) {
-			return 'polymart_ai_forbidden' === $error->get_error_code() ? 403 : 400;
+			if ( 'polymart_ai_forbidden' === $error->get_error_code() ) {
+				return 403;
+			}
+
+			if ( 'polymart_ai_translation_in_progress' === $error->get_error_code() ) {
+				return 409;
+			}
+
+			return 400;
 		}
 
 		return 500;

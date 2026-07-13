@@ -118,6 +118,9 @@ final class Meta_Box {
 								<span class="polymart-ai-translate-complete-btn__label"><?php esc_html_e( 'ترجمه و تکمیل این زبان', 'polymart-ai' ); ?></span>
 								<span class="polymart-ai-translate-complete-btn__spinner spinner" style="float:none;margin:0 8px 0 0;display:none;"></span>
 							</button>
+							<button type="button" class="button polymart-ai-release-lock-btn" style="display:none;">
+								<?php esc_html_e( 'آزاد کردن قفل ترجمه', 'polymart-ai' ); ?>
+							</button>
 						<?php endif; ?>
 						<button type="button" class="button button-primary polymart-ai-retranslate-all-btn">
 							<span class="polymart-ai-retranslate-all-btn__label"><?php esc_html_e( 'ترجمه مجدد همه زبان‌ها و ذخیره', 'polymart-ai' ); ?></span>
@@ -608,6 +611,17 @@ final class Meta_Box {
 					'scanDoneHeading'    => __( 'فیلدهای ترجمه‌شده:', 'polymart-ai' ),
 					'scanStatus'         => __( 'وضعیت:', 'polymart-ai' ),
 					'activeLangHint'     => __( 'زبان فعال تب بالا برای اسکن و ترجمه استفاده می‌شود.', 'polymart-ai' ),
+					'elementorHeading'   => __( 'جزئیات Elementor', 'polymart-ai' ),
+					'elementorFields'    => __( 'متن‌های فارسی در JSON', 'polymart-ai' ),
+					'elementorRemaining'   => __( 'هنوز ترجمه نشده', 'polymart-ai' ),
+					'elementorTranslated' => __( 'ترجمه‌شده در JSON', 'polymart-ai' ),
+					'elementorChunks'      => __( 'پیشرفت بخش‌های API', 'polymart-ai' ),
+					'elementorSamples'     => __( 'نمونه متن‌های باقی‌مانده:', 'polymart-ai' ),
+					'lockHeld'             => __( 'قفل ترجمه فعال است — اگر گیر کرد «آزاد کردن قفل» را بزنید.', 'polymart-ai' ),
+					'bulkJobOnPost'        => __( 'ترجمه خودکار همین برگه را روی سرور در حال پردازش است.', 'polymart-ai' ),
+					'releaseLock'          => __( 'آزاد کردن قفل ترجمه', 'polymart-ai' ),
+					'releaseLockSuccess'   => __( 'قفل آزاد شد — دوباره «ترجمه و تکمیل» را بزنید.', 'polymart-ai' ),
+					'releasingLock'        => __( 'در حال آزاد کردن قفل…', 'polymart-ai' ),
 				),
 			)
 		);
