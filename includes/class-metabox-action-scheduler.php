@@ -34,6 +34,7 @@ final class Metabox_Action_Scheduler {
 
 	const STATUS_META_PREFIX = '_polymart_ai_metabox_as_';
 	const BATCH_META_KEY     = '_polymart_ai_metabox_as_batch';
+	const FALLBACK_IDLE_SEC  = 20;
 
 	/**
 	 * @var int
@@ -336,6 +337,19 @@ final class Metabox_Action_Scheduler {
 		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
 		Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
 
+		// If Action Scheduler (or WP-Cron) is jammed, break stale plugin locks before enqueue.
+		try {
+			Activity_Logger::release_stale_locks_for_as( 60 );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
+		// Best-effort queue nudge: if AS runners are stuck behind migration/runner locks,
+		// attempt to run due actions (and one inline fallback) before enqueueing another row.
+		try {
+			self::run_queue_inline( true );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
 		self::update_status(
 			$post_id,
 			$lang,
@@ -350,11 +364,16 @@ final class Metabox_Action_Scheduler {
 
 		$action_id = self::schedule_slice( $post_id, $lang, 0 );
 
+		// DB insertion verification: if AS could not create a row (table locked / migration),
+		// immediately fall back to an inline slice so the metabox poll loop can act as the worker.
 		if ( $action_id <= 0 ) {
-			return new \WP_Error(
-				'polymart_ai_as_schedule_failed',
-				__( 'صف Action Scheduler ساخته نشد — دوباره تلاش کنید.', 'polymart-ai' )
-			);
+			$inline = self::run_inline_fallback_slice( $post_id, $lang, 'enqueue_failed' );
+
+			if ( is_wp_error( $inline ) ) {
+				return $inline;
+			}
+
+			return true;
 		}
 
 		Activity_Logger::log(
@@ -370,6 +389,153 @@ final class Metabox_Action_Scheduler {
 		);
 
 		return true;
+	}
+
+	/**
+	 * Best-effort queue + inline worker fallback for jammed Action Scheduler environments.
+	 *
+	 * Runs at most one bounded slice, updates metabox status meta, and (when possible)
+	 * schedules the next slice.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @param string $reason  Debug hint.
+	 * @return array<string, mixed>|true|\WP_Error
+	 */
+	public static function run_inline_fallback_slice( $post_id, $lang, $reason = '' ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$reason  = sanitize_key( (string) $reason );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return new \WP_Error( 'polymart_ai_invalid_request', __( 'شناسه مطلب یا زبان نامعتبر است.', 'polymart-ai' ) );
+		}
+
+		// First try: let AS queue runner process due actions; if it processes nothing,
+		// force one direct pending metabox action inline.
+		try {
+			self::run_queue_inline( true );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+
+		// Second try: if still stuck, run one job slice directly.
+		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
+
+		if ( is_wp_error( $slice ) ) {
+			if ( 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
+				self::update_status(
+					$post_id,
+					$lang,
+					array(
+						'status'  => 'running',
+						'phase'   => 'elementor',
+						'message' => $slice->get_error_message(),
+						'error'   => '',
+					)
+				);
+				return $slice;
+			}
+
+			self::mark_failed( $post_id, $lang, $slice->get_error_message() );
+			return $slice;
+		}
+
+		if ( is_array( $slice ) && ! empty( $slice['done'] ) ) {
+			self::update_status(
+				$post_id,
+				$lang,
+				array(
+					'status'       => 'complete',
+					'phase'        => (string) ( $slice['phase'] ?? 'complete' ),
+					'message'      => (string) ( $slice['message'] ?? __( 'ترجمه تکمیل شد.', 'polymart-ai' ) ),
+					'completed_at' => time(),
+					'error'        => '',
+				)
+			);
+			return $slice;
+		}
+
+		// Keep UI progress alive even when AS cannot persist its own status.
+		self::update_status(
+			$post_id,
+			$lang,
+			array(
+				'status'         => 'running',
+				'phase'          => (string) ( is_array( $slice ) ? ( $slice['phase'] ?? 'elementor' ) : 'elementor' ),
+				'phase_progress' => (string) ( is_array( $slice ) ? ( $slice['phase_progress'] ?? '' ) : '' ),
+				'message'        => (string) (
+					is_array( $slice ) && ! empty( $slice['message'] )
+						? $slice['message']
+						: __( 'Action Scheduler فعال نیست — اجرای مستقیم توسط Polling…', 'polymart-ai' )
+				),
+				'error'          => '',
+				'fallback'       => $reason ? $reason : 'inline',
+			)
+		);
+
+		// Try to keep the AS chain alive if DB accepts inserts again.
+		$action_id = self::schedule_slice( $post_id, $lang, 0 );
+		if ( $action_id > 0 ) {
+			try {
+				self::run_queue_inline( false );
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			}
+		}
+
+		return is_array( $slice ) ? $slice : true;
+	}
+
+	/**
+	 * Inspect pending/running state for one post/lang pair.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return array{pending: int, running: int}
+	 */
+	public static function get_queue_counts( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return array( 'pending' => 0, 'running' => 0 );
+		}
+
+		$pending = 0;
+		$running = 0;
+
+		foreach ( array( \ActionScheduler_Store::STATUS_PENDING, \ActionScheduler_Store::STATUS_RUNNING ) as $store_status ) {
+			$actions = as_get_scheduled_actions(
+				array(
+					'hook'     => self::HOOK,
+					'group'    => self::GROUP,
+					'status'   => $store_status,
+					'per_page' => 20,
+				)
+			);
+
+			foreach ( $actions as $action ) {
+				if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) ) {
+					continue;
+				}
+
+				$args = $action->get_args();
+
+				if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
+					continue;
+				}
+
+				if ( \ActionScheduler_Store::STATUS_PENDING === $store_status ) {
+					++$pending;
+				} else {
+					++$running;
+				}
+			}
+		}
+
+		return array(
+			'pending' => $pending,
+			'running' => $running,
+		);
 	}
 
 	/**
