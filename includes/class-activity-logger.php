@@ -357,11 +357,17 @@ final class Activity_Logger {
 	 * Mark the metabox AS worker trusted and impersonate a user who may edit the post.
 	 *
 	 * Must run before lock acquisition or translation slices in handle_metabox_action().
+	 * Never call from admin AJAX — pass $from_as_callback = true only from the AS hook.
 	 *
-	 * @param int $post_id Post being translated.
+	 * @param int  $post_id          Post being translated.
+	 * @param bool $from_as_callback When false, this is a no-op (browser/AJAX safety).
 	 * @return void
 	 */
-	public static function begin_metabox_as_worker( $post_id ) {
+	public static function begin_metabox_as_worker( $post_id, $from_as_callback = false ) {
+		if ( ! $from_as_callback ) {
+			return;
+		}
+
 		self::$trusted_metabox_as_tick = true;
 		self::$trusted_as_tick         = true;
 		self::$trusted_job_tick        = true;

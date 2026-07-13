@@ -382,6 +382,24 @@ final class Ajax_Handler {
 				);
 			}
 
+			$action_id = absint( $queued );
+
+			if ( $action_id <= 0 ) {
+				$message = __( 'خطا در ثبت صف Action Scheduler — کار در پس‌زمینه شروع نشد.', 'polymart-ai' );
+				update_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, $message );
+
+				if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
+					@ob_clean();
+				}
+				wp_send_json_error(
+					array(
+						'message' => $message,
+						'scan'    => self::build_scan_response( $post_id, $lang ),
+					),
+					500
+				);
+			}
+
 			$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
 			$scan = self::build_scan_response( $post_id, $lang );
 
@@ -391,6 +409,7 @@ final class Ajax_Handler {
 			wp_send_json_success(
 				array(
 					'queued'         => true,
+					'action_id'      => $action_id,
 					'done'           => false,
 					'background'     => true,
 					'phase'          => (string) ( $poll['phase'] ?? '' ),
@@ -510,6 +529,10 @@ final class Ajax_Handler {
 
 		if ( $unlock ) {
 			Post_Translator::release_stale_translation_lock( $post_id, $lang, 90 );
+		}
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) && Metabox_Action_Scheduler::is_available() ) {
+			Metabox_Action_Scheduler::run_poll_recovery( $post_id, $lang );
 		}
 
 		$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );

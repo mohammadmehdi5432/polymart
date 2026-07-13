@@ -285,61 +285,107 @@ final class Metabox_Action_Scheduler {
 	 * @return void
 	 */
 	public static function cancel_pending( $post_id, $lang ) {
-		if ( ! self::is_available() ) {
-			return;
-		}
-
-		$post_id = absint( $post_id );
-		$lang    = sanitize_key( (string) $lang );
-
-		if ( $post_id <= 0 || '' === $lang ) {
-			return;
-		}
-
-		self::recover_stale_running_actions( $post_id, $lang, self::STALE_RUNNING_SEC );
-
-		if ( ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
-			return;
-		}
-
-		$store = \ActionScheduler_Store::instance();
-
-		foreach ( array( \ActionScheduler_Store::STATUS_PENDING, \ActionScheduler_Store::STATUS_RUNNING ) as $store_status ) {
-			$actions = as_get_scheduled_actions(
-				array(
-					'hook'     => self::HOOK,
-					'group'    => self::GROUP,
-					'status'   => $store_status,
-					'per_page' => 50,
-				)
-			);
-
-			foreach ( $actions as $action ) {
-				if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) || ! method_exists( $action, 'get_id' ) ) {
-					continue;
-				}
-
-				$args = $action->get_args();
-
-				if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
-					continue;
-				}
-
-				try {
-					$store->cancel_action( $action->get_id() );
-				} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
-				}
-			}
-		}
+		self::purge_all_queue_actions( $post_id, $lang, 0 );
 	}
 
 	/**
+	 * Remove every metabox AS row for one post/language (pending, running, failed).
+	 *
+	 * Prevents ghost jobs where stale rows block as_schedule_single_action silently.
+	 *
+	 * @param int $post_id            Post ID.
+	 * @param string $lang            Language code.
+	 * @param int $preserve_action_id Skip this action ID (current in-flight slice).
+	 * @return int Number of rows cleared.
+	 */
+	public static function purge_all_queue_actions( $post_id, $lang, $preserve_action_id = 0 ) {
+		if ( ! self::is_available() ) {
+			return 0;
+		}
+
+		$post_id            = absint( $post_id );
+		$lang               = sanitize_key( (string) $lang );
+		$preserve_action_id = absint( $preserve_action_id );
+
+		if ( $post_id <= 0 || '' === $lang || ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		$store    = \ActionScheduler_Store::instance();
+		$removed  = 0;
+		$statuses = array(
+			\ActionScheduler_Store::STATUS_PENDING,
+			\ActionScheduler_Store::STATUS_RUNNING,
+			\ActionScheduler_Store::STATUS_FAILED,
+			\ActionScheduler_Store::STATUS_CANCELED,
+		);
+
+		foreach ( $statuses as $store_status ) {
+			$page = 1;
+
+			do {
+				$actions = as_get_scheduled_actions(
+					array(
+						'hook'     => self::HOOK,
+						'group'    => self::GROUP,
+						'status'   => $store_status,
+						'per_page' => 50,
+						'page'     => $page,
+					)
+				);
+
+				if ( empty( $actions ) ) {
+					break;
+				}
+
+				foreach ( $actions as $action ) {
+					if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) || ! method_exists( $action, 'get_id' ) ) {
+						continue;
+					}
+
+					$args      = $action->get_args();
+					$action_id = absint( $action->get_id() );
+
+					if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
+						continue;
+					}
+
+					if ( $preserve_action_id > 0 && $action_id === $preserve_action_id ) {
+						continue;
+					}
+
+					try {
+						if ( \ActionScheduler_Store::STATUS_RUNNING === $store_status ) {
+							$store->mark_failure( $action_id );
+						} else {
+							$store->cancel_action( $action_id );
+						}
+
+						++$removed;
+					} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+					}
+				}
+
+				++$page;
+			} while ( count( $actions ) >= 50 );
+		}
+
+		if ( $preserve_action_id <= 0 ) {
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+		}
+
+		return $removed;
+	}
+
+	/**
+	 * Whether Action Scheduler has a live pending or in-progress metabox action for this post/lang.
+	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Language code.
 	 * @return bool
 	 */
-	public static function has_pending_or_running( $post_id, $lang ) {
-		if ( ! self::is_available() ) {
+	public static function has_live_as_actions( $post_id, $lang ) {
+		if ( ! self::is_available() || ! function_exists( 'as_get_scheduled_actions' ) ) {
 			return false;
 		}
 
@@ -347,16 +393,6 @@ final class Metabox_Action_Scheduler {
 		$lang    = sanitize_key( (string) $lang );
 
 		if ( $post_id <= 0 || '' === $lang ) {
-			return false;
-		}
-
-		$status = (string) ( self::get_status( $post_id, $lang )['status'] ?? '' );
-
-		if ( 'running' === $status ) {
-			return true;
-		}
-
-		if ( ! function_exists( 'as_get_scheduled_actions' ) ) {
 			return false;
 		}
 
@@ -387,12 +423,159 @@ final class Metabox_Action_Scheduler {
 	}
 
 	/**
+	 * Whether the metabox job meta says "running" but AS has no live queue rows (ghost/stalled).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function is_job_stalled( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::is_available() ) {
+			return false;
+		}
+
+		if ( self::has_live_as_actions( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$status     = self::get_status( $post_id, $lang );
+		$meta_state = (string) ( $status['status'] ?? '' );
+
+		if ( 'running' !== $meta_state ) {
+			return false;
+		}
+
+		$gaps = Post_Translator::get_translation_gaps( $post_id, $lang );
+
+		if ( 'translated' === (string) ( $gaps['status'] ?? '' ) && empty( $gaps['missing'] ) ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Release locks and mark a ghost/stalled job so poll-driven fallback can resume work.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	public static function resolve_ghost_job( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		Post_Translator::release_translation_lock( $post_id, $lang, true );
+		Post_Translator::release_stale_translation_lock( $post_id, $lang, 0 );
+
+		self::update_status(
+			$post_id,
+			$lang,
+			array(
+				'status'   => 'running',
+				'message'  => __( 'صف Action Scheduler یافت نشد — ادامه با Polling…', 'polymart-ai' ),
+				'error'    => '',
+				'fallback' => 'ghost_recovery',
+			)
+		);
+
+		Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: language code */
+				__( 'مatabox poll — #%1$d (%2$s): وضعیت Ghost/Stalled — قفل آزاد شد، Fallback فعال شد.', 'polymart-ai' ),
+				$post_id,
+				$lang
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_poll' )
+		);
+	}
+
+	/**
+	 * Self-healing steps invoked by the metabox status poll (kill zombies, nudge AS, inline fallback).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	public static function run_poll_recovery( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::is_available() ) {
+			return;
+		}
+
+		if ( ! Post_Translator::uses_elementor_builder( $post_id ) ) {
+			return;
+		}
+
+		self::kill_stale_running_now( $post_id, $lang, 75 );
+
+		$meta_state = (string) ( self::get_status( $post_id, $lang )['status'] ?? '' );
+
+		if ( 'running' === $meta_state ) {
+			self::recover_stale_and_nudge( $post_id, $lang );
+		}
+
+		if ( self::is_job_stalled( $post_id, $lang ) ) {
+			self::resolve_ghost_job( $post_id, $lang );
+			self::run_inline_fallback_slice( $post_id, $lang, 'poll_stall' );
+		}
+	}
+
+	/**
+	 * Whether a metabox translation is actively queued (live AS rows or poll-driven inline work).
+	 *
+	 * Does not treat orphaned "running" meta without AS rows as queued — that is a stalled/ghost job.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function has_pending_or_running( $post_id, $lang ) {
+		if ( ! self::is_available() ) {
+			return false;
+		}
+
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( self::has_live_as_actions( $post_id, $lang ) ) {
+			return true;
+		}
+
+		$status = self::get_status( $post_id, $lang );
+
+		if ( 'running' === (string) ( $status['status'] ?? '' ) ) {
+			if ( self::is_job_stalled( $post_id, $lang ) ) {
+				return false;
+			}
+
+			return ! empty( $status['fallback'] );
+		}
+
+		return false;
+	}
+
+	/**
 	 * Queue background translation for one post/language pair.
 	 *
 	 * @param int                  $post_id Post ID.
 	 * @param string               $lang    Language code.
 	 * @param array<string, mixed> $options force, unlock.
-	 * @return true|\WP_Error
+	 * @return int|\WP_Error Action Scheduler action ID on success.
 	 */
 	public static function start_translation( $post_id, $lang, array $options = array() ) {
 		$post_id = absint( $post_id );
@@ -415,13 +598,7 @@ final class Metabox_Action_Scheduler {
 			self::force_unlock_post( $post_id, $lang );
 		}
 
-		if ( ! $force && self::has_pending_or_running( $post_id, $lang ) ) {
-			return true;
-		}
-
-		if ( $force ) {
-			self::cancel_pending( $post_id, $lang );
-		}
+		self::purge_all_queue_actions( $post_id, $lang, 0 );
 
 		if ( $force ) {
 			Post_Translator::clear_post_language_translations( $post_id, $lang );
@@ -442,13 +619,6 @@ final class Metabox_Action_Scheduler {
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
 
-		// Best-effort queue nudge: if AS runners are stuck behind migration/runner locks,
-		// attempt to run due actions (and one inline fallback) before enqueueing another row.
-		try {
-			self::run_queue_inline( true );
-		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
-		}
-
 		self::update_status(
 			$post_id,
 			$lang,
@@ -461,18 +631,15 @@ final class Metabox_Action_Scheduler {
 			)
 		);
 
-		$action_id = self::schedule_slice( $post_id, $lang, 0 );
+		$action_id = self::schedule_slice( $post_id, $lang, 0, 0 );
 
-		// DB insertion verification: if AS could not create a row (table locked / migration),
-		// immediately fall back to an inline slice so the metabox poll loop can act as the worker.
-		if ( $action_id <= 0 ) {
-			$inline = self::run_inline_fallback_slice( $post_id, $lang, 'enqueue_failed' );
+		if ( $action_id <= 0 || ! self::verify_scheduled_action( $action_id, $post_id, $lang ) ) {
+			return self::fail_enqueue( $post_id, $lang );
+		}
 
-			if ( is_wp_error( $inline ) ) {
-				return $inline;
-			}
-
-			return true;
+		try {
+			self::run_queue_inline( false );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
 
 		Activity_Logger::log(
@@ -487,7 +654,83 @@ final class Metabox_Action_Scheduler {
 			array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
 		);
 
-		return true;
+		return $action_id;
+	}
+
+	/**
+	 * Record a hard enqueue failure and return a WP_Error for AJAX callers.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return \WP_Error
+	 */
+	private static function fail_enqueue( $post_id, $lang ) {
+		$message = __( 'خطا در ثبت صف Action Scheduler — کار در پس‌زمینه شروع نشد.', 'polymart-ai' );
+
+		update_post_meta( $post_id, '_polymart_ai_elementor_error_' . sanitize_key( (string) $lang ), $message );
+
+		Post_Translator::release_translation_lock( $post_id, $lang, true );
+
+		self::update_status(
+			$post_id,
+			$lang,
+			array(
+				'status'  => 'failed',
+				'message' => $message,
+				'error'   => $message,
+			)
+		);
+
+		Activity_Logger::log(
+			'error',
+			sprintf(
+				/* translators: 1: post ID, 2: language code */
+				__( 'مatabox AS — #%1$d (%2$s): ثبت صف Action Scheduler ناموفق بود.', 'polymart-ai' ),
+				absint( $post_id ),
+				sanitize_key( (string) $lang )
+			),
+			array(
+				'post_id' => absint( $post_id ),
+				'lang'    => sanitize_key( (string) $lang ),
+				'source'  => 'metabox_as_enqueue',
+			)
+		);
+
+		return new \WP_Error( 'polymart_ai_as_enqueue_failed', $message );
+	}
+
+	/**
+	 * Confirm an Action Scheduler row exists for the expected metabox job.
+	 *
+	 * @param int    $action_id Scheduled action ID.
+	 * @param int    $post_id   Post ID.
+	 * @param string $lang      Language code.
+	 * @return bool
+	 */
+	private static function verify_scheduled_action( $action_id, $post_id, $lang ) {
+		$action_id = absint( $action_id );
+		$post_id   = absint( $post_id );
+		$lang      = sanitize_key( (string) $lang );
+
+		if ( $action_id <= 0 || $post_id <= 0 || '' === $lang || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return false;
+		}
+
+		try {
+			$store  = \ActionScheduler_Store::instance();
+			$action = $store->fetch_action( $action_id );
+
+			if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) ) {
+				return false;
+			}
+
+			$args = $action->get_args();
+
+			return absint( $args['post_id'] ?? 0 ) === $post_id
+				&& sanitize_key( (string) ( $args['lang'] ?? '' ) ) === $lang;
+		} catch ( \Throwable $e ) {
+			return false;
+		}
 	}
 
 	/**
@@ -517,21 +760,8 @@ final class Metabox_Action_Scheduler {
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
 
-		// Second try: if still stuck, run one job slice directly.
-		$bootstrapped_worker = false;
-
-		if ( get_current_user_id() <= 0 ) {
-			Activity_Logger::begin_metabox_as_worker( $post_id );
-			$bootstrapped_worker = true;
-		}
-
-		try {
-			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
-		} finally {
-			if ( $bootstrapped_worker ) {
-				Activity_Logger::end_metabox_as_worker();
-			}
-		}
+		// Second try: if still stuck, run one job slice directly (browser session keeps admin caps).
+		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
 
 		if ( is_wp_error( $slice ) ) {
 			// For metabox polling, never hard-fail on transport timeouts/recoverable slice errors.
@@ -733,21 +963,25 @@ final class Metabox_Action_Scheduler {
 	/**
 	 * @param int    $post_id   Post ID.
 	 * @param string $lang      Language code.
-	 * @param int    $delay_sec Delay before run.
+	 * @param int    $delay_sec          Delay before run.
+	 * @param int    $preserve_action_id Skip purging this in-flight action when chaining.
 	 * @return int Action ID or 0.
 	 */
-	public static function schedule_slice( $post_id, $lang, $delay_sec = 0 ) {
+	public static function schedule_slice( $post_id, $lang, $delay_sec = 0, $preserve_action_id = 0 ) {
 		if ( ! self::is_available() || ! function_exists( 'as_schedule_single_action' ) ) {
 			return 0;
 		}
 
-		$post_id   = absint( $post_id );
-		$lang      = sanitize_key( (string) $lang );
-		$delay_sec = max( 0, min( 30, absint( $delay_sec ) ) );
+		$post_id            = absint( $post_id );
+		$lang               = sanitize_key( (string) $lang );
+		$delay_sec          = max( 0, min( 30, absint( $delay_sec ) ) );
+		$preserve_action_id = absint( $preserve_action_id );
 
 		if ( $post_id <= 0 || '' === $lang ) {
 			return 0;
 		}
+
+		self::purge_all_queue_actions( $post_id, $lang, $preserve_action_id );
 
 		$args = array(
 			'post_id' => $post_id,
@@ -794,52 +1028,113 @@ final class Metabox_Action_Scheduler {
 		}
 
 		// Impersonate post author or admin before lock checks / meta saves (User ID 0 otherwise).
-		Activity_Logger::begin_metabox_as_worker( $post_id );
+		Activity_Logger::begin_metabox_as_worker( $post_id, true );
 
-		$should_chain = true;
-		$completed    = false;
+		$should_chain   = true;
+		$completed      = false;
+		$lock_acquired  = false;
 
 		// AS worker must own the per-post lock (avoid self-blocking during persist).
 		Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true );
-		Post_Translator::acquire_translation_lock( $post_id, $lang );
 
-		try {
-			Activity_Logger::on_ai_http_heartbeat();
+		if ( ! Post_Translator::acquire_translation_lock( $post_id, $lang ) ) {
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: language code */
+					__( 'مatabox AS — #%1$d (%2$s): acquire قفل ناموفق — slice رد شد (کارگر دیگر یا bulk job).', 'polymart-ai' ),
+					$post_id,
+					$lang
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
+			);
 
-			if ( ! Activity_Logger::is_bulk_job_running() ) {
-				Activity_Logger::clear_job_api_cooldown( false );
-			}
+			self::update_status(
+				$post_id,
+				$lang,
+				array(
+					'status'  => 'running',
+					'message' => __( 'قفل ترجمه موقتاً در اختیار کارگر دیگر است — slice بعدی زمان‌بندی می‌شود.', 'polymart-ai' ),
+					'error'   => '',
+				)
+			);
 
-			$recovered = self::recover_stale_running_actions( $post_id, $lang, self::STALE_RUNNING_SEC );
+			self::$handler_clean_exit = true;
+		} else {
+			$lock_acquired = true;
 
-			if ( $recovered > 0 ) {
-				Activity_Logger::log(
-					'warning',
-					sprintf(
-						/* translators: 1: post ID, 2: language code, 3: recovered count */
-						__( 'مatabox AS — #%1$d (%2$s): %3$d اکشن In-progress قدیمی آزاد شد — ادامه صف.', 'polymart-ai' ),
+			try {
+				Activity_Logger::on_ai_http_heartbeat();
+
+				if ( ! Activity_Logger::is_bulk_job_running() ) {
+					Activity_Logger::clear_job_api_cooldown( false );
+				}
+
+				$recovered = self::recover_stale_running_actions( $post_id, $lang, self::STALE_RUNNING_SEC );
+
+				if ( $recovered > 0 ) {
+					Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: language code, 3: recovered count */
+							__( 'مatabox AS — #%1$d (%2$s): %3$d اکشن In-progress قدیمی آزاد شد — ادامه صف.', 'polymart-ai' ),
+							$post_id,
+							$lang,
+							$recovered
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
+					);
+				}
+
+				Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
+
+				$result = self::run_metabox_batch( $post_id, $lang );
+
+				if ( is_wp_error( $result ) ) {
+					self::log_auth_failure_if_applicable( $post_id, $lang, $result->get_error_message() );
+
+					// Never stall: skip the next pending Elementor chunk and keep chaining.
+					$skipped = Post_Translator::skip_next_elementor_pending_chunk(
 						$post_id,
 						$lang,
-						$recovered
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
-				);
-			}
+						$result->get_error_code()
+					);
 
-			Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
+					if ( is_array( $skipped ) ) {
+						self::update_status_from_slice( $post_id, $lang, $skipped );
+					} else {
+						self::update_status_from_slice(
+							$post_id,
+							$lang,
+							array(
+								'done'    => false,
+								'message' => $result->get_error_message(),
+								'phase'   => 'elementor',
+							)
+						);
+					}
 
-			$result = self::run_metabox_batch( $post_id, $lang );
+					self::$handler_clean_exit = true;
+					return;
+				}
 
-			if ( is_wp_error( $result ) ) {
-				self::log_auth_failure_if_applicable( $post_id, $lang, $result->get_error_message() );
+				if ( ! empty( $result['done'] ) ) {
+					self::mark_complete( $post_id, $lang, $result );
+					self::maybe_advance_batch( $post_id );
+					$completed    = true;
+					$should_chain = false;
+					self::$handler_clean_exit = true;
 
-				// Never stall: skip the next pending Elementor chunk and keep chaining.
-				$skipped = Post_Translator::skip_next_elementor_pending_chunk(
-					$post_id,
-					$lang,
-					$result->get_error_code()
-				);
+					return;
+				}
 
+				self::update_status_from_slice( $post_id, $lang, $result );
+				self::$handler_clean_exit = true;
+			} catch ( \Throwable $e ) {
+				self::log_auth_failure_if_applicable( $post_id, $lang, $e->getMessage() );
+
+				// On any throwable, skip one chunk and keep going.
+				$skipped = Post_Translator::skip_next_elementor_pending_chunk( $post_id, $lang, 'throwable' );
 				if ( is_array( $skipped ) ) {
 					self::update_status_from_slice( $post_id, $lang, $skipped );
 				} else {
@@ -848,56 +1143,32 @@ final class Metabox_Action_Scheduler {
 						$lang,
 						array(
 							'done'    => false,
-							'message' => $result->get_error_message(),
+							'message' => $e->getMessage(),
 							'phase'   => 'elementor',
 						)
 					);
 				}
-
 				self::$handler_clean_exit = true;
-				return;
+			} finally {
+				if ( $lock_acquired && ( $completed || $should_chain ) ) {
+					Post_Translator::release_translation_lock( $post_id, $lang, $completed );
+				}
+
+				if ( $should_chain && ! $completed ) {
+					self::chain_next( $post_id, $lang );
+				}
+
+				Activity_Logger::end_metabox_as_worker();
 			}
 
-			if ( ! empty( $result['done'] ) ) {
-				self::mark_complete( $post_id, $lang, $result );
-				self::maybe_advance_batch( $post_id );
-				$completed = true;
-				$should_chain = false;
-				self::$handler_clean_exit = true;
-
-				return;
-			}
-
-			self::update_status_from_slice( $post_id, $lang, $result );
-			self::$handler_clean_exit = true;
-		} catch ( \Throwable $e ) {
-			self::log_auth_failure_if_applicable( $post_id, $lang, $e->getMessage() );
-
-			// On any throwable, skip one chunk and keep going.
-			$skipped = Post_Translator::skip_next_elementor_pending_chunk( $post_id, $lang, 'throwable' );
-			if ( is_array( $skipped ) ) {
-				self::update_status_from_slice( $post_id, $lang, $skipped );
-			} else {
-				self::update_status_from_slice(
-					$post_id,
-					$lang,
-					array(
-						'done'    => false,
-						'message' => $e->getMessage(),
-						'phase'   => 'elementor',
-					)
-				);
-			}
-			self::$handler_clean_exit = true;
-		} finally {
-			// Always release lock and chain next slice unless job completed.
-			Post_Translator::release_translation_lock( $post_id, $lang, true );
-			if ( $should_chain && ! $completed ) {
-				self::chain_next( $post_id, $lang );
-			}
-
-			Activity_Logger::end_metabox_as_worker();
+			return;
 		}
+
+		if ( $should_chain && ! $completed ) {
+			self::chain_next( $post_id, $lang );
+		}
+
+		Activity_Logger::end_metabox_as_worker();
 	}
 
 	/**
@@ -1091,10 +1362,22 @@ final class Metabox_Action_Scheduler {
 	 * @return void
 	 */
 	private static function chain_next( $post_id, $lang ) {
-		$action_id = self::schedule_slice( $post_id, $lang, self::CHAIN_DELAY_SEC );
+		$action_id = self::schedule_slice( $post_id, $lang, self::CHAIN_DELAY_SEC, self::$current_action_id );
 
 		if ( $action_id > 0 ) {
 			self::run_queue_inline( false );
+		} else {
+			$message = __( 'خطا در ثبت صف Action Scheduler — زنجیره slice متوقف شد.', 'polymart-ai' );
+			update_post_meta( $post_id, '_polymart_ai_elementor_error_' . sanitize_key( (string) $lang ), $message );
+			self::update_status(
+				$post_id,
+				$lang,
+				array(
+					'status'  => 'failed',
+					'message' => $message,
+					'error'   => $message,
+				)
+			);
 		}
 	}
 
@@ -1142,14 +1425,15 @@ final class Metabox_Action_Scheduler {
 	public static function build_poll_response( $post_id, $lang ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
-		$status  = self::get_status( $post_id, $lang );
+		$status      = self::get_status( $post_id, $lang );
 		$worker_mode = ! empty( $status['fallback'] ) ? 'poll_inline' : 'as';
-		$state   = (string) ( $status['status'] ?? 'idle' );
-		$running = self::has_pending_or_running( $post_id, $lang ) || 'running' === $state;
+		$state       = (string) ( $status['status'] ?? 'idle' );
+		$running     = self::has_pending_or_running( $post_id, $lang );
+		$meta_active = 'running' === $state;
 
 		$gaps = Post_Translator::get_translation_gaps( $post_id, $lang );
 		$done = 'complete' === $state
-			|| ( ! $running && 'translated' === (string) ( $gaps['status'] ?? '' ) && empty( $gaps['missing'] ) );
+			|| ( ! $running && ! $meta_active && 'translated' === (string) ( $gaps['status'] ?? '' ) && empty( $gaps['missing'] ) );
 
 		if ( 'failed' === $state ) {
 			$done = false;
