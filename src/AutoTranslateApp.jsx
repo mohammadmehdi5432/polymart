@@ -41,6 +41,20 @@ function isElementorPartialJob(job) {
 /** Top status line while Elementor chunks are in flight (lock is only held a few seconds per tick). */
 function formatElementorPartialStatus(job, cronAgeSec, workerLabel) {
   const progress = job?.partial_progress || '';
+  const parsed = progress && /^(\d+)\/(\d+)$/.exec(progress);
+
+  if (parsed && Number(parsed[1]) >= Number(parsed[2])) {
+    if (job?.worker_lock) {
+      return `Elementor ${progress} — تکمیل نهایی${workerLabel ? ` (${workerLabel})` : ''}`;
+    }
+
+    if (cronAgeSec == null || cronAgeSec < CRON_STALE_SEC) {
+      return `Elementor ${progress} — تکمیل نهایی / مورد بعدی…`;
+    }
+
+    return null;
+  }
+
   const suffix = progress ? ` — ${progress}` : '';
   const who = workerLabel ? ` (${workerLabel})` : '';
 
@@ -92,6 +106,15 @@ function isCronHealthy(job) {
       activityAge > 90);
 
   const elementorPartial = isElementorPartialJob(job);
+  const progressMatch = (job?.partial_progress || '').match(/^(\d+)\/(\d+)$/);
+  const elementorBatchesDone =
+    progressMatch &&
+    Number(progressMatch[1]) >= Number(progressMatch[2]) &&
+    Number(progressMatch[2]) > 0;
+
+  if (job?.status === 'running' && elementorBatchesDone && activityAge > 6) {
+    return false;
+  }
 
   if (job?.status === 'running' && Number(job?.api_cooldown_remaining || 0) > 0) {
     return true;

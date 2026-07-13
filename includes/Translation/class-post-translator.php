@@ -4412,6 +4412,28 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether every scheduled primary Elementor API batch index has been consumed.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function elementor_job_primary_batches_exhausted( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$stored = get_post_meta( $post_id, self::get_elementor_slice_cursor_meta_key( $lang ), true );
+		$cursor = is_array( $stored ) ? absint( $stored['cursor'] ?? 0 ) : absint( $stored );
+		$total  = is_array( $stored ) ? absint( $stored['total'] ?? 0 ) : 0;
+
+		return $total > 0 && $cursor >= $total;
+	}
+
+	/**
 	 * Reasons Elementor job finalization must not mark the post complete yet.
 	 *
 	 * @param int                   $post_id     Post ID.
@@ -4563,6 +4585,26 @@ final class Post_Translator {
 		}
 
 		if ( ! empty( $remaining ) ) {
+			if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+				$stored_total  = self::read_elementor_slice_cursor_total( $post_id, $lang );
+				$stored_cursor = self::read_elementor_slice_cursor( $post_id, $lang );
+				$done_count    = max( $done_count, $stored_cursor );
+				$total_chunks  = max( $total_chunks, $stored_total, 1 );
+
+				return array(
+					'done'           => false,
+					'phase'          => 'elementor',
+					'phase_progress' => min( $done_count, $total_chunks ) . '/' . $total_chunks,
+					'message'        => sprintf(
+						/* translators: 1: post ID, 2: remaining field count */
+						__( 'Elementor — #%1$d: %2$d فیلد باقی‌مانده — تکمیل نهایی…', 'polymart-ai' ),
+						$post_id,
+						count( $remaining )
+					),
+					'recoverable'    => true,
+				);
+			}
+
 			$batch_progress = self::compute_elementor_api_batch_progress( $source_data, $map, $state );
 			$done_count     = (int) $batch_progress['done'];
 			$total_chunks   = max( 1, (int) $batch_progress['total'], $total_chunks );
@@ -4735,13 +4777,16 @@ final class Post_Translator {
 			$state['elementor_skipped'] = $overlay_skipped;
 		}
 
-		$progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$marker = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
+		$parts  = explode( '/', $marker );
+		$done   = isset( $parts[0] ) ? absint( $parts[0] ) : 0;
+		$total  = isset( $parts[1] ) ? max( 1, absint( $parts[1] ) ) : 1;
 
 		return sprintf(
 			/* translators: 1: completed batches, 2: total batches */
 			__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
-			(int) $progress['done'],
-			max( 1, (int) $progress['total'] )
+			$done,
+			$total
 		);
 	}
 
@@ -5401,6 +5446,11 @@ final class Post_Translator {
 
 		if ( self::repair_stale_elementor_job_state( $post_id, $lang ) ) {
 			return true;
+		}
+
+		// Primary API schedule finished — gap-fill runs without wiping cursor/progress.
+		if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			return false;
 		}
 
 		$raw = get_post_meta( $post_id, '_elementor_data', true );
@@ -6138,8 +6188,11 @@ final class Post_Translator {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
-		self::unblock_elementor_chunk_queue( $post_id, $lang );
-		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+
+		if ( ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			self::unblock_elementor_chunk_queue( $post_id, $lang );
+			$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		}
 		$raw     = get_post_meta( $post_id, '_elementor_data', true );
 
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() && \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
@@ -6188,6 +6241,41 @@ final class Post_Translator {
 		$progress_total  = max( $chunk_queue['total'], 1 );
 		$state['elementor_chunks_total'] = $progress_total;
 
+		if ( empty( $chunks ) && self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			$map     = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
+			$map     = self::sanitize_elementor_translation_map( $map, $source_payload );
+			$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+			$gap_chunks = self::build_elementor_gap_fill_chunks( $data, $map, $skipped );
+
+			if ( ! empty( $gap_chunks ) ) {
+				$chunks                      = $gap_chunks;
+				$state['elementor_map']      = $map;
+				$state['elementor_gap_fill'] = true;
+				$stored_total                = self::read_elementor_slice_cursor_total( $post_id, $lang );
+
+				if ( $stored_total > 0 ) {
+					$progress_total                  = $stored_total;
+					$state['elementor_chunks_total'] = $stored_total;
+				}
+
+				$remaining_count = count(
+					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
+				);
+
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: post ID, 2: remaining fields, 3: gap batches */
+						__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد در %3$d بخش', 'polymart-ai' ),
+						$post_id,
+						$remaining_count,
+						count( $gap_chunks )
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+			}
+		}
+
 		if ( empty( $chunks ) ) {
 			if ( ! empty( $payload ) ) {
 				self::repair_stale_elementor_job_state( $post_id, $lang );
@@ -6233,7 +6321,10 @@ final class Post_Translator {
 					if ( $api_slices_complete ) {
 						// All API batches done — fall through to finalization below.
 						$chunks = array();
-					} elseif ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+					} elseif (
+						! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state )
+						&& ! self::elementor_job_primary_batches_exhausted( $post_id, $lang )
+					) {
 						self::unblock_elementor_chunk_queue( $post_id, $lang );
 						$state       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 						$chunk_queue = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
@@ -7330,6 +7421,29 @@ final class Post_Translator {
 	 * Uses the full source payload (not filter_remaining alone) so recovery can
 	 * continue after slice 4/11 even when the remaining-field map is stale.
 	 *
+	 * @param int                  $post_id     Post ID.
+	 * @param string               $lang        Language code.
+	 * @param array<string, mixed> $source_data Source Elementor tree.
+	 * @param array<string, mixed> $state       Hydrated partial state.
+	 * @return array<int, array<string, string>>
+	 */
+	private static function build_elementor_gap_fill_chunks( array $source_data, array $map, array $skipped ) {
+		$remaining = self::filter_remaining_elementor_payload(
+			self::collect_elementor_translation_payload( $source_data ),
+			$map,
+			$skipped
+		);
+
+		if ( empty( $remaining ) ) {
+			return array();
+		}
+
+		$collapsed = self::collapse_duplicate_elementor_payload( $remaining );
+
+		return self::chunk_elementor_payload_for_job( $collapsed['payload'] );
+	}
+
+	/**
 	 * @param int                  $post_id     Post ID.
 	 * @param string               $lang        Language code.
 	 * @param array<string, mixed> $source_data Source Elementor tree.

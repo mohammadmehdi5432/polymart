@@ -4544,6 +4544,23 @@ final class Activity_Logger {
 		$job  = self::get_job_raw();
 		$last = self::get_worker_real_activity_at( $job );
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+
+		if (
+			self::should_prioritize_elementor_partial( $job )
+			&& 'running' === ( $job['status'] ?? '' )
+		) {
+			$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
+
+			if (
+				is_array( $parsed )
+				&& $parsed['total'] > 0
+				&& $parsed['done'] >= $parsed['total']
+				&& $age >= 8
+			) {
+				self::schedule_elementor_partial_follow_up( 0 );
+			}
+		}
+
 		$busy = self::is_step_lock_held_fresh();
 		$stale_sec = Job_Action_Scheduler::STALE_RUNNING_SEC;
 
@@ -5425,6 +5442,17 @@ final class Activity_Logger {
 				self::humanize_api_error_message( (string) ( $slice['message'] ?? __( 'ادامه در مرحله بعد…', 'polymart-ai' ) ) )
 			);
 			self::save_job( $job );
+
+			$parsed_done = self::parse_job_phase_progress( (string) ( $slice['phase_progress'] ?? '' ) );
+
+			if (
+				'elementor' === sanitize_key( (string) ( $slice['phase'] ?? '' ) )
+				&& is_array( $parsed_done )
+				&& $parsed_done['total'] > 0
+				&& $parsed_done['done'] >= $parsed_done['total']
+			) {
+				self::schedule_elementor_partial_follow_up( 0 );
+			}
 
 			return self::normalize_job_for_response( $job, false );
 		}
