@@ -468,6 +468,7 @@ final class Ajax_Handler {
 		}
 
 		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
+		Metabox_Action_Scheduler::recover_stale_and_nudge( $post_id, $lang );
 
 		$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
 		$scan = self::build_scan_response( $post_id, $lang );

@@ -87,7 +87,7 @@ final class AI_Client {
 		$timeout = (int) self::$active_curl_timeout;
 
 		curl_setopt( $handle, CURLOPT_TIMEOUT, $timeout );
-		curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, min( 45, $timeout ) );
+		curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, min( 15, max( 5, (int) ceil( $timeout / 3 ) ) ) );
 
 		// Keep the auto-translate worker heartbeat alive while Arvan is thinking.
 		if ( $timeout >= 20 && function_exists( 'curl_setopt' ) ) {
@@ -478,6 +478,13 @@ final class AI_Client {
 
 		$timeout = max( $floor, min( $ceil, $timeout ) );
 
+		$max_transport_retries = self::MAX_TRANSPORT_RETRIES;
+
+		// Elementor/AS slices cap at 50s — never chain multi-minute transport retries.
+		if ( ! empty( $options['max_timeout'] ) && absint( $options['max_timeout'] ) <= 50 ) {
+			$max_transport_retries = 0;
+		}
+
 		self::$active_curl_timeout = $timeout;
 
 		/**
@@ -490,6 +497,7 @@ final class AI_Client {
 			self::resolve_chat_completions_url( $endpoint ),
 			array(
 				'timeout'     => $timeout,
+				'connect_timeout' => min( 15, max( 5, (int) ceil( $timeout / 3 ) ) ),
 				'httpversion' => '1.1',
 				'headers'     => self::build_request_headers( $api_key ),
 				'body'        => $encoded_body,
@@ -502,7 +510,7 @@ final class AI_Client {
 			$error_code    = $response->get_error_code();
 			$error_message = $response->get_error_message();
 
-			if ( 'http_request_failed' === $error_code && $attempt < self::MAX_TRANSPORT_RETRIES ) {
+			if ( 'http_request_failed' === $error_code && $max_transport_retries > 0 && $attempt < $max_transport_retries ) {
 				$retry_options = $options;
 				$cap           = ! empty( $options['max_timeout'] )
 					? max( 20, absint( $options['max_timeout'] ) )

@@ -23,8 +23,8 @@ final class Metabox_Action_Scheduler {
 	const GROUP = 'polymart_ai_metabox';
 
 	const REQUEST_BUDGET_SEC = 120;
-	const MAX_SLICES         = 10;
-	const STALE_RUNNING_SEC  = 150;
+	const MAX_SLICES         = 3;
+	const STALE_RUNNING_SEC  = 90;
 	const CHAIN_DELAY_SEC    = 1;
 
 	const STATUS_META_PREFIX = '_polymart_ai_metabox_as_';
@@ -52,6 +52,36 @@ final class Metabox_Action_Scheduler {
 	 */
 	public static function init() {
 		add_action( self::HOOK, array( __CLASS__, 'handle_metabox_action' ), 10, 3 );
+	}
+
+	/**
+	 * One Elementor API batch per metabox AS slice (avoids multi-minute hangs).
+	 *
+	 * @param int $chunks Requested chunk budget.
+	 * @return int
+	 */
+	public static function filter_metabox_elementor_chunk_budget( $chunks ) {
+		return 1;
+	}
+
+	/**
+	 * Recover stale in-progress metabox AS actions and nudge the queue.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return int Number of recovered actions.
+	 */
+	public static function recover_stale_and_nudge( $post_id, $lang ) {
+		$post_id   = absint( $post_id );
+		$lang      = sanitize_key( (string) $lang );
+		$recovered = self::recover_stale_running_actions( $post_id, $lang, self::STALE_RUNNING_SEC );
+
+		if ( $recovered > 0 ) {
+			self::chain_next( $post_id, $lang );
+			self::run_queue_inline( true );
+		}
+
+		return $recovered;
 	}
 
 	/**
@@ -463,12 +493,46 @@ final class Metabox_Action_Scheduler {
 				Activity_Logger::clear_job_api_cooldown( false );
 			}
 
-			self::recover_stale_running_actions( $post_id, $lang, self::STALE_RUNNING_SEC );
+			$recovered = self::recover_stale_running_actions( $post_id, $lang, self::STALE_RUNNING_SEC );
+
+			if ( $recovered > 0 ) {
+				Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post ID, 2: language code, 3: recovered count */
+						__( 'مatabox AS — #%1$d (%2$s): %3$d اکشن In-progress قدیمی آزاد شد — ادامه صف.', 'polymart-ai' ),
+						$post_id,
+						$lang,
+						$recovered
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
+				);
+			}
+
 			Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
 
 			$result = self::run_metabox_batch( $post_id, $lang );
 
 			if ( is_wp_error( $result ) ) {
+				if (
+					Post_Translator::is_recoverable_job_slice_error( $result )
+					|| Post_Translator::is_api_transport_timeout_error( $result )
+				) {
+					self::update_status_from_slice(
+						$post_id,
+						$lang,
+						array(
+							'done'    => false,
+							'message' => $result->get_error_message(),
+							'phase'   => 'elementor',
+						)
+					);
+					self::chain_next( $post_id, $lang );
+					self::$handler_clean_exit = true;
+
+					return;
+				}
+
 				self::mark_failed( $post_id, $lang, $result->get_error_message() );
 				self::$handler_clean_exit = true;
 
@@ -489,6 +553,7 @@ final class Metabox_Action_Scheduler {
 		} catch ( \Throwable $e ) {
 			self::mark_failed( $post_id, $lang, $e->getMessage() );
 			Post_Translator::release_translation_lock( $post_id, $lang, true );
+			self::chain_next( $post_id, $lang );
 			self::$handler_clean_exit = true;
 		}
 	}
@@ -512,7 +577,10 @@ final class Metabox_Action_Scheduler {
 		$slices_run = 0;
 		$last_slice = array();
 
-		while ( $slices_run < max( 1, $max_slices ) && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
+		add_filter( 'polymart_ai_job_step_max_elementor_chunks', array( __CLASS__, 'filter_metabox_elementor_chunk_budget' ), 100 );
+
+		try {
+			while ( $slices_run < max( 1, $max_slices ) && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
 			Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
 
 			Activity_Logger::log(
@@ -531,10 +599,16 @@ final class Metabox_Action_Scheduler {
 			++$slices_run;
 			$last_slice = is_array( $slice ) ? $slice : array();
 
+			if ( is_array( $slice ) && ! empty( $slice['recoverable'] ) ) {
+				self::update_status_from_slice( $post_id, $lang, $last_slice );
+
+				return $last_slice;
+			}
+
 			if ( is_wp_error( $slice ) ) {
 				if (
 					Post_Translator::is_recoverable_job_slice_error( $slice )
-					&& Post_Translator::job_partial_state_has_progress( $post_id, $lang )
+					|| Post_Translator::is_api_transport_timeout_error( $slice )
 				) {
 					self::update_status_from_slice(
 						$post_id,
@@ -550,11 +624,11 @@ final class Metabox_Action_Scheduler {
 					);
 
 					return array(
-						'done'        => false,
-						'phase'       => (string) ( $last_slice['phase'] ?? '' ),
-						'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
-						'message'     => $slice->get_error_message(),
-						'recoverable' => true,
+						'done'             => false,
+						'phase'            => (string) ( $last_slice['phase'] ?? 'elementor' ),
+						'phase_progress'   => (string) ( $last_slice['phase_progress'] ?? '' ),
+						'message'          => $slice->get_error_message(),
+						'recoverable'      => true,
 					);
 				}
 
@@ -566,6 +640,9 @@ final class Metabox_Action_Scheduler {
 			if ( ! empty( $slice['done'] ) ) {
 				return $last_slice;
 			}
+		}
+		} finally {
+			remove_filter( 'polymart_ai_job_step_max_elementor_chunks', array( __CLASS__, 'filter_metabox_elementor_chunk_budget' ), 100 );
 		}
 
 		return ! empty( $last_slice )
@@ -900,7 +977,7 @@ final class Metabox_Action_Scheduler {
 			$store = \ActionScheduler_Store::instance();
 			$date  = $store->get_date( $action->get_id() );
 
-			if ( ! $date || ( time() - $date->getTimestamp() ) < max( 60, absint( $max_age ) ) ) {
+			if ( ! $date || ( time() - $date->getTimestamp() ) < max( 30, absint( $max_age ) ) ) {
 				continue;
 			}
 
@@ -913,13 +990,34 @@ final class Metabox_Action_Scheduler {
 
 		if ( $recovered > 0 ) {
 			Post_Translator::release_translation_lock( $post_id, $lang, true );
+			self::chain_next( $post_id, $lang );
 		}
 
 		return $recovered;
 	}
 
 	/**
-	 * Release locks and re-queue when PHP fatals mid-slice.
+	 * Mark the in-flight AS action failed when PHP exits without finishing the callback.
+	 *
+	 * @return void
+	 */
+	private static function finalize_interrupted_action() {
+		if ( self::$current_action_id <= 0 ) {
+			self::$current_action_id = self::resolve_current_action_id();
+		}
+
+		if ( self::$current_action_id <= 0 || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return;
+		}
+
+		try {
+			\ActionScheduler_Store::instance()->mark_failure( self::$current_action_id );
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		}
+	}
+
+	/**
+	 * Release locks and re-queue when the AS callback is interrupted.
 	 *
 	 * @return void
 	 */
@@ -935,21 +1033,16 @@ final class Metabox_Action_Scheduler {
 			return;
 		}
 
-		$error = error_get_last();
-
-		if ( ! is_array( $error ) || ! in_array( (int) ( $error['type'] ?? 0 ), array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR ), true ) ) {
-			return;
-		}
-
 		Post_Translator::release_translation_lock( $post_id, $lang, true );
+		self::finalize_interrupted_action();
 
 		self::update_status(
 			$post_id,
 			$lang,
 			array(
 				'status'  => 'running',
-				'message' => __( 'پردازش قبلی قطع شد — ادامه در صف…', 'polymart-ai' ),
-				'error'   => (string) ( $error['message'] ?? '' ),
+				'message' => __( 'پردازش قبلی قطع شد — ادامه با بخش بعدی…', 'polymart-ai' ),
+				'error'   => '',
 			)
 		);
 

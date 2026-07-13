@@ -6474,6 +6474,19 @@ final class Post_Translator {
 	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}|\WP_Error
 	 */
 	private static function handle_elementor_job_slice_failure( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, \WP_Error $error, array $failed_keys = array() ) {
+		if ( self::is_api_transport_timeout_error( $error ) && ! empty( $failed_keys ) ) {
+			return self::skip_elementor_chunk_on_api_timeout(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_total,
+				$failed_keys,
+				$error
+			);
+		}
+
 		\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $error );
 
 		if ( \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
@@ -6536,6 +6549,125 @@ final class Post_Translator {
 		}
 
 		return $error;
+	}
+
+	/**
+	 * Whether an API error is a hard transport timeout (cURL 28 / http_request_failed).
+	 *
+	 * @param \WP_Error $error Error object.
+	 * @return bool
+	 */
+	public static function is_api_transport_timeout_error( $error ) {
+		if ( ! $error instanceof \WP_Error ) {
+			return false;
+		}
+
+		if ( 'polymart_ai_timeout' === $error->get_error_code() ) {
+			return true;
+		}
+
+		if ( 'http_request_failed' !== $error->get_error_code() ) {
+			return false;
+		}
+
+		$message = strtolower( $error->get_error_message() );
+
+		return false !== strpos( $message, 'curl error 28' )
+			|| false !== strpos( $message, 'timed out' )
+			|| false !== strpos( $message, 'timeout' )
+			|| false !== strpos( $message, 'operation timed out' );
+	}
+
+	/**
+	 * Skip an Elementor API chunk after a transport timeout and advance the job queue.
+	 *
+	 * @param int                   $post_id      Post ID.
+	 * @param string                $lang         Language code.
+	 * @param array<string, mixed>  $source_data  Source Elementor tree.
+	 * @param array<string, mixed>  $state        Partial state (by reference).
+	 * @param array<string, string> $map          Translation path map so far.
+	 * @param int                   $source_total Total API batches.
+	 * @param string[]              $failed_keys  Paths in the timed-out chunk.
+	 * @param \WP_Error             $error        Transport error.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}
+	 */
+	private static function skip_elementor_chunk_on_api_timeout( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, array $failed_keys, \WP_Error $error ) {
+		$post_id        = absint( $post_id );
+		$lang           = sanitize_key( (string) $lang );
+		$source_total   = max( 1, absint( $source_total ) );
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$failures       = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+		$skipped_paths  = array();
+
+		foreach ( $failed_keys as $failed_key ) {
+			$failed_key = (string) $failed_key;
+
+			if ( '' === $failed_key ) {
+				continue;
+			}
+
+			$skipped[]         = $failed_key;
+			$skipped_paths[]   = $failed_key;
+			unset( $failures[ $failed_key ] );
+		}
+
+		$state['elementor_skipped']  = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+		$state['elementor_failures'] = $failures;
+		$state['elementor_map']      = $map;
+		$state                       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+
+		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$done_count     = self::resolve_elementor_done_count( $state, $chunk_progress['done'], $post_id, $lang );
+		$progress_total = max( $source_total, (int) $chunk_progress['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+		$state['elementor_chunks_total'] = $progress_total;
+
+		if ( ! empty( $map ) ) {
+			self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
+		}
+
+		self::save_job_partial_state( $post_id, $lang, $state );
+
+		$progress   = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
+		$short_error = \PolymartAI\Activity_Logger::humanize_api_error_message( $error->get_error_message() );
+
+		update_post_meta(
+			$post_id,
+			'_polymart_ai_elementor_error_' . $lang,
+			sprintf(
+				/* translators: 1: skipped path count, 2: error detail */
+				__( 'timeout API — %1$d فیلد رد شد (%2$s)', 'polymart-ai' ),
+				count( $skipped_paths ),
+				$short_error
+			)
+		);
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: progress marker, 3: skipped count, 4: error */
+				__( 'Elementor — #%1$d: timeout API در %2$s — %3$d فیلد به skipped منتقل شد (%4$s) — ادامه با بخش بعدی.', 'polymart-ai' ),
+				$post_id,
+				$progress,
+				count( $skipped_paths ),
+				$short_error
+			),
+			array(
+				'post_id' => $post_id,
+				'lang'    => $lang,
+				'skipped' => $skipped_paths,
+			)
+		);
+
+		return self::make_recoverable_partial_slice_response(
+			'elementor',
+			$progress,
+			sprintf(
+				/* translators: 1: progress marker, 2: skipped field count */
+				__( 'Elementor — %1$s: بخش API به‌خاطر timeout رد شد (%2$d فیلد) — ادامه…', 'polymart-ai' ),
+				$progress,
+				count( $skipped_paths )
+			)
+		);
 	}
 
 	/**
