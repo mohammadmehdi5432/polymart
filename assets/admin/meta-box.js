@@ -466,19 +466,66 @@
 		setWorkflowLoading($('.polymart-ai-translate-complete-btn'), false, '', config.strings.translateCompleteLabel || '');
 	}
 
+	function formatTranslateProgressMessage(data, attempt) {
+		const scan = (data && data.scan) || {};
+		const elementor = scan.elementor || {};
+		const parts = [];
+
+		if (data && data.message) {
+			parts.push(data.message);
+		}
+
+		if (data && data.phase_progress) {
+			parts.push(data.phase_progress);
+		}
+
+		if (elementor.chunk_progress) {
+			parts.push('Elementor ' + elementor.chunk_progress);
+		}
+
+		if (elementor.source_field_count != null && elementor.translated_field_count != null) {
+			parts.push(
+				elementor.translated_field_count + '/' + elementor.source_field_count + ' ' +
+				(config.strings.elementorFieldsShort || 'فیلد JSON')
+			);
+		}
+
+		if (elementor.pending_api_chunks > 0) {
+			parts.push(elementor.pending_api_chunks + ' ' + (config.strings.elementorPendingChunks || 'بخش API در صف'));
+		}
+
+		if (data && data.slices_run) {
+			parts.push((config.strings.translateRound || 'دور') + ' ' + data.slices_run);
+		}
+
+		if (attempt > 0) {
+			parts.push((config.strings.translatePoll || 'بررسی') + ' #' + attempt);
+		}
+
+		return parts.join(' — ');
+	}
+
 	function pollTranslateComplete(postId, lang, attempt, unlockNext) {
 		attempt = attempt || 0;
 		unlockNext = unlockNext || false;
 
-		if (attempt > 120) {
-			setGlobalStatus(config.strings.error, 'error');
+		if (attempt > 180) {
+			setGlobalStatus(config.strings.translateTimeout || config.strings.error, 'error');
 			setWorkflowLoading($('.polymart-ai-translate-complete-btn'), false, '', config.strings.translateCompleteLabel || '');
 			return;
 		}
 
-		requestTranslateComplete(postId, lang, { force: false, unlock: unlockNext && attempt > 2 })
+		requestTranslateComplete(postId, lang, { force: false, unlock: unlockNext && attempt > 1 })
 			.done(function (response) {
 				if (!response || !response.success) {
+					if (response && response.data && response.data.locked && attempt < 8) {
+						setGlobalStatus((response.data.message || config.strings.translating) + ' — ' + (config.strings.lockRetry || 'تلاش مجدد…'), '');
+						window.setTimeout(function () {
+							pollTranslateComplete(postId, lang, attempt + 1, true);
+						}, 1500);
+						return;
+					}
+
 					handleTranslateError(postId, lang, response);
 					return;
 				}
@@ -501,15 +548,23 @@
 					return;
 				}
 
-				const progress = data.phase_progress ? ' (' + data.phase_progress + ')' : '';
-				setGlobalStatus((data.message || config.strings.translating) + progress, '');
-				setLangStatus(lang, (data.message || config.strings.translating) + progress, '');
+				const progressMessage = formatTranslateProgressMessage(data, attempt + 1);
+				setGlobalStatus(progressMessage || config.strings.translating, '');
+				setLangStatus(lang, progressMessage || config.strings.translating, '');
 
 				window.setTimeout(function () {
 					pollTranslateComplete(postId, lang, attempt + 1, unlockNext);
 				}, 2000);
 			})
 			.fail(function (xhr) {
+				if (xhr && xhr.status === 409 && attempt < 8) {
+					setGlobalStatus((config.strings.lockRetry || 'قفل موقت — تلاش مجدد…'), '');
+					window.setTimeout(function () {
+						pollTranslateComplete(postId, lang, attempt + 1, true);
+					}, 1500);
+					return;
+				}
+
 				handleTranslateError(postId, lang, null, xhr);
 			});
 	}
@@ -602,7 +657,7 @@
 			}
 
 			setWorkflowLoading($btn, true, config.strings.translating, config.strings.translateCompleteLabel || '');
-			setGlobalStatus('', '');
+			setGlobalStatus((config.strings.translating || '') + ' — ' + (config.strings.waitingServer || 'منتظر پاسخ سرور…'), '');
 			setLangStatus(lang, '', '');
 
 			requestTranslateComplete(postId, lang, { force: force, unlock: true })
@@ -629,6 +684,10 @@
 						setWorkflowLoading($btn, false, '', config.strings.translateCompleteLabel || '');
 						return;
 					}
+
+					const progressMessage = formatTranslateProgressMessage(data, 0);
+					setGlobalStatus(progressMessage || config.strings.translating, '');
+					setLangStatus(lang, progressMessage || config.strings.translating, '');
 
 					pollTranslateComplete(postId, lang, 0, true);
 				})

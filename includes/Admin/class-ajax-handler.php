@@ -228,6 +228,8 @@ final class Ajax_Handler {
 			);
 		}
 
+		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
+
 		wp_send_json_success( self::build_scan_response( $post_id, $lang ) );
 	}
 
@@ -277,6 +279,8 @@ final class Ajax_Handler {
 		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			\PolymartAI\Activity_Logger::clear_job_api_cooldown( false );
 		}
+
+		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
 
 		if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
 			wp_send_json_error(
@@ -378,8 +382,8 @@ final class Ajax_Handler {
 		}
 
 		$started_at  = microtime( true );
-		$budget_sec  = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 120, $post_id, $lang );
-		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 40, $post_id, $lang );
+		$budget_sec  = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 45, $post_id, $lang );
+		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 12, $post_id, $lang );
 		$slices_run  = 0;
 		$last_slice  = array();
 		$lock_retried = $unlock;
@@ -457,6 +461,7 @@ final class Ajax_Handler {
 				: __( 'ترجمه در حال انجام است — درخواست بعدی ادامه می‌دهد.', 'polymart-ai' ),
 			'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
 			'slices_run'     => $slices_run,
+			'scan'           => self::build_scan_response( $post_id, $lang ),
 		);
 	}
 

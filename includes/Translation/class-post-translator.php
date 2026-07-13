@@ -3582,23 +3582,10 @@ final class Post_Translator {
 		$map     = array_merge( $state_map, $rebuilt );
 
 		$state['elementor_map'] = $map;
-		$chunk_progress                  = self::get_elementor_chunk_progress( $post_id, $lang, $state );
-		$state['elementor_chunk_index']  = max(
-			$chunk_progress['done'],
-			self::read_elementor_slice_cursor( $post_id, $lang )
-		);
-		$state['elementor_chunks_total'] = $chunk_progress['total'];
-		$state['elementor_slices_completed'] = max(
-			absint( $state['elementor_slices_completed'] ?? 0 ),
-			self::read_elementor_slice_cursor( $post_id, $lang ),
-			$state['elementor_chunk_index']
-		);
-		self::write_elementor_slice_cursor(
-			$post_id,
-			$lang,
-			$state['elementor_slices_completed'],
-			$state['elementor_chunks_total']
-		);
+		$chunk_progress         = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$state['elementor_chunk_index']      = (int) $chunk_progress['done'];
+		$state['elementor_chunks_total']     = (int) $chunk_progress['total'];
+		$state['elementor_slices_completed'] = (int) $chunk_progress['done'];
 
 		return $state;
 	}
@@ -3611,14 +3598,20 @@ final class Post_Translator {
 	 * @return int
 	 */
 	private static function resolve_elementor_done_count( array $state, $computed_done, $post_id = 0, $lang = '' ) {
-		$done = max(
-			absint( $computed_done ),
+		$computed_done = absint( $computed_done );
+		$done          = max(
+			$computed_done,
 			absint( $state['elementor_slices_completed'] ?? 0 ),
 			absint( $state['elementor_chunk_index'] ?? 0 )
 		);
 
 		if ( $post_id > 0 && '' !== sanitize_key( (string) $lang ) ) {
 			$done = max( $done, self::read_elementor_slice_cursor( $post_id, $lang ) );
+		}
+
+		// Stale partial state must not outrun fields actually translated in JSON/map.
+		if ( $computed_done < $done ) {
+			return $computed_done;
 		}
 
 		return $done;
@@ -3869,6 +3862,7 @@ final class Post_Translator {
 
 		if ( $stored > $inferred && $stored > $translated_paths ) {
 			self::clear_elementor_slice_cursor( $post_id, $lang );
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 
 			$state = self::get_job_partial_state( $post_id, $lang );
 
@@ -4111,7 +4105,7 @@ final class Post_Translator {
 					$left_chunks = self::chunk_elementor_payload_for_job( $remaining );
 
 					$payload_done = max( 0, count( $all_chunks ) - count( $left_chunks ) );
-					$total        = max( count( $all_chunks ), $total, 1 );
+					$total        = max( count( $all_chunks ), 1 );
 					$done         = max(
 						$payload_done,
 						self::reconcile_elementor_slice_cursor( $post_id, $lang, $data, $map )
@@ -4125,8 +4119,7 @@ final class Post_Translator {
 			$done     = max( $map_done, absint( $state['elementor_chunk_index'] ?? 0 ) );
 		}
 
-		$done  = self::resolve_elementor_done_count( $state, $done, $post_id, $lang );
-		$total = max( $total, $done, self::read_elementor_slice_cursor_total( $post_id, $lang ), 1 );
+		$done = self::resolve_elementor_done_count( $state, $done, $post_id, $lang );
 
 		return array(
 			'done'  => $done,
@@ -4624,6 +4617,80 @@ final class Post_Translator {
 		}
 
 		self::release_translation_lock( $post_id, $lang, true );
+
+		return true;
+	}
+
+	/**
+	 * Reset Elementor API cursor/progress when it no longer matches saved translations.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool True when stale progress was repaired.
+	 */
+	public static function repair_stale_elementor_job_state( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+
+		$state     = self::get_job_partial_state( $post_id, $lang );
+		$state     = is_array( $state ) ? $state : array();
+		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$map       = array_merge(
+			self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data ),
+			$state_map
+		);
+		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$source    = self::collect_elementor_translation_payload( $data );
+		$remaining = self::filter_remaining_elementor_payload( $source, $map, $skipped );
+		$all_chunks = self::chunk_elementor_payload_for_job( $source );
+
+		if ( empty( $remaining ) ) {
+			return false;
+		}
+
+		$translated_count = max( 0, count( $source ) - count( $remaining ) );
+		$hydrated_state   = array_merge( $state, array( 'elementor_map' => $map ) );
+		$progress_done    = (int) self::get_elementor_chunk_progress( $post_id, $lang, $hydrated_state )['done'];
+		$stored_total     = self::read_elementor_slice_cursor_total( $post_id, $lang );
+		$chunk_total      = max( 1, count( $all_chunks ) );
+		$cursor           = self::resolve_elementor_slice_cursor( $post_id, $lang, $data, $hydrated_state );
+		$pending_chunks   = count( array_slice( $all_chunks, $cursor ) );
+
+		$stale = $progress_done > $translated_count
+			|| $stored_total > $chunk_total
+			|| ( 0 === $pending_chunks && count( $remaining ) > 0 );
+
+		if ( ! $stale ) {
+			return false;
+		}
+
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+
+		$inferred = self::infer_elementor_slice_cursor_from_saved( $post_id, $lang, $data, $map );
+
+		$state['phase']                       = 'elementor';
+		$state['elementor_map']               = $map;
+		$state['elementor_chunk_index']       = $inferred;
+		$state['elementor_slices_completed']  = $inferred;
+		$state['elementor_chunks_total']      = $chunk_total;
+		self::save_job_partial_state( $post_id, $lang, $state );
 
 		return true;
 	}
@@ -5289,12 +5356,18 @@ final class Post_Translator {
 		$chunk_queue     = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
 		$chunks          = $chunk_queue['pending'];
 		$slice_cursor    = $chunk_queue['cursor'];
-		$progress_total  = max( $chunk_queue['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+		$progress_total  = max( $chunk_queue['total'], 1 );
 		$state['elementor_chunks_total'] = $progress_total;
 
 		if ( empty( $chunks ) ) {
 			if ( ! empty( $payload ) ) {
-				$chunks = self::chunk_elementor_payload_for_job( $payload );
+				self::repair_stale_elementor_job_state( $post_id, $lang );
+				$state       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+				$chunk_queue = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+				$chunks       = $chunk_queue['pending'];
+				$slice_cursor = $chunk_queue['cursor'];
+				$progress_total                  = max( $chunk_queue['total'], 1 );
+				$state['elementor_chunks_total'] = $progress_total;
 			}
 
 			if ( empty( $chunks ) ) {
