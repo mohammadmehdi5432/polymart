@@ -301,6 +301,12 @@
 			}
 			html += '<li>' + (config.strings.elementorTranslated || '') + ': ' + (elementor.translated_field_count || 0) + '</li>';
 			html += '<li>' + (config.strings.elementorRemaining || '') + ': ' + (elementor.remaining_field_count || 0) + '</li>';
+			if (elementor.long_remaining_count > 0) {
+				html += '<li>' + (config.strings.elementorLongRemaining || 'متن‌های بلند مانده') + ': ' + elementor.long_remaining_count + '</li>';
+			}
+			if (elementor.filtered_out_count > 0) {
+				html += '<li>' + (config.strings.elementorFilteredOut || 'فیلترشده (HTML/ایمنی)') + ': ' + elementor.filtered_out_count + '</li>';
+			}
 			if (elementor.chunk_progress) {
 				html += '<li>' + (config.strings.elementorChunks || '') + ': ' + elementor.chunk_progress;
 				if (elementor.pending_api_chunks != null) {
@@ -335,6 +341,15 @@
 				html += '<p><strong>' + (config.strings.elementorSamples || '') + '</strong></p>';
 				html += '<ul class="polymart-ai-metabox__scan-list polymart-ai-metabox__scan-list--missing">';
 				elementor.remaining_samples.forEach(function (sample) {
+					html += '<li><code class="polymart-ai-metabox__path">' + sample.path + '</code> — ' + sample.preview + '</li>';
+				});
+				html += '</ul>';
+			}
+
+			if ((elementor.filtered_out_samples || []).length) {
+				html += '<p class="description">' + (config.strings.elementorFilteredOutHint || 'این فیلدها در JSON فارسی دارند ولی فعلاً در صف ترجمه نیستند:') + '</p>';
+				html += '<ul class="polymart-ai-metabox__scan-list polymart-ai-metabox__scan-list--missing">';
+				elementor.filtered_out_samples.forEach(function (sample) {
 					html += '<li><code class="polymart-ai-metabox__path">' + sample.path + '</code> — ' + sample.preview + '</li>';
 				});
 				html += '</ul>';

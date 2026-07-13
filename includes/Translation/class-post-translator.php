@@ -346,7 +346,7 @@ final class Post_Translator {
 	/**
 	 * Maximum characters per Elementor job-step API call.
 	 */
-	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1000;
+	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 2500;
 
 	/**
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
@@ -3814,16 +3814,24 @@ final class Post_Translator {
 	 */
 	private static function elementor_chunk_paths_translated( array $chunk, array $map ) {
 		foreach ( $chunk as $path => $text ) {
-			unset( $text );
 			$path = (string) $path;
+			$text = (string) $text;
 
-			if ( '' === $path || ! isset( $map[ $path ] ) ) {
-				return false;
+			if ( preg_match( '/^(.+)::__part\d+$/', $path, $matches ) ) {
+				$base = $matches[1];
+
+				if ( isset( $map[ $path ] ) && self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] ) ) {
+					continue;
+				}
+
+				if ( ! self::elementor_field_translation_complete( $base, $text, $map ) ) {
+					return false;
+				}
+
+				continue;
 			}
 
-			$translated = trim( (string) $map[ $path ] );
-
-			if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+			if ( ! self::elementor_field_translation_complete( $path, $text, $map ) ) {
 				return false;
 			}
 		}
@@ -4464,6 +4472,113 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Retry individual Elementor fields from a batch when the group response was partial.
+	 *
+	 * @param array<string, string>  $chunk         Source paths in this API batch.
+	 * @param array<string, string>  $mapped_chunk  Accepted translations so far.
+	 * @param string                 $api_key       API key.
+	 * @param string                 $api_endpoint  API endpoint.
+	 * @param string                 $ai_model      Model name.
+	 * @param string                 $lang          Target language.
+	 * @param array<string, mixed>   $ai_options    HTTP options.
+	 * @param array<string, int>     $failures      Failure counts (by reference).
+	 * @param array<string, mixed>   $state         Partial state (by reference).
+	 * @param int                    $max_retries   Max single-field API calls.
+	 * @return array<string, string>
+	 */
+	private static function retry_untranslated_elementor_chunk_fields(
+		array $chunk,
+		array $mapped_chunk,
+		$api_key,
+		$api_endpoint,
+		$ai_model,
+		$lang,
+		array $ai_options,
+		array &$failures,
+		array &$state,
+		$max_retries = 4
+	) {
+		$max_retries = max( 1, absint( $max_retries ) );
+		$attempts    = 0;
+
+		foreach ( $chunk as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( '' === $path ) {
+				continue;
+			}
+
+			if ( self::elementor_field_translation_complete( $path, $text, $mapped_chunk ) ) {
+				continue;
+			}
+
+			if ( $attempts >= $max_retries ) {
+				break;
+			}
+
+			++$attempts;
+
+			$field_payload = self::expand_payload_for_ai( array( $path => $text ) );
+			list( $aliased_field, $field_alias_map ) = self::alias_elementor_payload_keys( $field_payload );
+
+			if ( empty( $aliased_field ) ) {
+				continue;
+			}
+
+			\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
+
+			$single = AI_Client::translate_fields(
+				$aliased_field,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang,
+				$ai_options
+			);
+
+			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
+
+			if ( is_wp_error( $single ) ) {
+				$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+				continue;
+			}
+
+			$single_map = self::unmap_elementor_aliases(
+				self::collapse_payload_parts( $single ),
+				$field_alias_map
+			);
+
+			foreach ( $single_map as $single_path => $translated ) {
+				$single_path  = (string) $single_path;
+				$translated   = trim( (string) $translated );
+				$source_text  = (string) ( $field_payload[ $single_path ] ?? $text );
+
+				if ( preg_match( '/^(.+)::__part\d+$/', $single_path, $matches ) ) {
+					$source_text = (string) ( $field_payload[ $matches[1] ] ?? $text );
+				}
+
+				if ( ! self::elementor_map_value_is_valid_translation( $single_path, $source_text, $translated ) ) {
+					$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+
+					if ( $failures[ $path ] >= 2 ) {
+						$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+						$skipped[] = $path;
+						$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+						unset( $failures[ $path ] );
+					}
+
+					continue;
+				}
+
+				$mapped_chunk[ $single_path ] = $translated;
+			}
+		}
+
+		return $mapped_chunk;
+	}
+
+	/**
 	 * Transition job partial state from field phases to Elementor or clear it.
 	 *
 	 * @param int                  $post_id Post ID.
@@ -4852,7 +4967,7 @@ final class Post_Translator {
 		$saved_raw = get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
 		$state_map_count = 0;
 
-		foreach ( $state_map as $value ) {
+		foreach ( $map as $value ) {
 			$value = trim( (string) $value );
 
 			if ( '' !== $value && ! Persian_Detector::contains_persian( $value ) ) {
@@ -4864,6 +4979,22 @@ final class Post_Translator {
 		$stale_cursor           = (int) $progress['done'] > max( 0, count( $source ) - count( $remaining ) ) && count( $remaining ) > 0;
 		$collapsed              = self::collapse_duplicate_elementor_payload( $source );
 		$api_batches            = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
+		$long_field_count       = 0;
+		$long_remaining_count   = 0;
+
+		foreach ( $source as $text ) {
+			if ( mb_strlen( (string) $text ) > 300 ) {
+				++$long_field_count;
+			}
+		}
+
+		foreach ( $remaining as $text ) {
+			if ( mb_strlen( (string) $text ) > 300 ) {
+				++$long_remaining_count;
+			}
+		}
+
+		$filtered_probe         = self::collect_elementor_filtered_out_payload( $data );
 		$api_payload_samples    = array();
 		$sample_index           = 0;
 
@@ -4893,6 +5024,22 @@ final class Post_Translator {
 			'has_saved_json'         => is_string( $saved_raw ) && '' !== trim( $saved_raw ),
 			'saved_json_has_persian' => self::stored_elementor_translation_has_persian( $post_id, $lang ),
 			'remaining_samples'      => $samples,
+			'long_field_count'       => $long_field_count,
+			'long_remaining_count'   => $long_remaining_count,
+			'filtered_out_count'     => count( $filtered_probe ),
+			'filtered_out_samples'   => array_slice(
+				array_map(
+					static function ( $item ) {
+						return array(
+							'path'    => (string) ( $item['path'] ?? '' ),
+							'preview' => wp_trim_words( wp_strip_all_tags( html_entity_decode( (string) ( $item['preview'] ?? '' ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ), 12, '…' ),
+						);
+					},
+					array_values( $filtered_probe )
+				),
+				0,
+				4
+			),
 			'stale_api_cursor'       => $stale_cursor,
 			'api_cooldown_active'    => $api_cooldown_remaining > 0,
 			'api_cooldown_remaining' => $api_cooldown_remaining,
@@ -5735,6 +5882,19 @@ final class Post_Translator {
 					unset( $mapped_chunk[ $path ] );
 				}
 			}
+
+			$mapped_chunk = self::retry_untranslated_elementor_chunk_fields(
+				$chunk,
+				$mapped_chunk,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang,
+				$ai_options,
+				$failures,
+				$state,
+				max( 2, count( $chunk ) )
+			);
 
 			if ( empty( $mapped_chunk ) && ! empty( $chunk ) ) {
 				$first_path = (string) array_key_first( $chunk );
@@ -6707,6 +6867,7 @@ final class Post_Translator {
 	 * @return array<int, array<string, string>>
 	 */
 	private static function chunk_elementor_payload_for_ai( array $payload ) {
+		$payload       = self::expand_payload_for_ai( $payload );
 		$chunks        = array();
 		$current       = array();
 		$current_chars = 0;
@@ -6796,6 +6957,83 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Persian Elementor fields excluded by safety filters (shown in scan diagnostics).
+	 *
+	 * @param array<string|int, mixed> $node Elementor JSON root.
+	 * @return array<int, array{path: string, preview: string}>
+	 */
+	private static function collect_elementor_filtered_out_payload( array $node ) {
+		$filtered = array();
+		self::walk_elementor_filtered_out_payload( $node, $filtered, 'root' );
+
+		return $filtered;
+	}
+
+	/**
+	 * @param array<string|int, mixed>                             $node     Elementor node.
+	 * @param array<int, array{path: string, preview: string}>     $filtered Output list.
+	 * @param string                                               $path     Current path.
+	 * @return void
+	 */
+	private static function walk_elementor_filtered_out_payload( array $node, array &$filtered, $path ) {
+		if ( isset( $node['settings'] ) && is_array( $node['settings'] ) ) {
+			self::walk_elementor_filtered_out_settings( $node['settings'], $filtered, $path . '.settings' );
+		}
+
+		foreach ( $node as $key => $item ) {
+			if ( 'settings' === $key ) {
+				continue;
+			}
+
+			$child_path = $path . '.' . (string) $key;
+
+			if ( is_string( $key ) && isset( self::$elementor_text_keys[ $key ] ) && is_string( $item ) ) {
+				$value = trim( (string) $item );
+
+				if ( '' !== $value && Persian_Detector::contains_persian( $value ) && self::should_skip_elementor_setting_key( $key, $value ) ) {
+					$filtered[] = array(
+						'path'    => $child_path,
+						'preview' => $value,
+					);
+				}
+				continue;
+			}
+
+			if ( is_array( $item ) ) {
+				self::walk_elementor_filtered_out_payload( $item, $filtered, $child_path );
+			}
+		}
+	}
+
+	/**
+	 * @param array<string|int, mixed>                             $settings Settings node.
+	 * @param array<int, array{path: string, preview: string}>     $filtered Output list.
+	 * @param string                                               $path     Current path.
+	 * @return void
+	 */
+	private static function walk_elementor_filtered_out_settings( array $settings, array &$filtered, $path ) {
+		foreach ( $settings as $key => $item ) {
+			$child_path = $path . '.' . (string) $key;
+
+			if ( is_string( $item ) ) {
+				$value = trim( (string) $item );
+
+				if ( '' !== $value && Persian_Detector::contains_persian( $value ) && self::should_skip_elementor_setting_key( (string) $key, $value ) ) {
+					$filtered[] = array(
+						'path'    => $child_path,
+						'preview' => $value,
+					);
+				}
+				continue;
+			}
+
+			if ( is_array( $item ) ) {
+				self::walk_elementor_filtered_out_settings( $item, $filtered, $child_path );
+			}
+		}
+	}
+
+	/**
 	 * @param array<string|int, mixed> $node    Elementor node.
 	 * @param array<string, string>  $payload Output payload.
 	 * @param string                 $path    Current path.
@@ -6859,6 +7097,10 @@ final class Post_Translator {
 		}
 	}
 
+	private static function is_elementor_user_text_setting_key( $key ) {
+		return isset( self::$elementor_text_keys[ (string) $key ] );
+	}
+
 	/**
 	 * Whether an Elementor setting key/value pair should be excluded from AI translation.
 	 *
@@ -6867,8 +7109,9 @@ final class Post_Translator {
 	 * @return bool
 	 */
 	private static function should_skip_elementor_setting_key( $key, $value ) {
-		$key   = (string) $key;
-		$value = trim( (string) $value );
+		$key          = (string) $key;
+		$value        = trim( (string) $value );
+		$is_user_text = self::is_elementor_user_text_setting_key( $key );
 
 		if ( '' === $value || ! Persian_Detector::contains_persian( $value ) ) {
 			return true;
@@ -6900,13 +7143,15 @@ final class Post_Translator {
 			return true;
 		}
 
-		// HTML markup blobs.
-		if ( preg_match( '/^\s*<(?:html|body|div|span|section|style|script|svg|table|ul|ol|p|h[1-6]|!DOCTYPE)/i', $value ) ) {
-			return true;
-		}
+		// Rich-text widget fields (editor/html/text) may contain HTML — still translate Persian inside tags.
+		if ( ! $is_user_text ) {
+			if ( preg_match( '/^\s*<(?:html|body|div|span|section|style|script|svg|table|ul|ol|p|h[1-6]|!DOCTYPE)/i', $value ) ) {
+				return true;
+			}
 
-		if ( substr_count( $value, '<' ) >= 3 && substr_count( $value, '>' ) >= 3 ) {
-			return true;
+			if ( substr_count( $value, '<' ) >= 3 && substr_count( $value, '>' ) >= 3 ) {
+				return true;
+			}
 		}
 
 		// Long serialized JSON-like strings.
