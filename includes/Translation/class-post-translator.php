@@ -409,7 +409,14 @@ final class Post_Translator {
 	/**
 	 * Maximum characters per Elementor job-step API call.
 	 */
-	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 2500;
+	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1500;
+
+	/**
+	 * Split very long Elementor text fields before calling the AI.
+	 *
+	 * Helps avoid gateway timeouts on long HTML-heavy content.
+	 */
+	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = 1000;
 
 	/**
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
@@ -3268,6 +3275,324 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Split a long Elementor text value into smaller, paragraph-aware segments.
+	 *
+	 * Segments are keyed as "{$path}::__seg1", "{$path}::__seg2", ...
+	 *
+	 * @param string $path Base Elementor path.
+	 * @param string $text Source text.
+	 * @param int    $max_chars Segment size cap (characters).
+	 * @return array<string, string> Segment map.
+	 */
+	private static function split_elementor_text_into_segments( $path, $text, $max_chars ) {
+		$path      = (string) $path;
+		$text      = (string) $text;
+		$max_chars = max( 200, absint( $max_chars ) );
+
+		// Prefer splitting on paragraph boundaries.
+		$pieces = array();
+
+		if ( false !== stripos( $text, '<p' ) || false !== stripos( $text, '</p>' ) ) {
+			// Split after closing </p> while keeping the delimiter.
+			$raw = preg_split( '/(<\/p>\s*)/i', $text, -1, PREG_SPLIT_DELIM_CAPTURE );
+			if ( is_array( $raw ) ) {
+				for ( $i = 0; $i < count( $raw ); $i += 2 ) {
+					$chunk = (string) ( $raw[ $i ] ?? '' );
+					$delim = (string) ( $raw[ $i + 1 ] ?? '' );
+					$piece = $chunk . $delim;
+					if ( '' !== trim( $piece ) ) {
+						$pieces[] = $piece;
+					}
+				}
+			}
+		}
+
+		if ( empty( $pieces ) ) {
+			$raw = preg_split( "/\n\s*\n/u", $text );
+			if ( is_array( $raw ) ) {
+				foreach ( $raw as $p ) {
+					$p = (string) $p;
+					if ( '' !== trim( $p ) ) {
+						$pieces[] = $p . "\n\n";
+					}
+				}
+			}
+		}
+
+		if ( empty( $pieces ) ) {
+			$pieces = array( $text );
+		}
+
+		$segments = array();
+		$buffer   = '';
+		$seg      = 1;
+
+		foreach ( $pieces as $piece ) {
+			$piece = (string) $piece;
+
+			if ( '' === $buffer ) {
+				$buffer = $piece;
+			} elseif ( self::utf8_strlen( $buffer . $piece ) <= $max_chars ) {
+				$buffer .= $piece;
+			} else {
+				$segments[ $path . '::__seg' . $seg ] = $buffer;
+				++$seg;
+				$buffer = $piece;
+			}
+
+			// Extremely long single piece (e.g. one giant <p>) — hard cut.
+			while ( self::utf8_strlen( $buffer ) > $max_chars ) {
+				$segments[ $path . '::__seg' . $seg ] = self::utf8_substr( $buffer, 0, $max_chars );
+				++$seg;
+				$buffer = self::utf8_substr( $buffer, $max_chars, self::utf8_strlen( $buffer ) - $max_chars );
+			}
+		}
+
+		if ( '' !== $buffer ) {
+			$segments[ $path . '::__seg' . $seg ] = $buffer;
+		}
+
+		// If we failed to actually split, keep original.
+		if ( count( $segments ) <= 1 ) {
+			return array( $path => $text );
+		}
+
+		return $segments;
+	}
+
+	/**
+	 * Expand Elementor payload to segment long fields before chunking.
+	 *
+	 * @param array<string, string> $payload Path => text.
+	 * @return array<string, string>
+	 */
+	private static function expand_elementor_payload_for_ai( array $payload ) {
+		$expanded = array();
+
+		foreach ( $payload as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( '' === $path || '' === trim( $text ) ) {
+				continue;
+			}
+
+			if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+				$expanded[ $path ] = $text;
+				continue;
+			}
+
+			foreach ( self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) as $seg_key => $seg_text ) {
+				$expanded[ (string) $seg_key ] = (string) $seg_text;
+			}
+		}
+
+		return $expanded;
+	}
+
+	/**
+	 * Compute expected segment keys for a long Elementor field.
+	 *
+	 * @param string $path Base path.
+	 * @param string $text Source text.
+	 * @return array<int, string> List of segment keys in order.
+	 */
+	private static function get_elementor_segment_keys( $path, $text ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+			return array();
+		}
+
+		$segments = self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS );
+		$keys     = array();
+
+		foreach ( array_keys( $segments ) as $k ) {
+			$k = (string) $k;
+			if ( $k !== $path ) {
+				$keys[] = $k;
+			}
+		}
+
+		return $keys;
+	}
+
+	/**
+	 * Map segment key => segment source text for a long Elementor field.
+	 *
+	 * @param string $path Base path.
+	 * @param string $text Full source text.
+	 * @return array<string, string>
+	 */
+	private static function get_elementor_segment_source_lookup( $path, $text ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+			return array();
+		}
+
+		$segments = self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS );
+		$lookup   = array();
+
+		foreach ( $segments as $k => $v ) {
+			$k = (string) $k;
+			$v = (string) $v;
+			if ( $k === $path ) {
+				continue;
+			}
+			$lookup[ $k ] = $v;
+		}
+
+		return $lookup;
+	}
+
+	/**
+	 * Split a long Elementor text value into smaller, paragraph-aware segments.
+	 *
+	 * Segments are keyed as "{$path}::__seg1", "{$path}::__seg2", ...
+	 *
+	 * @param string $path Base Elementor path.
+	 * @param string $text Source text.
+	 * @param int    $max_chars Segment size cap (characters).
+	 * @return array<string, string> Segment map.
+	 */
+	private static function split_elementor_text_into_segments( $path, $text, $max_chars ) {
+		$path      = (string) $path;
+		$text      = (string) $text;
+		$max_chars = max( 200, absint( $max_chars ) );
+
+		// Prefer splitting on paragraph boundaries.
+		$pieces = array();
+
+		if ( false !== stripos( $text, '<p' ) || false !== stripos( $text, '</p>' ) ) {
+			// Split after closing </p> while keeping the delimiter.
+			$raw = preg_split( '/(<\/p>\s*)/i', $text, -1, PREG_SPLIT_DELIM_CAPTURE );
+			if ( is_array( $raw ) ) {
+				for ( $i = 0; $i < count( $raw ); $i += 2 ) {
+					$chunk = (string) ( $raw[ $i ] ?? '' );
+					$delim = (string) ( $raw[ $i + 1 ] ?? '' );
+					$piece = $chunk . $delim;
+					if ( '' !== trim( $piece ) ) {
+						$pieces[] = $piece;
+					}
+				}
+			}
+		}
+
+		if ( empty( $pieces ) ) {
+			$raw = preg_split( "/\n\s*\n/u", $text );
+			if ( is_array( $raw ) ) {
+				foreach ( $raw as $p ) {
+					$p = (string) $p;
+					if ( '' !== trim( $p ) ) {
+						$pieces[] = $p . "\n\n";
+					}
+				}
+			}
+		}
+
+		if ( empty( $pieces ) ) {
+			$pieces = array( $text );
+		}
+
+		$segments = array();
+		$buffer   = '';
+		$seg      = 1;
+
+		foreach ( $pieces as $piece ) {
+			$piece = (string) $piece;
+
+			if ( '' === $buffer ) {
+				$buffer = $piece;
+			} elseif ( self::utf8_strlen( $buffer . $piece ) <= $max_chars ) {
+				$buffer .= $piece;
+			} else {
+				$segments[ $path . '::__seg' . $seg ] = $buffer;
+				++$seg;
+				$buffer = $piece;
+			}
+
+			// Extremely long single piece (e.g. one giant <p>) — hard cut.
+			while ( self::utf8_strlen( $buffer ) > $max_chars ) {
+				$segments[ $path . '::__seg' . $seg ] = self::utf8_substr( $buffer, 0, $max_chars );
+				++$seg;
+				$buffer = self::utf8_substr( $buffer, $max_chars, self::utf8_strlen( $buffer ) - $max_chars );
+			}
+		}
+
+		if ( '' !== $buffer ) {
+			$segments[ $path . '::__seg' . $seg ] = $buffer;
+		}
+
+		// If we failed to actually split, keep original.
+		if ( count( $segments ) <= 1 ) {
+			return array( $path => $text );
+		}
+
+		return $segments;
+	}
+
+	/**
+	 * Expand Elementor payload to segment long fields before chunking.
+	 *
+	 * @param array<string, string> $payload Path => text.
+	 * @return array<string, string>
+	 */
+	private static function expand_elementor_payload_for_ai( array $payload ) {
+		$expanded = array();
+
+		foreach ( $payload as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( '' === $path || '' === trim( $text ) ) {
+				continue;
+			}
+
+			if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+				$expanded[ $path ] = $text;
+				continue;
+			}
+
+			foreach ( self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) as $seg_key => $seg_text ) {
+				$expanded[ (string) $seg_key ] = (string) $seg_text;
+			}
+		}
+
+		return $expanded;
+	}
+
+	/**
+	 * Compute expected segment keys for a long Elementor field.
+	 *
+	 * @param string $path Base path.
+	 * @param string $text Source text.
+	 * @return array<int, string> List of segment keys in order.
+	 */
+	private static function get_elementor_segment_keys( $path, $text ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+			return array();
+		}
+
+		$segments = self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS );
+		$keys     = array();
+
+		foreach ( array_keys( $segments ) as $k ) {
+			$k = (string) $k;
+			if ( $k !== $path ) {
+				$keys[] = $k;
+			}
+		}
+
+		return $keys;
+	}
+
+	/**
 	 * Merge translated payload parts back into their original field keys.
 	 *
 	 * @param array<string, string> $translations Translated field map.
@@ -3275,20 +3600,33 @@ final class Post_Translator {
 	 */
 	public static function collapse_payload_parts( array $translations ) {
 		$merged = array();
+		$parts  = array();
 
 		foreach ( $translations as $key => $value ) {
-			if ( preg_match( '/^(.+)::__part\d+$/', (string) $key, $matches ) ) {
-				$base = $matches[1];
+			$key = (string) $key;
 
-				if ( ! isset( $merged[ $base ] ) ) {
-					$merged[ $base ] = '';
+			if ( preg_match( '/^(.+)::__(part|seg)(\d+)$/', $key, $matches ) ) {
+				$base  = (string) $matches[1];
+				$index = absint( $matches[3] );
+
+				if ( $index <= 0 ) {
+					$index = 1;
 				}
 
-				$merged[ $base ] .= (string) $value;
+				if ( ! isset( $parts[ $base ] ) ) {
+					$parts[ $base ] = array();
+				}
+
+				$parts[ $base ][ $index ] = (string) $value;
 				continue;
 			}
 
-			$merged[ $key ] = $value;
+			$merged[ $key ] = (string) $value;
+		}
+
+		foreach ( $parts as $base => $chunk_parts ) {
+			ksort( $chunk_parts );
+			$merged[ $base ] = implode( '', array_values( $chunk_parts ) );
 		}
 
 		return $merged;
@@ -6789,6 +7127,11 @@ final class Post_Translator {
 
 			if ( preg_match( '/^(.+)::__part\d+$/', $path, $matches ) ) {
 				$source_text = (string) ( $source_payload[ $matches[1] ] ?? $source_text );
+			} elseif ( preg_match( '/^(.+)::__seg\d+$/', $path, $matches ) ) {
+				$base       = (string) $matches[1];
+				$base_text  = (string) ( $source_payload[ $base ] ?? '' );
+				$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
+				$source_text = (string) ( $seg_lookup[ $path ] ?? $base_text );
 			}
 
 			if ( self::elementor_map_value_is_valid_translation( $path, $source_text, $value ) ) {
@@ -6802,6 +7145,21 @@ final class Post_Translator {
 	private static function elementor_field_translation_complete( $path, $text, array $map ) {
 		$path = (string) $path;
 		$text = (string) $text;
+
+		// For very long Elementor fields, require all __segN pieces.
+		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+		if ( ! empty( $seg_lookup ) ) {
+			foreach ( $seg_lookup as $seg_key => $seg_source ) {
+				if (
+					! isset( $map[ $seg_key ] )
+					|| ! self::elementor_map_value_is_valid_translation( $seg_key, (string) $seg_source, (string) $map[ $seg_key ] )
+				) {
+					return false;
+				}
+			}
+
+			return true;
+		}
 
 		if ( self::utf8_strlen( $text ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
 			return isset( $map[ $path ] )
@@ -6853,6 +7211,9 @@ final class Post_Translator {
 		 * @param array<string, string> $payload    Source field map.
 		 */
 		$chunk_size = max( 1, (int) apply_filters( 'polymart_ai_elementor_job_field_chunk_size', $chunk_size, $payload ) );
+
+		// Sub-chunk long Elementor fields (paragraph-aware) before batching.
+		$payload = self::expand_elementor_payload_for_ai( $payload );
 
 		return self::chunk_payload_with_limits(
 			$payload,
