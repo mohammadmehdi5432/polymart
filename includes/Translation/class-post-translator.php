@@ -5804,9 +5804,19 @@ final class Post_Translator {
 		$manage_lock = (bool) $manage_lock;
 
 		if ( ! $post_id || ! self::can_translate_post( $post_id ) ) {
+			$message = __( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' );
+
+			if ( \PolymartAI\Activity_Logger::should_bypass_browser_auth_checks() ) {
+				$message = sprintf(
+					/* translators: 1: current user ID */
+					__( 'Worker پس‌زمینه نتوانست دسترسی ترجمه را تأیید کند (User ID: %1$d).', 'polymart-ai' ),
+					get_current_user_id()
+				);
+			}
+
 			return new \WP_Error(
 				'polymart_ai_forbidden',
-				__( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' )
+				$message
 			);
 		}
 
@@ -8669,9 +8679,19 @@ final class Post_Translator {
 		$post_id = absint( $post_id );
 
 		if ( ! $post_id || ! self::can_translate_post( $post_id ) ) {
+			$message = __( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' );
+
+			if ( \PolymartAI\Activity_Logger::should_bypass_browser_auth_checks() ) {
+				$message = sprintf(
+					/* translators: 1: current user ID */
+					__( 'Worker پس‌زمینه نتوانست دسترسی ترجمه را تأیید کند (User ID: %1$d).', 'polymart-ai' ),
+					get_current_user_id()
+				);
+			}
+
 			return new \WP_Error(
 				'polymart_ai_forbidden',
-				__( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' )
+				$message
 			);
 		}
 

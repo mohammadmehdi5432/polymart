@@ -53,6 +53,13 @@ final class Metabox_Action_Scheduler {
 	private static $active_job = null;
 
 	/**
+	 * Last auth/permission failure captured for shutdown logging.
+	 *
+	 * @var string
+	 */
+	private static $last_auth_failure_message = '';
+
+	/**
 	 * Register the metabox AS hook.
 	 *
 	 * @return void
@@ -511,7 +518,20 @@ final class Metabox_Action_Scheduler {
 		}
 
 		// Second try: if still stuck, run one job slice directly.
-		$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
+		$bootstrapped_worker = false;
+
+		if ( get_current_user_id() <= 0 ) {
+			Activity_Logger::begin_metabox_as_worker( $post_id );
+			$bootstrapped_worker = true;
+		}
+
+		try {
+			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
+		} finally {
+			if ( $bootstrapped_worker ) {
+				Activity_Logger::end_metabox_as_worker();
+			}
+		}
 
 		if ( is_wp_error( $slice ) ) {
 			// For metabox polling, never hard-fail on transport timeouts/recoverable slice errors.
@@ -758,18 +778,23 @@ final class Metabox_Action_Scheduler {
 			return;
 		}
 
-		self::$handler_clean_exit = false;
-		self::$current_action_id  = self::resolve_current_action_id();
-		self::$active_job         = array(
+		self::$handler_clean_exit       = false;
+		self::$last_auth_failure_message = '';
+		self::$current_action_id        = self::resolve_current_action_id();
+		self::$active_job               = array(
 			'post_id' => $post_id,
 			'lang'    => $lang,
 		);
+
+		// wp_die()/fatal errors skip PHP finally — register shutdown recovery first.
+		register_shutdown_function( array( __CLASS__, 'handler_shutdown_recovery' ) );
 
 		if ( function_exists( 'set_time_limit' ) ) {
 			@set_time_limit( 200 );
 		}
 
-		register_shutdown_function( array( __CLASS__, 'handler_shutdown_recovery' ) );
+		// Impersonate post author or admin before lock checks / meta saves (User ID 0 otherwise).
+		Activity_Logger::begin_metabox_as_worker( $post_id );
 
 		$should_chain = true;
 		$completed    = false;
@@ -779,7 +804,6 @@ final class Metabox_Action_Scheduler {
 		Post_Translator::acquire_translation_lock( $post_id, $lang );
 
 		try {
-			Activity_Logger::bootstrap_job_worker_context();
 			Activity_Logger::on_ai_http_heartbeat();
 
 			if ( ! Activity_Logger::is_bulk_job_running() ) {
@@ -807,6 +831,8 @@ final class Metabox_Action_Scheduler {
 			$result = self::run_metabox_batch( $post_id, $lang );
 
 			if ( is_wp_error( $result ) ) {
+				self::log_auth_failure_if_applicable( $post_id, $lang, $result->get_error_message() );
+
 				// Never stall: skip the next pending Elementor chunk and keep chaining.
 				$skipped = Post_Translator::skip_next_elementor_pending_chunk(
 					$post_id,
@@ -845,6 +871,8 @@ final class Metabox_Action_Scheduler {
 			self::update_status_from_slice( $post_id, $lang, $result );
 			self::$handler_clean_exit = true;
 		} catch ( \Throwable $e ) {
+			self::log_auth_failure_if_applicable( $post_id, $lang, $e->getMessage() );
+
 			// On any throwable, skip one chunk and keep going.
 			$skipped = Post_Translator::skip_next_elementor_pending_chunk( $post_id, $lang, 'throwable' );
 			if ( is_array( $skipped ) ) {
@@ -867,6 +895,8 @@ final class Metabox_Action_Scheduler {
 			if ( $should_chain && ! $completed ) {
 				self::chain_next( $post_id, $lang );
 			}
+
+			Activity_Logger::end_metabox_as_worker();
 		}
 	}
 
@@ -919,6 +949,8 @@ final class Metabox_Action_Scheduler {
 			}
 
 			if ( is_wp_error( $slice ) ) {
+				self::log_auth_failure_if_applicable( $post_id, $lang, $slice->get_error_message() );
+
 				if (
 					Post_Translator::is_recoverable_job_slice_error( $slice )
 					|| Post_Translator::is_api_transport_timeout_error( $slice )
@@ -1348,19 +1380,94 @@ final class Metabox_Action_Scheduler {
 			return;
 		}
 
+		$failure_message = self::$last_auth_failure_message;
+
+		if ( '' === $failure_message && function_exists( 'error_get_last' ) ) {
+			$last_error = error_get_last();
+
+			if ( is_array( $last_error ) && ! empty( $last_error['message'] ) ) {
+				$failure_message = (string) $last_error['message'];
+			}
+		}
+
+		self::log_auth_failure_if_applicable( $post_id, $lang, $failure_message );
+
 		Post_Translator::release_translation_lock( $post_id, $lang, true );
 		self::finalize_interrupted_action();
+
+		$status_message = __( 'پردازش قبلی قطع شد — ادامه با بخش بعدی…', 'polymart-ai' );
+
+		if ( '' !== $failure_message && self::is_auth_related_message( $failure_message ) ) {
+			$status_message = $failure_message;
+		}
 
 		self::update_status(
 			$post_id,
 			$lang,
 			array(
 				'status'  => 'running',
-				'message' => __( 'پردازش قبلی قطع شد — ادامه با بخش بعدی…', 'polymart-ai' ),
-				'error'   => '',
+				'message' => $status_message,
+				'error'   => self::is_auth_related_message( $failure_message ) ? $failure_message : '',
 			)
 		);
 
 		self::chain_next( $post_id, $lang );
+
+		Activity_Logger::end_metabox_as_worker();
+	}
+
+	/**
+	 * Whether a message looks like a permission, nonce, or capability failure.
+	 *
+	 * @param string $message Error text.
+	 * @return bool
+	 */
+	private static function is_auth_related_message( $message ) {
+		$message = trim( (string) $message );
+
+		if ( '' === $message ) {
+			return false;
+		}
+
+		return (bool) preg_match(
+			'/permission|nonce|forbidden|unauthorized|capabilit|access denied|not allowed|اجازه|دسترسی|مجوز|امنیت/i',
+			$message
+		);
+	}
+
+	/**
+	 * Persist auth/security failures on the post for metabox polling diagnostics.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @param string $message Error message.
+	 * @return void
+	 */
+	private static function log_auth_failure_if_applicable( $post_id, $lang, $message ) {
+		$message = trim( (string) $message );
+
+		if ( '' === $message || ! self::is_auth_related_message( $message ) ) {
+			return;
+		}
+
+		self::$last_auth_failure_message = $message;
+
+		update_post_meta( $post_id, '_polymart_ai_elementor_error_' . sanitize_key( (string) $lang ), $message );
+
+		Activity_Logger::log(
+			'error',
+			sprintf(
+				/* translators: 1: post ID, 2: language code, 3: error message */
+				__( 'مatabox AS — #%1$d (%2$s): خطای دسترسی Worker — %3$s', 'polymart-ai' ),
+				absint( $post_id ),
+				sanitize_key( (string) $lang ),
+				$message
+			),
+			array(
+				'post_id' => absint( $post_id ),
+				'lang'    => sanitize_key( (string) $lang ),
+				'source'  => 'metabox_as_auth',
+			)
+		);
 	}
 }

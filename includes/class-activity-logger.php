@@ -96,6 +96,13 @@ final class Activity_Logger {
 	private static $trusted_admin_worker = false;
 
 	/**
+	 * True while the metabox Elementor AS callback is executing.
+	 *
+	 * @var bool
+	 */
+	private static $trusted_metabox_as_tick = false;
+
+	/**
 	 * Prevent nested Elementor burst recursion (run_queue_inline ↔ run_pinned).
 	 *
 	 * @var bool
@@ -311,7 +318,17 @@ final class Activity_Logger {
 	 * @return bool
 	 */
 	public static function is_trusted_job_worker() {
-		if ( wp_doing_cron() || self::$trusted_loopback_tick || self::$trusted_job_tick || self::$trusted_as_tick ) {
+		if (
+			wp_doing_cron()
+			|| self::$trusted_loopback_tick
+			|| self::$trusted_job_tick
+			|| self::$trusted_as_tick
+			|| self::$trusted_metabox_as_tick
+		) {
+			return true;
+		}
+
+		if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			return true;
 		}
 
@@ -326,6 +343,44 @@ final class Activity_Logger {
 	}
 
 	/**
+	 * Whether browser-only nonce/capability checks should be skipped.
+	 *
+	 * Action Scheduler, WP-Cron, and CLI workers have no interactive session.
+	 *
+	 * @return bool
+	 */
+	public static function should_bypass_browser_auth_checks() {
+		return self::is_trusted_job_worker();
+	}
+
+	/**
+	 * Mark the metabox AS worker trusted and impersonate a user who may edit the post.
+	 *
+	 * Must run before lock acquisition or translation slices in handle_metabox_action().
+	 *
+	 * @param int $post_id Post being translated.
+	 * @return void
+	 */
+	public static function begin_metabox_as_worker( $post_id ) {
+		self::$trusted_metabox_as_tick = true;
+		self::$trusted_as_tick         = true;
+		self::$trusted_job_tick        = true;
+
+		self::impersonate_job_worker_user( absint( $post_id ) );
+	}
+
+	/**
+	 * Clear metabox AS worker trust flags after a slice finishes.
+	 *
+	 * @return void
+	 */
+	public static function end_metabox_as_worker() {
+		self::$trusted_metabox_as_tick = false;
+		self::$trusted_as_tick         = false;
+		self::$trusted_job_tick        = false;
+	}
+
+	/**
 	 * Ensure pluggable auth exists and impersonate an admin during background jobs.
 	 *
 	 * Elementor, Rank Math, and other plugins call wp_get_current_user() while we
@@ -333,7 +388,7 @@ final class Activity_Logger {
 	 *
 	 * @return void
 	 */
-	public static function bootstrap_job_worker_context() {
+	public static function bootstrap_job_worker_context( $post_id = 0 ) {
 		if ( ! function_exists( 'wp_get_current_user' ) ) {
 			require_once ABSPATH . WPINC . '/pluggable.php';
 		}
@@ -348,6 +403,52 @@ final class Activity_Logger {
 
 		if ( ! self::is_trusted_job_worker() && ! self::is_bulk_job_running() ) {
 			return;
+		}
+
+		self::impersonate_job_worker_user( absint( $post_id ) );
+	}
+
+	/**
+	 * Set the current user for a trusted background worker (post author or admin).
+	 *
+	 * @param int $post_id Optional post ID — prefer author when they can edit_post.
+	 * @return void
+	 */
+	private static function impersonate_job_worker_user( $post_id = 0 ) {
+		if ( ! function_exists( 'wp_get_current_user' ) ) {
+			require_once ABSPATH . WPINC . '/pluggable.php';
+		}
+
+		if ( ! function_exists( 'wp_get_current_user' ) || get_current_user_id() > 0 ) {
+			return;
+		}
+
+		$user_id = self::resolve_job_worker_user_id( $post_id );
+
+		if ( $user_id > 0 ) {
+			wp_set_current_user( $user_id );
+		}
+	}
+
+	/**
+	 * Pick a user ID suitable for saving translated post meta from a worker.
+	 *
+	 * @param int $post_id Optional post ID.
+	 * @return int
+	 */
+	private static function resolve_job_worker_user_id( $post_id = 0 ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id > 0 ) {
+			$post = get_post( $post_id );
+
+			if ( $post instanceof \WP_Post ) {
+				$author_id = absint( $post->post_author );
+
+				if ( $author_id > 0 && user_can( $author_id, 'edit_post', $post_id ) ) {
+					return $author_id;
+				}
+			}
 		}
 
 		$user_id = absint( get_option( 'polymart_ai_job_worker_user_id', 0 ) );
@@ -368,9 +469,7 @@ final class Activity_Logger {
 			}
 		}
 
-		if ( $user_id > 0 ) {
-			wp_set_current_user( $user_id );
-		}
+		return $user_id;
 	}
 
 	/**
