@@ -422,17 +422,17 @@ final class Post_Translator {
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
 	 * Keep under shared-host / AS runner limits so actions cannot hang In-progress.
 	 */
-	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 45;
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 30;
 
 	/**
 	 * Minimum HTTP timeout (seconds) for auto-translate job AI calls.
 	 */
-	const JOB_REQUEST_MIN_TIMEOUT = 45;
+	const JOB_REQUEST_MIN_TIMEOUT = 20;
 
 	/**
 	 * Maximum HTTP timeout (seconds) for a single auto-translate job AI call.
 	 */
-	const JOB_REQUEST_MAX_TIMEOUT = 50;
+	const JOB_REQUEST_MAX_TIMEOUT = 30;
 
 	/**
 	 * Variation title batches — variable products may have 100+ rows.

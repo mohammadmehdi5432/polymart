@@ -512,31 +512,6 @@ final class Ajax_Handler {
 			Post_Translator::release_stale_translation_lock( $post_id, $lang, 90 );
 		}
 
-		// Browser polling is the execution supervisor: kill stuck AS actions early.
-		// If a metabox AS action stays In-progress too long, fail it so inline polling can continue.
-		Metabox_Action_Scheduler::kill_stale_running_now( $post_id, $lang, 75 );
-
-		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
-		Metabox_Action_Scheduler::recover_stale_and_nudge( $post_id, $lang );
-
-		// Ajax Loopback Fallback Runner:
-		// When Action Scheduler/WP-Cron is jammed, the metabox polling loop becomes the worker.
-		// If we see pending metabox actions with no running worker, execute one bounded slice inline.
-		$poll_pre   = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
-		$queue_meta = Metabox_Action_Scheduler::get_queue_counts( $post_id, $lang );
-
-		if (
-			! empty( $poll_pre['queued'] )
-			&& empty( $poll_pre['done'] )
-			&& ! empty( $queue_meta['pending'] )
-			&& empty( $queue_meta['running'] )
-		) {
-			try {
-				Metabox_Action_Scheduler::run_inline_fallback_slice( $post_id, $lang, 'poll_worker' );
-			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
-			}
-		}
-
 		$poll = Metabox_Action_Scheduler::build_poll_response( $post_id, $lang );
 		$scan = self::build_scan_response( $post_id, $lang );
 

@@ -633,7 +633,7 @@
 
 				window.setTimeout(function () {
 					pollTranslateComplete(postId, lang, attempt + 1);
-				}, shouldUseChunkedTranslation() ? 3000 : 2000);
+				}, shouldUseChunkedTranslation() ? 8000 : 4000);
 			})
 			.fail(function (xhr) {
 				if (xhr && xhr.status === 409 && attempt < 24) {

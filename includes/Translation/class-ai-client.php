@@ -39,12 +39,12 @@ final class AI_Client {
 	 *
 	 * Job/AS path typically caps at 45–50s via request options.
 	 */
-	const REQUEST_TIMEOUT_MIN = 45;
+	const REQUEST_TIMEOUT_MIN = 20;
 
 	/**
 	 * Maximum HTTP timeout for a translation request (seconds).
 	 */
-	const REQUEST_TIMEOUT_MAX = 90;
+	const REQUEST_TIMEOUT_MAX = 30;
 
 	/**
 	 * Maximum automatic retries after transport failures.
