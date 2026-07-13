@@ -6910,6 +6910,107 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Skip the next pending Elementor API chunk (metabox Action Scheduler recovery).
+	 *
+	 * When the gateway repeatedly times out or returns structural errors, we prefer
+	 * to mark the entire next chunk as skipped so the job can continue to 13/13.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @param string $reason  Debug hint.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}|\WP_Error
+	 */
+	public static function skip_next_elementor_pending_chunk( $post_id, $lang, $reason = '' ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$reason  = sanitize_key( (string) $reason );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return new \WP_Error( 'polymart_ai_invalid_request', __( 'درخواست نامعتبر است.', 'polymart-ai' ) );
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return new \WP_Error( 'polymart_ai_elementor_source_missing', __( 'داده Elementor برای این صفحه یافت نشد.', 'polymart-ai' ) );
+		}
+
+		$data = json_decode( $raw, true );
+		if ( ! is_array( $data ) ) {
+			return new \WP_Error( 'polymart_ai_elementor_source_invalid', __( 'JSON Elementor نامعتبر است.', 'polymart-ai' ) );
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+		$state = is_array( $state ) ? $state : array();
+		$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+
+		$chunk_queue    = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+		$pending_chunks = is_array( $chunk_queue['pending'] ?? null ) ? $chunk_queue['pending'] : array();
+
+		if ( empty( $pending_chunks ) ) {
+			return self::make_recoverable_partial_slice_response(
+				'elementor',
+				self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+				__( 'Elementor: چیزی برای رد کردن باقی نمانده است.', 'polymart-ai' )
+			);
+		}
+
+		$chunk = reset( $pending_chunks );
+		if ( ! is_array( $chunk ) || empty( $chunk ) ) {
+			return self::make_recoverable_partial_slice_response(
+				'elementor',
+				self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+				__( 'Elementor: بخش معلق خالی بود — ادامه…', 'polymart-ai' )
+			);
+		}
+
+		$paths   = array_values( array_filter( array_map( 'strval', array_keys( $chunk ) ) ) );
+		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$skipped = array_values( array_unique( array_merge( array_map( 'strval', $skipped ), $paths ) ) );
+		$state['elementor_skipped'] = $skipped;
+
+		// Persist progress so UI sees 0/13 -> 1/13 etc even when a chunk is skipped.
+		$map            = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$progress_total  = max( 1, absint( $chunk_queue['total'] ?? 1 ) );
+		$chunk_progress  = self::get_elementor_chunk_progress(
+			$post_id,
+			$lang,
+			array(
+				'elementor_map'          => $map,
+				'elementor_skipped'      => $skipped,
+				'elementor_chunks_total' => $progress_total,
+			)
+		);
+		$done_count = self::resolve_elementor_done_count( $state, (int) $chunk_progress['done'], $post_id, $lang );
+
+		self::save_job_partial_state( $post_id, $lang, $state );
+		self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
+
+		$progress = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
+
+		update_post_meta(
+			$post_id,
+			'_polymart_ai_elementor_error_' . $lang,
+			sprintf(
+				/* translators: 1: skipped field count, 2: reason */
+				__( 'Elementor — chunk رد شد (%1$d فیلد) — %2$s', 'polymart-ai' ),
+				count( $paths ),
+				'' !== $reason ? $reason : 'skipped'
+			)
+		);
+
+		return self::make_recoverable_partial_slice_response(
+			'elementor',
+			$progress,
+			sprintf(
+				/* translators: 1: progress marker, 2: skipped field count */
+				__( 'Elementor — %1$s: یک بخش API رد شد (%2$d فیلد) — ادامه…', 'polymart-ai' ),
+				$progress,
+				count( $paths )
+			)
+		);
+	}
+
+	/**
 	 * @param array<string, string> $payload Source Elementor field map.
 	 * @param array<string, string> $map     Completed translations keyed by path.
 	 * @return array<string, string>

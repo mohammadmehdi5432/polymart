@@ -771,6 +771,13 @@ final class Metabox_Action_Scheduler {
 
 		register_shutdown_function( array( __CLASS__, 'handler_shutdown_recovery' ) );
 
+		$should_chain = true;
+		$completed    = false;
+
+		// AS worker must own the per-post lock (avoid self-blocking during persist).
+		Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true );
+		Post_Translator::acquire_translation_lock( $post_id, $lang );
+
 		try {
 			Activity_Logger::bootstrap_job_worker_context();
 			Activity_Logger::on_ai_http_heartbeat();
@@ -800,10 +807,16 @@ final class Metabox_Action_Scheduler {
 			$result = self::run_metabox_batch( $post_id, $lang );
 
 			if ( is_wp_error( $result ) ) {
-				if (
-					Post_Translator::is_recoverable_job_slice_error( $result )
-					|| Post_Translator::is_api_transport_timeout_error( $result )
-				) {
+				// Never stall: skip the next pending Elementor chunk and keep chaining.
+				$skipped = Post_Translator::skip_next_elementor_pending_chunk(
+					$post_id,
+					$lang,
+					$result->get_error_code()
+				);
+
+				if ( is_array( $skipped ) ) {
+					self::update_status_from_slice( $post_id, $lang, $skipped );
+				} else {
 					self::update_status_from_slice(
 						$post_id,
 						$lang,
@@ -813,34 +826,47 @@ final class Metabox_Action_Scheduler {
 							'phase'   => 'elementor',
 						)
 					);
-					self::chain_next( $post_id, $lang );
-					self::$handler_clean_exit = true;
-
-					return;
 				}
 
-				self::mark_failed( $post_id, $lang, $result->get_error_message() );
 				self::$handler_clean_exit = true;
-
 				return;
 			}
 
 			if ( ! empty( $result['done'] ) ) {
 				self::mark_complete( $post_id, $lang, $result );
 				self::maybe_advance_batch( $post_id );
+				$completed = true;
+				$should_chain = false;
 				self::$handler_clean_exit = true;
 
 				return;
 			}
 
 			self::update_status_from_slice( $post_id, $lang, $result );
-			self::chain_next( $post_id, $lang );
 			self::$handler_clean_exit = true;
 		} catch ( \Throwable $e ) {
-			self::mark_failed( $post_id, $lang, $e->getMessage() );
-			Post_Translator::release_translation_lock( $post_id, $lang, true );
-			self::chain_next( $post_id, $lang );
+			// On any throwable, skip one chunk and keep going.
+			$skipped = Post_Translator::skip_next_elementor_pending_chunk( $post_id, $lang, 'throwable' );
+			if ( is_array( $skipped ) ) {
+				self::update_status_from_slice( $post_id, $lang, $skipped );
+			} else {
+				self::update_status_from_slice(
+					$post_id,
+					$lang,
+					array(
+						'done'    => false,
+						'message' => $e->getMessage(),
+						'phase'   => 'elementor',
+					)
+				);
+			}
 			self::$handler_clean_exit = true;
+		} finally {
+			// Always release lock and chain next slice unless job completed.
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+			if ( $should_chain && ! $completed ) {
+				self::chain_next( $post_id, $lang );
+			}
 		}
 	}
 
@@ -881,7 +907,8 @@ final class Metabox_Action_Scheduler {
 				array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox_as' )
 			);
 
-			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, true );
+			// Lock is owned by the AS worker; avoid self-blocking lock checks.
+			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, false );
 			++$slices_run;
 			$last_slice = is_array( $slice ) ? $slice : array();
 
