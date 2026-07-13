@@ -2536,8 +2536,11 @@ final class Activity_Logger {
 
 		self::schedule_chain_safety_pulse( $delay_sec );
 
+		// Elementor bulk slices run inline (burst / cron pulse / SPA ensure). While a bulk
+		// job is active we disable AS's HTTP async runner — pending rows never self-execute
+		// on Local/cPanel and only clutter WooCommerce → Scheduled Actions.
 		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::enqueue_next( true, $delay_sec );
+			Job_Action_Scheduler::cancel_pending_slices();
 		}
 	}
 
