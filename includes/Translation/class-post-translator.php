@@ -4030,7 +4030,12 @@ final class Post_Translator {
 		}
 
 		$batch_progress = self::compute_elementor_api_batch_progress( $source_data, $map, $state );
-		$done_count     = (int) $batch_progress['done'];
+		$done_count     = max(
+			(int) $batch_progress['done'],
+			absint( $done_count ),
+			absint( $state['elementor_slices_completed'] ?? 0 ),
+			absint( $state['elementor_chunk_index'] ?? 0 )
+		);
 		$total_chunks   = max( 1, (int) $batch_progress['total'], absint( $total_chunks ) );
 
 		if ( $done_count <= 0 && empty( $map ) ) {
@@ -4668,8 +4673,24 @@ final class Post_Translator {
 	public static function format_elementor_job_progress_marker( $post_id, $lang, array $state = array() ) {
 		$state    = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		$progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$done     = (int) $progress['done'];
+		$total    = max( 1, (int) $progress['total'] );
 
-		return $progress['done'] . '/' . $progress['total'];
+		$cursor       = self::read_elementor_slice_cursor( $post_id, $lang );
+		$stored_total = self::read_elementor_slice_cursor_total( $post_id, $lang );
+
+		if ( $stored_total > 0 ) {
+			$total = max( $total, $stored_total );
+		}
+
+		$state_done = max(
+			absint( $state['elementor_slices_completed'] ?? 0 ),
+			absint( $state['elementor_chunk_index'] ?? 0 )
+		);
+
+		$done = min( $total, max( $done, $cursor, $state_done ) );
+
+		return $done . '/' . $total;
 	}
 
 	/**
@@ -6582,6 +6603,12 @@ final class Post_Translator {
 
 			if ( $chunk_satisfied ) {
 				++$slice_cursor;
+				self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $progress_total );
+				$state['elementor_chunk_index']      = $slice_cursor;
+				$state['elementor_slices_completed'] = $slice_cursor;
+				$state['elementor_chunks_total']     = $progress_total;
+				self::save_job_partial_state( $post_id, $lang, $state );
+				\PolymartAI\Activity_Logger::sync_elementor_partial_progress( $post_id, $lang );
 
 				if ( ! empty( $mapped_chunk ) ) {
 					\PolymartAI\Activity_Logger::touch_successful_api_call();
@@ -7481,8 +7508,15 @@ final class Post_Translator {
 				'elementor_chunks_total' => max( 1, absint( $total_chunks ) ),
 			)
 		);
-		$done_count   = (int) $chunk_progress['done'];
 		$total_chunks = max( absint( $total_chunks ), (int) $chunk_progress['total'], 1 );
+		$done_count   = min(
+			$total_chunks,
+			max(
+				(int) $chunk_progress['done'],
+				absint( $done_count ),
+				self::read_elementor_slice_cursor( $post_id, $lang )
+			)
+		);
 
 		$tree = self::apply_elementor_translation_payload( $source_data, $map );
 		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
@@ -7516,6 +7550,10 @@ final class Post_Translator {
 			self::flush_translation_status_cache( $post_id );
 
 			return true;
+		}
+
+		if ( '' === trim( (string) get_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), true ) ) ) {
+			self::save_elementor_source_hash( $post_id, $lang );
 		}
 
 		self::write_elementor_slice_cursor( $post_id, $lang, $done_count, $total_chunks );

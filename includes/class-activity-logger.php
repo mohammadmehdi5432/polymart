@@ -1389,6 +1389,7 @@ final class Activity_Logger {
 		}
 
 		$job['remaining'] = max( 0, (int) $job['remaining'] );
+		$job              = self::refresh_elementor_job_progress_snapshot( $job );
 
 		if ( ! isset( $job['needs_work'] ) && isset( $job['live_stats'] ) && is_array( $job['live_stats'] ) ) {
 			$job['needs_work'] = (int) ( $job['live_stats']['untranslated'] ?? 0 ) + (int) ( $job['live_stats']['partial'] ?? 0 );
@@ -1399,6 +1400,41 @@ final class Activity_Logger {
 		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) ) {
 			$job = self::attach_stalled_job_details( $job, $lang );
 		}
+
+		return $job;
+	}
+
+	/**
+	 * Refresh Elementor partial progress from post meta during SPA polling.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return array<string, mixed>
+	 */
+	private static function refresh_elementor_job_progress_snapshot( array $job ) {
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return $job;
+		}
+
+		$post_id = absint( $job['partial_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+
+		if ( $post_id <= 0 || '' === $lang || 'elementor' !== sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) {
+			return $job;
+		}
+
+		$marker = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang );
+
+		if ( '' === $marker || ! preg_match( '/^\d+\/\d+$/', $marker ) ) {
+			return $job;
+		}
+
+		if ( (string) ( $job['partial_progress'] ?? '' ) === $marker ) {
+			return $job;
+		}
+
+		$job['partial_progress'] = $marker;
+		self::touch_partial_progress_tracker( $job );
+		update_option( self::JOB_OPTION, $job, false );
 
 		return $job;
 	}
@@ -2600,6 +2636,9 @@ final class Activity_Logger {
 		if ( $post_id <= 0 || '' === $lang ) {
 			return self::normalize_job_for_response( $job, false );
 		}
+
+		Job_Action_Scheduler::cancel_pending_slices();
+		Metabox_Action_Scheduler::cancel_pending( $post_id, $lang );
 
 		self::$trusted_admin_worker = true;
 		self::$trusted_as_tick      = true;
