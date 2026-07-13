@@ -145,6 +145,22 @@ export async function refreshJobStats(lang = 'en') {
   return data;
 }
 
+/** Paginated backlog with edit links (pages, products, etc.). */
+export async function fetchRemainingWork({ lang = 'en', postType = 'page', page = 1, perPage = 20 } = {}) {
+  const { data } = await withRetries(() =>
+    api.get('/remaining-work', {
+      params: {
+        lang,
+        post_type: postType,
+        page,
+        per_page: perPage,
+      },
+      timeout: 120000,
+    })
+  );
+  return data;
+}
+
 /** Quick ArvanCloud translation smoke test (same code path as bulk jobs). */
 export async function testTranslationApi({ text = 'سلام دنیا', lang = 'en' } = {}) {
   const { data } = await api.post(

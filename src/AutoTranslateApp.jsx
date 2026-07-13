@@ -3,7 +3,7 @@ import Layout from './components/Layout';
 import Notice from './components/ui/Notice';
 import LanguageSelect from './components/ui/LanguageSelect';
 import { useTargetLanguages } from './hooks/useTargetLanguages';
-import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, testTranslationApi } from './api/job';
+import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, testTranslationApi, fetchRemainingWork } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
 const POLL_INTERVAL_MS = 2000;
@@ -302,6 +302,32 @@ function formatStepLog(step) {
   return step.message || `${prefix} — ${step.status}`;
 }
 
+function remainingStatusLabel(status) {
+  switch (status) {
+    case 'translated':
+      return 'کامل';
+    case 'partial':
+      return 'ناقص';
+    case 'untranslated':
+      return 'ترجمه‌نشده';
+    default:
+      return status || '—';
+  }
+}
+
+function remainingStatusClass(status) {
+  switch (status) {
+    case 'translated':
+      return 'bg-green-100 text-green-800';
+    case 'partial':
+      return 'bg-amber-100 text-amber-900';
+    case 'untranslated':
+      return 'bg-gray-100 text-gray-700';
+    default:
+      return 'bg-gray-100 text-gray-700';
+  }
+}
+
 export default function AutoTranslateApp() {
   const {
     langOptions,
@@ -322,6 +348,9 @@ export default function AutoTranslateApp() {
   const [apiTestText, setApiTestText] = useState('سلام دنیا');
   const [apiTestLoading, setApiTestLoading] = useState(false);
   const [apiTestResult, setApiTestResult] = useState(null);
+  const [remainingWork, setRemainingWork] = useState(null);
+  const [remainingLoading, setRemainingLoading] = useState(false);
+  const [remainingPage, setRemainingPage] = useState(1);
   const autoResumedRef = useRef(false);
   const lastStepLogRef = useRef('');
   const lastPartialProgressRef = useRef('');
@@ -494,6 +523,45 @@ export default function AutoTranslateApp() {
   useEffect(() => {
     loadJob().finally(() => setLoading(false));
   }, [loadJob]);
+
+  const loadRemainingWork = useCallback(
+    async (page = 1) => {
+      if (!targetLang) {
+        return;
+      }
+
+      setRemainingLoading(true);
+
+      try {
+        const data = await fetchRemainingWork({
+          lang: targetLang,
+          postType: 'page',
+          page,
+          perPage: 20,
+        });
+        setRemainingWork(data);
+        setRemainingPage(page);
+      } catch (error) {
+        setNotice({
+          type: 'warning',
+          message:
+            error?.response?.data?.message ||
+            'بارگذاری لیست برگه‌های باقی‌مانده ناموفق بود.',
+        });
+      } finally {
+        setRemainingLoading(false);
+      }
+    },
+    [targetLang]
+  );
+
+  useEffect(() => {
+    if (loading || langsLoading) {
+      return;
+    }
+
+    loadRemainingWork(1);
+  }, [loading, langsLoading, loadRemainingWork]);
 
   useEffect(() => {
     const el = logsRef.current;
@@ -972,6 +1040,7 @@ export default function AutoTranslateApp() {
       appendLog(
         `آمار به‌روز شد — ${stats.translated ?? 0} ترجمه‌شده، ${stats.partial ?? 0} ناقص، ${stats.untranslated ?? 0} ترجمه‌نشده.`
       );
+      await loadRemainingWork(1);
     } catch (error) {
       setNotice({
         type: 'error',
@@ -1610,6 +1679,125 @@ export default function AutoTranslateApp() {
             </>
           )}
         </div>
+      </div>
+
+      <div className="mb-6 rounded-lg border border-pmai-border bg-white p-5">
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-gray-900">برگه‌های باقی‌مانده</h3>
+            <p className="mt-1 text-xs text-pmai-muted">
+              برگه‌هایی که برای <strong>{targetLabel}</strong> هنوز ترجمه کامل ندارند — روی «ویرایش برگه» برو
+              و از متاباکس پلی‌مارت اسکن و ترجمه را انجام بده.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => loadRemainingWork(remainingPage)}
+            disabled={remainingLoading || langsLoading}
+            className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-pmai-border px-3 py-1.5 text-xs hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <HiArrowPath className={`h-3.5 w-3.5 ${remainingLoading ? 'animate-spin' : ''}`} />
+            {remainingLoading ? 'در حال بارگذاری…' : 'به‌روزرسانی لیست'}
+          </button>
+        </div>
+
+        {remainingLoading && !remainingWork ? (
+          <p className="text-sm text-pmai-muted">در حال اسکن برگه‌ها…</p>
+        ) : remainingWork?.total > 0 ? (
+          <>
+            <p className="mb-3 text-sm text-gray-700">
+              <strong>{remainingWork.total}</strong> برگه نیاز به کار دارد
+              {remainingWork.pages > 1
+                ? ` — صفحه ${remainingWork.page} از ${remainingWork.pages}`
+                : ''}
+            </p>
+            <ul className="space-y-3">
+              {(remainingWork.items || []).map((item) => (
+                <li
+                  key={item.post_id}
+                  className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="font-medium text-gray-900">
+                        #{item.post_id} — {item.title || '(بدون عنوان)'}
+                      </p>
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <span
+                          className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${remainingStatusClass(item.status)}`}
+                        >
+                          {remainingStatusLabel(item.status)}
+                        </span>
+                        {item.uses_elementor ? (
+                          <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs font-medium text-violet-800">
+                            Elementor
+                          </span>
+                        ) : null}
+                      </div>
+                      {item.gap_reason ? (
+                        <p className="mt-2 text-xs text-gray-600">{item.gap_reason}</p>
+                      ) : null}
+                      {Array.isArray(item.missing) && item.missing.length > 0 ? (
+                        <p className="mt-1 text-xs text-amber-800">
+                          فیلدهای مانده: {item.missing.join('، ')}
+                        </p>
+                      ) : null}
+                    </div>
+                    <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                      {item.edit_url ? (
+                        <a
+                          href={item.edit_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center justify-center rounded-lg border border-pmai-primary bg-white px-3 py-1.5 text-xs font-medium text-pmai-primary hover:bg-blue-50"
+                        >
+                          ویرایش برگه
+                        </a>
+                      ) : null}
+                      {item.view_url_lang ? (
+                        <a
+                          href={item.view_url_lang}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center justify-center rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-100"
+                        >
+                          پیش‌نمایش {targetLabel}
+                        </a>
+                      ) : null}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {remainingWork.pages > 1 ? (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => loadRemainingWork(Math.max(1, remainingPage - 1))}
+                  disabled={remainingLoading || remainingPage <= 1}
+                  className="rounded-lg border border-pmai-border px-3 py-1.5 text-xs hover:bg-gray-50 disabled:opacity-50"
+                >
+                  قبلی
+                </button>
+                <span className="text-xs text-pmai-muted">
+                  صفحه {remainingPage} از {remainingWork.pages}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => loadRemainingWork(Math.min(remainingWork.pages, remainingPage + 1))}
+                  disabled={remainingLoading || remainingPage >= remainingWork.pages}
+                  className="rounded-lg border border-pmai-border px-3 py-1.5 text-xs hover:bg-gray-50 disabled:opacity-50"
+                >
+                  بعدی
+                </button>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <p className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-900">
+            همه برگه‌ها برای {targetLabel} ترجمه کامل دارند.
+          </p>
+        )}
       </div>
 
       <div className="rounded-lg border border-pmai-border bg-white p-5">

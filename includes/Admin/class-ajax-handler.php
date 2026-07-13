@@ -28,6 +28,8 @@ final class Ajax_Handler {
 	public function __construct() {
 		add_action( 'wp_ajax_polymart_generate_translation', array( $this, 'handle_generate_translation' ) );
 		add_action( 'wp_ajax_polymart_retranslate_product', array( $this, 'handle_retranslate_product' ) );
+		add_action( 'wp_ajax_polymart_scan_translation_gaps', array( $this, 'handle_scan_translation_gaps' ) );
+		add_action( 'wp_ajax_polymart_translate_post_complete', array( $this, 'handle_translate_post_complete' ) );
 	}
 
 	/**
@@ -191,6 +193,282 @@ final class Ajax_Handler {
 				'fields'  => $fields,
 			)
 		);
+	}
+
+	/**
+	 * Scan translatable fields and report gaps for one post and language.
+	 *
+	 * @return void
+	 */
+	public function handle_scan_translation_gaps() {
+		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
+
+		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
+		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
+
+		if ( ! $post_id ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شناسه مطلب معتبر الزامی است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شما اجازه بررسی این مورد را ندارید.', 'polymart-ai' ) ),
+				403
+			);
+		}
+
+		if ( ! self::is_valid_target_language( $lang ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'زبان مقصد نامعتبر است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		wp_send_json_success( self::build_scan_response( $post_id, $lang ) );
+	}
+
+	/**
+	 * Run chunked translation slices until complete or the request budget expires.
+	 *
+	 * Uses the same job-slice pipeline as bulk auto-translate (Elementor-safe).
+	 *
+	 * @return void
+	 */
+	public function handle_translate_post_complete() {
+		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
+
+		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
+		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
+		$force   = ! empty( $_POST['force'] );
+
+		if ( ! $post_id ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شناسه مطلب معتبر الزامی است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' ) ),
+				403
+			);
+		}
+
+		if ( ! self::is_valid_target_language( $lang ) ) {
+			wp_send_json_error(
+				array( 'message' => __( 'زبان مقصد نامعتبر است.', 'polymart-ai' ) ),
+				400
+			);
+		}
+
+		if ( $force ) {
+			Post_Translator::clear_post_language_translations( $post_id, $lang );
+			Post_Translator::clear_job_partial_state( $post_id, $lang );
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+		}
+
+		$result = self::run_translation_slices_until_done( $post_id, $lang );
+
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error(
+				array(
+					'message' => $result->get_error_message(),
+					'scan'    => self::build_scan_response( $post_id, $lang ),
+				),
+				$this->error_status_code( $result )
+			);
+		}
+
+		$language   = Language_Registry::get_language( $lang );
+		$lang_label = $language ? $language['native_name'] : $lang;
+
+		wp_send_json_success(
+			array_merge(
+				$result,
+				array(
+					'fields'  => self::collect_meta_fields_for_response( $post_id, $lang ),
+					'scan'    => self::build_scan_response( $post_id, $lang ),
+					'message' => ! empty( $result['done'] )
+						? sprintf(
+							/* translators: %s: language name */
+							__( 'ترجمه %s تکمیل و ذخیره شد.', 'polymart-ai' ),
+							$lang_label
+						)
+						: (string) ( $result['message'] ?? __( 'ترجمه در حال انجام است…', 'polymart-ai' ) ),
+				)
+			)
+		);
+	}
+
+	/**
+	 * Execute bounded translation slices for one post/language pair.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	private static function run_translation_slices_until_done( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 600 );
+		}
+
+		$started_at  = microtime( true );
+		$budget_sec  = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 120, $post_id, $lang );
+		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 40, $post_id, $lang );
+		$slices_run  = 0;
+		$last_slice  = array();
+
+		while ( $slices_run < $max_slices && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
+			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
+			++$slices_run;
+			$last_slice = is_array( $slice ) ? $slice : array();
+
+			if ( is_wp_error( $slice ) ) {
+				if (
+					Post_Translator::is_recoverable_job_slice_error( $slice )
+					&& Post_Translator::job_partial_state_has_progress( $post_id, $lang )
+				) {
+					return array(
+						'done'           => false,
+						'phase'          => (string) ( $last_slice['phase'] ?? '' ),
+						'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
+						'message'        => $slice->get_error_message(),
+						'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
+						'slices_run'     => $slices_run,
+						'recoverable'    => true,
+					);
+				}
+
+				return $slice;
+			}
+
+			if ( ! empty( $slice['done'] ) ) {
+				return array(
+					'done'           => true,
+					'phase'          => (string) ( $slice['phase'] ?? 'complete' ),
+					'phase_progress' => (string) ( $slice['phase_progress'] ?? '' ),
+					'message'        => (string) ( $slice['message'] ?? '' ),
+					'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
+					'slices_run'     => $slices_run,
+				);
+			}
+		}
+
+		return array(
+			'done'           => false,
+			'phase'          => (string) ( $last_slice['phase'] ?? '' ),
+			'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
+			'message'        => ! empty( $last_slice['message'] )
+				? (string) $last_slice['message']
+				: __( 'ترجمه در حال انجام است — درخواست بعدی ادامه می‌دهد.', 'polymart-ai' ),
+			'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
+			'slices_run'     => $slices_run,
+		);
+	}
+
+	/**
+	 * Build scan payload for the meta box UI.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return array<string, mixed>
+	 */
+	private static function build_scan_response( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$gaps    = Post_Translator::get_translation_gaps( $post_id, $lang );
+		$status  = (string) ( $gaps['status'] ?? Post_Translator::get_translation_status( $post_id, $lang ) );
+		$fields  = array();
+
+		foreach ( (array) ( $gaps['fields'] ?? array() ) as $field ) {
+			if ( ! is_array( $field ) ) {
+				continue;
+			}
+
+			$fields[] = array(
+				'key'        => (string) ( $field['key'] ?? '' ),
+				'label'      => (string) ( $field['label'] ?? '' ),
+				'translated' => ! empty( $field['translated'] ),
+				'meta_key'   => (string) ( $field['meta_key'] ?? '' ),
+			);
+		}
+
+		$language   = Language_Registry::get_language( $lang );
+		$lang_label = $language ? $language['native_name'] : $lang;
+		$progress   = '';
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
+			$state = Post_Translator::get_job_partial_state( $post_id, $lang );
+
+			if ( ! empty( $state['phase'] ) && 'elementor' === (string) $state['phase'] ) {
+				$progress = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state );
+			}
+		}
+
+		return array(
+			'lang'             => $lang,
+			'lang_label'       => $lang_label,
+			'status'           => $status,
+			'status_label'     => self::get_status_label_for_scan( $status ),
+			'fields'           => $fields,
+			'missing'          => array_values( array_map( 'strval', (array) ( $gaps['missing'] ?? array() ) ) ),
+			'notes'            => array_values( array_map( 'strval', (array) ( $gaps['notes'] ?? array() ) ) ),
+			'uses_elementor'   => Post_Translator::uses_elementor_builder( $post_id ),
+			'elementor_error'  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
+			'elementor_progress' => $progress,
+			'needs_work'       => 'translated' !== $status || ! empty( $gaps['missing'] ),
+		);
+	}
+
+	/**
+	 * @param string $status Status slug.
+	 * @return string
+	 */
+	private static function get_status_label_for_scan( $status ) {
+		$labels = array(
+			'translated'   => __( 'کامل', 'polymart-ai' ),
+			'partial'      => __( 'ناقص', 'polymart-ai' ),
+			'untranslated' => __( 'ترجمه‌نشده', 'polymart-ai' ),
+		);
+
+		return $labels[ $status ] ?? $status;
+	}
+
+	/**
+	 * Collect metabox form field values after translation.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return array<string, string>
+	 */
+	private static function collect_meta_fields_for_response( $post_id, $lang ) {
+		$post_id     = absint( $post_id );
+		$lang        = sanitize_key( (string) $lang );
+		$meta_fields = array();
+
+		foreach ( array( 'title', 'excerpt', 'content' ) as $field ) {
+			$meta_key = Post_Translator::get_meta_key( $field, $lang );
+			$meta_fields[ Post_Translator::get_form_field_name( $meta_key ) ] = (string) get_post_meta( $post_id, $meta_key, true );
+		}
+
+		foreach ( Post_Translator::CUSTOM_META_KEYS as $meta_key ) {
+			$translated_key = Post_Translator::get_custom_meta_key( $meta_key, $lang );
+			$meta_fields[ Post_Translator::get_form_field_name( $translated_key ) ] = (string) get_post_meta( $post_id, $translated_key, true );
+		}
+
+		foreach ( array_keys( Post_Translator::collect_discovered_meta_fields( $post_id ) ) as $meta_key ) {
+			$translated_key = Post_Translator::get_custom_meta_key( $meta_key, $lang );
+			$meta_fields[ Post_Translator::get_form_field_name( $translated_key ) ] = (string) get_post_meta( $post_id, $translated_key, true );
+		}
+
+		return $meta_fields;
 	}
 
 	/**

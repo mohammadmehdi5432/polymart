@@ -291,6 +291,103 @@ final class Translation_Query {
 	}
 
 	/**
+	 * Paginated list of posts that still need translation work (partial + untranslated).
+	 *
+	 * @param array<string, mixed> $args lang, post_type, page, per_page.
+	 * @return array{items: array<int, array<string, mixed>>, total: int, page: int, per_page: int, pages: int}
+	 */
+	public static function get_remaining_work_page( array $args ) {
+		$lang       = sanitize_key( (string) ( $args['lang'] ?? 'en' ) );
+		$post_type  = sanitize_key( (string) ( $args['post_type'] ?? 'page' ) );
+		$page       = max( 1, absint( $args['page'] ?? 1 ) );
+		$per_page   = min( 50, max( 1, absint( $args['per_page'] ?? 20 ) ) );
+		$post_types = Post_Translator::get_supported_post_types();
+
+		if ( in_array( $post_type, $post_types, true ) ) {
+			$post_types = array( $post_type );
+		}
+
+		self::maybe_backfill_translation_index( $lang );
+		Post_Translator::reconcile_all_flagged_translation_indexes( $lang );
+		Post_Translator::flush_translation_status_cache();
+
+		$needed_offset = ( $page - 1 ) * $per_page;
+		$matched_total = 0;
+		$items         = array();
+
+		self::scan_posts(
+			array(
+				'post_type' => $post_types,
+			),
+			static function ( \WP_Post $post ) use ( $lang, $needed_offset, $per_page, &$matched_total, &$items ) {
+				if ( ! self::post_listing_needs_translation_work( $post, $lang ) ) {
+					return;
+				}
+
+				if ( $matched_total >= $needed_offset && count( $items ) < $per_page ) {
+					$status = Post_Translator::get_translation_status( $post->ID, $lang );
+					$gaps   = Post_Translator::get_translation_gaps( $post->ID, $lang );
+					$language = \PolymartAI\Language_Registry::get_language( $lang );
+					$prefix   = $language && ! empty( $language['url_prefix'] ) ? $language['url_prefix'] : $lang;
+
+					$items[] = array(
+						'post_id'         => (int) $post->ID,
+						'title'           => $post->post_title,
+						'post_type'       => $post->post_type,
+						'post_type_label' => Post_Translator::get_post_type_label( $post->post_type ),
+						'status'          => $status,
+						'edit_url'        => get_edit_post_link( $post->ID, 'raw' ),
+						'view_url_fa'     => get_permalink( $post->ID ),
+						'view_url_lang'   => '' !== $prefix
+							? home_url( '/' . $prefix . '/' . trim( str_replace( home_url(), '', get_permalink( $post->ID ) ), '/' ) . '/' )
+							: get_permalink( $post->ID ),
+						'gap_reason'      => Post_Translator::describe_translation_gap( $post->ID, $lang ),
+						'missing'         => array_values( array_map( 'strval', (array) ( $gaps['missing'] ?? array() ) ) ),
+						'uses_elementor'  => Post_Translator::uses_elementor_builder( $post->ID ),
+					);
+				}
+
+				++$matched_total;
+			}
+		);
+
+		$pages = (int) ceil( max( 1, $matched_total ) / $per_page );
+
+		return array(
+			'items'    => $items,
+			'total'    => $matched_total,
+			'page'     => $page,
+			'per_page' => $per_page,
+			'pages'    => max( 1, $pages ),
+		);
+	}
+
+	/**
+	 * Whether a post should appear in remaining-work admin lists.
+	 *
+	 * @param \WP_Post $post Post object.
+	 * @param string   $lang Target language code.
+	 * @return bool
+	 */
+	private static function post_listing_needs_translation_work( \WP_Post $post, $lang ) {
+		if ( ! Post_Translator::post_has_persian_content( $post ) ) {
+			return false;
+		}
+
+		if ( Post_Translator::post_needs_translation_work( $post->ID, $lang ) ) {
+			return true;
+		}
+
+		if ( Post_Translator::post_is_actionable_for_job( $post->ID, $lang ) ) {
+			return true;
+		}
+
+		$status = Post_Translator::get_translation_status( $post->ID, $lang );
+
+		return 'translated' !== $status;
+	}
+
+	/**
 	 * Collect every post ID that still needs translation (no sample cap).
 	 *
 	 * @param string $lang Target language code.

@@ -87,10 +87,17 @@ final class Meta_Box {
 
 		$languages        = Language_Registry::get_translation_target_languages();
 		$is_slide         = ( 'woodmart_slide' === $post->post_type );
+		$is_page          = ( 'page' === $post->post_type );
+		$uses_elementor   = $is_page && Post_Translator::uses_elementor_builder( $post->ID );
 		$show_image_field = Post_Translator::supports_featured_image_translation( $post->post_type );
 		$first_lang       = ! empty( $languages[0]['code'] ) ? sanitize_key( (string) $languages[0]['code'] ) : '';
 		?>
-		<div class="polymart-ai-metabox" data-first-lang="<?php echo esc_attr( $first_lang ); ?>">
+		<div
+			class="polymart-ai-metabox"
+			data-first-lang="<?php echo esc_attr( $first_lang ); ?>"
+			data-post-type="<?php echo esc_attr( $post->post_type ); ?>"
+			data-uses-elementor="<?php echo $uses_elementor ? '1' : '0'; ?>"
+		>
 			<div class="polymart-ai-metabox__toolbar">
 				<p class="polymart-ai-metabox__intro">
 					<?php if ( $is_slide ) : ?>
@@ -102,12 +109,32 @@ final class Meta_Box {
 
 				<?php if ( ! $is_slide && ! empty( $languages ) ) : ?>
 					<div class="polymart-ai-metabox__toolbar-actions">
+						<?php if ( $is_page ) : ?>
+							<button type="button" class="button polymart-ai-scan-gaps-btn">
+								<span class="polymart-ai-scan-gaps-btn__label"><?php esc_html_e( 'اسکن فیلدهای قابل ترجمه', 'polymart-ai' ); ?></span>
+								<span class="polymart-ai-scan-gaps-btn__spinner spinner" style="float:none;margin:0 8px 0 0;display:none;"></span>
+							</button>
+							<button type="button" class="button button-primary polymart-ai-translate-complete-btn">
+								<span class="polymart-ai-translate-complete-btn__label"><?php esc_html_e( 'ترجمه و تکمیل این زبان', 'polymart-ai' ); ?></span>
+								<span class="polymart-ai-translate-complete-btn__spinner spinner" style="float:none;margin:0 8px 0 0;display:none;"></span>
+							</button>
+						<?php endif; ?>
 						<button type="button" class="button button-primary polymart-ai-retranslate-all-btn">
 							<span class="polymart-ai-retranslate-all-btn__label"><?php esc_html_e( 'ترجمه مجدد همه زبان‌ها و ذخیره', 'polymart-ai' ); ?></span>
 							<span class="polymart-ai-retranslate-all-btn__spinner spinner" style="float:none;margin:0 8px 0 0;display:none;"></span>
 						</button>
 						<span class="polymart-ai-metabox__global-status" role="status" aria-live="polite"></span>
 					</div>
+					<?php if ( $is_page ) : ?>
+						<?php if ( $uses_elementor ) : ?>
+							<div class="notice notice-info inline polymart-ai-metabox__elementor-notice">
+								<p>
+									<?php esc_html_e( 'این برگه با Elementor ساخته شده — متن‌های اصلی در JSON المنتور هستند، نه در ویرایشگر «محتوای کامل» پایین. از «اسکن» و «ترجمه و تکمیل» استفاده کنید.', 'polymart-ai' ); ?>
+								</p>
+							</div>
+						<?php endif; ?>
+						<div class="polymart-ai-metabox__scan-results" hidden aria-live="polite"></div>
+					<?php endif; ?>
 				<?php endif; ?>
 			</div>
 
@@ -256,7 +283,13 @@ final class Meta_Box {
 					</span>
 					<?php if ( $uses_fallback ) : ?>
 						<p class="polymart-ai-metabox__warning">
-							<?php esc_html_e( 'فیلد عنوان خالی است و سیستم از ابتدای محتوای ترجمه‌شده عنوان استخراج کرده — برای محصولات حتماً عنوان را دستی پر یا دوباره ترجمه کنید.', 'polymart-ai' ); ?>
+							<?php
+							if ( 'page' === $post->post_type ) {
+								esc_html_e( 'فیلد عنوان خالی است و سیستم از ابتدای محتوای ترجمه‌شده عنوان استخراج کرده — برای برگه‌ها حتماً عنوان را دستی پر یا دوباره ترجمه کنید.', 'polymart-ai' );
+							} else {
+								esc_html_e( 'فیلد عنوان خالی است و سیستم از ابتدای محتوای ترجمه‌شده عنوان استخراج کرده — برای محصولات حتماً عنوان را دستی پر یا دوباره ترجمه کنید.', 'polymart-ai' );
+							}
+							?>
 						</p>
 					<?php elseif ( '' === trim( $title_val ) && $storefront_title === $post->post_title ) : ?>
 						<p class="polymart-ai-metabox__hint">
@@ -327,8 +360,13 @@ final class Meta_Box {
 					</table>
 				</div>
 
-				<div class="polymart-ai-metabox__field-group">
-					<h4 class="polymart-ai-metabox__group-title"><?php esc_html_e( 'محتوای کامل', 'polymart-ai' ); ?></h4>
+				<div class="polymart-ai-metabox__field-group<?php echo ( 'page' === $post->post_type && Post_Translator::uses_elementor_builder( $post->ID ) ) ? ' polymart-ai-metabox__field-group--deemphasized' : ''; ?>">
+					<h4 class="polymart-ai-metabox__group-title">
+						<?php esc_html_e( 'محتوای کامل', 'polymart-ai' ); ?>
+						<?php if ( 'page' === $post->post_type && Post_Translator::uses_elementor_builder( $post->ID ) ) : ?>
+							<span class="description"><?php esc_html_e( '(برای برگه‌های Elementor معمولاً خالی است)', 'polymart-ai' ); ?></span>
+						<?php endif; ?>
+					</h4>
 					<div class="polymart-ai-metabox__editor-wrap">
 						<?php
 						wp_editor(
@@ -509,6 +547,11 @@ final class Meta_Box {
 			return;
 		}
 
+		$post         = isset( $GLOBALS['post'] ) ? $GLOBALS['post'] : null;
+		$post_type    = $post instanceof \WP_Post ? $post->post_type : (string) $screen->post_type;
+		$type_label   = Post_Translator::get_post_type_label( $post_type );
+		$uses_elementor = $post instanceof \WP_Post && 'page' === $post->post_type && Post_Translator::uses_elementor_builder( $post->ID );
+
 		wp_enqueue_media();
 
 		wp_enqueue_style(
@@ -530,22 +573,41 @@ final class Meta_Box {
 			'polymart-ai-meta-box',
 			'polymartAiMetaBox',
 			array(
-				'ajaxUrl'   => admin_url( 'admin-ajax.php' ),
-				'nonce'     => wp_create_nonce( Ajax_Handler::NONCE_ACTION ),
-				'postId'    => isset( $GLOBALS['post'] ) ? (int) $GLOBALS['post']->ID : 0,
-				'languages' => self::build_language_script_config( isset( $GLOBALS['post'] ) ? $GLOBALS['post'] : null ),
-				'strings'   => array(
-					'generating'       => __( 'در حال تولید ترجمه…', 'polymart-ai' ),
-					'retranslating'    => __( 'در حال ترجمه مجدد همه زبان‌ها…', 'polymart-ai' ),
-					'success'          => __( 'ترجمه تولید و در دیتابیس ذخیره شد.', 'polymart-ai' ),
+				'ajaxUrl'        => admin_url( 'admin-ajax.php' ),
+				'nonce'          => wp_create_nonce( Ajax_Handler::NONCE_ACTION ),
+				'postId'         => $post instanceof \WP_Post ? (int) $post->ID : 0,
+				'postType'       => $post_type,
+				'postTypeLabel'  => $type_label,
+				'usesElementor'  => $uses_elementor,
+				'languages'      => self::build_language_script_config( $post ),
+				'strings'        => array(
+					'generating'         => __( 'در حال تولید ترجمه…', 'polymart-ai' ),
+					'retranslating'      => __( 'در حال ترجمه مجدد همه زبان‌ها…', 'polymart-ai' ),
+					'scanning'           => __( 'در حال اسکن…', 'polymart-ai' ),
+					'translating'        => __( 'در حال ترجمه و تکمیل…', 'polymart-ai' ),
+					'success'            => __( 'ترجمه تولید و در دیتابیس ذخیره شد.', 'polymart-ai' ),
 					'retranslateSuccess' => __( 'ترجمه مجدد انجام و در دیتابیس ذخیره شد.', 'polymart-ai' ),
-					'error'            => __( 'ترجمه ناموفق بود. لطفاً تنظیمات API را بررسی کنید.', 'polymart-ai' ),
-					'noPostId'         => __( 'ابتدا مطلب را به‌صورت پیش‌نویس ذخیره کنید، سپس ترجمه را تولید کنید.', 'polymart-ai' ),
-					'selectImage'      => __( 'انتخاب تصویر بنر', 'polymart-ai' ),
-					'selectImageBtn'   => __( 'استفاده از این تصویر', 'polymart-ai' ),
-					'noImageSelected'  => __( 'تصویری انتخاب نشده', 'polymart-ai' ),
-					'confirmRetranslate' => __( 'همه ترجمه‌های ذخیره‌شده این محصول برای همه زبان‌ها پاک و دوباره با AI ساخته می‌شوند. ادامه می‌دهید؟', 'polymart-ai' ),
+					'translateCompleteSuccess' => __( 'ترجمه تکمیل و ذخیره شد.', 'polymart-ai' ),
+					'error'              => __( 'ترجمه ناموفق بود. لطفاً تنظیمات API را بررسی کنید.', 'polymart-ai' ),
+					'noPostId'           => __( 'ابتدا مطلب را به‌صورت پیش‌نویس ذخیره کنید، سپس ترجمه را تولید کنید.', 'polymart-ai' ),
+					'selectImage'        => __( 'انتخاب تصویر بنر', 'polymart-ai' ),
+					'selectImageBtn'     => __( 'استفاده از این تصویر', 'polymart-ai' ),
+					'noImageSelected'    => __( 'تصویری انتخاب نشده', 'polymart-ai' ),
+					'confirmRetranslate' => sprintf(
+						/* translators: %s: post type label (e.g. page, product) */
+						__( 'همه ترجمه‌های ذخیره‌شده این %s برای همه زبان‌ها پاک و دوباره با AI ساخته می‌شوند. ادامه می‌دهید؟', 'polymart-ai' ),
+						$type_label
+					),
+					'confirmForceTranslate' => __( 'ترجمه‌های قبلی این زبان پاک و از نو ساخته می‌شوند. ادامه می‌دهید؟', 'polymart-ai' ),
 					'retranslateLabel'   => __( 'ترجمه مجدد همه زبان‌ها و ذخیره', 'polymart-ai' ),
+					'scanLabel'          => __( 'اسکن فیلدهای قابل ترجمه', 'polymart-ai' ),
+					'translateCompleteLabel' => __( 'ترجمه و تکمیل این زبان', 'polymart-ai' ),
+					'scanEmpty'          => __( 'فیلد فارسی قابل ترجمه‌ای یافت نشد.', 'polymart-ai' ),
+					'scanComplete'       => __( 'همه فیلدها ترجمه شده‌اند.', 'polymart-ai' ),
+					'scanMissingHeading' => __( 'فیلدهای نیازمند ترجمه:', 'polymart-ai' ),
+					'scanDoneHeading'    => __( 'فیلدهای ترجمه‌شده:', 'polymart-ai' ),
+					'scanStatus'         => __( 'وضعیت:', 'polymart-ai' ),
+					'activeLangHint'     => __( 'زبان فعال تب بالا برای اسکن و ترجمه استفاده می‌شود.', 'polymart-ai' ),
 				),
 			)
 		);

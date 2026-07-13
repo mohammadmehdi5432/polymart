@@ -229,7 +229,46 @@
 }
 
 .polymart-ai-generate-btn,
-.polymart-ai-retranslate-all-btn {
+.polymart-ai-retranslate-all-btn,
+.polymart-ai-scan-gaps-btn,
+.polymart-ai-translate-complete-btn {
 	display: inline-flex;
 	align-items: center;
+}
+
+.polymart-ai-metabox__elementor-notice {
+	margin: 0;
+}
+
+.polymart-ai-metabox__scan-results {
+	margin: 0 0 12px;
+	padding: 12px 14px;
+	border: 1px solid #dcdcde;
+	border-radius: 6px;
+	background: #fff;
+}
+
+.polymart-ai-metabox__scan-summary {
+	margin: 0 0 10px;
+}
+
+.polymart-ai-metabox__scan-list {
+	margin: 0 0 10px 18px;
+}
+
+.polymart-ai-metabox__scan-list--missing li {
+	color: #8a2424;
+}
+
+.polymart-ai-metabox__scan-list--done li {
+	color: #0a6b2d;
+}
+
+.polymart-ai-metabox__scan-notes {
+	margin: 0 0 10px 18px;
+	color: #646970;
+}
+
+.polymart-ai-metabox__field-group--deemphasized {
+	opacity: 0.75;
 }

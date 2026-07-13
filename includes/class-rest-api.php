@@ -100,6 +100,16 @@ final class REST_API {
 
 		register_rest_route(
 			self::NAMESPACE,
+			'/remaining-work',
+			array(
+				'methods'             => \WP_REST_Server::READABLE,
+				'callback'            => array( $this, 'get_remaining_work' ),
+				'permission_callback' => array( $this, 'check_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
 			'/bulk-translate',
 			array(
 				'methods'             => \WP_REST_Server::CREATABLE,
@@ -730,6 +740,48 @@ final class REST_API {
 				'scanned_through' => $result['scanned_through'],
 				'stats'           => $stats,
 				'needs_work'      => (int) $stats['untranslated'] + (int) $stats['partial'],
+			)
+		);
+	}
+
+	/**
+	 * List posts/pages that still need manual or auto translation work.
+	 *
+	 * @param \WP_REST_Request $request REST request object.
+	 * @return \WP_REST_Response
+	 */
+	public function get_remaining_work( $request ) {
+		$lang      = $this->resolve_target_language( $request->get_param( 'lang' ) );
+		$post_type = sanitize_key( (string) $request->get_param( 'post_type' ) );
+		$page      = max( 1, absint( $request->get_param( 'page' ) ) );
+		$per_page  = min( 50, max( 1, absint( $request->get_param( 'per_page' ) ) ?: 20 ) );
+
+		if ( '' === $post_type ) {
+			$post_type = 'page';
+		}
+
+		$result = Translation_Query::get_remaining_work_page(
+			array(
+				'lang'      => $lang,
+				'post_type' => $post_type,
+				'page'      => $page,
+				'per_page'  => $per_page,
+			)
+		);
+
+		$language = Language_Registry::get_language( $lang );
+
+		return rest_ensure_response(
+			array(
+				'items'          => $result['items'],
+				'total'          => $result['total'],
+				'page'           => $result['page'],
+				'per_page'       => $result['per_page'],
+				'pages'          => $result['pages'],
+				'lang'           => $lang,
+				'lang_label'     => $language ? $language['native_name'] : $lang,
+				'post_type'      => $post_type,
+				'post_type_label' => Post_Translator::get_post_type_label( $post_type ),
 			)
 		);
 	}
