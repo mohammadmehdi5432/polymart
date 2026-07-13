@@ -311,20 +311,15 @@ final class Ajax_Handler {
 
 		$language   = Language_Registry::get_language( $lang );
 		$lang_label = $language ? $language['native_name'] : $lang;
+		$scan       = self::build_scan_response( $post_id, $lang );
 
 		wp_send_json_success(
 			array_merge(
 				$result,
 				array(
 					'fields'  => self::collect_meta_fields_for_response( $post_id, $lang ),
-					'scan'    => self::build_scan_response( $post_id, $lang ),
-					'message' => ! empty( $result['done'] )
-						? sprintf(
-							/* translators: %s: language name */
-							__( 'ترجمه %s تکمیل و ذخیره شد.', 'polymart-ai' ),
-							$lang_label
-						)
-						: (string) ( $result['message'] ?? __( 'ترجمه در حال انجام است…', 'polymart-ai' ) ),
+					'scan'    => $scan,
+					'message' => self::format_metabox_translate_response_message( $post_id, $lang, $result, $scan ),
 				)
 			)
 		);
@@ -463,6 +458,59 @@ final class Ajax_Handler {
 			'slices_run'     => $slices_run,
 			'scan'           => self::build_scan_response( $post_id, $lang ),
 		);
+	}
+
+	/**
+	 * Keep metabox progress text aligned with the scan panel (same counters).
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Target language code.
+	 * @param array<string, mixed> $result  Slice runner result.
+	 * @param array<string, mixed> $scan    Scan payload.
+	 * @return string
+	 */
+	private static function format_metabox_translate_response_message( $post_id, $lang, array $result, array $scan ) {
+		unset( $post_id );
+
+		$language   = Language_Registry::get_language( $lang );
+		$lang_label = $language ? $language['native_name'] : $lang;
+
+		if ( ! empty( $result['done'] ) ) {
+			return sprintf(
+				/* translators: %s: language name */
+				__( 'ترجمه %s تکمیل و ذخیره شد.', 'polymart-ai' ),
+				$lang_label
+			);
+		}
+
+		$elementor = is_array( $scan['elementor'] ?? null ) ? $scan['elementor'] : array();
+
+		if ( ! empty( $elementor['active'] ) && ! empty( $elementor['chunk_progress'] ) ) {
+			$parts = explode( '/', (string) $elementor['chunk_progress'] );
+			$done  = isset( $parts[0] ) ? absint( $parts[0] ) : 0;
+			$total = isset( $parts[1] ) ? max( 1, absint( $parts[1] ) ) : 1;
+
+			$message = sprintf(
+				/* translators: 1: completed batches, 2: total batches */
+				__( 'Elementor — %1$d از %2$d بخش ذخیره شد', 'polymart-ai' ),
+				$done,
+				$total
+			);
+
+			$remaining = absint( $elementor['remaining_field_count'] ?? 0 );
+
+			if ( $remaining > 0 ) {
+				$message .= sprintf(
+					/* translators: %d: remaining JSON field count */
+					__( ' — %d فیلد JSON مانده', 'polymart-ai' ),
+					$remaining
+				);
+			}
+
+			return $message;
+		}
+
+		return (string) ( $result['message'] ?? __( 'ترجمه در حال انجام است…', 'polymart-ai' ) );
 	}
 
 	/**
