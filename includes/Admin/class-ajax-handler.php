@@ -229,6 +229,7 @@ final class Ajax_Handler {
 		}
 
 		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
+		Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
 
 		wp_send_json_success( self::build_scan_response( $post_id, $lang ) );
 	}
@@ -245,8 +246,9 @@ final class Ajax_Handler {
 
 		$post_id = isset( $_POST['post_id'] ) ? absint( $_POST['post_id'] ) : 0;
 		$lang    = isset( $_POST['lang'] ) ? sanitize_key( wp_unslash( $_POST['lang'] ) ) : 'en';
-		$force   = ! empty( $_POST['force'] );
-		$unlock  = ! empty( $_POST['unlock'] ) || $force;
+		$force    = ! empty( $_POST['force'] );
+		$continue = ! empty( $_POST['continue_job'] );
+		$unlock   = ! empty( $_POST['unlock'] ) || $force || $continue;
 
 		if ( ! $post_id ) {
 			wp_send_json_error(
@@ -281,6 +283,7 @@ final class Ajax_Handler {
 		}
 
 		Post_Translator::repair_stale_elementor_job_state( $post_id, $lang );
+		Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
 
 		if ( ! Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, $unlock ) ) {
 			wp_send_json_error(
@@ -376,37 +379,21 @@ final class Ajax_Handler {
 			@set_time_limit( 600 );
 		}
 
-		$started_at  = microtime( true );
-		$budget_sec  = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 90, $post_id, $lang );
-		$max_slices  = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 8, $post_id, $lang );
-		$slices_run  = 0;
-		$last_slice  = array();
+		$started_at   = microtime( true );
+		$budget_sec   = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 90, $post_id, $lang );
+		$max_slices   = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 8, $post_id, $lang );
+		$slices_run   = 0;
+		$last_slice   = array();
 		$lock_retried = $unlock;
+		$lock_held    = false;
 
-		while ( $slices_run < $max_slices && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
-			if ( $slices_run > 0 ) {
-				Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, false );
-			}
-
-			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
-			++$slices_run;
-			$last_slice = is_array( $slice ) ? $slice : array();
-
-			if (
-				is_wp_error( $slice )
-				&& 'polymart_ai_translation_in_progress' === $slice->get_error_code()
-				&& ! $lock_retried
-			) {
-				if ( Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true ) ) {
-					$lock_retried = true;
-					$slice        = Post_Translator::process_job_translation_slice( $post_id, $lang );
-					++$slices_run;
-					$last_slice   = is_array( $slice ) ? $slice : array();
-				}
-			}
-
-			if ( is_wp_error( $slice ) ) {
-				if ( 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
+		try {
+			if ( ! Post_Translator::acquire_translation_lock( $post_id, $lang ) ) {
+				if ( Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true )
+					&& Post_Translator::acquire_translation_lock( $post_id, $lang )
+				) {
+					$lock_held = true;
+				} else {
 					return new \WP_Error(
 						'polymart_ai_translation_in_progress',
 						self::format_lock_blocked_message( $post_id, $lang ),
@@ -416,48 +403,88 @@ final class Ajax_Handler {
 						)
 					);
 				}
+			} else {
+				$lock_held = true;
+			}
+
+			while ( $slices_run < $max_slices && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
+				Post_Translator::touch_translation_lock( $post_id, $lang );
+				Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
+
+				$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, false );
+				++$slices_run;
+				$last_slice = is_array( $slice ) ? $slice : array();
 
 				if (
-					Post_Translator::is_recoverable_job_slice_error( $slice )
-					&& Post_Translator::job_partial_state_has_progress( $post_id, $lang )
+					is_wp_error( $slice )
+					&& 'polymart_ai_translation_in_progress' === $slice->get_error_code()
+					&& ! $lock_retried
 				) {
-					return array(
-						'done'           => false,
-						'phase'          => (string) ( $last_slice['phase'] ?? '' ),
-						'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
-						'message'        => $slice->get_error_message(),
-						'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
-						'slices_run'     => $slices_run,
-						'recoverable'    => true,
-					);
+					Post_Translator::prepare_admin_metabox_translation_lock( $post_id, $lang, true );
+					$lock_retried = true;
+					$slice        = Post_Translator::process_job_translation_slice( $post_id, $lang, false );
+					++$slices_run;
+					$last_slice   = is_array( $slice ) ? $slice : array();
 				}
 
-				return $slice;
+				if ( is_wp_error( $slice ) ) {
+					if ( 'polymart_ai_translation_in_progress' === $slice->get_error_code() ) {
+						return new \WP_Error(
+							'polymart_ai_translation_in_progress',
+							self::format_lock_blocked_message( $post_id, $lang ),
+							array(
+								'locked' => true,
+								'scan'   => self::build_scan_response( $post_id, $lang ),
+							)
+						);
+					}
+
+					if (
+						Post_Translator::is_recoverable_job_slice_error( $slice )
+						&& Post_Translator::job_partial_state_has_progress( $post_id, $lang )
+					) {
+						return array(
+							'done'           => false,
+							'phase'          => (string) ( $last_slice['phase'] ?? '' ),
+							'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
+							'message'        => $slice->get_error_message(),
+							'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
+							'slices_run'     => $slices_run,
+							'recoverable'    => true,
+						);
+					}
+
+					return $slice;
+				}
+
+				if ( ! empty( $slice['done'] ) ) {
+					return array(
+						'done'           => true,
+						'phase'          => (string) ( $slice['phase'] ?? 'complete' ),
+						'phase_progress' => (string) ( $slice['phase_progress'] ?? '' ),
+						'message'        => (string) ( $slice['message'] ?? '' ),
+						'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
+						'slices_run'     => $slices_run,
+					);
+				}
 			}
 
-			if ( ! empty( $slice['done'] ) ) {
-				return array(
-					'done'           => true,
-					'phase'          => (string) ( $slice['phase'] ?? 'complete' ),
-					'phase_progress' => (string) ( $slice['phase_progress'] ?? '' ),
-					'message'        => (string) ( $slice['message'] ?? '' ),
-					'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
-					'slices_run'     => $slices_run,
-				);
+			return array(
+				'done'           => false,
+				'phase'          => (string) ( $last_slice['phase'] ?? '' ),
+				'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
+				'message'        => ! empty( $last_slice['message'] )
+					? (string) $last_slice['message']
+					: __( 'ترجمه در حال انجام است — درخواست بعدی ادامه می‌دهد.', 'polymart-ai' ),
+				'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
+				'slices_run'     => $slices_run,
+				'scan'           => self::build_scan_response( $post_id, $lang ),
+			);
+		} finally {
+			if ( $lock_held ) {
+				Post_Translator::release_translation_lock( $post_id, $lang );
 			}
 		}
-
-		return array(
-			'done'           => false,
-			'phase'          => (string) ( $last_slice['phase'] ?? '' ),
-			'phase_progress' => (string) ( $last_slice['phase_progress'] ?? '' ),
-			'message'        => ! empty( $last_slice['message'] )
-				? (string) $last_slice['message']
-				: __( 'ترجمه در حال انجام است — درخواست بعدی ادامه می‌دهد.', 'polymart-ai' ),
-			'status'         => Post_Translator::get_translation_status( $post_id, $lang ),
-			'slices_run'     => $slices_run,
-			'scan'           => self::build_scan_response( $post_id, $lang ),
-		);
 	}
 
 	/**

@@ -449,6 +449,7 @@
 				lang: lang,
 				force: options.force ? 1 : 0,
 				unlock: options.unlock ? 1 : 0,
+				continue_job: options.continueJob ? 1 : 0,
 			},
 		});
 	}
@@ -546,10 +547,10 @@
 			return;
 		}
 
-		requestTranslateComplete(postId, lang, { force: false, unlock: unlockNext && attempt > 1 })
+		requestTranslateComplete(postId, lang, { force: false, unlock: true, continueJob: true })
 			.done(function (response) {
 				if (!response || !response.success) {
-					if (response && response.data && response.data.locked && attempt < 8) {
+					if (response && response.data && response.data.locked && attempt < 24) {
 						setGlobalStatus((response.data.message || config.strings.translating) + ' — ' + (config.strings.lockRetry || 'تلاش مجدد…'), '');
 						window.setTimeout(function () {
 							pollTranslateComplete(postId, lang, attempt + 1, true);
@@ -588,7 +589,7 @@
 				}, 2000);
 			})
 			.fail(function (xhr) {
-				if (xhr && xhr.status === 409 && attempt < 8) {
+				if (xhr && xhr.status === 409 && attempt < 24) {
 					setGlobalStatus((config.strings.lockRetry || 'قفل موقت — تلاش مجدد…'), '');
 					window.setTimeout(function () {
 						pollTranslateComplete(postId, lang, attempt + 1, true);

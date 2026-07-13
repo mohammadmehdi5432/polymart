@@ -3461,16 +3461,6 @@ final class Post_Translator {
 		// Translations live in `_elementor_data_{lang}` — keep partial meta lightweight.
 		if ( 'elementor' === sanitize_key( (string) ( $persist['phase'] ?? '' ) ) ) {
 			unset( $persist['elementor_map'] );
-
-			$cursor = max(
-				absint( $state['elementor_slices_completed'] ?? 0 ),
-				absint( $state['elementor_chunk_index'] ?? 0 )
-			);
-			$total  = max( 1, absint( $state['elementor_chunks_total'] ?? 0 ) );
-
-			if ( $cursor > 0 ) {
-				self::write_elementor_slice_cursor( $post_id, $lang, $cursor, $total );
-			}
 		}
 
 		update_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ), $persist );
@@ -4768,6 +4758,10 @@ final class Post_Translator {
 			return true;
 		}
 
+		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			self::release_stale_translation_lock( $post_id, $lang, 35 );
+		}
+
 		$status = self::get_translation_lock_status( $post_id, $lang );
 
 		if ( ! $status['held'] || $status['owned_by_self'] ) {
@@ -4875,6 +4869,84 @@ final class Post_Translator {
 		}
 
 		self::save_job_partial_state( $post_id, $lang, $state );
+
+		return true;
+	}
+
+	/**
+	 * Rebuild the Elementor API queue when the cursor overshot real progress.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool True when the queue was unblocked.
+	 */
+	public static function unblock_elementor_chunk_queue( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( self::repair_stale_elementor_job_state( $post_id, $lang ) ) {
+			return true;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+
+		$state = self::hydrate_elementor_job_partial_state(
+			$post_id,
+			$lang,
+			self::get_job_partial_state( $post_id, $lang )
+		);
+		$map       = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$source    = self::collect_elementor_translation_payload( $data );
+		$remaining = self::filter_remaining_elementor_payload( $source, $map, $skipped );
+
+		if ( empty( $remaining ) ) {
+			return false;
+		}
+
+		$chunk_queue = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+
+		if ( ! empty( $chunk_queue['pending'] ) ) {
+			return false;
+		}
+
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+
+		$batch_progress = self::compute_elementor_api_batch_progress( $data, $map, $state );
+		$state['phase']                      = 'elementor';
+		$state['elementor_map']              = $map;
+		$state['elementor_chunk_index']      = (int) $batch_progress['done'];
+		$state['elementor_slices_completed'] = (int) $batch_progress['done'];
+		$state['elementor_chunks_total']     = (int) $batch_progress['total'];
+		unset( $state['elementor_failures'] );
+
+		self::save_job_partial_state( $post_id, $lang, $state );
+
+		\PolymartAI\Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: 1: post ID, 2: remaining field count */
+				__( 'Elementor — #%1$d: صف API بازسازی شد — %2$d فیلد در انتظار', 'polymart-ai' ),
+				$post_id,
+				count( $remaining )
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang )
+		);
 
 		return true;
 	}
@@ -5244,9 +5316,10 @@ final class Post_Translator {
 	 * @param string $lang    Target language code.
 	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
 	 */
-	public static function process_job_translation_slice( $post_id, $lang ) {
-		$post_id = absint( $post_id );
-		$lang    = sanitize_key( (string) $lang );
+	public static function process_job_translation_slice( $post_id, $lang, $manage_lock = true ) {
+		$post_id     = absint( $post_id );
+		$lang        = sanitize_key( (string) $lang );
+		$manage_lock = (bool) $manage_lock;
 
 		if ( ! $post_id || ! self::can_translate_post( $post_id ) ) {
 			return new \WP_Error(
@@ -5273,7 +5346,7 @@ final class Post_Translator {
 			);
 		}
 
-		if ( ! self::acquire_translation_lock( $post_id, $lang ) ) {
+		if ( $manage_lock && ! self::acquire_translation_lock( $post_id, $lang ) ) {
 			return new \WP_Error(
 				'polymart_ai_translation_in_progress',
 				__( 'این مورد در حال ترجمه است. لطفاً چند لحظه صبر کنید.', 'polymart-ai' )
@@ -5292,7 +5365,9 @@ final class Post_Translator {
 				$e->getMessage()
 			);
 		} finally {
-			self::release_translation_lock( $post_id, $lang );
+			if ( $manage_lock ) {
+				self::release_translation_lock( $post_id, $lang );
+			}
 		}
 	}
 
@@ -5542,6 +5617,8 @@ final class Post_Translator {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		self::unblock_elementor_chunk_queue( $post_id, $lang );
+		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		$raw     = get_post_meta( $post_id, '_elementor_data', true );
 
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() && \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
@@ -5636,6 +5713,7 @@ final class Post_Translator {
 						// All API batches done — fall through to finalization below.
 						$chunks = array();
 					} elseif ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+						self::unblock_elementor_chunk_queue( $post_id, $lang );
 						self::save_job_partial_state( $post_id, $lang, $state );
 
 						return array(
@@ -5944,6 +6022,8 @@ final class Post_Translator {
 			if ( is_wp_error( $committed ) ) {
 				return $committed;
 			}
+
+			self::touch_translation_lock( $post_id, $lang );
 
 			if ( $chunk_satisfied ) {
 				++$slice_cursor;
@@ -7930,7 +8010,13 @@ final class Post_Translator {
 		}
 
 		if ( ! add_option( $keys['claim'], (string) $now, '', 'no' ) ) {
-			return false;
+			$existing_claim = absint( get_option( $keys['claim'], 0 ) );
+
+			if ( $existing_claim > 0 && ( $now - $existing_claim ) < self::TRANSLATION_LOCK_TTL ) {
+				return false;
+			}
+
+			update_option( $keys['claim'], (string) $now, false );
 		}
 
 		update_option( $keys['owner'], $token, false );
