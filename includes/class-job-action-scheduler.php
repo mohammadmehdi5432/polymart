@@ -719,6 +719,15 @@ final class Job_Action_Scheduler {
 			$job_after_chain = Activity_Logger::get_job_for_as_debug();
 
 			if ( $any_productive ) {
+				Activity_Logger::touch_job_worker_heartbeat();
+
+				$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
+				$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
+
+				if ( $post_id > 0 && '' !== $lang ) {
+					Activity_Logger::sync_elementor_partial_progress( $post_id, $lang );
+				}
+
 				self::chain_next_slice_immediately();
 			} elseif (
 				Activity_Logger::should_prioritize_elementor_partial( $job_after_chain )
@@ -887,7 +896,7 @@ final class Job_Action_Scheduler {
 				return;
 			}
 
-			self::run_queue_inline( false );
+			self::run_queue_inline( true );
 		} finally {
 			self::$chaining_next = false;
 		}

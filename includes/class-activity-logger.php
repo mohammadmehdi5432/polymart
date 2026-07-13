@@ -2606,7 +2606,9 @@ final class Activity_Logger {
 		}
 
 		if ( self::$trusted_as_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
-			return max( 3, min( 20, self::get_elementor_partial_step_cap( self::get_job_raw() ) ) );
+			$cap = self::get_elementor_partial_step_cap( self::get_job_raw() );
+
+			return max( 3, min( 5, $cap ) );
 		}
 
 		return 1;
@@ -4535,7 +4537,11 @@ final class Activity_Logger {
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
 		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
-			$force_inline = ! $slice_active && ( $worker_dead || $age >= self::PICK_STALL_SEC );
+			$needs_recovery = $worker_dead
+				|| $age >= self::PICK_STALL_SEC
+				|| ( $as_pending && ! $slice_active && $age >= 20 );
+			$force_inline   = ! $slice_active && $needs_recovery;
+
 			Job_Action_Scheduler::run_queue_inline( $force_inline );
 
 			$job = self::get_job_raw();

@@ -4253,6 +4253,12 @@ final class Post_Translator {
 			return $inferred;
 		}
 
+		// During bulk jobs the in-memory map advances before _elementor_data_{lang} is fully
+		// readable — never roll the API batch cursor backward (that re-translates chunk 1–3).
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			return max( $stored, $inferred );
+		}
+
 		$translated_paths = 0;
 
 		foreach ( $map as $value ) {
