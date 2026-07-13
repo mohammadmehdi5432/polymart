@@ -252,16 +252,27 @@ final class Job_Action_Scheduler {
 
 		$job = Activity_Logger::get_job_for_as_debug();
 
-		// Elementor partials are driven by cron/UI inline batches — stale AS rows block enqueue.
+		// Elementor partials use the same AS chain as metabox (inline queue runner + delay 0).
 		if ( Activity_Logger::should_prioritize_elementor_partial( $job ) ) {
-			if (
-				! Activity_Logger::is_bulk_worker_lively( 75 )
-				&& self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0
-			) {
-				self::cancel_pending_slices();
+			if ( ! Activity_Logger::is_bulk_worker_lively( self::STALE_RUNNING_SEC ) ) {
+				self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
+				Activity_Logger::release_stale_locks_for_as( self::STALE_RUNNING_SEC );
+				Activity_Logger::release_step_lock();
+				self::clear_slice_mutex();
 			}
 
-			return 0;
+			if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+				return 0;
+			}
+
+			if (
+				self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0
+				&& Activity_Logger::is_bulk_worker_lively( 75 )
+			) {
+				return 0;
+			}
+
+			return self::enqueue_next( false, 0 );
 		}
 
 		// Pending follow-up already waiting — nudge the queue runner.
@@ -651,13 +662,9 @@ final class Job_Action_Scheduler {
 
 		if ( Activity_Logger::is_bulk_job_running() ) {
 			$job_after_chain = Activity_Logger::get_job_for_as_debug();
+			$elementor_left  = Activity_Logger::should_prioritize_elementor_partial( $job_after_chain );
 
-			if ( Activity_Logger::should_prioritize_elementor_partial( $job_after_chain ) ) {
-				// Cron/UI owns the Elementor chain — avoid enqueueing AS rows that stall.
-				return;
-			}
-
-			if ( $any_productive ) {
+			if ( $any_productive || $elementor_left ) {
 				self::chain_next_slice_immediately();
 			} else {
 				Activity_Logger::nudge_as_queue_runner();

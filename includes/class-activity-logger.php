@@ -578,19 +578,6 @@ final class Activity_Logger {
 			return $out;
 		}
 
-		if ( self::should_prioritize_elementor_partial( $job ) ) {
-			self::run_pinned_elementor_work();
-
-			self::schedule_chain_safety_pulse( self::CRON_FAST_INTERVAL_SEC );
-
-			$out = self::normalize_job_for_response( self::get_job_raw(), false );
-			$out['as_processed']   = 1;
-			$out['worker_mode']    = 'cron';
-			$out['elementor_direct'] = true;
-
-			return $out;
-		}
-
 		if ( Job_Action_Scheduler::is_available() ) {
 			Job_Action_Scheduler::ensure_scheduled();
 			$processed = Job_Action_Scheduler::run_queue_inline( true );
@@ -598,8 +585,9 @@ final class Activity_Logger {
 			self::schedule_chain_safety_pulse( self::CRON_FAST_INTERVAL_SEC );
 
 			$out = self::normalize_job_for_response( self::get_job_raw(), false );
-			$out['as_processed'] = $processed;
-			$out['worker_mode']  = 'as';
+			$out['as_processed']   = $processed;
+			$out['worker_mode']    = 'as';
+
 			return $out;
 		}
 
@@ -641,35 +629,18 @@ final class Activity_Logger {
 			self::force_release_step_lock_if_idle();
 			Job_Action_Scheduler::clear_slice_mutex_if_stale();
 
-			$job = self::get_job_raw();
-
-			if ( self::should_prioritize_elementor_partial( $job ) ) {
-				$burst_job = self::get_job_raw();
-
-				if ( self::maybe_restore_elementor_pin_from_queue( $burst_job ) ) {
-					self::save_job( $burst_job );
-				}
-
-				if ( absint( self::get_job_raw()['partial_post_id'] ?? 0 ) > 0 ) {
-					return self::run_elementor_page_burst();
-				}
-			}
-
 			if ( Job_Action_Scheduler::is_available() ) {
-				$job        = self::get_job_raw();
-				$last_real  = self::get_worker_real_activity_at( $job );
-				$force_as   = $last_real <= 0 || ( time() - $last_real ) >= self::get_ensure_inline_idle_sec();
-				$processed  = Job_Action_Scheduler::run_queue_inline( $force_as );
+				Job_Action_Scheduler::ensure_scheduled();
+				$processed = Job_Action_Scheduler::run_queue_inline( true );
 
 				if ( $processed > 0 ) {
 					return self::normalize_job_for_response( self::get_job_raw(), false );
 				}
 			}
 
-			$steps  = null === $max_steps ? 2 : max( 1, absint( $max_steps ) );
-			$budget = null === $budget_sec ? self::get_cron_step_budget_sec() : max( 30, absint( $budget_sec ) );
+			$limits = self::get_inline_worker_tick_limits( self::get_job_raw() );
 
-			return self::run_action_scheduler_batch( $steps, $budget );
+			return self::run_action_scheduler_batch( $limits['steps'], $limits['budget'] );
 		} finally {
 			self::$trusted_admin_worker = false;
 		}
@@ -1780,6 +1751,7 @@ final class Activity_Logger {
 		$job['as_available']   = ! empty( $as_status['available'] );
 		$job['as_pending']     = ! empty( $as_status['pending'] );
 		$job['worker_mode']    = ! empty( $as_status['available'] ) ? 'as' : 'cron';
+		$job['elementor_priority'] = self::should_prioritize_elementor_partial( $job );
 		$job['elementor_progress_stalled'] = self::is_elementor_progress_stalled( $job );
 		$job['cli_alive']      = false;
 		$job['cli_spawn_ok']   = false;
@@ -2536,11 +2508,10 @@ final class Activity_Logger {
 
 		self::schedule_chain_safety_pulse( $delay_sec );
 
-		// Elementor bulk slices run inline (burst / cron pulse / SPA ensure). While a bulk
-		// job is active we disable AS's HTTP async runner — pending rows never self-execute
-		// on Local/cPanel and only clutter WooCommerce → Scheduled Actions.
+		// Same pattern as metabox AS: enqueue ASAP + run the queue inline in this request.
 		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::cancel_pending_slices();
+			Job_Action_Scheduler::enqueue_next( false, 0 );
+			Job_Action_Scheduler::run_queue_inline( false );
 		}
 	}
 
@@ -2640,7 +2611,6 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		Job_Action_Scheduler::cancel_pending_slices();
 		Metabox_Action_Scheduler::cancel_pending( $post_id, $lang );
 
 		self::$trusted_admin_worker = true;
@@ -3833,7 +3803,7 @@ final class Activity_Logger {
 		}
 
 		Job_Action_Scheduler::cancel_all();
-		self::bootstrap_background_worker( false );
+		self::bootstrap_background_worker( true );
 		self::ping_wp_cron( false );
 		self::log(
 			'info',
@@ -3919,7 +3889,7 @@ final class Activity_Logger {
 			self::recover_stalled_job_picker( $job, $lang, true );
 
 			self::save_job( $job );
-			self::bootstrap_background_worker( false );
+			self::bootstrap_background_worker( true );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -4404,12 +4374,7 @@ final class Activity_Logger {
 
 		if ( $as_ok ) {
 			Job_Action_Scheduler::clear_slice_mutex();
-
-			if ( self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
-				Job_Action_Scheduler::cancel_pending_slices();
-			} else {
-				Job_Action_Scheduler::enqueue_next( true, 0 );
-			}
+			Job_Action_Scheduler::enqueue_next( true, 0 );
 
 			if ( $run_inline ) {
 				Job_Action_Scheduler::run_queue_inline( true );
@@ -4457,25 +4422,8 @@ final class Activity_Logger {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( self::should_prioritize_elementor_partial( $job ) ) {
-			$last = self::get_worker_real_activity_at( $job );
-			$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
-
-			if ( $age >= self::get_ensure_inline_idle_sec() ) {
-				$direct_ran = self::run_pinned_elementor_work( self::is_elementor_progress_stalled( $job ) );
-
-				if ( $direct_ran ) {
-					$job = self::get_job_raw();
-					$job['worker_direct_tick'] = true;
-					self::save_job( $job );
-				}
-			}
-		} elseif ( self::is_elementor_progress_stalled( $job ) ) {
-			if ( self::run_direct_elementor_burst() ) {
-				$job = self::get_job_raw();
-				$job['worker_direct_tick'] = true;
-				self::save_job( $job );
-			}
+		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {
+			self::save_job( $job );
 		}
 
 		$released_stale_lock = self::force_release_step_lock_if_idle();
@@ -4486,13 +4434,14 @@ final class Activity_Logger {
 		$last = self::get_worker_real_activity_at( $job );
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		if ( $released_stale_lock || ( $age >= self::PICK_STALL_SEC && ! self::should_prioritize_elementor_partial( $job ) ) ) {
+		if ( $released_stale_lock || ( $age >= self::PICK_STALL_SEC ) ) {
 			if ( self::recover_stalled_job_picker( $job, $lang, $released_stale_lock ) ) {
 				self::save_job( $job );
 			}
 		}
 
 		self::ensure_recurring_pulse();
+		Job_Action_Scheduler::ensure_scheduled();
 
 		$job  = self::get_job_raw();
 		$last = self::get_worker_real_activity_at( $job );
@@ -4514,26 +4463,18 @@ final class Activity_Logger {
 			$released_stale_lock = true;
 		}
 
-		Job_Action_Scheduler::ensure_scheduled();
-
-		$as_pending = Job_Action_Scheduler::has_pending_or_running();
+		$as_pending  = Job_Action_Scheduler::has_pending_or_running();
 		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
 		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
 
-		if ( $should_tick ) {
-			$inline_steps  = $worker_dead || $age >= self::PICK_STALL_SEC ? 2 : 1;
-			$inline_budget = $worker_dead || $age >= self::PICK_STALL_SEC ? 90 : 60;
-			$ran_work      = false;
+		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::run_queue_inline( true );
 
-			if ( self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
-				$ran_work = self::run_pinned_elementor_work(
-					self::is_elementor_progress_stalled( self::get_job_raw() )
-				);
-			}
-
-			if ( ! $ran_work ) {
-				self::run_inline_worker_tick( $inline_steps, $inline_budget );
-			}
+			$job = self::get_job_raw();
+			$job['worker_inline_tick'] = true;
+			self::save_job( $job );
+		} elseif ( $should_tick ) {
+			self::run_inline_worker_tick( 2, 90 );
 
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;
@@ -4805,22 +4746,9 @@ final class Activity_Logger {
 
 		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {
 			self::save_job( $job );
-			$job = self::get_job_raw();
 		}
 
-		if (
-			self::should_prioritize_elementor_partial( $job )
-			&& absint( $job['partial_post_id'] ?? 0 ) > 0
-		) {
-			$result = self::run_elementor_page_burst( 300 );
-
-			if ( is_array( $result ) ) {
-				$result['worker_kicked'] = true;
-				$result['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
-
-				return $result;
-			}
-		} else {
+		if ( Job_Action_Scheduler::is_available() ) {
 			Job_Action_Scheduler::enqueue_next( true, 0 );
 		}
 

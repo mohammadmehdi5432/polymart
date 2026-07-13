@@ -33,8 +33,8 @@ function latestWorkerStamp(job, includeScheduled = false) {
 function isElementorPartialJob(job) {
   return (
     job?.status === 'running' &&
-    job?.partial_phase === 'elementor' &&
-    Boolean(job?.partial_post_id)
+    (Boolean(job?.elementor_priority) ||
+      (job?.partial_phase === 'elementor' && Boolean(job?.partial_post_id)))
   );
 }
 
@@ -101,8 +101,12 @@ function isCronHealthy(job) {
     return false;
   }
 
-  // AS action queued but worker silent — wake the queue quickly.
-  if (job?.status === 'running' && job?.as_pending && activityAge > 10) {
+  // AS action queued but worker silent — wake the queue quickly (metabox pattern).
+  if (job?.status === 'running' && job?.as_pending && activityAge > 3) {
+    return false;
+  }
+
+  if (job?.status === 'running' && job?.elementor_priority && activityAge > 5) {
     return false;
   }
 
