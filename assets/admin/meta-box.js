@@ -442,6 +442,7 @@
 			url: config.ajaxUrl,
 			method: 'POST',
 			dataType: 'json',
+			timeout: 300000,
 			data: {
 				action: 'polymart_translate_post_complete',
 				nonce: config.nonce,

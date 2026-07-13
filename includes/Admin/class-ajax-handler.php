@@ -375,13 +375,26 @@ final class Ajax_Handler {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 
+		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
+
 		if ( function_exists( 'set_time_limit' ) ) {
 			@set_time_limit( 600 );
 		}
 
-		$started_at   = microtime( true );
-		$budget_sec   = (int) apply_filters( 'polymart_ai_metabox_translate_budget_sec', 90, $post_id, $lang );
-		$max_slices   = (int) apply_filters( 'polymart_ai_metabox_translate_max_slices', 8, $post_id, $lang );
+		$uses_elementor = Post_Translator::uses_elementor_builder( $post_id );
+		$started_at     = microtime( true );
+		$budget_sec     = (int) apply_filters(
+			'polymart_ai_metabox_translate_budget_sec',
+			$uses_elementor ? 150 : 90,
+			$post_id,
+			$lang
+		);
+		$max_slices     = (int) apply_filters(
+			'polymart_ai_metabox_translate_max_slices',
+			$uses_elementor ? 12 : 8,
+			$post_id,
+			$lang
+		);
 		$slices_run   = 0;
 		$last_slice   = array();
 		$lock_retried = $unlock;
@@ -410,6 +423,18 @@ final class Ajax_Handler {
 			while ( $slices_run < $max_slices && ( microtime( true ) - $started_at ) < max( 30, $budget_sec ) ) {
 				Post_Translator::touch_translation_lock( $post_id, $lang );
 				Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang );
+
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: post ID, 2: language code, 3: slice number */
+						__( 'متاباکس — #%1$d (%2$s): شروع slice ترجمه #%3$d…', 'polymart-ai' ),
+						$post_id,
+						$lang,
+						$slices_run + 1
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang, 'source' => 'metabox' )
+				);
 
 				$slice = Post_Translator::process_job_translation_slice( $post_id, $lang, false );
 				++$slices_run;

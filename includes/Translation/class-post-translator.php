@@ -6002,18 +6002,30 @@ final class Post_Translator {
 						$chunks = array();
 					} elseif ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
 						self::unblock_elementor_chunk_queue( $post_id, $lang );
-						self::save_job_partial_state( $post_id, $lang, $state );
+						$state       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+						$chunk_queue = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+						$chunks      = $chunk_queue['pending'];
 
-						return array(
-							'done'           => false,
-							'phase'          => 'elementor',
-							'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-							'message'        => self::format_elementor_job_slice_status_message(
-								$post_id,
-								$lang,
-								array_merge( $state, array( 'elementor_map' => $map ) )
-							),
-						);
+						if ( ! empty( $chunks ) ) {
+							$slice_cursor   = $chunk_queue['cursor'];
+							$progress_total = max( $chunk_queue['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
+							$state['elementor_chunks_total'] = $progress_total;
+							// Fall through to the API batch loop below.
+						} else {
+							self::save_job_partial_state( $post_id, $lang, $state );
+
+							return array(
+								'done'           => false,
+								'phase'          => 'elementor',
+								'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+								'message'        => self::format_elementor_job_slice_status_message(
+									$post_id,
+									$lang,
+									array_merge( $state, array( 'elementor_map' => $map ) )
+								),
+								'recoverable'    => true,
+							);
+						}
 					} else {
 						self::save_elementor_source_hash( $post_id, $lang );
 						delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
@@ -6767,12 +6779,54 @@ final class Post_Translator {
 	 * @return array{all: array<int, array<string, string>>, pending: array<int, array<string, string>>, total: int, cursor: int}
 	 */
 	private static function build_elementor_job_chunk_queue( $post_id, $lang, array $source_data, array $state ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
 		$source_payload = self::collect_elementor_translation_payload( $source_data );
 		$collapsed      = self::collapse_duplicate_elementor_payload( $source_payload );
 		$all_chunks     = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
 		$total          = max( 1, count( $all_chunks ) );
-		$cursor         = self::resolve_elementor_slice_cursor( $post_id, $lang, $source_data, $state );
-		$pending        = array_slice( $all_chunks, $cursor );
+
+		$map     = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$map     = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$skipped_lookup = array_flip( array_map( 'strval', $skipped ) );
+
+		$pending = array();
+
+		foreach ( $all_chunks as $chunk ) {
+			if ( ! is_array( $chunk ) || empty( $chunk ) ) {
+				continue;
+			}
+
+			$needs_work = false;
+
+			foreach ( $chunk as $path => $text ) {
+				$path = (string) $path;
+
+				if ( isset( $skipped_lookup[ $path ] ) ) {
+					continue;
+				}
+
+				if ( ! self::elementor_field_translation_complete( $path, (string) $text, $map ) ) {
+					$needs_work = true;
+					break;
+				}
+			}
+
+			if ( $needs_work ) {
+				$pending[] = $chunk;
+			}
+		}
+
+		$cursor = max( 0, $total - count( $pending ) );
+
+		// Drop stale cursor meta when it overshot real field progress (common after failed runs).
+		$stored_cursor = self::read_elementor_slice_cursor( $post_id, $lang );
+
+		if ( $stored_cursor > $cursor && ! empty( $pending ) ) {
+			self::clear_elementor_slice_cursor( $post_id, $lang );
+		}
 
 		return array(
 			'all'     => $all_chunks,
