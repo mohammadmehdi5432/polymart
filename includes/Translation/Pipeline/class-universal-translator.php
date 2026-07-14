@@ -10,6 +10,14 @@ namespace PolymartAI\Translation\Pipeline;
 use PolymartAI\Frontend\Storefront_Script_Guard;
 use PolymartAI\Routing\Url_Router;
 
+use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Post_Translator;
+use PolymartAI\Translation\Storefront\Layout_Guard;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+use PolymartAI\Translation\Storefront\Storefront_Gettext_Resolver;
+use PolymartAI\Translation\UI_String\UI_String_Registry;
+use PolymartAI\Translation\WooCommerce\WooCommerce_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

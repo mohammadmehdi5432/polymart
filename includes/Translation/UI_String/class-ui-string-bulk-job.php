@@ -7,6 +7,9 @@
 
 namespace PolymartAI\Translation\UI_String;
 
+use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\Post_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

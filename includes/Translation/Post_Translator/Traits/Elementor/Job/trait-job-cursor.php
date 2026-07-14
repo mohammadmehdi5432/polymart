@@ -16,6 +16,7 @@ use PolymartAI\Translation\Post_Translator\Persistence_Guard;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
+
 defined( 'ABSPATH' ) || exit;
 
 trait Trait_Job_Cursor {

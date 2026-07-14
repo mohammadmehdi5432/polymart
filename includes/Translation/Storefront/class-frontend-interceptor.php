@@ -11,6 +11,8 @@ use PolymartAI\Routing\Url_Router;
 use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator;
 
+use PolymartAI\Translation\WooCommerce\WooCommerce_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

@@ -11,6 +11,9 @@ use PolymartAI\Activity_Logger;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
 
+use PolymartAI\Translation\Post_Translator;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

@@ -14,6 +14,7 @@ use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

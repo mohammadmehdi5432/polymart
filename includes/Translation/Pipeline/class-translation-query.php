@@ -7,6 +7,8 @@
 
 namespace PolymartAI\Translation\Pipeline;
 
+use PolymartAI\Translation\Post_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

@@ -11,6 +11,8 @@
 
 namespace PolymartAI\Activity_Logger;
 
+use PolymartAI\Translation\Post_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

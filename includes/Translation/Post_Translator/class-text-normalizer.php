@@ -9,6 +9,7 @@ namespace PolymartAI\Translation\Post_Translator;
 
 use PolymartAI\Translation\AI\Persian_Detector;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

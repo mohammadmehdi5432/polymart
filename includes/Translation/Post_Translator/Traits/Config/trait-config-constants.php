@@ -15,6 +15,7 @@ use PolymartAI\Translation\Post_Translator\Persistence_Guard;
 use PolymartAI\Translation\Post_Translator\Storefront_Resolver;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
+
 defined( 'ABSPATH' ) || exit;
 
 trait Trait_Config_Constants {

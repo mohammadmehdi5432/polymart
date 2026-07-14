@@ -10,6 +10,7 @@ namespace PolymartAI\Integration;
 use PolymartAI\Frontend\Currency;
 use PolymartAI\Language_Registry;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

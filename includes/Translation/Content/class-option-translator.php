@@ -11,6 +11,9 @@ namespace PolymartAI\Translation\Content;
 
 use PolymartAI\Routing\Url_Router;
 
+use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

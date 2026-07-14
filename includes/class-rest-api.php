@@ -20,6 +20,7 @@ use PolymartAI\Translation\UI_String\UI_String_Scanner;
 use PolymartAI\Translation\UI_String\UI_String_Source_Scanner;
 use PolymartAI\Translation\WooCommerce\Variation_Translation_Sync;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

@@ -17,6 +17,7 @@ use PolymartAI\Translation\Storefront\Runtime_String_Translator;
 use PolymartAI\Translation\UI_String\UI_String_Registry;
 use PolymartAI\Translation\WooCommerce\WooCommerce_Translator;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

@@ -16,6 +16,8 @@ use PolymartAI\Translation\Post_Translator\Persistence_Guard;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 trait Trait_Invalidation {

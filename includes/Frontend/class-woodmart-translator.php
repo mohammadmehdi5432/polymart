@@ -17,6 +17,7 @@ use PolymartAI\Translation\Storefront\Runtime_String_Translator;
 use PolymartAI\Translation\Storefront\Storefront_Gettext_Resolver;
 use PolymartAI\Translation\UI_String\UI_String_Registry;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

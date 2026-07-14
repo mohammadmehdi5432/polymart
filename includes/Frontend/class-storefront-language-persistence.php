@@ -9,6 +9,7 @@ namespace PolymartAI\Frontend;
 
 use PolymartAI\Routing\Url_Router;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

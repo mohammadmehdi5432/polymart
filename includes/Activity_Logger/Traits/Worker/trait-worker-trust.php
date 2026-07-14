@@ -15,6 +15,7 @@ use PolymartAI\Translation\Content\Menu_Translator;
 use PolymartAI\Translation\Post_Translator;
 use PolymartAI\Translation\Pipeline\Translation_Query;
 
+
 defined( 'ABSPATH' ) || exit;
 
 trait Trait_Worker_Trust {

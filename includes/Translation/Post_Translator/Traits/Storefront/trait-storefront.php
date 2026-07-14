@@ -9,6 +9,7 @@ namespace PolymartAI\Translation\Post_Translator\Traits\Storefront;
 
 use PolymartAI\Translation\Post_Translator\Storefront_Resolver;
 
+
 defined( 'ABSPATH' ) || exit;
 
 trait Trait_Storefront {

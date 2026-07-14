@@ -9,6 +9,7 @@ namespace PolymartAI\Integration;
 
 use PolymartAI\Language_Registry;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

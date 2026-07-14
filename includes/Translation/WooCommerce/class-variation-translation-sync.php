@@ -9,6 +9,8 @@ namespace PolymartAI\Translation\WooCommerce;
 
 use PolymartAI\Language_Registry;
 
+use PolymartAI\Translation\Post_Translator;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

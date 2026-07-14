@@ -11,6 +11,7 @@ use PolymartAI\Frontend\Currency;
 use PolymartAI\Language_Registry;
 use PolymartAI\Routing\Url_Router;
 
+
 defined( 'ABSPATH' ) || exit;
 
 /**

@@ -10,6 +10,12 @@ namespace PolymartAI\Translation\WooCommerce;
 use PolymartAI\Language_Registry;
 use PolymartAI\Routing\Url_Router;
 
+use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Post_Translator;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+use PolymartAI\Translation\Storefront\Storefront_Gettext_Resolver;
+use PolymartAI\Translation\UI_String\UI_String_Registry;
+
 defined( 'ABSPATH' ) || exit;
 
 /**

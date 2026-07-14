@@ -8,6 +8,8 @@
 namespace PolymartAI\Translation\WooCommerce;
 
 use PolymartAI\Routing\Url_Router;
+use PolymartAI\Translation\Storefront\Layout_Guard;
+
 
 defined( 'ABSPATH' ) || exit;
 
