@@ -45,9 +45,24 @@ trait Trait_Storage {
 			return false;
 		}
 
+		$partial = self::get_job_partial_state( $post_id, $lang );
+
+		if (
+			! empty( $partial['elementor_gap_fill'] )
+			|| ! empty( $partial['elementor_gap_fill_stubborn_only'] )
+		) {
+			return false;
+		}
+
 		$finalized = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
 
 		if ( is_numeric( $finalized ) && absint( $finalized ) > 0 ) {
+			if ( ! \PolymartAI\Activity_Logger::is_job_poll_request() ) {
+				if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+					return false;
+				}
+			}
+
 			return true;
 		}
 

@@ -249,17 +249,31 @@ trait Trait_Job_Elementor {
 
 		self::schedule_chain_safety_pulse( $delay_sec );
 
-		// Same pattern as metabox AS: enqueue ASAP + run the queue inline in this request.
-		if ( Job_Action_Scheduler::is_available() ) {
-			$force_inline = ! self::is_bulk_worker_lively( 45 );
+		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
-			if ( Job_Action_Scheduler::has_pending_or_running() ) {
-				Job_Action_Scheduler::run_queue_inline( $force_inline );
-				return;
-			}
+		if ( ! Job_Action_Scheduler::is_available() ) {
+			return;
+		}
 
+		Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
+		Job_Action_Scheduler::clear_slice_mutex_if_stale();
+
+		$force_inline = ! self::is_bulk_worker_lively( 45 );
+
+		if ( ! Job_Action_Scheduler::has_pending_or_running() ) {
 			Job_Action_Scheduler::enqueue_next( false, 0 );
-			Job_Action_Scheduler::run_queue_inline( true );
+		}
+
+		Job_Action_Scheduler::run_queue_inline( $force_inline );
+
+		if (
+			$post_id > 0
+			&& '' !== $lang
+			&& Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+			&& ! self::is_bulk_worker_lively( 25 )
+		) {
+			self::run_pinned_elementor_work( false );
 		}
 	}
 

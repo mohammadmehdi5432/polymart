@@ -88,6 +88,25 @@ trait Trait_Job_Gap_Fill {
 
 		$ghost_ticks = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
 
+		if ( $ghost_ticks >= 2 && ! empty( $remaining ) ) {
+			foreach ( $remaining as $path => $text ) {
+				$path = (string) $path;
+				$text = (string) $text;
+
+				if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+					continue;
+				}
+
+				self::apply_elementor_field_source_fallback( $path, $text, $map, $state );
+			}
+
+			$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+			$map = self::prepare_elementor_map_for_persist( $map, $source_payload );
+			$state['elementor_map'] = $map;
+			self::save_job_partial_state( $post_id, $lang, $state );
+			$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+		}
+
 		if ( $ghost_ticks >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT ) {
 			return self::force_finalize_elementor_job_with_fallback(
 				$post_id,

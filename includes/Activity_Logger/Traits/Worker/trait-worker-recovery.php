@@ -213,11 +213,8 @@ trait Trait_Worker_Recovery {
 		$job = self::get_job_raw();
 		self::recover_stalled_job_picker( $job, $lang, true );
 		unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
-		$job['worker_heartbeat_at'] = time();
-		$job['last_cron_at']        = time();
-		$job['last_worker']         = wp_doing_cron() ? 'cron' : self::resolve_last_worker_label();
-		$job['worker_recovered_at'] = time();
-		$job['worker_recover_reason'] = sanitize_key( (string) $reason );
+		$job['worker_recovered_at']    = time();
+		$job['worker_recover_reason']  = sanitize_key( (string) $reason );
 		self::save_job( $job );
 
 		self::ensure_recurring_pulse();
@@ -226,6 +223,21 @@ trait Trait_Worker_Recovery {
 			Job_Action_Scheduler::enqueue_next( true, 0 );
 			Job_Action_Scheduler::run_queue_inline( true );
 		}
+
+		if (
+			self::should_prioritize_elementor_partial( $job )
+			&& $post_id > 0
+			&& '' !== $lang
+			&& Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+		) {
+			self::run_pinned_elementor_work( true );
+		}
+
+		$job = self::get_job_raw();
+		$job['worker_heartbeat_at'] = time();
+		$job['last_cron_at']        = time();
+		$job['last_worker']         = wp_doing_cron() ? 'cron' : self::resolve_last_worker_label();
+		self::save_job( $job );
 
 		self::log(
 			'warning',

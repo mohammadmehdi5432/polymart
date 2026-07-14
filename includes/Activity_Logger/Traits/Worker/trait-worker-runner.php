@@ -645,6 +645,15 @@ trait Trait_Worker_Runner {
 			self::log( 'warning', __( 'قفل مرحلهٔ گیرکرده آزاد شد — صف Action Scheduler دوباره شروع می‌کند.', 'polymart-ai' ) );
 		}
 
+		if (
+			self::should_prioritize_elementor_partial( $job )
+			&& self::is_elementor_progress_stalled( $job )
+			&& ! self::is_job_api_cooldown_active( $job )
+		) {
+			self::run_pinned_elementor_work( true );
+			$job = self::get_job_raw();
+		}
+
 		self::save_job( $job );
 
 		return self::normalize_job_for_response( $job, false );

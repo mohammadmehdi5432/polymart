@@ -273,6 +273,22 @@ trait Trait_Queue_Run {
 			$result['worker_kicked'] = true;
 			$result['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
 
+			$post_id = absint( $result['partial_post_id'] ?? 0 ) ?: absint( $result['current_post_id'] ?? 0 );
+			$lang    = sanitize_key( (string) ( $result['lang'] ?? 'en' ) );
+
+			if (
+				$post_id > 0
+				&& '' !== $lang
+				&& Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+				&& self::is_elementor_progress_stalled( $result )
+				&& ! self::is_job_api_cooldown_active( $result )
+			) {
+				self::run_pinned_elementor_work( true );
+				$result = self::normalize_job_for_response( self::get_job_raw(), false );
+				$result['worker_kicked'] = true;
+				$result['worker_direct_tick'] = true;
+			}
+
 			return $result;
 		}
 

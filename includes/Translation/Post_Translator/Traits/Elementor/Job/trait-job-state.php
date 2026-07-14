@@ -225,13 +225,8 @@ trait Trait_Job_State {
 
 		self::bind_elementor_accepted_paths_context( $post_id, $lang );
 
-		if (
-			self::is_elementor_translation_finalized( $post_id, $lang )
-			&& self::is_elementor_translation_current( $post_id, $lang )
-			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
-			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
-		) {
-			return true;
+		if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+			return false;
 		}
 
 		if (
@@ -851,12 +846,17 @@ trait Trait_Job_State {
 
 		self::bind_elementor_accepted_paths_context( $post_id, $lang );
 
-		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
+		if ( ! self::should_require_elementor_translation( $post_id ) ) {
 			return false;
 		}
 
-		if ( ! self::should_require_elementor_translation( $post_id ) ) {
-			return false;
+		$partial = self::get_job_partial_state( $post_id, $lang );
+
+		if (
+			! empty( $partial['elementor_gap_fill'] )
+			|| ! empty( $partial['elementor_gap_fill_stubborn_only'] )
+		) {
+			return true;
 		}
 
 		$raw = get_post_meta( $post_id, '_elementor_data', true );
@@ -871,8 +871,8 @@ trait Trait_Job_State {
 			return false;
 		}
 
-		$state     = self::get_job_partial_state( $post_id, $lang );
-		$map       = self::merge_elementor_job_path_map( $post_id, $lang, $data, $state );
+		$state   = self::get_job_partial_state( $post_id, $lang );
+		$map     = self::merge_elementor_job_path_map( $post_id, $lang, $data, $state );
 		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 
 		$remaining = self::filter_remaining_elementor_payload(

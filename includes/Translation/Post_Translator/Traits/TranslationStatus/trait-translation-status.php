@@ -136,6 +136,11 @@ trait Trait_Translation_Status {
 				$status = 'partial';
 			} elseif (
 				self::uses_elementor_builder( $post_id )
+				&& self::elementor_job_has_remaining_payload( $post_id, $lang )
+			) {
+				$status = 'partial';
+			} elseif (
+				self::uses_elementor_builder( $post_id )
 				&& self::has_elementor_persian_content( $post_id )
 				&& ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang )
 			) {
