@@ -6341,33 +6341,39 @@ final class Post_Translator {
 				}
 
 				if ( ! $was_gap_fill ) {
-					$state['elementor_gap_fill_total'] = count( $gap_chunks );
-					$state['elementor_gap_fill_done']  = 0;
+					$resuming_gap_fill = $stored_total > 0 && $stored_cursor >= $stored_total;
 
-					$remaining_count = count(
-						self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
-					);
+					if ( $resuming_gap_fill ) {
+						$state['elementor_gap_fill_total'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks );
+					} else {
+						$state['elementor_gap_fill_total'] = count( $gap_chunks );
+						$state['elementor_gap_fill_done']  = 0;
 
-					\PolymartAI\Activity_Logger::log(
-						'info',
-						sprintf(
-							/* translators: 1: post ID, 2: remaining fields, 3: gap batches */
-							__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد در %3$d بخش', 'polymart-ai' ),
+						$remaining_count = count(
+							self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
+						);
+
+						\PolymartAI\Activity_Logger::log(
+							'info',
+							sprintf(
+								/* translators: 1: post ID, 2: remaining fields, 3: gap batches */
+								__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد در %3$d بخش', 'polymart-ai' ),
+								$post_id,
+								$remaining_count,
+								count( $gap_chunks )
+							),
+							array( 'post_id' => $post_id, 'lang' => $lang )
+						);
+
+						self::log_elementor_remaining_field_diagnostics(
 							$post_id,
-							$remaining_count,
-							count( $gap_chunks )
-						),
-						array( 'post_id' => $post_id, 'lang' => $lang )
-					);
-
-					self::log_elementor_remaining_field_diagnostics(
-						$post_id,
-						$lang,
-						$source_payload,
-						$map,
-						$skipped,
-						'gap-fill-start'
-					);
+							$lang,
+							$source_payload,
+							$map,
+							$skipped,
+							'gap-fill-start'
+						);
+					}
 				} else {
 					$state['elementor_gap_fill_total'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks );
 				}
@@ -6763,10 +6769,7 @@ final class Post_Translator {
 				is_array( $chunk_result ) ? $chunk_result : array(),
 				$alias_to_path
 			);
-			$mapped_chunk = array_merge(
-				$raw_mapped,
-				self::collapse_payload_parts( $raw_mapped )
-			);
+			$mapped_chunk = self::merge_elementor_api_translations_into_map( $raw_mapped, $source_payload );
 
 			if ( empty( $mapped_chunk ) && ! empty( $aliased_payload ) ) {
 				\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
@@ -6788,10 +6791,7 @@ final class Post_Translator {
 						is_array( $recovered ) ? $recovered : array(),
 						$alias_to_path
 					);
-					$mapped_chunk = array_merge(
-						$raw_recovered,
-						self::collapse_payload_parts( $raw_recovered )
-					);
+					$mapped_chunk = self::merge_elementor_api_translations_into_map( $raw_recovered, $source_payload );
 				}
 			}
 
@@ -7075,7 +7075,7 @@ final class Post_Translator {
 		);
 		$state['elementor_failures']         = $failures;
 
-		if ( $gap_fill_mode && empty( $remaining ) ) {
+		if ( $gap_fill_mode && empty( $remaining ) && self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
 			unset(
 				$state['elementor_gap_fill'],
 				$state['elementor_gap_fill_done'],
@@ -7755,6 +7755,43 @@ final class Post_Translator {
 		return $clean;
 	}
 
+	private static function elementor_collapsed_base_translation_complete( $path, $text, array $map ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( ! isset( $map[ $path ] ) ) {
+			return false;
+		}
+
+		$translated = trim( (string) $map[ $path ] );
+
+		if ( ! self::elementor_map_value_is_valid_translation( $path, $text, $translated ) ) {
+			return false;
+		}
+
+		return self::utf8_strlen( $translated ) >= (int) floor( self::utf8_strlen( $text ) * 0.85 );
+	}
+
+	private static function merge_elementor_api_translations_into_map( array $raw_mapped, array $source_payload ) {
+		$mapped = $raw_mapped;
+
+		foreach ( self::collapse_payload_parts( $raw_mapped ) as $base => $value ) {
+			$base = (string) $base;
+
+			if ( '' === $base || preg_match( '/::__(?:part|seg)\d+$/', $base ) ) {
+				continue;
+			}
+
+			$source = (string) ( $source_payload[ $base ] ?? '' );
+
+			if ( self::elementor_collapsed_base_translation_complete( $base, $source, array( $base => (string) $value ) ) ) {
+				$mapped[ $base ] = (string) $value;
+			}
+		}
+
+		return $mapped;
+	}
+
 	private static function elementor_field_translation_complete( $path, $text, array $map ) {
 		$path = (string) $path;
 		$text = (string) $text;
@@ -7778,10 +7815,7 @@ final class Post_Translator {
 				return true;
 			}
 
-			if (
-				isset( $map[ $path ] )
-				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
-			) {
+			if ( self::elementor_collapsed_base_translation_complete( $path, $text, $map ) ) {
 				return true;
 			}
 
@@ -8301,10 +8335,7 @@ final class Post_Translator {
 			is_array( $result ) ? $result : array(),
 			$alias_map
 		);
-		$field_map  = array_merge(
-			$raw_mapped,
-			self::collapse_payload_parts( $raw_mapped )
-		);
+		$field_map = self::merge_elementor_api_translations_into_map( $raw_mapped, $source_payload );
 
 		foreach ( $field_map as $map_path => $translated ) {
 			$map_path   = (string) $map_path;
