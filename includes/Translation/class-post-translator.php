@@ -3173,8 +3173,11 @@ final class Post_Translator {
 	 * @param int                   $max_chars  Max combined characters per batch.
 	 * @return array<int, array<string, string>>
 	 */
-	private static function chunk_payload_with_limits( array $payload, $max_fields, $max_chars ) {
-		$payload       = self::expand_payload_for_ai( $payload );
+	private static function chunk_payload_with_limits( array $payload, $max_fields, $max_chars, $expand = true ) {
+		if ( $expand ) {
+			$payload = self::expand_payload_for_ai( $payload );
+		}
+
 		$chunks        = array();
 		$current       = array();
 		$current_chars = 0;
@@ -4175,7 +4178,7 @@ final class Post_Translator {
 	 * @param array<string, string> $map   Path map.
 	 * @return bool
 	 */
-	private static function elementor_chunk_paths_translated( array $chunk, array $map ) {
+	private static function elementor_chunk_paths_translated( array $chunk, array $map, array $source_payload = array() ) {
 		foreach ( $chunk as $path => $text ) {
 			$path = (string) $path;
 			$text = (string) $text;
@@ -4187,7 +4190,29 @@ final class Post_Translator {
 					continue;
 				}
 
-				if ( ! self::elementor_field_translation_complete( $base, $text, $map ) ) {
+				$base_text = (string) ( $source_payload[ $base ] ?? $chunk[ $base ] ?? $text );
+
+				if ( ! self::elementor_field_translation_complete( $base, $base_text, $map ) ) {
+					return false;
+				}
+
+				continue;
+			}
+
+			if ( preg_match( '/^(.+)::__seg\d+$/', $path, $matches ) ) {
+				$base = $matches[1];
+
+				if ( isset( $map[ $path ] ) && self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] ) ) {
+					continue;
+				}
+
+				$base_text = (string) ( $source_payload[ $base ] ?? $chunk[ $base ] ?? '' );
+
+				if ( '' === $base_text ) {
+					return false;
+				}
+
+				if ( ! self::elementor_field_translation_complete( $base, $base_text, $map ) ) {
 					return false;
 				}
 
@@ -6334,6 +6359,15 @@ final class Post_Translator {
 						),
 						array( 'post_id' => $post_id, 'lang' => $lang )
 					);
+
+					self::log_elementor_remaining_field_diagnostics(
+						$post_id,
+						$lang,
+						$source_payload,
+						$map,
+						$skipped,
+						'gap-fill-start'
+					);
 				} else {
 					$state['elementor_gap_fill_total'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks );
 				}
@@ -6551,7 +6585,7 @@ final class Post_Translator {
 				continue;
 			}
 
-			if ( self::elementor_chunk_paths_translated( $chunk, $map ) ) {
+			if ( self::elementor_chunk_paths_translated( $chunk, $map, $source_payload ) ) {
 				++$processed;
 				$state['elementor_map'] = $map;
 
@@ -6722,9 +6756,13 @@ final class Post_Translator {
 				);
 			}
 
-			$mapped_chunk = self::unmap_elementor_aliases(
-				self::collapse_payload_parts( $chunk_result ),
+			$raw_mapped = self::unmap_elementor_aliases(
+				is_array( $chunk_result ) ? $chunk_result : array(),
 				$alias_to_path
+			);
+			$mapped_chunk = array_merge(
+				$raw_mapped,
+				self::collapse_payload_parts( $raw_mapped )
 			);
 
 			if ( empty( $mapped_chunk ) && ! empty( $aliased_payload ) ) {
@@ -6743,9 +6781,13 @@ final class Post_Translator {
 				\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
 
 				if ( ! is_wp_error( $recovered ) ) {
-					$mapped_chunk = self::unmap_elementor_aliases(
-						self::collapse_payload_parts( $recovered ),
+					$raw_recovered = self::unmap_elementor_aliases(
+						is_array( $recovered ) ? $recovered : array(),
 						$alias_to_path
+					);
+					$mapped_chunk = array_merge(
+						$raw_recovered,
+						self::collapse_payload_parts( $raw_recovered )
 					);
 				}
 			}
@@ -6755,6 +6797,20 @@ final class Post_Translator {
 				$path       = (string) $path;
 
 				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+					if ( $gap_fill_mode ) {
+						\PolymartAI\Activity_Logger::log(
+							'warning',
+							sprintf(
+								/* translators: 1: post ID, 2: field path, 3: reject reason */
+								__( 'Elementor — #%1$d: رد پاسخ API برای %2$s — %3$s', 'polymart-ai' ),
+								$post_id,
+								$path,
+								'' === $translated ? 'empty' : 'persian'
+							),
+							array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
+						);
+					}
+
 					$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
 
 					if ( $failures[ $path ] >= 2 ) {
@@ -6815,7 +6871,7 @@ final class Post_Translator {
 			$state['elementor_map'] = $map;
 			++$processed;
 
-			$chunk_satisfied = self::elementor_chunk_paths_translated( $chunk, $map );
+			$chunk_satisfied = self::elementor_chunk_paths_translated( $chunk, $map, $source_payload );
 
 			if ( $gap_fill_mode ) {
 				if ( $chunk_satisfied ) {
@@ -6902,6 +6958,17 @@ final class Post_Translator {
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);
+
+				if ( $gap_fill_mode ) {
+					self::log_elementor_remaining_field_diagnostics(
+						$post_id,
+						$lang,
+						$source_payload,
+						$map,
+						is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array(),
+						sprintf( 'chunk-%d-partial', $attempt_index )
+					);
+				}
 			}
 
 			if ( $processed < $budget && ! empty( $chunks ) ) {
@@ -6977,6 +7044,15 @@ final class Post_Translator {
 		}
 
 		if ( ! $truly_complete && $gap_fill_mode && ! empty( $remaining ) ) {
+			self::log_elementor_remaining_field_diagnostics(
+				$post_id,
+				$lang,
+				self::collect_elementor_translation_payload( $data ),
+				$map,
+				$skipped_list,
+				'gap-fill-tick-end'
+			);
+
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
 
 			if ( is_wp_error( $persisted ) ) {
@@ -7392,6 +7468,171 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Human-readable reason a single Elementor path is still untranslated.
+	 *
+	 * @param string               $path Field path.
+	 * @param string               $text Source text.
+	 * @param array<string, string> $map Completed translations keyed by path.
+	 * @return array{path: string, reason: string, detail: string, chars: int}
+	 */
+	private static function describe_elementor_field_translation_blocker( $path, $text, array $map ) {
+		$path = (string) $path;
+		$text = (string) $text;
+		$chars = self::utf8_strlen( $text );
+		$detail = '';
+		$reason = 'unknown';
+
+		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+		if ( ! empty( $seg_lookup ) ) {
+			$missing = array();
+			$bad     = array();
+
+			foreach ( $seg_lookup as $seg_key => $seg_source ) {
+				if ( ! isset( $map[ $seg_key ] ) ) {
+					$missing[] = $seg_key;
+					continue;
+				}
+
+				$translated = trim( (string) $map[ $seg_key ] );
+				if ( '' === $translated ) {
+					$bad[] = $seg_key . ':empty';
+				} elseif ( Persian_Detector::contains_persian( $translated ) ) {
+					$bad[] = $seg_key . ':persian';
+				} elseif ( $translated === trim( (string) $seg_source ) ) {
+					$bad[] = $seg_key . ':unchanged';
+				}
+			}
+
+			if ( ! empty( $missing ) ) {
+				$reason = 'missing_segments';
+				$detail = implode( ', ', array_slice( $missing, 0, 4 ) );
+			} elseif ( ! empty( $bad ) ) {
+				$reason = 'invalid_segments';
+				$detail = implode( ', ', array_slice( $bad, 0, 4 ) );
+			} elseif (
+				isset( $map[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
+			) {
+				$reason = 'logic_mismatch';
+				$detail = 'base_ok_segments_ok_but_still_remaining';
+			} else {
+				$reason = 'collapsed_base_missing';
+				$detail = 'needs_full_field_or_all_segments';
+			}
+
+			return compact( 'path', 'reason', 'detail', 'chars' );
+		}
+
+		if ( ! isset( $map[ $path ] ) ) {
+			$reason = 'not_in_map';
+		} else {
+			$translated = trim( (string) $map[ $path ] );
+
+			if ( '' === $translated ) {
+				$reason = 'empty_translation';
+			} elseif ( Persian_Detector::contains_persian( $translated ) ) {
+				$reason = 'persian_translation';
+			} elseif ( $translated === trim( $text ) ) {
+				$reason = 'unchanged_from_source';
+			} elseif ( self::utf8_strlen( $text ) > self::AI_MAX_SINGLE_FIELD_CHARS ) {
+				$reason = 'long_field_parts_incomplete';
+				$parts  = (int) ceil( self::utf8_strlen( $text ) / self::AI_MAX_SINGLE_FIELD_CHARS );
+				$have   = 0;
+
+				for ( $part = 1; $part <= $parts; $part++ ) {
+					$part_key = $path . '::__part' . $part;
+					if (
+						isset( $map[ $part_key ] )
+						&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $part_key ] )
+					) {
+						++$have;
+					}
+				}
+
+				$detail = sprintf( '%d/%d parts', $have, $parts );
+			} else {
+				$reason = 'invalid_translation';
+			}
+		}
+
+		if ( '' === $detail ) {
+			$detail = wp_trim_words(
+				wp_strip_all_tags( html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ),
+				10,
+				'…'
+			);
+		}
+
+		return compact( 'path', 'reason', 'detail', 'chars' );
+	}
+
+	/**
+	 * Log why Elementor gap-fill fields remain after API batches.
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string> $map            Translation map.
+	 * @param array<int, string>    $skipped        Skipped paths.
+	 * @param string                $context        Short context label.
+	 * @return void
+	 */
+	private static function log_elementor_remaining_field_diagnostics( $post_id, $lang, array $source_payload, array $map, array $skipped, $context ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$context = sanitize_text_field( (string) $context );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		if ( empty( $remaining ) ) {
+			return;
+		}
+
+		$lines = array();
+		$max   = 8;
+
+		foreach ( $remaining as $path => $text ) {
+			if ( count( $lines ) >= $max ) {
+				break;
+			}
+
+			$blocker = self::describe_elementor_field_translation_blocker( $path, $text, $map );
+			$lines[] = sprintf(
+				'%s [%s: %s, %d chars]',
+				$blocker['path'],
+				$blocker['reason'],
+				$blocker['detail'],
+				(int) $blocker['chars']
+			);
+		}
+
+		$extra = count( $remaining ) > $max ? sprintf( ' +%d more', count( $remaining ) - $max ) : '';
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: remaining count, 3: context, 4: field diagnostics */
+				__( 'Elementor — #%1$d: تشخیص %2$d فیلد باقی (%3$s) — %4$s%5$s', 'polymart-ai' ),
+				$post_id,
+				count( $remaining ),
+				$context,
+				implode( ' | ', $lines ),
+				$extra
+			),
+			array(
+				'post_id'   => $post_id,
+				'lang'      => $lang,
+				'remaining' => array_keys( $remaining ),
+				'context'   => $context,
+			)
+		);
+	}
+
+	/**
 	 * Whether an Elementor field (including oversized multi-part values) is fully translated.
 	 *
 	 * @param string               $path Field path.
@@ -7457,19 +7698,33 @@ final class Post_Translator {
 		$path = (string) $path;
 		$text = (string) $text;
 
-		// For very long Elementor fields, require all __segN pieces.
+		// For very long Elementor fields, require all __segN pieces (or one collapsed base value).
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
 		if ( ! empty( $seg_lookup ) ) {
+			$all_segs_ok = true;
+
 			foreach ( $seg_lookup as $seg_key => $seg_source ) {
 				if (
 					! isset( $map[ $seg_key ] )
 					|| ! self::elementor_map_value_is_valid_translation( $seg_key, (string) $seg_source, (string) $map[ $seg_key ] )
 				) {
-					return false;
+					$all_segs_ok = false;
+					break;
 				}
 			}
 
-			return true;
+			if ( $all_segs_ok ) {
+				return true;
+			}
+
+			if (
+				isset( $map[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
+			) {
+				return true;
+			}
+
+			return false;
 		}
 
 		if ( self::utf8_strlen( $text ) <= self::AI_MAX_SINGLE_FIELD_CHARS ) {
@@ -7659,7 +7914,8 @@ final class Post_Translator {
 		return self::chunk_payload_with_limits(
 			$expanded,
 			3,
-			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
+			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS,
+			false
 		);
 	}
 
