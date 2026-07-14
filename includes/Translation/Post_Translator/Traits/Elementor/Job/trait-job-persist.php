@@ -105,6 +105,7 @@ trait Trait_Job_Persist {
 
 			if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 				\PolymartAI\Activity_Logger::touch_successful_api_call();
+				\PolymartAI\Activity_Logger::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
 			}
 
 			return true;

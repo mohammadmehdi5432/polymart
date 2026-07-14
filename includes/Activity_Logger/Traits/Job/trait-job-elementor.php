@@ -497,6 +497,66 @@ trait Trait_Job_Elementor {
 		return $worked;
 	}
 
+	public static function sync_bulk_job_after_elementor_finalize( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		if ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+			return;
+		}
+
+		$job = self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) ) {
+			return;
+		}
+
+		$was_new = ! self::job_already_counted_success( $job, $post_id );
+		self::track_succeeded_post( $job, $post_id );
+		self::clear_partial_post( $job, $post_id );
+
+		if ( absint( $job['partial_post_id'] ?? 0 ) === $post_id ) {
+			$job['partial_post_id']  = null;
+			$job['partial_phase']    = null;
+			$job['partial_progress'] = null;
+			unset( $job['step_partial'] );
+		}
+
+		if ( absint( $job['current_post_id'] ?? 0 ) === $post_id ) {
+			$job['current_post_id'] = null;
+			$job['step_started_at'] = null;
+		}
+
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['last_post_id']           = max( (int) ( $job['last_post_id'] ?? 0 ), $post_id );
+
+		Post_Translator::release_translation_lock( $post_id, $lang, true );
+		Post_Translator::flush_translation_status_cache( $post_id );
+		REST_API::invalidate_stats_cache();
+		self::save_job( $job );
+
+		if ( $was_new ) {
+			$title = get_the_title( $post_id ) ?: ( '#' . $post_id );
+
+			self::log(
+				'success',
+				sprintf(
+					/* translators: 1: post title, 2: language label */
+					__( '«%1$s» — Elementor کامل شد؛ از صف bulk خارج شد (%2$s).', 'polymart-ai' ),
+					$title,
+					$job['lang_label'] ?? $lang
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+		}
+	}
+
 	public static function run_direct_elementor_burst() {
 		return self::run_pinned_elementor_work( true );
 	}

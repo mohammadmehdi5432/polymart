@@ -513,6 +513,11 @@ trait Trait_Queue_Run {
 		if (
 			self::job_already_counted_success( $job, $post_id )
 			|| 'translated' === self::resolve_post_job_status( $post_id, $lang )
+			|| (
+				Post_Translator::uses_elementor_builder( $post_id )
+				&& Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+				&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			)
 		) {
 			return self::normalize_job_for_response(
 				self::advance_past_already_translated_post( $job, $post_id, $lang ),
