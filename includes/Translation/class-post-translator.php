@@ -427,11 +427,23 @@ final class Post_Translator {
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = 3;
 
 	/**
+	 * Empty stubborn hand-off ticks before force-saving with source-text fallback.
+	 */
+	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 5;
+
+	/**
 	 * Segment passthrough keys for the active Elementor slice (from partial state).
 	 *
 	 * @var string[]
 	 */
 	private static $current_elementor_segment_passthrough = array();
+
+	/**
+	 * Base field passthrough keys (source-text fallback) for the active slice.
+	 *
+	 * @var string[]
+	 */
+	private static $current_elementor_field_passthrough = array();
 
 	/**
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
@@ -3487,6 +3499,9 @@ final class Post_Translator {
 		self::$current_elementor_segment_passthrough = is_array( $state['elementor_segment_passthrough'] ?? null )
 			? array_values( array_unique( array_map( 'strval', $state['elementor_segment_passthrough'] ) ) )
 			: array();
+		self::$current_elementor_field_passthrough = is_array( $state['elementor_field_passthrough'] ?? null )
+			? array_values( array_unique( array_map( 'strval', $state['elementor_field_passthrough'] ) ) )
+			: array();
 	}
 
 	/**
@@ -3540,6 +3555,55 @@ final class Post_Translator {
 				$seg_key
 			),
 			array( 'path' => $seg_key )
+		);
+	}
+
+	/**
+	 * Store source text for a stubborn base field (short or collapsed long field).
+	 *
+	 * @param string               $path  Base field path.
+	 * @param string               $text  Source text.
+	 * @param array<string, string> $map   Translation map (by reference).
+	 * @param array<string, mixed> $state Partial state (by reference).
+	 * @return void
+	 */
+	private static function apply_elementor_field_source_fallback( $path, $text, array &$map, array &$state ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( '' === $path || '' === $text ) {
+			return;
+		}
+
+		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+
+		if ( ! empty( $seg_lookup ) ) {
+			foreach ( $seg_lookup as $seg_key => $seg_source ) {
+				if ( ! self::elementor_segment_is_resolved( $seg_key, (string) $seg_source, $map ) ) {
+					self::apply_elementor_segment_source_fallback( $seg_key, (string) $seg_source, $map, $state );
+				}
+			}
+
+			return;
+		}
+
+		$map[ $path ] = $text;
+
+		$passthrough = is_array( $state['elementor_field_passthrough'] ?? null )
+			? $state['elementor_field_passthrough']
+			: array();
+		$passthrough[]                            = $path;
+		$state['elementor_field_passthrough']       = array_values( array_unique( array_map( 'strval', $passthrough ) ) );
+		self::$current_elementor_field_passthrough  = $state['elementor_field_passthrough'];
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: field path */
+				__( 'Elementor — فیلد %1$s با متن اصلی ذخیره شد (force fallback).', 'polymart-ai' ),
+				$path
+			),
+			array( 'path' => $path )
 		);
 	}
 
@@ -4311,6 +4375,8 @@ final class Post_Translator {
 			'elementor_skipped'           => array(),
 			'elementor_segment_failures'  => array(),
 			'elementor_segment_passthrough' => array(),
+			'elementor_field_passthrough' => array(),
+			'elementor_stubborn_ghost_ticks' => 0,
 		);
 
 		$state = array_merge( $defaults, $state );
@@ -4978,6 +5044,292 @@ final class Post_Translator {
 
 		self::write_elementor_slice_cursor( $post_id, $lang, $progress_total, $progress_total );
 		self::persist_elementor_primary_batches_done( $post_id, $lang, $progress_total );
+	}
+
+	/**
+	 * Run one stubborn gap-fill tick (API segments + partial site save).
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, mixed>  $source_data    Source Elementor tree.
+	 * @param array<string, mixed>  $state          Partial state (by reference).
+	 * @param array<string, string> $map            Translation map (by reference).
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string[]> $text_mirrors Mirror lookup.
+	 * @param string                $api_key        API key.
+	 * @param string                $api_endpoint   API endpoint.
+	 * @param string                $ai_model       Model id.
+	 * @param int                   $progress_total Primary batch total.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable?: bool}|\WP_Error
+	 */
+	private static function run_elementor_stubborn_handoff_tick(
+		$post_id,
+		$lang,
+		array $source_data,
+		array &$state,
+		array &$map,
+		array $source_payload,
+		array $text_mirrors,
+		$api_key,
+		$api_endpoint,
+		$ai_model,
+		$progress_total
+	) {
+		$post_id        = absint( $post_id );
+		$lang           = sanitize_key( (string) $lang );
+		$progress_total = max( 1, absint( $progress_total ) );
+
+		self::bind_elementor_segment_passthrough_context( $state );
+		self::ensure_elementor_stubborn_handoff( $post_id, $lang, $state, $source_payload, $map, $progress_total );
+
+		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		if ( empty( $remaining ) ) {
+			unset( $state['elementor_stubborn_ghost_ticks'] );
+			self::save_job_partial_state( $post_id, $lang, $state );
+
+			if ( self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
+
+				if ( is_wp_error( $persisted ) ) {
+					return $persisted;
+				}
+
+				self::clear_elementor_slice_cursor( $post_id, $lang );
+				self::clear_job_partial_state( $post_id, $lang, true );
+
+				return array(
+					'done'           => true,
+					'phase'          => 'elementor',
+					'phase_progress' => '',
+					'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+				);
+			}
+		}
+
+		$ghost_ticks = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
+
+		if ( $ghost_ticks >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT ) {
+			return self::force_finalize_elementor_job_with_fallback(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_payload,
+				$text_mirrors,
+				$progress_total
+			);
+		}
+
+		$stubborn_left = count( $remaining );
+		$stubborn_result = array(
+			'completed' => 0,
+			'touched'   => false,
+		);
+
+		if ( $stubborn_left > 0 ) {
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: 1: post ID, 2: remaining field count, 3: ghost tick count */
+					__( 'Elementor — #%1$d: stubborn dispatch — %2$d فیلد باقی (تلاش %3$d/%4$d)', 'polymart-ai' ),
+					$post_id,
+					$stubborn_left,
+					$ghost_ticks + 1,
+					self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
+			$stubborn_result = self::translate_elementor_gap_fill_stubborn_fields(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_payload,
+				$text_mirrors,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				min( 4, $stubborn_left )
+			);
+		}
+
+		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
+		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+		$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$state['elementor_map'] = $map;
+
+		if ( empty( $stubborn_result['touched'] ) && empty( $stubborn_result['completed'] ) ) {
+			$state['elementor_stubborn_ghost_ticks'] = $ghost_ticks + 1;
+		} else {
+			unset( $state['elementor_stubborn_ghost_ticks'] );
+		}
+
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+
+		$committed = self::commit_elementor_chunk_progress_to_site(
+			$post_id,
+			$lang,
+			$source_data,
+			$state,
+			$map,
+			$progress_total,
+			$progress_total,
+			true
+		);
+
+		if ( is_wp_error( $committed ) ) {
+			return $committed;
+		}
+
+		self::touch_translation_lock( $post_id, $lang );
+		self::save_job_partial_state( $post_id, $lang, $state );
+
+		$remaining_after = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		if (
+			absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
+			&& ! empty( $remaining_after )
+		) {
+			return self::force_finalize_elementor_job_with_fallback(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_payload,
+				$text_mirrors,
+				$progress_total
+			);
+		}
+
+		if ( empty( $remaining_after ) && self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
+
+			if ( is_wp_error( $persisted ) ) {
+				return $persisted;
+			}
+
+			self::clear_elementor_slice_cursor( $post_id, $lang );
+			self::clear_job_partial_state( $post_id, $lang, true );
+
+			return array(
+				'done'           => true,
+				'phase'          => 'elementor',
+				'phase_progress' => '',
+				'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+			);
+		}
+
+		return array(
+			'done'           => false,
+			'phase'          => 'elementor',
+			'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+			'message'        => self::format_elementor_gap_fill_remaining_message( $post_id, $remaining_after, $map ),
+			'recoverable'    => true,
+		);
+	}
+
+	/**
+	 * Escape hatch: fallback stubborn fields to source text, persist JSON, mark job done.
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, mixed>  $source_data    Source Elementor tree.
+	 * @param array<string, mixed>  $state          Partial state (by reference).
+	 * @param array<string, string> $map            Translation map (by reference).
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string[]> $text_mirrors Mirror lookup.
+	 * @param int                   $progress_total Primary batch total.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string}|\WP_Error
+	 */
+	private static function force_finalize_elementor_job_with_fallback(
+		$post_id,
+		$lang,
+		array $source_data,
+		array &$state,
+		array &$map,
+		array $source_payload,
+		array $text_mirrors,
+		$progress_total
+	) {
+		$post_id        = absint( $post_id );
+		$lang           = sanitize_key( (string) $lang );
+		$progress_total = max( 1, absint( $progress_total ) );
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining      = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+		$forced         = 0;
+
+		foreach ( $remaining as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+				continue;
+			}
+
+			self::apply_elementor_field_source_fallback( $path, $text, $map, $state );
+			++$forced;
+		}
+
+		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
+		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+		$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$state['elementor_map'] = $map;
+
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: forced field count */
+				__( 'Elementor — #%1$d: تکمیل اجباری — %2$d فیلد سرسخت با متن اصلی ذخیره شد و ترجمه روی سایت اعمال شد.', 'polymart-ai' ),
+				$post_id,
+				$forced
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang, 'forced' => $forced )
+		);
+
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
+
+		if ( is_wp_error( $persisted ) ) {
+			return $persisted;
+		}
+
+		unset(
+			$state['elementor_gap_fill'],
+			$state['elementor_gap_fill_done'],
+			$state['elementor_gap_fill_total'],
+			$state['elementor_gap_fill_finished_keys'],
+			$state['elementor_gap_fill_scheduled_keys'],
+			$state['elementor_gap_fill_stubborn_only'],
+			$state['elementor_primary_batches_done'],
+			$state['elementor_persist_map'],
+			$state['elementor_seg_map'],
+			$state['elementor_stubborn_ghost_ticks'],
+			$state['elementor_stubborn_long_index'],
+			$state['elementor_segment_passthrough'],
+			$state['elementor_field_passthrough']
+		);
+
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang, true );
+		self::flush_translation_status_cache( $post_id );
+
+		return array(
+			'done'           => true,
+			'phase'          => 'elementor',
+			'phase_progress' => '',
+			'message'        => sprintf(
+				/* translators: 1: forced field count */
+				__( 'ترجمه Elementor با تکمیل اجباری ذخیره شد (%1$d فیلد با متن اصلی).', 'polymart-ai' ),
+				$forced
+			),
+		);
 	}
 
 	/**
@@ -7064,8 +7416,20 @@ final class Post_Translator {
 					absint( $progress_total ),
 					1
 				);
-				self::ensure_elementor_stubborn_handoff( $post_id, $lang, $state, $source_payload, $map, $progress_total );
-				self::save_job_partial_state( $post_id, $lang, $state );
+
+				return self::run_elementor_stubborn_handoff_tick(
+					$post_id,
+					$lang,
+					$data,
+					$state,
+					$map,
+					$source_payload,
+					$text_mirrors,
+					$api_key,
+					$api_endpoint,
+					$ai_model,
+					$progress_total
+				);
 			}
 
 			if ( empty( $chunks ) && ! $in_handoff ) {
@@ -7157,8 +7521,7 @@ final class Post_Translator {
 			}
 		}
 
-		if ( empty( $chunks ) ) {
-			$map             = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : $map;
+		if ( empty( $chunks ) && ! self::elementor_in_gap_fill_handoff( $post_id, $lang, $state ) ) {
 			$chunk_progress  = self::get_elementor_chunk_progress( $post_id, $lang, array_merge( $state, array( 'elementor_map' => $map ) ) );
 			$progress_total  = max( $progress_total, (int) $chunk_progress['total'], 1 );
 			$done_count      = self::resolve_elementor_done_count( $state, $chunk_progress['done'], $post_id, $lang );
@@ -8587,6 +8950,15 @@ final class Post_Translator {
 				&& trim( (string) $value ) === trim( $source_text )
 			) {
 				$clean[ $path ] = trim( (string) $value );
+				continue;
+			}
+
+			if (
+				! preg_match( '/::__(?:part|seg)\d+$/', $path )
+				&& in_array( $path, self::$current_elementor_field_passthrough, true )
+				&& trim( (string) $value ) === trim( $source_text )
+			) {
+				$clean[ $path ] = trim( (string) $value );
 			}
 		}
 
@@ -8964,6 +9336,14 @@ final class Post_Translator {
 	private static function elementor_field_translation_complete( $path, $text, array $map ) {
 		$path = (string) $path;
 		$text = (string) $text;
+
+		if (
+			in_array( $path, self::$current_elementor_field_passthrough, true )
+			&& isset( $map[ $path ] )
+			&& (string) $map[ $path ] === $text
+		) {
+			return true;
+		}
 
 		// For very long Elementor fields, require all __segN pieces (or one collapsed base value).
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
