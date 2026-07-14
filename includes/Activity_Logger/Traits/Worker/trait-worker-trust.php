@@ -45,6 +45,13 @@ trait Trait_Worker_Trust {
 		return false;
 	}
 
+	/**
+	 * True while an Action Scheduler slice (or equivalent bounded worker tick) is running.
+	 */
+	public static function is_trusted_as_tick() {
+		return (bool) self::$trusted_as_tick;
+	}
+
 	public static function should_bypass_browser_auth_checks() {
 		return self::is_trusted_job_worker();
 	}
