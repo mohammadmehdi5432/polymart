@@ -8,7 +8,8 @@
  *   Queue sim: /wp-admin/admin.php?page=polymart-ai-queue-debug&view=queue
  *   Remaining: /wp-admin/admin.php?page=polymart-ai-queue-debug&view=remaining
  *   Mismatch:  /wp-admin/admin.php?page=polymart-ai-queue-debug&view=mismatch
- *   JSON:      append &format=json to any view
+ *   JSON:      append &format=json  OR  admin-ajax.php?action=polymart_ai_queue_debug&view=summary&lang=en
+ *   Compact:   add &compact=1 (summary JSON only — short)
  *
  * @package PolymartAI
  */
@@ -43,6 +44,90 @@ add_action(
 		);
 	}
 );
+
+/**
+ * Send pure JSON before WordPress admin HTML wrapper (load-* runs pre-header).
+ *
+ * @return void
+ */
+function polymart_ai_queue_diag_maybe_send_json_early() {
+	if ( ! is_admin() || ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	if ( ! isset( $_GET['page'] ) || 'polymart-ai-queue-debug' !== $_GET['page'] ) {
+		return;
+	}
+
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$format = sanitize_key( (string) ( $_GET['format'] ?? '' ) );
+
+	if ( 'json' !== $format ) {
+		return;
+	}
+
+	polymart_ai_queue_diag_send_json_response();
+}
+
+add_action( 'load-admin_page_polymart-ai-queue-debug', 'polymart_ai_queue_diag_maybe_send_json_early' );
+
+/**
+ * AJAX endpoint — pure JSON, no admin HTML chrome.
+ *
+ * @return void
+ */
+function polymart_ai_queue_diag_ajax_handler() {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => 'forbidden' ), 403 );
+	}
+
+	polymart_ai_queue_diag_send_json_response();
+}
+
+add_action( 'wp_ajax_polymart_ai_queue_debug', 'polymart_ai_queue_diag_ajax_handler' );
+
+/**
+ * Collect and output JSON, then exit.
+ *
+ * @return void
+ */
+function polymart_ai_queue_diag_send_json_response() {
+	polymart_ai_queue_diag_bootstrap();
+
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$lang    = sanitize_key( (string) ( $_GET['lang'] ?? 'en' ) );
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$view    = sanitize_key( (string) ( $_GET['view'] ?? 'summary' ) );
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$compact = ! empty( $_GET['compact'] );
+
+	if ( '' === $view ) {
+		$view = 'summary';
+	}
+
+	try {
+		$data = polymart_ai_queue_diag_collect( $view, $lang, $compact );
+	} catch ( \Throwable $exception ) {
+		$data = array(
+			'error'   => $exception->getMessage(),
+			'view'    => $view,
+			'lang'    => $lang,
+			'compact' => $compact,
+		);
+	}
+
+	while ( ob_get_level() > 0 ) {
+		ob_end_clean();
+	}
+
+	nocache_headers();
+	status_header( 200 );
+	header( 'Content-Type: application/json; charset=utf-8' );
+
+	echo wp_json_encode( $data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT );
+	exit;
+}
 
 /**
  * @return string
@@ -273,7 +358,7 @@ function polymart_ai_queue_diag_simulate_start( $lang ) {
  * @param string $lang Language code.
  * @return array<string, mixed>
  */
-function polymart_ai_queue_diag_summary( $lang ) {
+function polymart_ai_queue_diag_summary( $lang, $compact = false ) {
 	$lang = sanitize_key( (string) $lang );
 	$job  = \PolymartAI\Activity_Logger::get_job( false );
 	$front = absint( get_option( 'page_on_front' ) );
@@ -282,6 +367,19 @@ function polymart_ai_queue_diag_summary( $lang ) {
 		&& \PolymartAI\Activity_Logger\Job_Action_Scheduler::is_available();
 
 	$as_pending = $as_available && \PolymartAI\Activity_Logger\Job_Action_Scheduler::has_pending_or_running();
+
+	$remaining = polymart_ai_queue_diag_remaining_light( $lang );
+
+	if ( $compact && ! empty( $remaining['items'] ) ) {
+		$remaining['items'] = array_slice( $remaining['items'], 0, 5 );
+		$remaining['truncated'] = true;
+	}
+
+	$homepage = $front > 0 ? polymart_ai_queue_diag_post_snapshot( $front, $lang ) : null;
+
+	if ( $compact && is_array( $homepage ) ) {
+		unset( $homepage['meta'], $homepage['gaps_missing'], $homepage['edit_url'], $homepage['view_url_fa'] );
+	}
 
 	return array(
 		'site'            => home_url(),
@@ -306,8 +404,8 @@ function polymart_ai_queue_diag_summary( $lang ) {
 			'lang'            => (string) ( $job['lang'] ?? '' ),
 		),
 		'stats_index'     => \PolymartAI\Translation\Pipeline\Translation_Query::compute_translation_stats( $lang, false ),
-		'remaining_light' => polymart_ai_queue_diag_remaining_light( $lang ),
-		'homepage_snapshot' => $front > 0 ? polymart_ai_queue_diag_post_snapshot( $front, $lang ) : null,
+		'remaining_light' => $remaining,
+		'homepage_snapshot' => $homepage,
 		'start_simulation'  => polymart_ai_queue_diag_simulate_start( $lang ),
 	);
 }
@@ -433,7 +531,7 @@ function polymart_ai_queue_diag_mismatches( $lang, $limit = 40 ) {
  * @param string $lang Language code.
  * @return array<string, mixed>
  */
-function polymart_ai_queue_diag_collect( $view, $lang ) {
+function polymart_ai_queue_diag_collect( $view, $lang, $compact = false ) {
 	polymart_ai_queue_diag_bootstrap();
 
 	$view = sanitize_key( (string) $view );
@@ -447,17 +545,21 @@ function polymart_ai_queue_diag_collect( $view, $lang ) {
 		$lang = 'en';
 	}
 
+	$ajax_json = admin_url( 'admin-ajax.php?action=polymart_ai_queue_debug&view=' . rawurlencode( $view ) . '&lang=' . rawurlencode( $lang ) . '&compact=1' );
+
 	$data = array(
 		'generated_at' => gmdate( 'c' ),
 		'view'         => $view,
 		'lang'         => $lang,
+		'compact'      => (bool) $compact,
 		'links'        => array(
-			'summary'   => polymart_ai_queue_diag_url( 'summary', array( 'lang' => $lang ) ),
-			'homepage'  => polymart_ai_queue_diag_url( 'homepage', array( 'lang' => $lang ) ),
-			'queue'     => polymart_ai_queue_diag_url( 'queue', array( 'lang' => $lang ) ),
-			'remaining' => polymart_ai_queue_diag_url( 'remaining', array( 'lang' => $lang ) ),
-			'mismatch'  => polymart_ai_queue_diag_url( 'mismatch', array( 'lang' => $lang ) ),
-			'json'      => polymart_ai_queue_diag_url( $view, array( 'lang' => $lang, 'format' => 'json' ) ),
+			'summary'      => polymart_ai_queue_diag_url( 'summary', array( 'lang' => $lang ) ),
+			'homepage'     => polymart_ai_queue_diag_url( 'homepage', array( 'lang' => $lang ) ),
+			'queue'        => polymart_ai_queue_diag_url( 'queue', array( 'lang' => $lang ) ),
+			'remaining'    => polymart_ai_queue_diag_url( 'remaining', array( 'lang' => $lang ) ),
+			'mismatch'     => polymart_ai_queue_diag_url( 'mismatch', array( 'lang' => $lang ) ),
+			'json_compact' => add_query_arg( array( 'format' => 'json', 'compact' => '1' ), polymart_ai_queue_diag_url( $view, array( 'lang' => $lang ) ) ),
+			'json_ajax'    => $ajax_json,
 		),
 	);
 
@@ -493,7 +595,7 @@ function polymart_ai_queue_diag_collect( $view, $lang ) {
 			break;
 
 		default:
-			$data['summary'] = polymart_ai_queue_diag_summary( $lang );
+			$data['summary'] = polymart_ai_queue_diag_summary( $lang, $compact );
 			break;
 	}
 
@@ -549,7 +651,9 @@ function polymart_ai_queue_diag_render_html( array $data ) {
 					<tr><th>Start seed IDs</th><td><code><?php echo esc_html( polymart_ai_queue_diag_str( $s['start_simulation']['simulation']['seed_ids'] ?? array() ) ); ?></code></td></tr>
 					<tr><th>Would start fail?</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['start_simulation']['simulation']['would_error'] ?? false ) ); ?></td></tr>
 					<tr><th>Current job total</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['current_job']['total'] ?? '' ) ); ?> (status: <?php echo esc_html( polymart_ai_queue_diag_str( $s['current_job']['status'] ?? '' ) ); ?>)</td></tr>
-					<tr><th>Stats (index / full)</th><td><pre style="margin:0;"><?php echo esc_html( polymart_ai_queue_diag_str( $s['stats_index'] ?? array() ) . "\n" . polymart_ai_queue_diag_str( $s['stats_full'] ?? array() ) ); ?></pre></td></tr>
+					<tr><th>Stats (index)</th><td><pre style="margin:0;"><?php echo esc_html( polymart_ai_queue_diag_str( $s['stats_index'] ?? array() ) ); ?></pre></td></tr>
+					<tr><th>Pure JSON (compact)</th><td><a href="<?php echo esc_url( (string) ( $data['links']['json_compact'] ?? '' ) ); ?>"><?php echo esc_html( (string) ( $data['links']['json_compact'] ?? '' ) ); ?></a></td></tr>
+					<tr><th>Pure JSON (ajax)</th><td><a href="<?php echo esc_url( (string) ( $data['links']['json_ajax'] ?? '' ) ); ?>"><?php echo esc_html( (string) ( $data['links']['json_ajax'] ?? '' ) ); ?></a></td></tr>
 				</tbody>
 			</table>
 		<?php endif; ?>
@@ -613,29 +717,21 @@ function polymart_ai_render_queue_diagnostic_page() {
 		}
 	);
 
-	$lang   = sanitize_key( (string) ( $_GET['lang'] ?? 'en' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
-	$view   = sanitize_key( (string) ( $_GET['view'] ?? 'summary' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
-	$format = sanitize_key( (string) ( $_GET['format'] ?? 'html' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$lang = sanitize_key( (string) ( $_GET['lang'] ?? 'en' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$view = sanitize_key( (string) ( $_GET['view'] ?? 'summary' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 
 	if ( '' === $view ) {
 		$view = 'summary';
 	}
 
 	try {
-		$data = polymart_ai_queue_diag_collect( $view, $lang );
+		$data = polymart_ai_queue_diag_collect( $view, $lang, ! empty( $_GET['compact'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	} catch ( \Throwable $exception ) {
 		$data = array(
 			'error'   => $exception->getMessage(),
 			'view'    => $view,
 			'lang'    => $lang,
 		);
-	}
-
-	if ( 'json' === $format ) {
-		nocache_headers();
-		header( 'Content-Type: application/json; charset=utf-8' );
-		echo wp_json_encode( $data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT );
-		exit;
 	}
 
 	polymart_ai_queue_diag_render_html( $data );
