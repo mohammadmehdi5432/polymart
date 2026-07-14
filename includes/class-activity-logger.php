@@ -2645,7 +2645,7 @@ final class Activity_Logger {
 			$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
 			if ( $post_id > 0 && '' !== $lang && Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang ) ) {
-				return 8;
+				return 3;
 			}
 
 			return 3;

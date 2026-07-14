@@ -6335,10 +6335,7 @@ final class Post_Translator {
 						array( 'post_id' => $post_id, 'lang' => $lang )
 					);
 				} else {
-					$state['elementor_gap_fill_total'] = max(
-						absint( $state['elementor_gap_fill_total'] ?? 0 ),
-						absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks )
-					);
+					$state['elementor_gap_fill_total'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks );
 				}
 
 				$state['elementor_gap_fill'] = true;
@@ -6533,9 +6530,10 @@ final class Post_Translator {
 			);
 			$slice_cursor = min( $slice_cursor, $progress_total );
 			$ai_options   = array( 'max_timeout' => 45 );
+			$budget       = min( $budget, 3 );
 
 			if ( function_exists( 'set_time_limit' ) ) {
-				@set_time_limit( max( 120, $budget * 45 ) );
+				@set_time_limit( max( 120, $budget * 50 ) );
 			}
 		}
 
@@ -6609,14 +6607,19 @@ final class Post_Translator {
 				: sprintf( '#%d', $post_id );
 
 			if ( $gap_fill_mode ) {
+				$remaining_fields = count(
+					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped_list )
+				);
+
 				\PolymartAI\Activity_Logger::log(
 					'info',
 					sprintf(
-						/* translators: 1: post label, 2: gap chunk index, 3: gap chunk total */
-						__( 'Elementor — %1$s: تکمیل نهایی — ارسال بخش %2$d از %3$d به API آروان…', 'polymart-ai' ),
+						/* translators: 1: post label, 2: gap chunk index, 3: gap chunk total, 4: remaining fields */
+						__( 'Elementor — %1$s: تکمیل نهایی — ارسال بخش %2$d از %3$d به API آروان (%4$d فیلد باقی)…', 'polymart-ai' ),
 						$post_label,
 						$attempt_index,
-						$attempt_total
+						$attempt_total,
+						$remaining_fields
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);
