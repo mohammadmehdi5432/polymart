@@ -650,7 +650,17 @@ trait Trait_Job_Gap_Fill {
 
 			if ( ! empty( $missing ) ) {
 				$reason = 'missing_segments';
-				$detail = implode( ', ', array_slice( $missing, 0, 4 ) );
+				$labels = array();
+
+				foreach ( array_slice( $missing, 0, 4 ) as $seg_key ) {
+					if ( preg_match( '/::__seg(\d+)$/', (string) $seg_key, $matches ) ) {
+						$labels[] = '__seg' . $matches[1];
+					} else {
+						$labels[] = (string) $seg_key;
+					}
+				}
+
+				$detail = implode( ', ', $labels );
 			} elseif ( ! empty( $bad ) ) {
 				$reason = 'invalid_segments';
 				$detail = implode( ', ', array_slice( $bad, 0, 4 ) );
@@ -1188,6 +1198,12 @@ trait Trait_Job_Gap_Fill {
 				if ( self::elementor_segment_is_resolved( $batch_path, $batch_text, $map ) ) {
 					continue;
 				}
+
+				if ( absint( $seg_failures[ $batch_path ] ?? 0 ) >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+					self::apply_elementor_segment_source_fallback( $batch_path, $batch_text, $map, $state );
+					$touched = true;
+					continue;
+				}
 			} elseif ( isset( $map[ $batch_path ] ) && self::elementor_map_value_is_valid_translation( $batch_path, $batch_text, (string) $map[ $batch_path ] ) ) {
 				continue;
 			}
@@ -1201,7 +1217,10 @@ trait Trait_Job_Gap_Fill {
 			return compact( 'completed', 'touched' );
 		}
 
-		$max_attempts = self::ELEMENTOR_SEGMENT_MAX_RETRIES;
+		$max_attempts = \PolymartAI\Activity_Logger::is_trusted_as_tick()
+			? 1
+			: self::ELEMENTOR_SEGMENT_MAX_RETRIES;
+		$request_timeout = self::resolve_elementor_stubborn_request_timeout( $pending );
 
 		for ( $attempt = 1; $attempt <= $max_attempts && ! empty( $pending ); $attempt++ ) {
 			list( $aliased_attempt, $alias_map_attempt ) = self::alias_elementor_payload_keys( $pending );
@@ -1232,7 +1251,7 @@ trait Trait_Job_Gap_Fill {
 				$api_endpoint,
 				$ai_model,
 				$lang,
-				array( 'max_timeout' => 45 )
+				array( 'max_timeout' => $request_timeout )
 			);
 
 			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();

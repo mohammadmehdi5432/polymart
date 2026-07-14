@@ -675,16 +675,78 @@ trait Trait_Chunking {
 		}
 
 		$field_keys = self::expand_elementor_payload_for_ai( array( $path => $text ) );
-		$batches    = self::chunk_payload_with_limits( $field_keys, 2, self::ELEMENTOR_JOB_MAX_CHUNK_CHARS, false );
-		$pending    = array();
+		$missing    = array();
 
-		foreach ( $batches as $batch ) {
-			if ( ! self::elementor_chunk_paths_translated( $batch, $map, $source_payload ) ) {
-				$pending[] = $batch;
+		foreach ( $field_keys as $seg_path => $seg_text ) {
+			$seg_path = (string) $seg_path;
+			$seg_text = (string) $seg_text;
+
+			if ( self::elementor_path_is_segment( $seg_path ) ) {
+				if ( ! self::elementor_segment_is_resolved( $seg_path, $seg_text, $map ) ) {
+					$missing[ $seg_path ] = $seg_text;
+				}
+				continue;
+			}
+
+			if ( ! self::elementor_field_translation_complete( $seg_path, $seg_text, $map ) ) {
+				$missing[ $seg_path ] = $seg_text;
 			}
 		}
 
-		return $pending;
+		if ( empty( $missing ) ) {
+			return array();
+		}
+
+		uksort(
+			$missing,
+			static function ( $left, $right ) {
+				$left_num  = 0;
+				$right_num = 0;
+
+				if ( preg_match( '/::__seg(\d+)$/', (string) $left, $matches ) ) {
+					$left_num = (int) $matches[1];
+				}
+
+				if ( preg_match( '/::__seg(\d+)$/', (string) $right, $matches ) ) {
+					$right_num = (int) $matches[1];
+				}
+
+				if ( $left_num !== $right_num ) {
+					return $left_num <=> $right_num;
+				}
+
+				return strcmp( (string) $left, (string) $right );
+			}
+		);
+
+		// One missing __segN per AS tick — long Text Editor HTML must not share a batch or retry loop.
+		$batch_size = \PolymartAI\Activity_Logger::is_trusted_as_tick() ? 1 : 2;
+
+		return self::chunk_payload_with_limits(
+			$missing,
+			$batch_size,
+			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS,
+			false
+		);
+	}
+
+	private static function resolve_elementor_stubborn_request_timeout( array $pending ) {
+		$max_chars = 0;
+
+		foreach ( $pending as $text ) {
+			$max_chars = max( $max_chars, self::utf8_strlen( (string) $text ) );
+		}
+
+		if ( $max_chars <= 0 ) {
+			return self::ELEMENTOR_JOB_REQUEST_TIMEOUT;
+		}
+
+		$scaled = (int) ceil( $max_chars / 12 ) + 25;
+
+		return min(
+			self::ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX,
+			max( self::ELEMENTOR_JOB_REQUEST_TIMEOUT, $scaled )
+		);
 	}
 
 	private static function prune_complete_elementor_segment_map_entries( array $map, array $source_payload ) {
