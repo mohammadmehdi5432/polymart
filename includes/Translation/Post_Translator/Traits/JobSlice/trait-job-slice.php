@@ -1369,6 +1369,7 @@ trait Trait_Job_Slice {
 
 		if ( self::uses_elementor_builder( $post_id ) ) {
 			self::repair_stale_elementor_completion_meta( $post_id, $lang );
+			self::repair_completed_elementor_job_meta( $post_id, $lang );
 		}
 
 		if ( self::storefront_would_show_persian_source( $post_id, $lang ) ) {

@@ -880,13 +880,14 @@ export default function AutoTranslateApp() {
         `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود.`,
         'success'
       );
-      const kicked = await jobStep().catch(() => ensureServerWorker());
-      if (kicked?.worker_inline_tick || kicked?.worker_kicked) {
-        applyJobUpdate(kicked);
-        appendLog('اولین تیک کارگر اجرا شد — صف شروع به جلو رفتن می‌کند.', 'success');
-      } else {
-        await ensureServerWorker();
-      }
+      // Server already enqueued Action Scheduler — nudge worker without blocking the UI on a heavy kick.
+      void jobAction('ensure', targetLang)
+        .then((kicked) => {
+          if (kicked) {
+            applyJobUpdate(kicked);
+          }
+        })
+        .catch(() => {});
     } catch (error) {
       const code = error?.response?.data?.code;
       const isTimeout =

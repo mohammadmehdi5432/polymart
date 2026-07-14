@@ -466,6 +466,10 @@ trait Trait_Worker_Runner {
 			$job['worker_scheduled_at']      = time();
 			self::save_job( $job );
 
+			if ( Job_Action_Scheduler::is_available() ) {
+				Job_Action_Scheduler::schedule_cooldown_wakeup( $job['api_cooldown_remaining'] );
+			}
+
 			return self::normalize_job_for_response( $job, false );
 		}
 

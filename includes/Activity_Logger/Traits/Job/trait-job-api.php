@@ -425,6 +425,10 @@ trait Trait_Job_Api {
 
 		self::schedule_chain_safety_pulse( max( self::CRON_FAST_INTERVAL_SEC, min( 180, (int) ceil( $cooldown_sec / 3 ) ) ) );
 
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::schedule_cooldown_wakeup( $cooldown_sec );
+		}
+
 		return true;
 	}
 

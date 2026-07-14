@@ -236,21 +236,36 @@ trait Trait_Job_Lifecycle {
 		REST_API::invalidate_stats_cache();
 
 		// Fast bootstrap: indexed stats + light storefront probe only (heavy reconcile runs on worker ticks).
-		$issues     = Translation_Query::collect_storefront_translation_issues( $lang, 8, true );
-		$issue_ids  = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
+		$issues         = Translation_Query::collect_storefront_translation_issues( $lang, 8, true );
+		$issue_ids      = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
+		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
+		$front          = absint( get_option( 'page_on_front' ) );
+		$repair_ids     = array_values(
+			array_unique(
+				array_filter(
+					array_map(
+						'absint',
+						array_merge(
+							$issue_ids,
+							$priority_probe,
+							$front > 0 ? array( $front ) : array()
+						)
+					)
+				)
+			)
+		);
+
+		self::reconcile_start_probe_posts( $lang, $repair_ids );
+
 		$stats      = Translation_Query::compute_translation_stats( $lang, false );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
-		$probe_ids  = $issue_ids;
-
-		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
+		$probe_ids = $issue_ids;
 
 		if ( ! empty( $priority_probe ) ) {
 			$probe_ids = array_values( array_unique( array_merge( $probe_ids, $priority_probe ) ) );
 		}
-
-		$front = absint( get_option( 'page_on_front' ) );
 
 		if ( $front > 0 && Post_Translator::post_needs_translation_work( $front, $lang ) ) {
 			$probe_ids = array_values( array_unique( array_merge( array( $front ), $probe_ids ) ) );
@@ -514,7 +529,7 @@ trait Trait_Job_Lifecycle {
 			self::recover_stalled_job_picker( $job, $lang, true );
 
 			self::save_job( $job );
-			self::bootstrap_background_worker( true );
+			self::bootstrap_background_worker( false );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
@@ -709,6 +724,30 @@ trait Trait_Job_Lifecycle {
 		$job = get_option( self::JOB_OPTION, array() );
 
 		return is_array( $job ) && 'running' === ( $job['status'] ?? '' );
+	}
+
+	/**
+	 * Repair stale Elementor completion meta for posts the start probe flagged.
+	 *
+	 * @param string $lang     Target language.
+	 * @param int[]  $post_ids Candidate post IDs.
+	 * @return void
+	 */
+	private static function reconcile_start_probe_posts( $lang, array $post_ids ) {
+		$lang = sanitize_key( (string) $lang );
+
+		if ( '' === $lang || empty( $post_ids ) ) {
+			return;
+		}
+
+		foreach ( array_slice( array_values( array_unique( array_map( 'absint', $post_ids ) ) ), 0, 12 ) as $post_id ) {
+			if ( $post_id <= 0 ) {
+				continue;
+			}
+
+			Post_Translator::repair_stale_elementor_completion_meta( $post_id, $lang );
+			Post_Translator::repair_completed_elementor_job_meta( $post_id, $lang );
+		}
 	}
 
 }

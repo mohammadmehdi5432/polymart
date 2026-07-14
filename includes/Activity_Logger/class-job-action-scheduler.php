@@ -170,7 +170,14 @@ final class Job_Action_Scheduler {
 			$delay_sec = self::CHAIN_DELAY_SEC;
 		}
 
-		$delay_sec = max( 0, min( 30, absint( $delay_sec ) ) );
+		$cooldown_remaining = \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining();
+
+		if ( $cooldown_remaining > 0 ) {
+			$delay_sec = min( 600, max( 1, $cooldown_remaining ) );
+		}
+
+		$max_delay = $cooldown_remaining > 0 ? 600 : 30;
+		$delay_sec = max( 0, min( $max_delay, absint( $delay_sec ) ) );
 
 		if ( $delay_sec <= 1 && self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0 ) {
 			$running_ids = self::query_running_action_ids( 5 );
@@ -489,6 +496,28 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function run_slice_action_batch() {
+		$cooldown_remaining = \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining();
+
+		if ( $cooldown_remaining > 0 ) {
+			self::schedule_cooldown_wakeup( $cooldown_remaining );
+
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: 1: AS action ID, 2: seconds remaining */
+					__( 'AS #%1$d: API در cooldown — %2$d ثانیه تا تلاش بعدی (بدون مصرف توکن).', 'polymart-ai' ),
+					self::$current_action_id,
+					$cooldown_remaining
+				),
+				array( 'as_action_id' => self::$current_action_id )
+			);
+
+			self::$handler_clean_exit = true;
+			self::release_slice_mutex();
+
+			return;
+		}
+
 		$job     = \PolymartAI\Activity_Logger::get_job_for_as_debug();
 		$queued  = is_array( $job['deferred_queue'] ?? null ) ? count( $job['deferred_queue'] ) : 0;
 		$next_hint = 0;
@@ -907,6 +936,13 @@ final class Job_Action_Scheduler {
 		self::$chaining_next = true;
 
 		try {
+			$cooldown_remaining = \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining();
+
+			if ( $cooldown_remaining > 0 ) {
+				self::schedule_cooldown_wakeup( $cooldown_remaining );
+				return;
+			}
+
 			if ( function_exists( 'set_time_limit' ) ) {
 				@set_time_limit( 330 );
 			}
@@ -921,6 +957,33 @@ final class Job_Action_Scheduler {
 		} finally {
 			self::$chaining_next = false;
 		}
+	}
+
+	/**
+	 * Schedule one AS wake-up after API cooldown (avoid empty no-op batches).
+	 *
+	 * @param int $cooldown_remaining Seconds until cooldown ends.
+	 * @return int Action ID or 0.
+	 */
+	public static function schedule_cooldown_wakeup( $cooldown_remaining ) {
+		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() || ! self::is_available() ) {
+			return 0;
+		}
+
+		$cooldown_remaining = max( 1, absint( $cooldown_remaining ) );
+
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+			return 0;
+		}
+
+		if (
+			self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0
+			&& \PolymartAI\Activity_Logger::is_bulk_worker_lively( 30 )
+		) {
+			return 0;
+		}
+
+		return self::enqueue_next( false, min( 600, $cooldown_remaining ) );
 	}
 
 	/**
