@@ -3816,13 +3816,39 @@ final class Post_Translator {
 	 */
 	public static function save_job_partial_state( $post_id, $lang, array $state ) {
 		$persist = $state;
+		$post_id = absint( $post_id );
 
 		// Translations live in `_elementor_data_{lang}` — keep partial meta lightweight.
 		if ( 'elementor' === sanitize_key( (string) ( $persist['phase'] ?? '' ) ) ) {
+			$map_for_seg = is_array( $persist['elementor_map'] ?? null ) ? $persist['elementor_map'] : array();
+
+			if ( $post_id > 0 && ! empty( $map_for_seg ) ) {
+				$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+				if ( is_string( $raw ) && '' !== trim( $raw ) ) {
+					$data = json_decode( $raw, true );
+
+					if ( is_array( $data ) ) {
+						$map_for_seg = self::prune_complete_elementor_segment_map_entries(
+							$map_for_seg,
+							self::collect_elementor_translation_payload( $data )
+						);
+					}
+				}
+			}
+
+			$seg_only = self::extract_elementor_segment_map_entries( $map_for_seg );
+
 			unset( $persist['elementor_map'] );
+
+			if ( ! empty( $seg_only ) ) {
+				$persist['elementor_seg_map'] = $seg_only;
+			} else {
+				unset( $persist['elementor_seg_map'] );
+			}
 		}
 
-		update_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ), $persist );
+		update_post_meta( $post_id, self::get_job_partial_meta_key( $lang ), $persist );
 	}
 
 	/**
@@ -3901,6 +3927,7 @@ final class Post_Translator {
 		$defaults = array(
 			'phase'                       => 'elementor',
 			'elementor_map'               => array(),
+			'elementor_seg_map'           => array(),
 			'elementor_chunk_index'       => 0,
 			'elementor_chunks_total'      => 0,
 			'elementor_slices_completed'  => 0,
@@ -3928,9 +3955,7 @@ final class Post_Translator {
 		}
 
 		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
-		$rebuilt   = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data );
-		// Saved JSON is authoritative — stale in-memory map must not roll back persisted progress.
-		$map = array_merge( $state_map, $rebuilt );
+		$map       = self::merge_elementor_job_path_map( $post_id, $lang, $data, $state, $state_map );
 
 		$state['elementor_map'] = $map;
 		$chunk_progress         = self::get_elementor_chunk_progress( $post_id, $lang, $state );
@@ -4660,12 +4685,7 @@ final class Post_Translator {
 					'done'           => false,
 					'phase'          => 'elementor',
 					'phase_progress' => min( $done_count, $total_chunks ) . '/' . $total_chunks,
-					'message'        => sprintf(
-						/* translators: 1: post ID, 2: remaining field count */
-						__( 'Elementor — #%1$d: %2$d فیلد باقی‌مانده — تکمیل نهایی…', 'polymart-ai' ),
-						$post_id,
-						count( $remaining )
-					),
+					'message'        => self::format_elementor_gap_fill_remaining_message( $post_id, $remaining, $map ),
 					'recoverable'    => true,
 				);
 			}
@@ -4803,7 +4823,21 @@ final class Post_Translator {
 
 		$done = min( $total, max( $done, $cursor, $state_done ) );
 
-		return $done . '/' . $total;
+		$marker = $done . '/' . $total;
+
+		if ( ! empty( $state['elementor_gap_fill'] ) ) {
+			$gap_done  = absint( $state['elementor_gap_fill_done'] ?? 0 );
+			$gap_total = max( 1, absint( $state['elementor_gap_fill_total'] ?? 0 ), $gap_done );
+
+			$marker .= ' · ' . sprintf(
+				/* translators: 1: completed gap-fill batches, 2: total gap-fill batches */
+				__( 'تکمیل %1$d/%2$d', 'polymart-ai' ),
+				min( $gap_done, $gap_total ),
+				$gap_total
+			);
+		}
+
+		return $marker;
 	}
 
 	/**
@@ -5444,11 +5478,7 @@ final class Post_Translator {
 
 		$state     = self::get_job_partial_state( $post_id, $lang );
 		$state     = is_array( $state ) ? $state : array();
-		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
-		$map       = array_merge(
-			self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data ),
-			$state_map
-		);
+		$map       = self::merge_elementor_job_path_map( $post_id, $lang, $data, $state );
 		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$source    = self::collect_elementor_translation_payload( $data );
 		$remaining = self::filter_remaining_elementor_payload( $source, $map, $skipped );
@@ -5812,11 +5842,7 @@ final class Post_Translator {
 		}
 
 		$state     = self::get_job_partial_state( $post_id, $lang );
-		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
-		$map       = array_merge(
-			self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $data ),
-			$state_map
-		);
+		$map       = self::merge_elementor_job_path_map( $post_id, $lang, $data, $state );
 		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 
 		$remaining = self::filter_remaining_elementor_payload(
@@ -7112,7 +7138,10 @@ final class Post_Translator {
 				$state['elementor_gap_fill'],
 				$state['elementor_gap_fill_done'],
 				$state['elementor_gap_fill_total'],
-				$state['elementor_primary_batches_done']
+				$state['elementor_gap_fill_stubborn_only'],
+				$state['elementor_primary_batches_done'],
+				$state['elementor_seg_map'],
+				$state['elementor_stubborn_long_index']
 			);
 		}
 
@@ -7146,12 +7175,7 @@ final class Post_Translator {
 				'done'           => false,
 				'phase'          => 'elementor',
 				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-				'message'        => sprintf(
-					/* translators: 1: post ID, 2: remaining field count */
-					__( 'Elementor — #%1$d: %2$d فیلد باقی‌مانده — تکمیل نهایی…', 'polymart-ai' ),
-					$post_id,
-					count( $remaining )
-				),
+				'message'        => self::format_elementor_gap_fill_remaining_message( $post_id, $remaining, $map ),
 				'recoverable'    => true,
 			);
 		}
@@ -7660,6 +7684,54 @@ final class Post_Translator {
 	}
 
 	/**
+	 * User-facing gap-fill status with the first remaining field blocker.
+	 *
+	 * @param int                   $post_id   Post ID.
+	 * @param array<string, string> $remaining Remaining source payload.
+	 * @param array<string, string> $map       Translation map.
+	 * @return string
+	 */
+	private static function format_elementor_gap_fill_remaining_message( $post_id, array $remaining, array $map ) {
+		$post_id = absint( $post_id );
+		$count   = count( $remaining );
+
+		if ( $post_id <= 0 || empty( $remaining ) ) {
+			return sprintf(
+				/* translators: 1: post ID, 2: remaining field count */
+				__( 'Elementor — #%1$d: %2$d فیلد باقی‌مانده — تکمیل نهایی…', 'polymart-ai' ),
+				$post_id,
+				$count
+			);
+		}
+
+		$first_path = (string) array_key_first( $remaining );
+		$first_text = (string) ( $remaining[ $first_path ] ?? '' );
+		$blocker    = self::describe_elementor_field_translation_blocker( $first_path, $first_text, $map );
+		$detail     = (string) ( $blocker['detail'] ?? '' );
+
+		if ( '' !== $detail ) {
+			return sprintf(
+				/* translators: 1: post ID, 2: remaining count, 3: field path, 4: blocker reason, 5: blocker detail */
+				__( 'Elementor — #%1$d: %2$d فیلد باقی‌مانده — تکمیل نهایی… [%3$s: %4$s — %5$s]', 'polymart-ai' ),
+				$post_id,
+				$count,
+				(string) ( $blocker['path'] ?? $first_path ),
+				(string) ( $blocker['reason'] ?? 'unknown' ),
+				$detail
+			);
+		}
+
+		return sprintf(
+			/* translators: 1: post ID, 2: remaining count, 3: field path, 4: blocker reason */
+			__( 'Elementor — #%1$d: %2$d فیلد باقی‌مانده — تکمیل نهایی… [%3$s: %4$s]', 'polymart-ai' ),
+			$post_id,
+			$count,
+			(string) ( $blocker['path'] ?? $first_path ),
+			(string) ( $blocker['reason'] ?? 'unknown' )
+		);
+	}
+
+	/**
 	 * Log why Elementor gap-fill fields remain after API batches.
 	 *
 	 * @param int                   $post_id        Post ID.
@@ -7787,9 +7859,139 @@ final class Post_Translator {
 		return $clean;
 	}
 
+	private static function extract_elementor_segment_map_entries( array $map ) {
+		$segment_map = array();
+
+		foreach ( $map as $path => $value ) {
+			$path = (string) $path;
+
+			if ( preg_match( '/::__(?:part|seg)\d+$/', $path ) ) {
+				$segment_map[ $path ] = (string) $value;
+			}
+		}
+
+		return $segment_map;
+	}
+
+	/**
+	 * Drop segment/part keys once their base Elementor field is fully translated.
+	 *
+	 * @param array<string, string> $map            Translation path map.
+	 * @param array<string, string> $source_payload Source field map.
+	 * @return array<string, string>
+	 */
+	private static function prune_complete_elementor_segment_map_entries( array $map, array $source_payload ) {
+		$pruned = $map;
+
+		foreach ( $source_payload as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( ! self::elementor_field_translation_complete( $path, $text, $pruned ) ) {
+				continue;
+			}
+
+			foreach ( self::get_elementor_segment_keys( $path, $text ) as $seg_key ) {
+				unset( $pruned[ $seg_key ] );
+			}
+
+			$parts = (int) ceil( self::utf8_strlen( $text ) / self::AI_MAX_SINGLE_FIELD_CHARS );
+
+			for ( $part = 1; $part <= $parts; $part++ ) {
+				unset( $pruned[ $path . '::__part' . $part ] );
+			}
+		}
+
+		return $pruned;
+	}
+
+	/**
+	 * Merge completed __seg/__part entries into base paths for Elementor JSON persistence.
+	 *
+	 * @param array<string, string> $map            Translation path map.
+	 * @param array<string, string> $source_payload Source field map.
+	 * @return array<string, string>
+	 */
+	private static function prepare_elementor_map_for_persist( array $map, array $source_payload ) {
+		$prepared = $map;
+
+		foreach ( $source_payload as $path => $text ) {
+			$path     = (string) $path;
+			$text     = (string) $text;
+			$seg_keys = self::get_elementor_segment_keys( $path, $text );
+
+			if ( empty( $seg_keys ) ) {
+				continue;
+			}
+
+			$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+			$parts      = array();
+
+			foreach ( $seg_keys as $seg_key ) {
+				$seg_source = (string) ( $seg_lookup[ $seg_key ] ?? '' );
+
+				if (
+					! isset( $prepared[ $seg_key ] )
+					|| ! self::elementor_map_value_is_valid_translation( $seg_key, $seg_source, (string) $prepared[ $seg_key ] )
+				) {
+					$parts = array();
+					break;
+				}
+
+				$parts[] = (string) $prepared[ $seg_key ];
+			}
+
+			if ( empty( $parts ) ) {
+				continue;
+			}
+
+			$prepared[ $path ] = implode( '', $parts );
+
+			foreach ( $seg_keys as $seg_key ) {
+				unset( $prepared[ $seg_key ] );
+			}
+		}
+
+		return $prepared;
+	}
+
+	/**
+	 * Whether every expected segment for a long Elementor field is present in a raw API map.
+	 *
+	 * @param string               $base         Base field path.
+	 * @param string               $source       Source text.
+	 * @param array<string, string> $raw_mapped Raw API response map.
+	 * @return bool
+	 */
+	private static function elementor_all_segments_present_in_map( $base, $source, array $raw_mapped ) {
+		$base       = (string) $base;
+		$source     = (string) $source;
+		$seg_lookup = self::get_elementor_segment_source_lookup( $base, $source );
+
+		if ( empty( $seg_lookup ) ) {
+			return false;
+		}
+
+		foreach ( $seg_lookup as $seg_key => $seg_source ) {
+			if (
+				! isset( $raw_mapped[ $seg_key ] )
+				|| ! self::elementor_map_value_is_valid_translation( $seg_key, (string) $seg_source, (string) $raw_mapped[ $seg_key ] )
+			) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	private static function elementor_collapsed_base_translation_complete( $path, $text, array $map ) {
 		$path = (string) $path;
 		$text = (string) $text;
+
+		// Partial segment collapse must never satisfy completion for long fields.
+		if ( ! empty( self::get_elementor_segment_keys( $path, $text ) ) ) {
+			return false;
+		}
 
 		if ( ! isset( $map[ $path ] ) ) {
 			return false;
@@ -7815,6 +8017,11 @@ final class Post_Translator {
 			}
 
 			$source = (string) ( $source_payload[ $base ] ?? '' );
+
+			if ( self::elementor_all_segments_present_in_map( $base, $source, $raw_mapped ) ) {
+				$mapped[ $base ] = (string) $value;
+				continue;
+			}
 
 			if ( self::elementor_collapsed_base_translation_complete( $base, $source, array( $base => (string) $value ) ) ) {
 				$mapped[ $base ] = (string) $value;
@@ -7844,10 +8051,6 @@ final class Post_Translator {
 			}
 
 			if ( $all_segs_ok ) {
-				return true;
-			}
-
-			if ( self::elementor_collapsed_base_translation_complete( $path, $text, $map ) ) {
 				return true;
 			}
 
@@ -8154,10 +8357,29 @@ final class Post_Translator {
 		}
 
 		if ( ! empty( $long ) && empty( $short ) ) {
-			$path = (string) array_key_first( $long );
-			$text = (string) ( $long[ $path ] ?? '' );
+			$long_paths   = array_keys( $long );
+			$field_count  = count( $long_paths );
+			$start_index  = absint( $state['elementor_stubborn_long_index'] ?? 0 ) % max( 1, $field_count );
+			$fields_to_try = min( $field_count, 2 );
+			$seg_budget   = ( 1 === $field_count ) ? 3 : 2;
 
-			if ( '' !== $path && '' !== $text ) {
+			if ( ! empty( $state['elementor_gap_fill_stubborn_only'] ) ) {
+				$seg_budget = ( 1 === $field_count ) ? 4 : 3;
+			}
+
+			for ( $field_offset = 0; $field_offset < $fields_to_try; ++$field_offset ) {
+				$path = (string) $long_paths[ ( $start_index + $field_offset ) % $field_count ];
+				$text = (string) ( $long[ $path ] ?? '' );
+
+				if ( '' === $path || '' === $text ) {
+					continue;
+				}
+
+				if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+					++$done;
+					continue;
+				}
+
 				$field_keys = self::expand_elementor_payload_for_ai( array( $path => $text ) );
 				$batches    = self::chunk_payload_with_limits( $field_keys, 2, self::ELEMENTOR_JOB_MAX_CHUNK_CHARS, false );
 				$total      = max( 1, count( $batches ) );
@@ -8168,8 +8390,6 @@ final class Post_Translator {
 						$pending[] = $batch;
 					}
 				}
-
-				$seg_budget = ( 1 === count( $long ) && empty( $short ) ) ? 3 : 2;
 
 				foreach ( array_slice( $pending, 0, $seg_budget ) as $index => $batch ) {
 					$progress = self::translate_elementor_stubborn_field_batch(
@@ -8209,16 +8429,23 @@ final class Post_Translator {
 						array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
 					);
 				} elseif ( $touched ) {
+					$blocker = self::describe_elementor_field_translation_blocker( $path, $text, $map );
 					self::log_elementor_remaining_field_diagnostics(
 						$post_id,
 						$lang,
 						$source_payload,
 						$map,
 						$skipped,
-						'stubborn-long-partial-' . $path
+						sprintf(
+							'stubborn-long-partial-%s-%s',
+							$path,
+							(string) ( $blocker['reason'] ?? 'partial' )
+						)
 					);
 				}
 			}
+
+			$state['elementor_stubborn_long_index'] = ( $start_index + $fields_to_try ) % max( 1, $field_count );
 		}
 
 		$state['elementor_failures'] = $failures;
@@ -8530,6 +8757,14 @@ final class Post_Translator {
 	 * @param array<string, mixed> $source_data Source Elementor tree.
 	 * @return array<string, string>
 	 */
+	private static function merge_elementor_job_path_map( $post_id, $lang, array $source_data, array $state = array(), array $overlay_map = array() ) {
+		$state_map = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$seg_map   = is_array( $state['elementor_seg_map'] ?? null ) ? $state['elementor_seg_map'] : array();
+		$rebuilt   = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
+
+		return array_merge( $rebuilt, $seg_map, $state_map, $overlay_map );
+	}
+
 	private static function rebuild_elementor_map_from_saved_translation( $post_id, $lang, array $source_data ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
@@ -8652,6 +8887,7 @@ final class Post_Translator {
 			self::merge_elementor_path_map( $post_id, $lang, $source_data, $map ),
 			$source_payload
 		);
+		$map            = self::prepare_elementor_map_for_persist( $map, $source_payload );
 		$chunk_progress = self::get_elementor_chunk_progress(
 			$post_id,
 			$lang,
