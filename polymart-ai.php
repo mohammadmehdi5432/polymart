@@ -104,7 +104,12 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	);
 }
 
-// Optional admin debug tool (not shipped in production builds).
+// Optional admin debug tools (not shipped in production builds).
+$polymart_ai_queue_diagnostic = POLYMART_AI_PLUGIN_DIR . 'tools/queue-diagnostic.php';
+if ( is_admin() && is_readable( $polymart_ai_queue_diagnostic ) ) {
+	require_once $polymart_ai_queue_diagnostic;
+}
+
 $polymart_ai_production_debug = POLYMART_AI_PLUGIN_DIR . 'tools/production-debug.php';
 if ( is_admin() && is_readable( $polymart_ai_production_debug ) ) {
 	require_once $polymart_ai_production_debug;
