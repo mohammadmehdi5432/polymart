@@ -10,8 +10,8 @@ namespace PolymartAI\Integration;
 use PolymartAI\Language_Registry;
 use PolymartAI\Plugin;
 use PolymartAI\Routing\Url_Router;
-use PolymartAI\Translation\AI_Client;
-use PolymartAI\Translation\Persian_Detector;
+use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator;
 
 defined( 'ABSPATH' ) || exit;

@@ -24,17 +24,17 @@ use PolymartAI\Integration\Knd_Integration;
 use PolymartAI\Integration\Kndpi_Integration;
 use PolymartAI\Integration\Wve_Integration;
 use PolymartAI\Routing\Url_Router;
-use PolymartAI\Translation\AI_Client;
-use PolymartAI\Translation\Async_Translator;
-use PolymartAI\Translation\Comment_Translator;
-use PolymartAI\Translation\Frontend_Interceptor;
-use PolymartAI\Translation\Layout_Guard;
-use PolymartAI\Translation\Option_Translator;
+use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\Pipeline\Async_Translator;
+use PolymartAI\Translation\Content\Comment_Translator;
+use PolymartAI\Translation\Storefront\Frontend_Interceptor;
+use PolymartAI\Translation\Storefront\Layout_Guard;
+use PolymartAI\Translation\Content\Option_Translator;
 use PolymartAI\Translation\Post_Translator;
-use PolymartAI\Translation\Product_Diagnostics;
-use PolymartAI\Translation\Runtime_String_Translator;
-use PolymartAI\Translation\Universal_Translator;
-use PolymartAI\Translation\WooCommerce_Translator;
+use PolymartAI\Translation\WooCommerce\Product_Diagnostics;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+use PolymartAI\Translation\Pipeline\Universal_Translator;
+use PolymartAI\Translation\WooCommerce\WooCommerce_Translator;
 
 defined( 'ABSPATH' ) || exit;
 

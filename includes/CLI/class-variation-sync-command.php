@@ -7,7 +7,7 @@
 
 namespace PolymartAI\CLI;
 
-use PolymartAI\Translation\Variation_Translation_Sync;
+use PolymartAI\Translation\WooCommerce\Variation_Translation_Sync;
 use WP_CLI;
 
 defined( 'ABSPATH' ) || exit;

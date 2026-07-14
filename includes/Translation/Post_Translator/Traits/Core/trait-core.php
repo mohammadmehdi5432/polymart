@@ -9,11 +9,10 @@ namespace PolymartAI\Translation\Post_Translator\Traits\Core;
 
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
-use PolymartAI\Translation\AI_Client;
-use PolymartAI\Translation\Persian_Detector;
+use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator\Meta_Keys;
 use PolymartAI\Translation\Post_Translator\Persistence_Guard;
-use PolymartAI\Translation\Post_Translator\Storefront_Resolver;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 

@@ -167,4 +167,28 @@ final class Translation_Lock {
 		delete_option( $keys['claim'] );
 		delete_option( $keys['owner'] );
 	}
+
+	/**
+	 * Refresh timestamps on a lock already owned by this worker.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function touch_translation_lock( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::owns_translation_lock( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$keys = self::get_translation_lock_keys( $post_id, $lang );
+		$now  = time();
+
+		update_option( $keys['claim'], (string) $now, false );
+		set_transient( $keys['key'], $now, self::TRANSLATION_LOCK_TTL );
+
+		return true;
+	}
 }

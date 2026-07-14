@@ -13,16 +13,6 @@ defined( 'ABSPATH' ) || exit;
 trait Trait_Config_State {
 
 	/**
-	 * While true, async invalidation hooks must not delete stored translations.
-	 * @var bool
-	 */
-	private static $is_persisting_translations = false;
-	/**
-	 * Per-request token identifying the current translation worker.
-	 * @var string|null
-	 */
-	private static $translation_lock_token = null;
-	/**
 	 * Per-request cache for translation status lookups.
 	 * @var array<string, string>
 	 */

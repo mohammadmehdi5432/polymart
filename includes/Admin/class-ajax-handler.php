@@ -8,7 +8,7 @@
 namespace PolymartAI\Admin;
 
 use PolymartAI\Language_Registry;
-use PolymartAI\Metabox_Action_Scheduler;
+use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
 use PolymartAI\Translation\Post_Translator;
 
 defined( 'ABSPATH' ) || exit;
@@ -599,7 +599,7 @@ final class Ajax_Handler {
 			wp_send_json_error( array( 'message' => __( 'شما اجازه این عملیات را ندارید.', 'polymart-ai' ) ), 403 );
 		}
 
-		$toxic = get_post_meta( $post_id, \PolymartAI\Metabox_Action_Scheduler::TOXIC_META_PREFIX . $lang, true );
+		$toxic = get_post_meta( $post_id, \PolymartAI\Activity_Logger\Metabox_Action_Scheduler::TOXIC_META_PREFIX . $lang, true );
 		$error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
 
 		wp_send_json_success(

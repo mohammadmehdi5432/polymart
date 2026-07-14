@@ -2,91 +2,56 @@
 /**
  * Post_Translator Config Constants (auto-split).
  *
+ * Re-exports shared constants from helper classes so Post_Translator::CONST
+ * remains stable. Job/AI tuning constants live here only.
+ *
  * @package PolymartAI\Translation\Post_Translator\Traits
  */
 
 namespace PolymartAI\Translation\Post_Translator\Traits\Config;
 
+use PolymartAI\Translation\Post_Translator\Meta_Keys;
+use PolymartAI\Translation\Post_Translator\Persistence_Guard;
+use PolymartAI\Translation\Post_Translator\Storefront_Resolver;
+use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
 defined( 'ABSPATH' ) || exit;
 
 trait Trait_Config_Constants {
 
-	/**
-	 * Nonce action for saving meta box fields.
-	 */
-	const META_BOX_NONCE_ACTION = 'polymart_ai_save_translations';
-	/**
-	 * Nonce field name for the meta box form.
-	 */
-	const META_BOX_NONCE_NAME = 'polymart_ai_meta_box_nonce';
-	/**
-	 * Transient prefix for in-flight AI translation locks.
-	 */
-	const TRANSLATION_LOCK_PREFIX = 'polymart_ai_post_translate_';
-	/**
-	 * TTL for per-post translation locks (seconds).
-	 * Must stay above one AI call, but not so long that a killed PHP worker
-	 * blocks the queue for a quarter hour.
-	 */
-	const TRANSLATION_LOCK_TTL = 180;
-	/**
-	 * Option suffix storing the worker token that owns a per-post translation lock.
-	 */
-	const TRANSLATION_LOCK_OWNER_SUFFIX = '_owner';
-	/**
-	 * Post meta flag: this post has Persian source content worth translating.
-	 */
-	const PERSIAN_CONTENT_FLAG_META = '_polymart_ai_has_persian';
-	/**
-	 * Prefix for per-language translation status index meta.
-	 */
-	const STATUS_INDEX_META_PREFIX = '_polymart_ai_status_';
+	const META_BOX_NONCE_ACTION = Persistence_Guard::META_BOX_NONCE_ACTION;
+	const META_BOX_NONCE_NAME     = Persistence_Guard::META_BOX_NONCE_NAME;
+
+	const TRANSLATION_LOCK_PREFIX       = Translation_Lock::TRANSLATION_LOCK_PREFIX;
+	const TRANSLATION_LOCK_TTL          = Translation_Lock::TRANSLATION_LOCK_TTL;
+	const TRANSLATION_LOCK_OWNER_SUFFIX = Translation_Lock::TRANSLATION_LOCK_OWNER_SUFFIX;
+
+	const PERSIAN_CONTENT_FLAG_META = Meta_Keys::PERSIAN_CONTENT_FLAG_META;
+	const STATUS_INDEX_META_PREFIX  = Meta_Keys::STATUS_INDEX_META_PREFIX;
+
 	/**
 	 * Maximum `_elementor_data_{lang}` payload served on the storefront (bytes).
 	 */
 	const MAX_STOREFRONT_ELEMENTOR_JSON_BYTES = 2097152;
-	/**
-	 * Meta keys for translated core post fields.
-	 */
-	const META_KEY_TITLE_EN   = '_polymart_ai_title_en';
-	const META_KEY_CONTENT_EN = '_polymart_ai_content_en';
-	const META_KEY_EXCERPT_EN = '_polymart_ai_excerpt_en';
+
+	const META_KEY_TITLE_EN   = Meta_Keys::META_KEY_TITLE_EN;
+	const META_KEY_CONTENT_EN = Meta_Keys::META_KEY_CONTENT_EN;
+	const META_KEY_EXCERPT_EN = Meta_Keys::META_KEY_EXCERPT_EN;
+
 	/**
 	 * Default ArvanCloud AI model when none is configured.
 	 */
 	const DEFAULT_AI_MODEL = 'DeepSeek-V3-2-g6zde';
-	/**
-	 * Custom meta keys from companion plugins. English values stored as {key}_en.
-	 * @var string[]
-	 */
-	const CUSTOM_META_KEYS = array(
-		'custom_card_subtitle',
-		'custom_card_btn_text',
-		'_apd_ai_analysis',
-		'_custom_title',
-		'_custom_description',
-	);
-	/**
-	 * WoodMart Variable Enhancer: custom variation title meta key.
-	 */
-	const WVE_VARIATION_CUSTOM_TITLE_META = '_custom_title';
-	/**
-	 * WoodMart Variable Enhancer: custom variation short description meta key.
-	 */
-	const WVE_VARIATION_CUSTOM_DESCRIPTION_META = '_custom_description';
-	/**
-	 * Post types that support English translation.
-	 * @var string[]
-	 */
-	const SUPPORTED_POST_TYPES = array(
-		'product',
-		'post',
-		'page',
-		'woodmart_slide',
-		'cms_block',
-		'woodmart_layout',
-	);
+
+	/** @var string[] */
+	const CUSTOM_META_KEYS = Meta_Keys::CUSTOM_META_KEYS;
+
+	const WVE_VARIATION_CUSTOM_TITLE_META       = Meta_Keys::WVE_VARIATION_CUSTOM_TITLE_META;
+	const WVE_VARIATION_CUSTOM_DESCRIPTION_META = Meta_Keys::WVE_VARIATION_CUSTOM_DESCRIPTION_META;
+
+	/** @var string[] */
+	const SUPPORTED_POST_TYPES = Meta_Keys::SUPPORTED_POST_TYPES;
+
 	/**
 	 * Maximum string fields sent to AI per request (large posts are chunked).
 	 */
@@ -121,7 +86,6 @@ trait Trait_Config_Constants {
 	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1500;
 	/**
 	 * Split very long Elementor text fields before calling the AI.
-	 * Helps avoid gateway timeouts on long HTML-heavy content.
 	 */
 	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = 1000;
 	/**
@@ -134,7 +98,6 @@ trait Trait_Config_Constants {
 	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 5;
 	/**
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
-	 * Keep under shared-host / AS runner limits so actions cannot hang In-progress.
 	 */
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 30;
 	/**
@@ -165,36 +128,17 @@ trait Trait_Config_Constants {
 	 * Maximum characters per discovered meta value sent to AI.
 	 */
 	const MAX_META_VALUE_LENGTH = 12000;
-	/**
-	 * Post types that support a translated featured image / banner.
-	 * @var string[]
-	 */
-	const FEATURED_IMAGE_POST_TYPES = array(
-		'product',
-		'woodmart_slide',
-	);
-	/**
-	 * Taxonomies whose public labels should be translated alongside content.
-	 * @var string[]
-	 */
-	const SUPPORTED_TAXONOMIES = array(
-		'product_cat',
-		'product_tag',
-		'category',
-		'post_tag',
-	);
-	/**
-	 * Maximum plain-text length for a derived/companion product title on the storefront.
-	 */
-	const STOREFRONT_TITLE_MAX_LENGTH = 120;
-	/**
-	 * Maximum plain-text length when deriving a title from translated content.
-	 */
-	const DERIVED_TITLE_MAX_LENGTH = 80;
-	/**
-	 * Absolute maximum plain-text length for something to be treated as title meta.
-	 */
-	const STOREFRONT_TITLE_HARD_MAX_LENGTH = 500;
+
+	/** @var string[] */
+	const FEATURED_IMAGE_POST_TYPES = Meta_Keys::FEATURED_IMAGE_POST_TYPES;
+
+	/** @var string[] */
+	const SUPPORTED_TAXONOMIES = Meta_Keys::SUPPORTED_TAXONOMIES;
+
+	const STOREFRONT_TITLE_MAX_LENGTH      = Storefront_Resolver::STOREFRONT_TITLE_MAX_LENGTH;
+	const DERIVED_TITLE_MAX_LENGTH         = Storefront_Resolver::DERIVED_TITLE_MAX_LENGTH;
+	const STOREFRONT_TITLE_HARD_MAX_LENGTH = Storefront_Resolver::STOREFRONT_TITLE_HARD_MAX_LENGTH;
+
 	/**
 	 * Post meta prefix for in-progress auto-translate job slices (per post + language).
 	 */

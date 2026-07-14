@@ -10,9 +10,9 @@
 
 namespace PolymartAI\Integration;
 
-use PolymartAI\Translation\Persian_Detector;
-use PolymartAI\Translation\Runtime_String_Translator;
-use PolymartAI\Translation\UI_String_Registry;
+use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+use PolymartAI\Translation\UI_String\UI_String_Registry;
 
 defined( 'ABSPATH' ) || exit;
 

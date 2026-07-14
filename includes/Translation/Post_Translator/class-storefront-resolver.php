@@ -317,4 +317,79 @@ final class Storefront_Resolver {
 
 		return $first_line;
 	}
+
+	/**
+	 * Whether a post type supports a translated featured image / banner.
+	 *
+	 * @param string $post_type Post type slug.
+	 * @return bool
+	 */
+	public static function supports_featured_image_translation( $post_type ) {
+		return in_array( $post_type, Meta_Keys::FEATURED_IMAGE_POST_TYPES, true );
+	}
+
+	/**
+	 * Database meta key that stores the translated companion for one source field.
+	 *
+	 * @param int    $post_id    Post ID (reserved for future per-post mapping).
+	 * @param string $source_key Source meta key or core field identifier.
+	 * @param string $lang       Target language code.
+	 * @return string
+	 */
+	public static function get_storefront_companion_meta_key( $post_id, $source_key, $lang ) {
+		return Meta_Keys::get_storefront_companion_meta_key( $post_id, $source_key, $lang );
+	}
+
+	/**
+	 * Resolve the translated featured image attachment ID for a post.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return int Attachment ID, or 0 when unavailable.
+	 */
+	public static function get_translated_thumbnail_id( $post_id, $lang ) {
+		$attachment_id = (int) get_post_meta(
+			absint( $post_id ),
+			Meta_Keys::get_thumbnail_meta_key( $lang ),
+			true
+		);
+
+		if ( $attachment_id > 0 && 'attachment' === get_post_type( $attachment_id ) ) {
+			return $attachment_id;
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Ensure a translated thumbnail exists, falling back to the source featured image.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return int Attachment ID, or 0 when unavailable.
+	 */
+	public static function ensure_translated_thumbnail_fallback( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return 0;
+		}
+
+		$existing = self::get_translated_thumbnail_id( $post_id, $lang );
+
+		if ( $existing > 0 ) {
+			return $existing;
+		}
+
+		$source_id = (int) get_post_thumbnail_id( $post_id );
+
+		if ( $source_id <= 0 || 'attachment' !== get_post_type( $source_id ) ) {
+			return 0;
+		}
+
+		update_post_meta( $post_id, Meta_Keys::get_thumbnail_meta_key( $lang ), $source_id );
+
+		return $source_id;
+	}
 }

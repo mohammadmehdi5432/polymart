@@ -9,13 +9,13 @@ namespace PolymartAI\Frontend;
 
 use PolymartAI\Integration\Woodmart_Header_Integration;
 use PolymartAI\Routing\Url_Router;
-use PolymartAI\Translation\Layout_Guard;
-use PolymartAI\Translation\Menu_Translator;
-use PolymartAI\Translation\Persian_Detector;
+use PolymartAI\Translation\Storefront\Layout_Guard;
+use PolymartAI\Translation\Content\Menu_Translator;
+use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator;
-use PolymartAI\Translation\Runtime_String_Translator;
-use PolymartAI\Translation\Storefront_Gettext_Resolver;
-use PolymartAI\Translation\UI_String_Registry;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
+use PolymartAI\Translation\Storefront\Storefront_Gettext_Resolver;
+use PolymartAI\Translation\UI_String\UI_String_Registry;
 
 defined( 'ABSPATH' ) || exit;
 

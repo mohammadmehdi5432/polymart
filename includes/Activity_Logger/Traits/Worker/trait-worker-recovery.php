@@ -1,0 +1,174 @@
+<?php
+/**
+ * Activity_Logger Worker_Recovery (auto-split).
+ *
+ * @package PolymartAI\Activity_Logger\Traits
+ */
+
+namespace PolymartAI\Activity_Logger\Traits\Worker;
+
+use PolymartAI\Activity_Logger\Job_Action_Scheduler;
+use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
+use PolymartAI\Language_Registry;
+use PolymartAI\REST_API;
+use PolymartAI\Translation\Content\Menu_Translator;
+use PolymartAI\Translation\Post_Translator;
+use PolymartAI\Translation\Pipeline\Translation_Query;
+
+defined( 'ABSPATH' ) || exit;
+
+trait Trait_Worker_Recovery {
+
+	public static function recover_job_item_failure( $message, $post_id = 0, array $context = array() ) {
+		$job     = self::get_job_raw();
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $post_id );
+		$message = is_string( $message ) ? $message : wp_json_encode( $message );
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['current_post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['partial_post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 && is_array( $job['last_step'] ?? null ) ) {
+			$post_id = absint( $job['last_step']['post_id'] ?? 0 );
+		}
+
+		if ( $post_id <= 0 ) {
+			return self::recover_worker_infrastructure_failure( $message, $context );
+		}
+
+		$title = (string) ( get_the_title( $post_id ) ?: '' );
+
+		self::log(
+			'error',
+			sprintf(
+				/* translators: 1: post ID, 2: title, 3: error */
+				__( 'مورد #%1$d «%2$s» خطا داد و کنار گذاشته شد — صف ادامه می‌یابد. خطا: %3$s', 'polymart-ai' ),
+				$post_id,
+				'' !== $title ? $title : __( '(نامشخص)', 'polymart-ai' ),
+				$message
+			),
+			array_merge(
+				array(
+					'post_id' => $post_id,
+					'lang'    => $lang,
+					'cli'     => 1,
+				),
+				$context
+			)
+		);
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+		}
+
+		self::release_step_lock();
+
+		// Re-load after lock release in case another writer touched state.
+		$job = self::get_job_raw();
+
+		if ( $post_id > 0 ) {
+			self::park_job_post( $job, $post_id, $lang );
+			self::remove_post_from_deferred_queue( $job, $post_id );
+
+			// Don't keep pinning a crashing partial — move forward in the queue.
+			if ( absint( $job['partial_post_id'] ?? 0 ) === $post_id ) {
+				$job['partial_post_id']  = null;
+				$job['partial_phase']    = null;
+				$job['partial_progress'] = null;
+			}
+
+			$job['failed'] = (int) ( $job['failed'] ?? 0 ) + 1;
+			self::set_job_last_step( $job, $post_id, 'failed', $message );
+			$job['last_post_id'] = max( absint( $job['last_post_id'] ?? 0 ), $post_id );
+			self::increment_job_step( $job );
+		}
+
+		// Never leave the bulk job paused because of one bad product (auth/billing still stops).
+		$status = (string) ( $job['status'] ?? '' );
+
+		if ( ! in_array( $status, array( 'idle', 'completed' ), true ) ) {
+			if ( ! ( 'paused' === $status && self::is_job_pause_auth_critical( $job ) ) ) {
+				$job['status']       = 'running';
+				$job['pause_reason'] = null;
+			}
+		}
+
+		$job['current_post_id']        = null;
+		$job['step_started_at']        = null;
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['last_error']             = $message;
+		$job['worker_heartbeat_at']    = time();
+		$job['last_cron_at']           = time();
+		$job['last_worker']            = self::$trusted_as_tick ? 'as' : self::resolve_last_worker_label();
+
+		self::save_job( $job );
+
+		return self::normalize_job_for_response( $job, false );
+	}
+
+	public static function recover_worker_infrastructure_failure( $message, array $context = array() ) {
+		$message = is_string( $message ) ? $message : wp_json_encode( $message );
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: %s: error message */
+				__( 'خطای زیرساخت کارگر ترجمه — صف ادامه می‌یابد. خطا: %s', 'polymart-ai' ),
+				$message
+			),
+			$context
+		);
+
+		$job     = self::get_job_raw();
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $context['post_id'] ?? 0 );
+
+		if ( $post_id <= 0 ) {
+			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		}
+
+		$force_release = ! empty( $context['fatal'] )
+			|| in_array(
+				(string) ( $context['source'] ?? '' ),
+				array( 'as_shutdown', 'as_fatal', 'as_elementor_burst' ),
+				true
+			);
+
+		if ( $force_release ) {
+			Job_Action_Scheduler::clear_slice_mutex();
+
+			if ( $post_id > 0 && '' !== $lang ) {
+				Post_Translator::release_translation_lock( $post_id, $lang, true );
+			}
+		}
+
+		self::force_unlock_step_now();
+
+		$job = self::get_job_raw();
+
+		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			if ( $force_release ) {
+				unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
+			}
+
+			$job['worker_heartbeat_at'] = time();
+			$job['last_cron_at']        = time();
+			$job['last_worker']         = self::$trusted_as_tick ? 'as' : self::resolve_last_worker_label();
+			self::save_job( $job );
+		}
+
+		if ( $force_release && self::is_bulk_job_running() && Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::chain_next_after_recovery();
+		}
+
+		return self::normalize_job_for_response( $job, false );
+	}
+
+}

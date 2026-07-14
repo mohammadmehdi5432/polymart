@@ -18,13 +18,13 @@ namespace PolymartAI\Integration;
 
 use PolymartAI\Routing\Url_Router;
 
-use PolymartAI\Translation\Comment_Translator;
+use PolymartAI\Translation\Content\Comment_Translator;
 
-use PolymartAI\Translation\Persian_Detector;
+use PolymartAI\Translation\AI\Persian_Detector;
 
 use PolymartAI\Translation\Post_Translator;
 
-use PolymartAI\Translation\Runtime_String_Translator;
+use PolymartAI\Translation\Storefront\Runtime_String_Translator;
 
 
 

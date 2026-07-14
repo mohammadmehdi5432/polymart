@@ -9,11 +9,10 @@ namespace PolymartAI\Translation\Post_Translator\Traits\JobSlice;
 
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
-use PolymartAI\Translation\AI_Client;
-use PolymartAI\Translation\Persian_Detector;
+use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator\Meta_Keys;
 use PolymartAI\Translation\Post_Translator\Persistence_Guard;
-use PolymartAI\Translation\Post_Translator\Storefront_Resolver;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
@@ -768,20 +767,7 @@ trait Trait_Job_Slice {
 	}
 
 	public static function touch_translation_lock( $post_id, $lang ) {
-		$post_id = absint( $post_id );
-		$lang    = sanitize_key( (string) $lang );
-
-		if ( $post_id <= 0 || '' === $lang || ! self::owns_translation_lock( $post_id, $lang ) ) {
-			return false;
-		}
-
-		$keys = self::get_translation_lock_keys( $post_id, $lang );
-		$now  = time();
-
-		update_option( $keys['claim'], (string) $now, false );
-		set_transient( $keys['key'], $now, self::TRANSLATION_LOCK_TTL );
-
-		return true;
+		return Translation_Lock::touch_translation_lock( $post_id, $lang );
 	}
 
 	private static function ensure_translation_lock_for_persist( $post_id, $lang ) {
@@ -800,7 +786,7 @@ trait Trait_Job_Slice {
 			return false;
 		}
 
-		$keys  = self::get_translation_lock_keys( $post_id, $lang );
+		$keys  = Translation_Lock::get_translation_lock_keys( $post_id, $lang );
 		$claim = absint( get_option( $keys['claim'], 0 ) );
 		$lock  = get_transient( $keys['key'] );
 
@@ -845,7 +831,7 @@ trait Trait_Job_Slice {
 			);
 		}
 
-		$keys  = self::get_translation_lock_keys( $post_id, $lang );
+		$keys  = Translation_Lock::get_translation_lock_keys( $post_id, $lang );
 		$claim = absint( get_option( $keys['claim'], 0 ) );
 		$lock  = get_transient( $keys['key'] );
 		$stamp = max( $claim, $lock ? absint( $lock ) : 0 );
@@ -1428,26 +1414,6 @@ trait Trait_Job_Slice {
 
 		return 'elementor' === sanitize_key( (string) ( $state['phase'] ?? '' ) )
 			&& self::job_partial_state_has_progress( $post_id, $lang, $state );
-	}
-
-	private static function get_translation_lock_token() {
-		if ( null === self::$translation_lock_token ) {
-			self::$translation_lock_token = function_exists( 'wp_generate_uuid4' )
-				? wp_generate_uuid4()
-				: uniqid( 'pm_lock_', true );
-		}
-
-		return self::$translation_lock_token;
-	}
-
-	private static function get_translation_lock_keys( $post_id, $lang ) {
-		$key = self::TRANSLATION_LOCK_PREFIX . absint( $post_id ) . '_' . sanitize_key( (string) $lang );
-
-		return array(
-			'key'   => $key,
-			'claim' => $key . '_claim',
-			'owner' => $key . self::TRANSLATION_LOCK_OWNER_SUFFIX,
-		);
 	}
 
 }

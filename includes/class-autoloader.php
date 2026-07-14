@@ -5,7 +5,8 @@
  * Maps:
  * - PolymartAI\Plugin              → includes/class-plugin.php
  * - PolymartAI\Routing\Url_Router  → includes/Routing/class-url-router.php
- * - PolymartAI\Translation\AI_Client → includes/Translation/class-ai-client.php
+ * - PolymartAI\Translation\AI\AI_Client → includes/Translation/AI/class-ai-client.php
+ * - PolymartAI\Activity_Logger\Job_Action_Scheduler → includes/Activity_Logger/class-job-action-scheduler.php
  *
  * @package PolymartAI
  */

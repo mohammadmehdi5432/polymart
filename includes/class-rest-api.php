@@ -10,15 +10,15 @@ namespace PolymartAI;
 use PolymartAI\Language_Registry;
 use PolymartAI\Frontend\Currency;
 use PolymartAI\Frontend\Currency_Price_Sync;
-use PolymartAI\Translation\AI_Client;
-use PolymartAI\Translation\Async_Translator;
+use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\Pipeline\Async_Translator;
 use PolymartAI\Translation\Post_Translator;
-use PolymartAI\Translation\Translation_Query;
-use PolymartAI\Translation\UI_String_Bulk_Job;
-use PolymartAI\Translation\UI_String_Registry;
-use PolymartAI\Translation\UI_String_Scanner;
-use PolymartAI\Translation\UI_String_Source_Scanner;
-use PolymartAI\Translation\Variation_Translation_Sync;
+use PolymartAI\Translation\Pipeline\Translation_Query;
+use PolymartAI\Translation\UI_String\UI_String_Bulk_Job;
+use PolymartAI\Translation\UI_String\UI_String_Registry;
+use PolymartAI\Translation\UI_String\UI_String_Scanner;
+use PolymartAI\Translation\UI_String\UI_String_Source_Scanner;
+use PolymartAI\Translation\WooCommerce\Variation_Translation_Sync;
 
 defined( 'ABSPATH' ) || exit;
 
