@@ -457,6 +457,7 @@ trait Trait_Queue_Metrics {
 
 	private static function attach_job_poll_snapshot_fields( array $job, $lang ) {
 		$gap_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$job         = self::refresh_elementor_job_progress_snapshot( $job, false );
 
 		$job['as_available']               = array_key_exists( 'as_available', $job )
 			? (bool) $job['as_available']

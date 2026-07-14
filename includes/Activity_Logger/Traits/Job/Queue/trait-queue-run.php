@@ -253,6 +253,11 @@ trait Trait_Queue_Run {
 		$before_progress = (string) ( $job['partial_progress'] ?? '' );
 		$did_recover     = self::force_recover_stalled_bulk_worker( 'kick' );
 
+		if ( ! $did_recover && self::should_prioritize_elementor_partial( $job ) ) {
+			self::reconcile_elementor_bulk_pin( $job );
+			$job = self::get_job_raw();
+		}
+
 		if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {
 			self::force_release_step_lock_if_idle();
 		}

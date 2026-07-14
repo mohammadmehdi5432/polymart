@@ -109,7 +109,11 @@ trait Trait_Worker_Heartbeat {
 			&& is_array( $old_parsed )
 			&& $old_parsed['done'] > $new_parsed['done']
 		) {
-			$marker = $old_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+			if ( ( $old_parsed['done'] - $new_parsed['done'] ) >= 2 ) {
+				$marker = $new_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+			} else {
+				$marker = $old_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+			}
 		}
 
 		$job['partial_post_id']  = $post_id;

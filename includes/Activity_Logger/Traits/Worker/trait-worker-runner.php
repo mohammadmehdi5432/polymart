@@ -194,7 +194,24 @@ trait Trait_Worker_Runner {
 
 			$limits = self::get_inline_worker_tick_limits( self::get_job_raw() );
 
-			return self::run_action_scheduler_batch( $limits['steps'], $limits['budget'] );
+			$result = self::run_action_scheduler_batch( $limits['steps'], $limits['budget'] );
+
+			$job = self::get_job_raw();
+
+			if (
+				self::should_prioritize_elementor_partial( $job )
+				&& self::is_elementor_progress_stalled( $job )
+				&& ! self::is_job_api_cooldown_active( $job )
+			) {
+				self::reconcile_elementor_bulk_pin( $job );
+
+				if ( self::run_pinned_elementor_work( false ) ) {
+					$result = self::normalize_job_for_response( self::get_job_raw(), false );
+					$result['worker_direct_tick'] = true;
+				}
+			}
+
+			return $result;
 		} finally {
 			self::$trusted_admin_worker = false;
 		}
@@ -488,6 +505,11 @@ trait Trait_Worker_Runner {
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
 			return self::normalize_job_for_response( $job, false );
+		}
+
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			self::reconcile_elementor_bulk_pin( $job );
+			$job = self::get_job_raw();
 		}
 
 		if ( self::is_job_api_cooldown_active( $job ) ) {

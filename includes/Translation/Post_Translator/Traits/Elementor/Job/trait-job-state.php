@@ -452,6 +452,117 @@ trait Trait_Job_State {
 		return $marker;
 	}
 
+	/**
+	 * Unstick Elementor when the primary schedule/cursor blocks API chunks but fields remain.
+	 *
+	 * @return bool True when queue/cursor/primary lock was repaired.
+	 */
+	public static function repair_elementor_stalled_chunk_queue( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+		if ( self::repair_stale_elementor_job_state( $post_id, $lang ) ) {
+			return true;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+
+		$state   = self::hydrate_elementor_job_partial_state(
+			$post_id,
+			$lang,
+			self::get_job_partial_state( $post_id, $lang )
+		);
+		$map     = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$source  = self::collect_elementor_translation_payload( $data );
+		$remaining = self::filter_remaining_elementor_payload( $source, $map, $skipped );
+
+		if ( empty( $remaining ) ) {
+			return self::repair_completed_elementor_job_meta( $post_id, $lang );
+		}
+
+		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$done           = (int) $chunk_progress['done'];
+		$total          = max( 1, (int) $chunk_progress['total'] );
+		$chunk_queue    = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+		$pending        = is_array( $chunk_queue['pending'] ?? null ) ? $chunk_queue['pending'] : array();
+
+		if ( ! empty( $pending ) ) {
+			return false;
+		}
+
+		if ( $done >= $total && ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			return self::unblock_elementor_chunk_queue( $post_id, $lang );
+		}
+
+		$primary_blocked = self::elementor_job_primary_batches_exhausted( $post_id, $lang )
+			|| self::elementor_primary_schedule_locked( $post_id, $lang, $state );
+
+		if ( ! $primary_blocked && $done >= $total ) {
+			return false;
+		}
+
+		self::clear_elementor_primary_batches_lock( $post_id, $lang );
+
+		$stored_cursor = self::read_elementor_slice_cursor( $post_id, $lang );
+		$stored_total  = self::read_elementor_slice_cursor_total( $post_id, $lang );
+
+		if ( $primary_blocked || ( $stored_total > 0 && $stored_cursor >= $stored_total ) ) {
+			self::clear_elementor_slice_cursor( $post_id, $lang );
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+		}
+
+		$inferred       = self::infer_elementor_slice_cursor_from_saved( $post_id, $lang, $data, $map );
+		$batch_progress = self::compute_elementor_api_batch_progress( $data, $map, $state );
+		$repaired_done  = max( $inferred, (int) $batch_progress['done'] );
+
+		$state['phase']                          = 'elementor';
+		$state['elementor_map']                  = $map;
+		$state['elementor_primary_batches_done'] = 0;
+		$state['elementor_chunk_index']          = $repaired_done;
+		$state['elementor_slices_completed']     = $repaired_done;
+		$state['elementor_chunks_total']         = max( $total, (int) $batch_progress['total'] );
+		unset(
+			$state['elementor_gap_fill'],
+			$state['elementor_gap_fill_stubborn_only'],
+			$state['elementor_gap_fill_done'],
+			$state['elementor_gap_fill_total']
+		);
+
+		self::save_job_partial_state( $post_id, $lang, $state );
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: repaired chunk index, 3: total chunks, 4: remaining field count */
+				__( 'Elementor — #%1$d: صف گیرکرده بازسازی شد (%2$d/%3$d) — %4$d فیلد باقی‌مانده', 'polymart-ai' ),
+				$post_id,
+				$repaired_done,
+				$state['elementor_chunks_total'],
+				count( $remaining )
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang )
+		);
+
+		return true;
+	}
+
 	private static function format_elementor_job_slice_status_message( $post_id, $lang, array $state = array() ) {
 		$overlay_map     = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 		$overlay_skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();

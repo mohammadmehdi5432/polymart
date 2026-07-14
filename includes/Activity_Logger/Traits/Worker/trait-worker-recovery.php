@@ -183,6 +183,12 @@ trait Trait_Worker_Recovery {
 			return false;
 		}
 
+		$mutex_key = 'polymart_ai_worker_recover_mux';
+		if ( get_transient( $mutex_key ) ) {
+			return false;
+		}
+		set_transient( $mutex_key, time(), 45 );
+
 		$job  = self::get_job_raw();
 		$age  = self::get_bulk_worker_activity_age();
 		$need = max(
@@ -194,16 +200,25 @@ trait Trait_Worker_Recovery {
 		);
 
 		if ( $age < $need ) {
+			delete_transient( $mutex_key );
 			return false;
 		}
 
 		$last_recover = absint( $job['worker_recovered_at'] ?? 0 );
 		if ( $last_recover > 0 && ( time() - $last_recover ) < min( 55, $need ) ) {
+			delete_transient( $mutex_key );
 			return false;
 		}
 
-		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$lang              = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id           = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$before_progress   = (string) ( $job['partial_progress'] ?? '' );
+		$before_progress_at = absint( $job['partial_progress_at'] ?? 0 );
+
+		if ( self::should_prioritize_elementor_partial( $job ) ) {
+			self::reconcile_elementor_bulk_pin( $job );
+			$job = self::get_job_raw();
+		}
 
 		Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
 		Job_Action_Scheduler::clear_slice_mutex();
@@ -224,25 +239,40 @@ trait Trait_Worker_Recovery {
 
 		self::ensure_recurring_pulse();
 
+		$burst_ran = false;
+
 		if ( Job_Action_Scheduler::is_available() ) {
 			Job_Action_Scheduler::enqueue_next( true, 0 );
 			Job_Action_Scheduler::run_queue_inline( true );
 		}
 
+		$job = self::get_job_raw();
+
 		if (
 			self::should_prioritize_elementor_partial( $job )
 			&& $post_id > 0
 			&& '' !== $lang
-			&& Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+			&& ! self::is_job_api_cooldown_active( $job )
+			&& (
+				self::is_elementor_progress_stalled( $job )
+				|| Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+				|| Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
+			)
 		) {
-			self::run_pinned_elementor_work( true );
+			$burst_ran = self::run_pinned_elementor_work( true );
 		}
 
-		$job = self::get_job_raw();
-		$job['worker_heartbeat_at'] = time();
-		$job['last_cron_at']        = time();
-		$job['last_worker']         = wp_doing_cron() ? 'cron' : self::resolve_last_worker_label();
-		self::save_job( $job );
+		$job            = self::get_job_raw();
+		$after_progress = (string) ( $job['partial_progress'] ?? '' );
+		$progress_moved = $before_progress !== $after_progress
+			|| absint( $job['partial_progress_at'] ?? 0 ) > $before_progress_at;
+
+		if ( $progress_moved || $burst_ran ) {
+			$job['worker_heartbeat_at'] = time();
+			$job['last_cron_at']        = time();
+			$job['last_worker']         = wp_doing_cron() ? 'cron' : self::resolve_last_worker_label();
+			self::save_job( $job );
+		}
 
 		self::log(
 			'warning',

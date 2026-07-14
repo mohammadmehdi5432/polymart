@@ -20,13 +20,105 @@ defined( 'ABSPATH' ) || exit;
 
 trait Trait_Job_Elementor {
 
-	private static function refresh_elementor_job_progress_snapshot( array $job ) {
+	/**
+	 * Merge bulk-job progress with live Elementor partial state (allow resync after restart).
+	 */
+	private static function resolve_elementor_bulk_progress_marker( $current, $marker ) {
+		$marker = trim( (string) $marker );
+
+		if ( preg_match( '/^(\d+\/\d+)/', $marker, $matches ) ) {
+			$marker = (string) $matches[1];
+		}
+
+		$new_parsed = self::parse_job_phase_progress( $marker );
+		$old_parsed = self::parse_job_phase_progress( (string) $current );
+
+		if (
+			is_array( $new_parsed )
+			&& is_array( $old_parsed )
+			&& $old_parsed['done'] > $new_parsed['done']
+		) {
+			if ( ( $old_parsed['done'] - $new_parsed['done'] ) >= 2 ) {
+				return $new_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+			}
+
+			return $old_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
+		}
+
+		return $marker;
+	}
+
+	/**
+	 * Repair pinned Elementor bulk work and resync progress before ensure/kick/burst.
+	 *
+	 * @param array<string, mixed>|null $job Optional job snapshot.
+	 * @return bool True when repair/finalize/resync ran.
+	 */
+	public static function reconcile_elementor_bulk_pin( $job = null ) {
+		$job = is_array( $job ) ? $job : self::get_job_raw();
+
+		if ( 'running' !== ( $job['status'] ?? '' ) || ! self::should_prioritize_elementor_partial( $job ) ) {
+			return false;
+		}
+
+		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$changed = false;
+
+		if (
+			Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			self::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
+
+			return true;
+		}
+
+		Post_Translator::repair_stale_elementor_completion_meta( $post_id, $lang );
+
+		if ( Post_Translator::repair_elementor_stalled_chunk_queue( $post_id, $lang ) ) {
+			$changed = true;
+		}
+
+		if ( Post_Translator::unblock_elementor_chunk_queue( $post_id, $lang ) ) {
+			$changed = true;
+		}
+
+		$marker = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang );
+
+		if ( '' !== $marker && preg_match( '/^(\d+\/\d+)/', $marker, $matches ) ) {
+			$resolved = self::resolve_elementor_bulk_progress_marker(
+				(string) ( $job['partial_progress'] ?? '' ),
+				(string) $matches[1]
+			);
+
+			if ( $resolved !== (string) ( $job['partial_progress'] ?? '' ) ) {
+				$job = self::get_job_raw();
+				$job['partial_post_id']  = $post_id;
+				$job['partial_phase']    = 'elementor';
+				$job['partial_progress'] = $resolved;
+				self::touch_partial_progress_tracker( $job );
+				self::save_job( $job );
+				$changed = true;
+			}
+		}
+
+		return $changed;
+	}
+
+	private static function refresh_elementor_job_progress_snapshot( array $job, $persist = true ) {
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
 			return $job;
 		}
 
-		if ( self::is_job_poll_request() ) {
-			return $job;
+		$poll_only = self::is_job_poll_request();
+		if ( $poll_only ) {
+			$persist = false;
 		}
 
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
@@ -38,27 +130,23 @@ trait Trait_Job_Elementor {
 
 		$marker = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang );
 
-		if ( '' === $marker || ! preg_match( '/^\d+\/\d+$/', $marker ) ) {
+		if ( '' === $marker || ! preg_match( '/^\d+\/\d+/', $marker ) ) {
 			return $job;
 		}
 
-		$current   = (string) ( $job['partial_progress'] ?? '' );
-		$new_parsed = self::parse_job_phase_progress( $marker );
-		$old_parsed = self::parse_job_phase_progress( $current );
-
-		if (
-			is_array( $new_parsed )
-			&& is_array( $old_parsed )
-			&& $old_parsed['done'] > $new_parsed['done']
-		) {
-			$marker = $old_parsed['done'] . '/' . max( $old_parsed['total'], $new_parsed['total'] );
-		}
+		$current = (string) ( $job['partial_progress'] ?? '' );
+		$marker  = self::resolve_elementor_bulk_progress_marker( $current, $marker );
 
 		if ( $current === $marker ) {
 			return $job;
 		}
 
 		$job['partial_progress'] = $marker;
+
+		if ( ! $persist ) {
+			return $job;
+		}
+
 		self::touch_partial_progress_tracker( $job );
 		update_option( self::JOB_OPTION, $job, false );
 
