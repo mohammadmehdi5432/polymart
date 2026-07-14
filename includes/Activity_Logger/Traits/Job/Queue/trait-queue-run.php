@@ -806,6 +806,12 @@ trait Trait_Queue_Run {
 				&& Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
 			) {
 				self::schedule_elementor_partial_follow_up( 0 );
+			} elseif (
+				'elementor' === sanitize_key( (string) ( $slice['phase'] ?? '' ) )
+				&& ! empty( $slice['recoverable'] )
+			) {
+				// Timeout / recoverable API errors must chain the next slice immediately.
+				self::schedule_elementor_partial_follow_up( 0 );
 			}
 
 			return self::normalize_job_for_response( $job, false );

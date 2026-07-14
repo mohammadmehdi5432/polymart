@@ -25,9 +25,9 @@ final class Job_Action_Scheduler {
 
 	/**
 	 * Seconds after which an In-progress AS action is treated as dead.
-	 * Must exceed one full AS batch (multi-slice + Elementor partials + retries).
+	 * Align with STEP_LOCK_TTL (~90s) so ghost actions recover before the SPA gives up.
 	 */
-	const STALE_RUNNING_SEC = 150;
+	const STALE_RUNNING_SEC = 90;
 
 	/** Wall-clock budget for one AS slice callback (shared-host safe). */
 	const SLICE_BUDGET_SEC = 120;
@@ -1028,6 +1028,51 @@ final class Job_Action_Scheduler {
 	 * @param int $except_id      Optional action ID to leave alone (current).
 	 * @return int Number recovered.
 	 */
+	/**
+	 * Fail ghost In-progress actions and enqueue a fresh slice (poll-safe, no inline AI).
+	 *
+	 * Called from GET /translation-job so the SPA heals AS without a heavy kick/ensure.
+	 *
+	 * @return bool True when at least one stale action was cleared.
+	 */
+	public static function maybe_heal_ghost_actions_on_poll() {
+		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() || ! self::is_available() ) {
+			return false;
+		}
+
+		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) <= 0 ) {
+			return false;
+		}
+
+		$stale_sec = self::STALE_RUNNING_SEC;
+
+		if ( \PolymartAI\Activity_Logger::is_bulk_worker_lively( $stale_sec ) ) {
+			return false;
+		}
+
+		$recovered = self::recover_stale_running_actions( $stale_sec );
+
+		if ( $recovered <= 0 ) {
+			return false;
+		}
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: %d: number of recovered actions */
+				__( 'Action Scheduler: %d اکشن گیرکرده In-progress آزاد شد — زنجیره از سر گرفته می‌شود.', 'polymart-ai' ),
+				$recovered
+			)
+		);
+
+		\PolymartAI\Activity_Logger::release_stale_locks_for_as( $stale_sec );
+		\PolymartAI\Activity_Logger::release_step_lock();
+		self::clear_slice_mutex();
+		self::enqueue_next( true, 0 );
+
+		return true;
+	}
+
 	public static function recover_stale_running_actions( $older_than_sec = 60, $except_id = 0 ) {
 		if ( ! self::is_available() || ! class_exists( 'ActionScheduler' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
 			return 0;

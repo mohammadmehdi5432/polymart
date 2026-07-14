@@ -71,8 +71,12 @@ trait Trait_Job_Lifecycle {
 
 		$job = wp_parse_args( $job, self::empty_job() );
 
-		if ( 'running' === ( $job['status'] ?? '' ) && ! self::get_next_worker_cron() ) {
-			self::schedule_background_worker();
+		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			Job_Action_Scheduler::maybe_heal_ghost_actions_on_poll();
+
+			if ( ! self::get_next_worker_cron() ) {
+				self::schedule_background_worker();
+			}
 		}
 
 		return self::normalize_job_for_response( $job, $deep_sync );
