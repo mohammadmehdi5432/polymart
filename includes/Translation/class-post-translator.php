@@ -422,6 +422,18 @@ final class Post_Translator {
 	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = 1000;
 
 	/**
+	 * Max API attempts per Elementor __segN key before source-text fallback.
+	 */
+	const ELEMENTOR_SEGMENT_MAX_RETRIES = 3;
+
+	/**
+	 * Segment passthrough keys for the active Elementor slice (from partial state).
+	 *
+	 * @var string[]
+	 */
+	private static $current_elementor_segment_passthrough = array();
+
+	/**
 	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
 	 * Keep under shared-host / AS runner limits so actions cannot hang In-progress.
 	 */
@@ -3249,6 +3261,289 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Effective max characters per Elementor __segN chunk (filterable).
+	 *
+	 * @return int
+	 */
+	private static function get_elementor_segment_max_chars() {
+		return max(
+			400,
+			absint(
+				apply_filters(
+					'polymart_ai_elementor_segment_chars',
+					self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS
+				)
+			)
+		);
+	}
+
+	/**
+	 * Find a safe UTF-8 cut point inside HTML (prefer closing block tags).
+	 *
+	 * @param string $text      Full text buffer.
+	 * @param int    $max_chars Target segment size.
+	 * @return int Character offset to cut at (exclusive).
+	 */
+	private static function elementor_find_html_safe_cut( $text, $max_chars ) {
+		$text      = (string) $text;
+		$max_chars = max( 200, absint( $max_chars ) );
+		$length    = self::utf8_strlen( $text );
+
+		if ( $length <= $max_chars ) {
+			return $length;
+		}
+
+		$window = self::utf8_substr( $text, 0, $max_chars );
+		$delims = array(
+			'</p>',
+			'</div>',
+			'</li>',
+			'</ul>',
+			'</ol>',
+			'</h1>',
+			'</h2>',
+			'</h3>',
+			'</h4>',
+			'</h5>',
+			'</h6>',
+			'</section>',
+			'</article>',
+			'</blockquote>',
+			'</table>',
+			'</tr>',
+			'</td>',
+			'</th>',
+			'</span>',
+		);
+
+		$best   = 0;
+		$min_ok = (int) floor( $max_chars * 0.45 );
+
+		foreach ( $delims as $delim ) {
+			$pos = 0;
+
+			while ( true ) {
+				$found = function_exists( 'mb_stripos' )
+					? mb_stripos( $window, $delim, $pos, 'UTF-8' )
+					: stripos( $window, $delim, $pos );
+
+				if ( false === $found ) {
+					break;
+				}
+
+				$cut = $found + self::utf8_strlen( $delim );
+
+				if ( $cut >= $min_ok && $cut > $best ) {
+					$best = $cut;
+				}
+
+				$pos = $found + 1;
+			}
+		}
+
+		if ( $best > 0 ) {
+			return $best;
+		}
+
+		$gt = function_exists( 'mb_strrpos' )
+			? mb_strrpos( $window, '>', 0, 'UTF-8' )
+			: strrpos( $window, '>' );
+
+		if ( false !== $gt && $gt >= $min_ok ) {
+			return $gt + 1;
+		}
+
+		return $max_chars;
+	}
+
+	/**
+	 * Close any still-open HTML tags at the end of a truncated fragment.
+	 *
+	 * @param string $html HTML fragment.
+	 * @return string
+	 */
+	private static function elementor_balance_html_fragment( $html ) {
+		$html = (string) $html;
+
+		if ( '' === $html || false === strpos( $html, '<' ) ) {
+			return $html;
+		}
+
+		if ( ! preg_match_all( '/<\/?([a-z][a-z0-9]*)\b[^>]*>/i', $html, $matches, PREG_SET_ORDER ) ) {
+			return $html;
+		}
+
+		$void_tags = array(
+			'area',
+			'base',
+			'br',
+			'col',
+			'embed',
+			'hr',
+			'img',
+			'input',
+			'link',
+			'meta',
+			'source',
+			'track',
+			'wbr',
+		);
+		$stack     = array();
+
+		foreach ( $matches as $match ) {
+			$tag  = strtolower( (string) ( $match[1] ?? '' ) );
+			$full = (string) ( $match[0] ?? '' );
+
+			if ( '' === $tag || in_array( $tag, $void_tags, true ) ) {
+				continue;
+			}
+
+			if ( 0 === strpos( $full, '</' ) ) {
+				for ( $i = count( $stack ) - 1; $i >= 0; $i-- ) {
+					if ( $stack[ $i ] === $tag ) {
+						array_splice( $stack, $i, 1 );
+						break;
+					}
+				}
+				continue;
+			}
+
+			if ( '/>' !== substr( $full, -2 ) ) {
+				$stack[] = $tag;
+			}
+		}
+
+		while ( ! empty( $stack ) ) {
+			$tag  = array_pop( $stack );
+			$html .= '</' . $tag . '>';
+		}
+
+		return $html;
+	}
+
+	/**
+	 * Hard-split a long HTML buffer on a tag-safe boundary.
+	 *
+	 * @param string $buffer    Remaining text.
+	 * @param int    $max_chars Segment cap.
+	 * @return array{0: string, 1: string} Head segment and tail remainder.
+	 */
+	private static function elementor_html_safe_take_chunk( $buffer, $max_chars ) {
+		$buffer    = (string) $buffer;
+		$max_chars = max( 200, absint( $max_chars ) );
+		$cut_at    = self::elementor_find_html_safe_cut( $buffer, $max_chars );
+		$head      = self::utf8_substr( $buffer, 0, $cut_at );
+		$head      = self::elementor_balance_html_fragment( $head );
+		$tail      = self::utf8_substr( $buffer, $cut_at, self::utf8_strlen( $buffer ) - $cut_at );
+
+		return array( $head, $tail );
+	}
+
+	/**
+	 * Whether a path key is an Elementor segment (__segN) or part (__partN).
+	 *
+	 * @param string $path Field path.
+	 * @return bool
+	 */
+	private static function elementor_path_is_segment( $path ) {
+		return (bool) preg_match( '/::__(?:part|seg)\d+$/', (string) $path );
+	}
+
+	/**
+	 * Whether a segment is translated or intentionally passed through with source text.
+	 *
+	 * @param string               $seg_key    Segment path.
+	 * @param string               $seg_source Segment source text.
+	 * @param array<string, string> $map        Translation map.
+	 * @return bool
+	 */
+	private static function elementor_segment_is_resolved( $seg_key, $seg_source, array $map ) {
+		$seg_key    = (string) $seg_key;
+		$seg_source = (string) $seg_source;
+
+		if ( ! isset( $map[ $seg_key ] ) ) {
+			return false;
+		}
+
+		$value = (string) $map[ $seg_key ];
+
+		if (
+			in_array( $seg_key, self::$current_elementor_segment_passthrough, true )
+			&& $value === $seg_source
+		) {
+			return true;
+		}
+
+		return self::elementor_map_value_is_valid_translation( $seg_key, $seg_source, $value );
+	}
+
+	/**
+	 * Bind segment passthrough keys from partial state for completion checks.
+	 *
+	 * @param array<string, mixed> $state Partial state.
+	 * @return void
+	 */
+	private static function bind_elementor_segment_passthrough_context( array $state ) {
+		self::$current_elementor_segment_passthrough = is_array( $state['elementor_segment_passthrough'] ?? null )
+			? array_values( array_unique( array_map( 'strval', $state['elementor_segment_passthrough'] ) ) )
+			: array();
+	}
+
+	/**
+	 * Persist durable Elementor segment progress immediately (survives job timeouts).
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, mixed>  $state          Partial state (by reference).
+	 * @param array<string, string> $map            Translation map.
+	 * @param array<string, string> $source_payload Source field map.
+	 * @return void
+	 */
+	private static function remember_elementor_segment_progress( $post_id, $lang, array &$state, array $map, array $source_payload ) {
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+		$state['elementor_map'] = $map;
+		self::save_job_partial_state( $post_id, $lang, $state );
+		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
+	}
+
+	/**
+	 * Store source text for a failed segment so collapse can continue.
+	 *
+	 * @param string               $seg_key    Segment path.
+	 * @param string               $seg_source Segment source text.
+	 * @param array<string, string> $map        Translation map (by reference).
+	 * @param array<string, mixed> $state      Partial state (by reference).
+	 * @return void
+	 */
+	private static function apply_elementor_segment_source_fallback( $seg_key, $seg_source, array &$map, array &$state ) {
+		$seg_key    = (string) $seg_key;
+		$seg_source = (string) $seg_source;
+
+		if ( '' === $seg_key || '' === $seg_source ) {
+			return;
+		}
+
+		$map[ $seg_key ] = $seg_source;
+
+		$passthrough = is_array( $state['elementor_segment_passthrough'] ?? null )
+			? $state['elementor_segment_passthrough']
+			: array();
+		$passthrough[]                               = $seg_key;
+		$state['elementor_segment_passthrough']      = array_values( array_unique( array_map( 'strval', $passthrough ) ) );
+		self::$current_elementor_segment_passthrough = $state['elementor_segment_passthrough'];
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: segment path */
+				__( 'Elementor — سگمنت %1$s پس از چند تلاش با متن اصلی پر شد (fallback).', 'polymart-ai' ),
+				$seg_key
+			),
+			array( 'path' => $seg_key )
+		);
+	}
+
+	/**
 	 * Split oversized field values so each API request stays within safe limits.
 	 *
 	 * @param array<string, string> $payload Field map.
@@ -3313,6 +3608,20 @@ final class Post_Translator {
 			}
 		}
 
+		if ( empty( $pieces ) && ( false !== stripos( $text, '</div>' ) || false !== stripos( $text, '</li>' ) ) ) {
+			$raw = preg_split( '/(<\/(?:div|li|ul|ol|section|article|blockquote)>\s*)/i', $text, -1, PREG_SPLIT_DELIM_CAPTURE );
+			if ( is_array( $raw ) ) {
+				for ( $i = 0; $i < count( $raw ); $i += 2 ) {
+					$chunk = (string) ( $raw[ $i ] ?? '' );
+					$delim = (string) ( $raw[ $i + 1 ] ?? '' );
+					$piece = $chunk . $delim;
+					if ( '' !== trim( $piece ) ) {
+						$pieces[] = $piece;
+					}
+				}
+			}
+		}
+
 		if ( empty( $pieces ) ) {
 			$raw = preg_split( "/\n\s*\n/u", $text );
 			if ( is_array( $raw ) ) {
@@ -3346,11 +3655,12 @@ final class Post_Translator {
 				$buffer = $piece;
 			}
 
-			// Extremely long single piece (e.g. one giant <p>) — hard cut.
+			// Extremely long single piece — HTML-safe hard cut (never mid-tag).
 			while ( self::utf8_strlen( $buffer ) > $max_chars ) {
-				$segments[ $path . '::__seg' . $seg ] = self::utf8_substr( $buffer, 0, $max_chars );
+				list( $head, $tail ) = self::elementor_html_safe_take_chunk( $buffer, $max_chars );
+				$segments[ $path . '::__seg' . $seg ] = $head;
 				++$seg;
-				$buffer = self::utf8_substr( $buffer, $max_chars, self::utf8_strlen( $buffer ) - $max_chars );
+				$buffer = $tail;
 			}
 		}
 
@@ -3383,12 +3693,12 @@ final class Post_Translator {
 				continue;
 			}
 
-			if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+			if ( self::utf8_strlen( $text ) <= self::get_elementor_segment_max_chars() ) {
 				$expanded[ $path ] = $text;
 				continue;
 			}
 
-			foreach ( self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) as $seg_key => $seg_text ) {
+			foreach ( self::split_elementor_text_into_segments( $path, $text, self::get_elementor_segment_max_chars() ) as $seg_key => $seg_text ) {
 				$expanded[ (string) $seg_key ] = (string) $seg_text;
 			}
 		}
@@ -3407,11 +3717,11 @@ final class Post_Translator {
 		$path = (string) $path;
 		$text = (string) $text;
 
-		if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+		if ( self::utf8_strlen( $text ) <= self::get_elementor_segment_max_chars() ) {
 			return array();
 		}
 
-		$segments = self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS );
+		$segments = self::split_elementor_text_into_segments( $path, $text, self::get_elementor_segment_max_chars() );
 		$keys     = array();
 
 		foreach ( array_keys( $segments ) as $k ) {
@@ -3435,11 +3745,11 @@ final class Post_Translator {
 		$path = (string) $path;
 		$text = (string) $text;
 
-		if ( self::utf8_strlen( $text ) <= self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS ) {
+		if ( self::utf8_strlen( $text ) <= self::get_elementor_segment_max_chars() ) {
 			return array();
 		}
 
-		$segments = self::split_elementor_text_into_segments( $path, $text, self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS );
+		$segments = self::split_elementor_text_into_segments( $path, $text, self::get_elementor_segment_max_chars() );
 		$lookup   = array();
 
 		foreach ( $segments as $k => $v ) {
@@ -3761,6 +4071,16 @@ final class Post_Translator {
 				return true;
 			}
 
+			$persist = is_array( $state['elementor_persist_map'] ?? null ) ? $state['elementor_persist_map'] : array();
+
+			if ( ! empty( $persist ) ) {
+				return true;
+			}
+
+			if ( ! empty( $state['elementor_gap_fill'] ) ) {
+				return true;
+			}
+
 			return (bool) get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
 		}
 
@@ -3855,12 +4175,61 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Whether Elementor partial state must survive error recovery / partial clears.
+	 *
 	 * @param int    $post_id Post ID.
 	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function elementor_job_partial_state_is_durable( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		if ( ! is_array( $state ) || 'elementor' !== sanitize_key( (string) ( $state['phase'] ?? '' ) ) ) {
+			return false;
+		}
+
+		$persist = is_array( $state['elementor_persist_map'] ?? null ) ? $state['elementor_persist_map'] : array();
+
+		if ( ! empty( $persist ) ) {
+			return true;
+		}
+
+		if ( ! empty( $state['elementor_gap_fill'] ) ) {
+			return true;
+		}
+
+		if (
+			! empty( $state['elementor_gap_fill_finished_keys'] )
+			|| ! empty( $state['elementor_gap_fill_scheduled_keys'] )
+		) {
+			return true;
+		}
+
+		return absint( $state['elementor_chunk_index'] ?? 0 ) > 0;
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @param bool   $force   When true, delete even durable Elementor progress.
 	 * @return void
 	 */
-	public static function clear_job_partial_state( $post_id, $lang ) {
-		delete_post_meta( absint( $post_id ), self::get_job_partial_meta_key( $lang ) );
+	public static function clear_job_partial_state( $post_id, $lang, $force = false ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( ! $force && self::elementor_job_partial_state_is_durable( $post_id, $lang ) ) {
+			return;
+		}
+
+		delete_post_meta( $post_id, self::get_job_partial_meta_key( $lang ) );
 	}
 
 	/**
@@ -3939,10 +4308,13 @@ final class Post_Translator {
 			'elementor_slices_completed'  => 0,
 			'elementor_failures'          => array(),
 			'elementor_skipped'           => array(),
+			'elementor_segment_failures'  => array(),
+			'elementor_segment_passthrough' => array(),
 		);
 
 		$state = array_merge( $defaults, $state );
 		$state['phase'] = 'elementor';
+		self::bind_elementor_segment_passthrough_context( $state );
 
 		if ( $post_id <= 0 || '' === $lang ) {
 			return $state;
@@ -4530,6 +4902,49 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Drop segment-only skips and fields that still have durable segment progress.
+	 *
+	 * @param string[]              $skipped     Skipped paths.
+	 * @param array<string, mixed>  $source_data Source Elementor tree.
+	 * @param array<string, string> $map         Translation path map.
+	 * @param array<string, mixed>  $state       Partial state.
+	 * @return string[]
+	 */
+	private static function filter_elementor_finalize_blocker_skipped( array $skipped, array $source_data, array $map, array $state ) {
+		if ( empty( $skipped ) ) {
+			return array();
+		}
+
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$persist_map    = is_array( $state['elementor_persist_map'] ?? null ) ? $state['elementor_persist_map'] : array();
+		$merged_map     = array_merge( $persist_map, $map );
+		$blocking       = array();
+
+		foreach ( $skipped as $path ) {
+			$path = (string) $path;
+
+			if ( '' === $path ) {
+				continue;
+			}
+
+			// Segment-level timeouts must not block whole-post finalize.
+			if ( self::elementor_path_is_segment( $path ) ) {
+				continue;
+			}
+
+			$text = (string) ( $source_payload[ $path ] ?? '' );
+
+			if ( '' !== $text && self::elementor_field_translation_complete( $path, $text, $merged_map ) ) {
+				continue;
+			}
+
+			$blocking[] = $path;
+		}
+
+		return array_values( array_unique( $blocking ) );
+	}
+
+	/**
 	 * Reasons Elementor job finalization must not mark the post complete yet.
 	 *
 	 * @param int                   $post_id     Post ID.
@@ -4545,6 +4960,7 @@ final class Post_Translator {
 		$skipped = is_array( $state['elementor_skipped'] ?? null )
 			? array_values( array_filter( array_map( 'strval', $state['elementor_skipped'] ) ) )
 			: array();
+		$skipped = self::filter_elementor_finalize_blocker_skipped( $skipped, $source_data, $map, $state );
 
 		if ( ! empty( $skipped ) ) {
 			return array(
@@ -4632,13 +5048,27 @@ final class Post_Translator {
 		$done_count     = max( $done_count, (int) $batch_progress['done'] );
 		$total_chunks   = max( $total_chunks, (int) $batch_progress['total'], 1 );
 
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+		$state['elementor_map'] = $map;
+
 		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $total_chunks );
 
 		if ( is_wp_error( $persisted ) ) {
 			return $persisted;
 		}
 
-		unset( $state['elementor_skipped'], $state['elementor_failures'] );
+		// Keep durable segment progress; only clear base-path skip markers so gap-fill can resume.
+		$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$state['elementor_skipped'] = array_values(
+			array_filter(
+				array_map( 'strval', $skipped ),
+				static function ( $path ) {
+					return self::elementor_path_is_segment( $path );
+				}
+			)
+		);
+		unset( $state['elementor_failures'] );
 		$state['phase'] = 'elementor';
 		self::save_job_partial_state( $post_id, $lang, $state );
 		self::flush_translation_status_cache( $post_id );
@@ -4740,7 +5170,7 @@ final class Post_Translator {
 		}
 
 		self::clear_elementor_slice_cursor( $post_id, $lang );
-		self::clear_job_partial_state( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang, true );
 		self::flush_translation_status_cache( $post_id );
 
 		return array(
@@ -5282,7 +5712,7 @@ final class Post_Translator {
 			);
 		}
 
-		self::clear_job_partial_state( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang, true );
 
 		return array(
 			'done'           => true,
@@ -6088,7 +6518,7 @@ final class Post_Translator {
 		}
 
 		if ( 'complete' === (string) ( $state['phase'] ?? '' ) ) {
-			self::clear_job_partial_state( $post_id, $lang );
+			self::clear_job_partial_state( $post_id, $lang, true );
 
 			return array(
 				'done'           => true,
@@ -6258,7 +6688,7 @@ final class Post_Translator {
 				) {
 					delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 					delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
-					self::clear_job_partial_state( $post_id, $lang );
+					self::clear_job_partial_state( $post_id, $lang, true );
 
 					return array(
 						'done'           => true,
@@ -6279,7 +6709,7 @@ final class Post_Translator {
 				self::clear_elementor_slice_cursor( $post_id, $lang );
 				delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 				delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
-				self::clear_job_partial_state( $post_id, $lang );
+				self::clear_job_partial_state( $post_id, $lang, true );
 
 				return array(
 					'done'           => true,
@@ -6289,7 +6719,7 @@ final class Post_Translator {
 				);
 			}
 
-		self::clear_job_partial_state( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang, true );
 
 		return array(
 			'done'           => true,
@@ -6525,7 +6955,16 @@ final class Post_Translator {
 						array( 'post_id' => $post_id, 'lang' => $lang )
 					);
 
-					$state['elementor_skipped'] = array();
+					// Never wipe durable segment progress — only clear stale base-path skip markers.
+					$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+					$state['elementor_skipped'] = array_values(
+						array_filter(
+							array_map( 'strval', $skipped ),
+							static function ( $path ) {
+								return self::elementor_path_is_segment( $path );
+							}
+						)
+					);
 					$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 					$chunk_queue                = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
 					$chunks                     = $chunk_queue['pending'];
@@ -6579,7 +7018,7 @@ final class Post_Translator {
 						self::save_elementor_source_hash( $post_id, $lang );
 						delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 						self::clear_elementor_slice_cursor( $post_id, $lang );
-						self::clear_job_partial_state( $post_id, $lang );
+						self::clear_job_partial_state( $post_id, $lang, true );
 
 						return array(
 							'done'           => true,
@@ -6658,7 +7097,7 @@ final class Post_Translator {
 			}
 
 			self::clear_elementor_slice_cursor( $post_id, $lang );
-			self::clear_job_partial_state( $post_id, $lang );
+			self::clear_job_partial_state( $post_id, $lang, true );
 
 			return array(
 				'done'           => true,
@@ -6708,10 +7147,13 @@ final class Post_Translator {
 			$chunk = array_shift( $chunks );
 			$first_key = (string) array_key_first( $chunk );
 
-			if ( '' !== $first_key && absint( $failures[ $first_key ] ?? 0 ) >= 3 ) {
-				$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-				$skipped[] = $first_key;
-				$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+			if ( '' !== $first_key && absint( $failures[ $first_key ] ?? 0 ) >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+				if ( ! self::elementor_path_is_segment( $first_key ) ) {
+					$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+					$skipped[] = $first_key;
+					$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+				}
+
 				unset( $failures[ $first_key ] );
 				++$processed;
 				$state['elementor_map'] = $map;
@@ -6963,13 +7405,34 @@ final class Post_Translator {
 						);
 					}
 
-					$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+					if ( self::elementor_path_is_segment( $path ) ) {
+						$seg_failures = is_array( $state['elementor_segment_failures'] ?? null ) ? $state['elementor_segment_failures'] : array();
+						$seg_failures[ $path ] = absint( $seg_failures[ $path ] ?? 0 ) + 1;
+						$state['elementor_segment_failures'] = $seg_failures;
 
-					if ( $failures[ $path ] >= 2 ) {
-						$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-						$skipped[] = $path;
-						$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
-						unset( $failures[ $path ] );
+						if ( $seg_failures[ $path ] >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+							$base      = preg_replace( '/::__(?:part|seg)\d+$/', '', $path );
+							$base_text = (string) ( $source_payload[ $base ] ?? '' );
+							$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
+							$seg_source = (string) ( $seg_lookup[ $path ] ?? (string) ( $chunk[ $path ] ?? '' ) );
+
+							if ( '' !== $seg_source ) {
+								self::apply_elementor_segment_source_fallback( $path, $seg_source, $map, $state );
+								$mapped_chunk[ $path ] = $seg_source;
+								unset( $seg_failures[ $path ] );
+								$state['elementor_segment_failures'] = $seg_failures;
+								continue;
+							}
+						}
+					} else {
+						$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+
+						if ( $failures[ $path ] >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+							$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+							$skipped[] = $path;
+							$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+							unset( $failures[ $path ] );
+						}
 					}
 
 					unset( $mapped_chunk[ $path ] );
@@ -7005,13 +7468,19 @@ final class Post_Translator {
 				);
 
 				if ( '' !== $first_path ) {
-					$failures[ $first_path ] = absint( $failures[ $first_path ] ?? 0 ) + 1;
+					if ( self::elementor_path_is_segment( $first_path ) ) {
+						$seg_failures = is_array( $state['elementor_segment_failures'] ?? null ) ? $state['elementor_segment_failures'] : array();
+						$seg_failures[ $first_path ] = absint( $seg_failures[ $first_path ] ?? 0 ) + 1;
+						$state['elementor_segment_failures'] = $seg_failures;
+					} else {
+						$failures[ $first_path ] = absint( $failures[ $first_path ] ?? 0 ) + 1;
 
-					if ( $failures[ $first_path ] >= 2 ) {
-						$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-						$skipped[] = $first_path;
-						$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
-						unset( $failures[ $first_path ] );
+						if ( $failures[ $first_path ] >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+							$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+							$skipped[] = $first_path;
+							$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+							unset( $failures[ $first_path ] );
+						}
 					}
 				}
 			}
@@ -7030,7 +7499,14 @@ final class Post_Translator {
 					self::register_elementor_gap_fill_chunk_done( $state, $chunk );
 					$gap_fill_done = absint( $state['elementor_gap_fill_done'] ?? 0 );
 				}
-				self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+
+				if ( ! empty( $mapped_chunk ) ) {
+					self::remember_elementor_segment_progress( $post_id, $lang, $state, $map, $source_payload );
+				} else {
+					self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+					$state['elementor_map'] = $map;
+				}
+
 				$commit_done = $progress_total;
 			} elseif ( $chunk_satisfied ) {
 				++$slice_cursor;
@@ -7318,7 +7794,7 @@ final class Post_Translator {
 		}
 
 		self::clear_elementor_slice_cursor( $post_id, $lang );
-		self::clear_job_partial_state( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang, true );
 
 		return array(
 			'done'           => true,
@@ -7366,6 +7842,8 @@ final class Post_Translator {
 		}
 
 		$state['elementor_map'] = $map;
+		$source_payload         = self::collect_elementor_translation_payload( $source_data );
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
 		$state                  = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		$progress               = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
 		$progress_total         = max( 1, absint( $state['elementor_chunks_total'] ?? $source_total ) );
@@ -7460,12 +7938,17 @@ final class Post_Translator {
 	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable: bool}
 	 */
 	private static function skip_elementor_chunk_on_api_timeout( $post_id, $lang, array $source_data, array &$state, array $map, $source_total, array $failed_keys, \WP_Error $error ) {
-		$post_id        = absint( $post_id );
-		$lang           = sanitize_key( (string) $lang );
-		$source_total   = max( 1, absint( $source_total ) );
+		$post_id      = absint( $post_id );
+		$lang         = sanitize_key( (string) $lang );
+		$source_total = max( 1, absint( $source_total ) );
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$seg_failures   = is_array( $state['elementor_segment_failures'] ?? null ) ? $state['elementor_segment_failures'] : array();
 		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$failures       = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
-		$skipped_paths  = array();
+		$timed_out      = array();
+
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+		$state['elementor_map'] = $map;
 
 		foreach ( $failed_keys as $failed_key ) {
 			$failed_key = (string) $failed_key;
@@ -7474,37 +7957,59 @@ final class Post_Translator {
 				continue;
 			}
 
-			$skipped[]         = $failed_key;
-			$skipped_paths[]   = $failed_key;
-			unset( $failures[ $failed_key ] );
+			$timed_out[] = $failed_key;
+
+			if ( self::elementor_path_is_segment( $failed_key ) ) {
+				$attempts = absint( $seg_failures[ $failed_key ] ?? 0 ) + 1;
+				$seg_failures[ $failed_key ] = $attempts;
+
+				if ( $attempts >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+					$base      = preg_replace( '/::__(?:part|seg)\d+$/', '', $failed_key );
+					$base_text = (string) ( $source_payload[ $base ] ?? '' );
+					$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
+					$seg_source = (string) ( $seg_lookup[ $failed_key ] ?? '' );
+
+					if ( '' !== $seg_source ) {
+						self::apply_elementor_segment_source_fallback( $failed_key, $seg_source, $map, $state );
+					}
+				}
+
+				continue;
+			}
+
+			$failures[ $failed_key ] = absint( $failures[ $failed_key ] ?? 0 ) + 1;
+
+			if ( $failures[ $failed_key ] >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+				$skipped[] = $failed_key;
+				unset( $failures[ $failed_key ] );
+			}
 		}
 
-		$state['elementor_skipped']  = array_values( array_unique( array_map( 'strval', $skipped ) ) );
-		$state['elementor_failures'] = $failures;
-		$state['elementor_map']      = $map;
-		$state                       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		$state['elementor_segment_failures'] = $seg_failures;
+		$state['elementor_skipped']          = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+		$state['elementor_failures']         = $failures;
+		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+		$state['elementor_map']              = $map;
+		$state                               = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 
 		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
 		$done_count     = self::resolve_elementor_done_count( $state, $chunk_progress['done'], $post_id, $lang );
 		$progress_total = max( $source_total, (int) $chunk_progress['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
 		$state['elementor_chunks_total'] = $progress_total;
 
-		if ( ! empty( $map ) ) {
-			self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
-		}
-
+		self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
 		self::save_job_partial_state( $post_id, $lang, $state );
 
-		$progress   = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
+		$progress    = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
 		$short_error = \PolymartAI\Activity_Logger::humanize_api_error_message( $error->get_error_message() );
 
 		update_post_meta(
 			$post_id,
 			'_polymart_ai_elementor_error_' . $lang,
 			sprintf(
-				/* translators: 1: skipped path count, 2: error detail */
-				__( 'timeout API — %1$d فیلد رد شد (%2$s)', 'polymart-ai' ),
-				count( $skipped_paths ),
+				/* translators: 1: timed-out path count, 2: error detail */
+				__( 'timeout API — %1$d مسیر معلق (%2$s)', 'polymart-ai' ),
+				count( $timed_out ),
 				$short_error
 			)
 		);
@@ -7512,17 +8017,17 @@ final class Post_Translator {
 		\PolymartAI\Activity_Logger::log(
 			'warning',
 			sprintf(
-				/* translators: 1: post ID, 2: progress marker, 3: skipped count, 4: error */
-				__( 'Elementor — #%1$d: timeout API در %2$s — %3$d فیلد به skipped منتقل شد (%4$s) — ادامه با بخش بعدی.', 'polymart-ai' ),
+				/* translators: 1: post ID, 2: progress marker, 3: timed-out count, 4: error */
+				__( 'Elementor — #%1$d: timeout API در %2$s — %3$d مسیر معلق (%4$s) — پیشرفت سگمنت‌ها حفظ شد.', 'polymart-ai' ),
 				$post_id,
 				$progress,
-				count( $skipped_paths ),
+				count( $timed_out ),
 				$short_error
 			),
 			array(
 				'post_id' => $post_id,
 				'lang'    => $lang,
-				'skipped' => $skipped_paths,
+				'timed_out' => $timed_out,
 			)
 		);
 
@@ -7530,10 +8035,10 @@ final class Post_Translator {
 			'elementor',
 			$progress,
 			sprintf(
-				/* translators: 1: progress marker, 2: skipped field count */
-				__( 'Elementor — %1$s: بخش API به‌خاطر timeout رد شد (%2$d فیلد) — ادامه…', 'polymart-ai' ),
+				/* translators: 1: progress marker, 2: timed-out path count */
+				__( 'Elementor — %1$s: timeout API — %2$d مسیر معلق — ادامه با سگمنت بعدی…', 'polymart-ai' ),
 				$progress,
-				count( $skipped_paths )
+				count( $timed_out )
 			)
 		);
 	}
@@ -7947,6 +8452,15 @@ final class Post_Translator {
 
 			if ( self::elementor_map_value_is_valid_translation( $path, $source_text, $value ) ) {
 				$clean[ $path ] = trim( (string) $value );
+				continue;
+			}
+
+			if (
+				preg_match( '/::__(?:part|seg)\d+$/', $path )
+				&& in_array( $path, self::$current_elementor_segment_passthrough, true )
+				&& trim( (string) $value ) === trim( $source_text )
+			) {
+				$clean[ $path ] = trim( (string) $value );
 			}
 		}
 
@@ -7985,7 +8499,14 @@ final class Post_Translator {
 			$path = (string) $path;
 
 			if ( preg_match( '/::__(?:part|seg)\d+$/', $path ) ) {
-				$persist[ $path ] = (string) $value;
+				$base       = preg_replace( '/::__(?:part|seg)\d+$/', '', $path );
+				$base_text  = (string) ( $source_payload[ $base ] ?? '' );
+				$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
+				$seg_source = (string) ( $seg_lookup[ $path ] ?? '' );
+
+				if ( self::elementor_segment_is_resolved( $path, $seg_source, $clean ) ) {
+					$persist[ $path ] = (string) $value;
+				}
 				continue;
 			}
 
@@ -8215,7 +8736,7 @@ final class Post_Translator {
 
 				if (
 					! isset( $prepared[ $seg_key ] )
-					|| ! self::elementor_map_value_is_valid_translation( $seg_key, $seg_source, (string) $prepared[ $seg_key ] )
+					|| ! self::elementor_segment_is_resolved( $seg_key, $seg_source, $prepared )
 				) {
 					$parts = array();
 					break;
@@ -8324,13 +8845,12 @@ final class Post_Translator {
 			$all_segs_ok = true;
 
 			foreach ( $seg_lookup as $seg_key => $seg_source ) {
-				if (
-					! isset( $map[ $seg_key ] )
-					|| ! self::elementor_map_value_is_valid_translation( $seg_key, (string) $seg_source, (string) $map[ $seg_key ] )
-				) {
-					$all_segs_ok = false;
-					break;
+				if ( self::elementor_segment_is_resolved( $seg_key, (string) $seg_source, $map ) ) {
+					continue;
 				}
+
+				$all_segs_ok = false;
+				break;
 			}
 
 			if ( $all_segs_ok ) {
@@ -8722,7 +9242,6 @@ final class Post_Translator {
 
 				if ( ! empty( $progress['touched'] ) ) {
 					$touched = true;
-					self::sync_elementor_persist_map_state( $state, $map, $source_payload );
 				}
 			}
 
@@ -8795,7 +9314,6 @@ final class Post_Translator {
 
 			if ( ! empty( $progress['touched'] ) ) {
 				$touched = true;
-				self::sync_elementor_persist_map_state( $state, $map, $source_payload );
 			}
 
 			if ( ! empty( $progress['completed'] ) ) {
@@ -8822,7 +9340,7 @@ final class Post_Translator {
 		$text = (string) $text;
 
 		return ! empty( self::get_elementor_segment_source_lookup( $path, $text ) )
-			|| self::utf8_strlen( $text ) > self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS;
+			|| self::utf8_strlen( $text ) > self::get_elementor_segment_max_chars();
 	}
 
 	/**
@@ -8916,89 +9434,179 @@ final class Post_Translator {
 		\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
 		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 
-		$result = AI_Client::translate_fields(
-			$aliased,
-			$api_key,
-			$api_endpoint,
-			$ai_model,
-			$lang,
-			array( 'max_timeout' => 45 )
-		);
+		$seg_failures = is_array( $state['elementor_segment_failures'] ?? null ) ? $state['elementor_segment_failures'] : array();
+		$pending      = array();
 
-		\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
-		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
+		foreach ( $batch as $batch_path => $batch_text ) {
+			$batch_path = (string) $batch_path;
+			$batch_text = (string) $batch_text;
 
-		if ( is_wp_error( $result ) ) {
-			\PolymartAI\Activity_Logger::log(
-				'warning',
-				sprintf(
-					/* translators: 1: post ID, 2: field path, 3: error */
-					__( 'Elementor — #%1$d: stubborn %2$s — خطای API: %3$s', 'polymart-ai' ),
-					absint( $post_id ),
-					$path,
-					\PolymartAI\Activity_Logger::humanize_api_error_message( $result->get_error_message() )
-				),
-				array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
-			);
+			if ( self::elementor_path_is_segment( $batch_path ) ) {
+				if ( self::elementor_segment_is_resolved( $batch_path, $batch_text, $map ) ) {
+					continue;
+				}
+			} elseif ( isset( $map[ $batch_path ] ) && self::elementor_map_value_is_valid_translation( $batch_path, $batch_text, (string) $map[ $batch_path ] ) ) {
+				continue;
+			}
 
-			$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+			$pending[ $batch_path ] = $batch_text;
+		}
+
+		if ( empty( $pending ) ) {
+			$completed = self::elementor_field_translation_complete( $path, $text, $map );
 
 			return compact( 'completed', 'touched' );
 		}
 
-		$raw_mapped = self::unmap_elementor_aliases(
-			is_array( $result ) ? $result : array(),
-			$alias_map
-		);
-		$field_map = self::merge_elementor_api_translations_into_map( $raw_mapped, $source_payload );
+		$max_attempts = self::ELEMENTOR_SEGMENT_MAX_RETRIES;
 
-		foreach ( $field_map as $map_path => $translated ) {
-			$map_path   = (string) $map_path;
-			$translated = trim( (string) $translated );
+		for ( $attempt = 1; $attempt <= $max_attempts && ! empty( $pending ); $attempt++ ) {
+			list( $aliased_attempt, $alias_map_attempt ) = self::alias_elementor_payload_keys( $pending );
 
-			if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+			if ( empty( $aliased_attempt ) ) {
+				break;
+			}
+
+			if ( $attempt > 1 ) {
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: post ID, 2: field path, 3: attempt number */
+						__( 'Elementor — #%1$d: stubborn %2$s — تلاش مجدد سگمنت %3$d/%4$d', 'polymart-ai' ),
+						absint( $post_id ),
+						$path,
+						$attempt,
+						$max_attempts
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
+				);
+				\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
+			}
+
+			$result = AI_Client::translate_fields(
+				$aliased_attempt,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang,
+				array( 'max_timeout' => 45 )
+			);
+
+			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
+			\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
+
+			if ( is_wp_error( $result ) ) {
 				\PolymartAI\Activity_Logger::log(
 					'warning',
 					sprintf(
-						/* translators: 1: post ID, 2: map path, 3: reason */
-						__( 'Elementor — #%1$d: stubborn رد شد — %2$s (%3$s)', 'polymart-ai' ),
+						/* translators: 1: post ID, 2: field path, 3: attempt, 4: error */
+						__( 'Elementor — #%1$d: stubborn %2$s — خطای API (تلاش %3$d): %4$s', 'polymart-ai' ),
 						absint( $post_id ),
-						$map_path,
-						'' === $translated ? 'empty' : 'persian'
+						$path,
+						$attempt,
+						\PolymartAI\Activity_Logger::humanize_api_error_message( $result->get_error_message() )
 					),
-					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
+					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
 				);
-				$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+
+				foreach ( array_keys( $pending ) as $pending_key ) {
+					$pending_key = (string) $pending_key;
+
+					if ( self::elementor_path_is_segment( $pending_key ) ) {
+						$seg_failures[ $pending_key ] = absint( $seg_failures[ $pending_key ] ?? 0 ) + 1;
+					} else {
+						$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+					}
+				}
+
 				continue;
 			}
 
-			$source_snippet = (string) ( $batch[ $map_path ] ?? $source_payload[ $map_path ] ?? $text );
-			if ( preg_match( '/^(.+)::__(?:part|seg)\d+$/', $map_path, $matches ) ) {
-				$source_snippet = (string) ( $batch[ $map_path ] ?? $source_payload[ $matches[1] ] ?? $text );
-			}
+			$raw_mapped = self::unmap_elementor_aliases(
+				is_array( $result ) ? $result : array(),
+				$alias_map_attempt
+			);
+			$field_map = self::merge_elementor_api_translations_into_map( $raw_mapped, $source_payload );
 
-			if ( ! self::elementor_map_value_is_valid_translation( $map_path, $source_snippet, $translated ) ) {
-				\PolymartAI\Activity_Logger::log(
-					'warning',
-					sprintf(
-						/* translators: 1: post ID, 2: map path */
-						__( 'Elementor — #%1$d: stubborn رد شد — %2$s (unchanged/invalid)', 'polymart-ai' ),
-						absint( $post_id ),
-						$map_path
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
-				);
-				continue;
-			}
+			foreach ( $field_map as $map_path => $translated ) {
+				$map_path   = (string) $map_path;
+				$translated = trim( (string) $translated );
 
-			$map[ $map_path ] = $translated;
-			$touched          = true;
+				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: map path, 3: reason */
+							__( 'Elementor — #%1$d: stubborn رد شد — %2$s (%3$s)', 'polymart-ai' ),
+							absint( $post_id ),
+							$map_path,
+							'' === $translated ? 'empty' : 'persian'
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
+					);
+
+					if ( self::elementor_path_is_segment( $map_path ) ) {
+						$seg_failures[ $map_path ] = absint( $seg_failures[ $map_path ] ?? 0 ) + 1;
+					} else {
+						$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+					}
+					continue;
+				}
+
+				$source_snippet = (string) ( $pending[ $map_path ] ?? $batch[ $map_path ] ?? $source_payload[ $map_path ] ?? $text );
+				if ( preg_match( '/^(.+)::__(?:part|seg)\d+$/', $map_path, $matches ) ) {
+					$source_snippet = (string) ( $pending[ $map_path ] ?? $batch[ $map_path ] ?? $source_payload[ $matches[1] ] ?? $text );
+				}
+
+				if ( ! self::elementor_map_value_is_valid_translation( $map_path, $source_snippet, $translated ) ) {
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: map path */
+							__( 'Elementor — #%1$d: stubborn رد شد — %2$s (unchanged/invalid)', 'polymart-ai' ),
+							absint( $post_id ),
+							$map_path
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
+					);
+
+					if ( self::elementor_path_is_segment( $map_path ) ) {
+						$seg_failures[ $map_path ] = absint( $seg_failures[ $map_path ] ?? 0 ) + 1;
+					}
+					continue;
+				}
+
+				$map[ $map_path ] = $translated;
+				$touched          = true;
+				unset( $pending[ $map_path ], $seg_failures[ $map_path ] );
+			}
 		}
+
+		foreach ( $pending as $pending_key => $pending_text ) {
+			$pending_key  = (string) $pending_key;
+			$pending_text = (string) $pending_text;
+
+			if ( ! self::elementor_path_is_segment( $pending_key ) ) {
+				continue;
+			}
+
+			if ( absint( $seg_failures[ $pending_key ] ?? 0 ) >= $max_attempts ) {
+				self::apply_elementor_segment_source_fallback( $pending_key, $pending_text, $map, $state );
+				$touched = true;
+				unset( $pending[ $pending_key ], $seg_failures[ $pending_key ] );
+			}
+		}
+
+		$state['elementor_segment_failures'] = $seg_failures;
 
 		$map                    = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$map                    = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
 		$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
 		$state['elementor_map'] = $map;
+
+		if ( $touched ) {
+			self::remember_elementor_segment_progress( $post_id, $lang, $state, $map, $source_payload );
+		}
 
 		if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
 			$completed = true;
