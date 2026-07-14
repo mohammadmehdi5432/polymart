@@ -4303,6 +4303,7 @@ final class Post_Translator {
 			'elementor_seg_map'              => array(),
 			'elementor_gap_fill_finished_keys' => array(),
 			'elementor_gap_fill_scheduled_keys' => array(),
+			'elementor_primary_batches_done'  => 0,
 			'elementor_chunk_index'          => 0,
 			'elementor_chunks_total'      => 0,
 			'elementor_slices_completed'  => 0,
@@ -4524,6 +4525,39 @@ final class Post_Translator {
 				'total'  => $total,
 			)
 		);
+
+		if ( $total > 0 && $cursor >= $total ) {
+			self::persist_elementor_primary_batches_done( $post_id, $lang, $total );
+		}
+	}
+
+	/**
+	 * Immutable marker: primary Elementor API batches (e.g. 24/24) are finished.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @param int    $total   Completed primary batch count.
+	 * @return void
+	 */
+	private static function persist_elementor_primary_batches_done( $post_id, $lang, $total ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$total   = max( 1, absint( $total ) );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		$partial = self::get_job_partial_state( $post_id, $lang );
+		$partial = is_array( $partial ) ? $partial : array();
+
+		$partial['phase']                          = 'elementor';
+		$partial['elementor_primary_batches_done'] = $total;
+		$partial['elementor_chunks_total']         = max( absint( $partial['elementor_chunks_total'] ?? 0 ), $total );
+		$partial['elementor_chunk_index']          = max( absint( $partial['elementor_chunk_index'] ?? 0 ), $total );
+		$partial['elementor_slices_completed']     = max( absint( $partial['elementor_slices_completed'] ?? 0 ), $total );
+
+		self::save_job_partial_state( $post_id, $lang, $partial );
 	}
 
 	/**
@@ -4876,7 +4910,74 @@ final class Post_Translator {
 		$cursor = is_array( $stored ) ? absint( $stored['cursor'] ?? 0 ) : absint( $stored );
 		$total  = is_array( $stored ) ? absint( $stored['total'] ?? 0 ) : 0;
 
-		return $total > 0 && $cursor >= $total;
+		if ( $total > 0 && $cursor >= $total ) {
+			return true;
+		}
+
+		// Durable hand-off flag survives accidental cursor clears during gap-fill/stubborn.
+		$state       = self::get_job_partial_state( $post_id, $lang );
+		$primary_done = is_array( $state ) ? absint( $state['elementor_primary_batches_done'] ?? 0 ) : 0;
+		$chunk_total  = is_array( $state ) ? absint( $state['elementor_chunks_total'] ?? 0 ) : 0;
+		$chunk_total  = max( $chunk_total, $total, $primary_done );
+
+		return $primary_done > 0 && $chunk_total > 0 && $primary_done >= $chunk_total;
+	}
+
+	/**
+	 * Whether the job has finished primary API batches and is in gap-fill/stubborn hand-off.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Partial state.
+	 * @return bool
+	 */
+	private static function elementor_in_gap_fill_handoff( $post_id, $lang, array $state = array() ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( ! empty( $state['elementor_gap_fill'] ) || ! empty( $state['elementor_gap_fill_stubborn_only'] ) ) {
+			return true;
+		}
+
+		return self::elementor_job_primary_batches_exhausted( $post_id, $lang );
+	}
+
+	/**
+	 * Ensure gap-fill/stubborn hand-off state is active after primary 24/24.
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, mixed>  $state          Partial state (by reference).
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string> $map            Translation map.
+	 * @param int                   $progress_total Primary batch total.
+	 * @return void
+	 */
+	private static function ensure_elementor_stubborn_handoff( $post_id, $lang, array &$state, array $source_payload, array $map, $progress_total ) {
+		$post_id        = absint( $post_id );
+		$lang           = sanitize_key( (string) $lang );
+		$progress_total = max( 1, absint( $progress_total ) );
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining      = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		if ( empty( $remaining ) ) {
+			return;
+		}
+
+		$state['elementor_gap_fill']               = true;
+		$state['elementor_primary_batches_done']   = $progress_total;
+		$state['elementor_chunks_total']           = $progress_total;
+		$state['elementor_chunk_index']            = $progress_total;
+		$state['elementor_slices_completed']       = $progress_total;
+		$state['elementor_gap_fill_stubborn_only'] = true;
+		$state['elementor_gap_fill_total']         = max(
+			1,
+			absint( $state['elementor_gap_fill_total'] ?? 0 ),
+			absint( $state['elementor_gap_fill_done'] ?? 0 )
+		);
+
+		self::write_elementor_slice_cursor( $post_id, $lang, $progress_total, $progress_total );
+		self::persist_elementor_primary_batches_done( $post_id, $lang, $progress_total );
 	}
 
 	/**
@@ -5943,6 +6044,11 @@ final class Post_Translator {
 
 		$state     = self::get_job_partial_state( $post_id, $lang );
 		$state     = is_array( $state ) ? $state : array();
+
+		if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			return false;
+		}
+
 		$map       = self::merge_elementor_job_path_map( $post_id, $lang, $data, $state );
 		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$source    = self::collect_elementor_translation_payload( $data );
@@ -5960,10 +6066,16 @@ final class Post_Translator {
 		$chunk_total      = max( 1, count( $all_chunks ) );
 		$cursor           = self::resolve_elementor_slice_cursor( $post_id, $lang, $data, $hydrated_state );
 		$pending_chunks   = count( array_slice( $all_chunks, $cursor ) );
+		$cursor_at_end    = $stored_total > 0 && $cursor >= $stored_total;
+
+		// Primary schedule finished but stubborn/gap-fill fields remain — not stale.
+		if ( $cursor_at_end && count( $remaining ) > 0 ) {
+			return false;
+		}
 
 		$stale = $progress_done > $translated_count
 			|| $stored_total > $chunk_total
-			|| ( 0 === $pending_chunks && count( $remaining ) > 0 );
+			|| ( 0 === $pending_chunks && count( $remaining ) > 0 && ! $cursor_at_end );
 
 		if ( ! $stale ) {
 			return false;
@@ -6932,7 +7044,9 @@ final class Post_Translator {
 		}
 
 		if ( empty( $chunks ) ) {
-			if ( ! empty( $payload ) ) {
+			$in_handoff = self::elementor_in_gap_fill_handoff( $post_id, $lang, $state );
+
+			if ( ! $in_handoff && ! empty( $payload ) ) {
 				self::repair_stale_elementor_job_state( $post_id, $lang );
 				$state       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 				$chunk_queue = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
@@ -6942,7 +7056,19 @@ final class Post_Translator {
 				$state['elementor_chunks_total'] = $progress_total;
 			}
 
-			if ( empty( $chunks ) ) {
+			if ( empty( $chunks ) && $in_handoff ) {
+				$progress_total = max(
+					absint( $state['elementor_primary_batches_done'] ?? 0 ),
+					self::read_elementor_slice_cursor_total( $post_id, $lang ),
+					absint( $state['elementor_chunks_total'] ?? 0 ),
+					absint( $progress_total ),
+					1
+				);
+				self::ensure_elementor_stubborn_handoff( $post_id, $lang, $state, $source_payload, $map, $progress_total );
+				self::save_job_partial_state( $post_id, $lang, $state );
+			}
+
+			if ( empty( $chunks ) && ! $in_handoff ) {
 				if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
 					\PolymartAI\Activity_Logger::log(
 						'warning',
@@ -7617,7 +7743,7 @@ final class Post_Translator {
 				self::filter_remaining_elementor_payload( $source_payload, $map, $stubborn_skipped )
 			);
 
-			if ( $stubborn_left > 0 && $stubborn_left <= 12 ) {
+			if ( $stubborn_left > 0 ) {
 				$stubborn_result = self::translate_elementor_gap_fill_stubborn_fields(
 					$post_id,
 					$lang,
@@ -9663,6 +9789,30 @@ final class Post_Translator {
 		$collapsed      = self::collapse_duplicate_elementor_payload( $source_payload );
 		$all_chunks     = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
 		$total          = max( 1, count( $all_chunks ) );
+
+		// Primary 24/24 is immutable — never re-queue base chunks during gap-fill/stubborn.
+		if ( self::elementor_in_gap_fill_handoff( $post_id, $lang, $state ) ) {
+			$stored_total  = max(
+				$total,
+				self::read_elementor_slice_cursor_total( $post_id, $lang ),
+				absint( $state['elementor_primary_batches_done'] ?? 0 ),
+				absint( $state['elementor_chunks_total'] ?? 0 ),
+				1
+			);
+			$stored_cursor = max(
+				$stored_total,
+				self::read_elementor_slice_cursor( $post_id, $lang ),
+				absint( $state['elementor_primary_batches_done'] ?? 0 )
+			);
+
+			return array(
+				'all'     => $all_chunks,
+				'pending' => array(),
+				'total'   => $stored_total,
+				'cursor'  => $stored_cursor,
+				'mirrors' => $collapsed['mirrors'],
+			);
+		}
 
 		$map     = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 		$map     = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
