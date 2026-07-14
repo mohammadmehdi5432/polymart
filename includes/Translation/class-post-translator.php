@@ -6569,6 +6569,9 @@ final class Post_Translator {
 			if ( function_exists( 'set_time_limit' ) ) {
 				@set_time_limit( max( 120, $budget * 50 ) );
 			}
+
+			$gap_fill_total = $gap_fill_done + count( $chunks );
+			$state['elementor_gap_fill_total'] = max( 1, $gap_fill_total );
 		}
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
@@ -6978,6 +6981,49 @@ final class Post_Translator {
 
 				if ( $delay > 0 ) {
 					\PolymartAI\Activity_Logger::sleep_with_worker_heartbeat( max( 1, min( 20, $delay ) ) );
+				}
+			}
+		}
+
+		if ( $gap_fill_mode ) {
+			$stubborn_skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+			$stubborn_left    = count(
+				self::filter_remaining_elementor_payload( $source_payload, $map, $stubborn_skipped )
+			);
+
+			if ( $stubborn_left > 0 && $stubborn_left <= 12 ) {
+				$stubborn_done = self::translate_elementor_gap_fill_stubborn_fields(
+					$post_id,
+					$lang,
+					$data,
+					$state,
+					$map,
+					$source_payload,
+					$text_mirrors,
+					$api_key,
+					$api_endpoint,
+					$ai_model,
+					min( 2, $stubborn_left )
+				);
+
+				if ( $stubborn_done > 0 ) {
+					$state['elementor_gap_fill_done'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + $stubborn_done;
+					$committed                        = self::commit_elementor_chunk_progress_to_site(
+						$post_id,
+						$lang,
+						$data,
+						$state,
+						$map,
+						$progress_total,
+						$progress_total,
+						true
+					);
+
+					if ( is_wp_error( $committed ) ) {
+						return $committed;
+					}
+
+					self::touch_translation_lock( $post_id, $lang );
 				}
 			}
 		}
@@ -7484,6 +7530,18 @@ final class Post_Translator {
 
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
 		if ( ! empty( $seg_lookup ) ) {
+			if (
+				isset( $map[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
+			) {
+				return array(
+					'path'   => $path,
+					'reason' => 'collapsed_base_ok',
+					'detail' => 'full field in map but segments listed separately',
+					'chars'  => $chars,
+				);
+			}
+
 			$missing = array();
 			$bad     = array();
 
@@ -7893,7 +7951,229 @@ final class Post_Translator {
 			return array();
 		}
 
+		$remaining = self::sort_elementor_gap_fill_remaining( $remaining );
+
 		return self::chunk_elementor_gap_fill_payload( $remaining );
+	}
+
+	/**
+	 * Short UI strings first — they unblock gap-fill faster than long HTML blocks.
+	 *
+	 * @param array<string, string> $remaining Path => source text.
+	 * @return array<string, string>
+	 */
+	private static function sort_elementor_gap_fill_remaining( array $remaining ) {
+		uasort(
+			$remaining,
+			static function ( $a, $b ) {
+				$left  = self::utf8_strlen( (string) $a );
+				$right = self::utf8_strlen( (string) $b );
+
+				if ( $left === $right ) {
+					return 0;
+				}
+
+				return $left <=> $right;
+			}
+		);
+
+		return $remaining;
+	}
+
+	/**
+	 * Direct single-field API pass for stubborn gap-fill paths (not_in_map / missing_segments).
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, mixed>  $source_data    Source Elementor tree.
+	 * @param array<string, mixed>  $state          Partial state (by reference).
+	 * @param array<string, string> $map            Translation map (by reference).
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string[]> $text_mirrors Mirror lookup.
+	 * @param string                $api_key        API key.
+	 * @param string                $api_endpoint   API endpoint.
+	 * @param string                $ai_model       Model id.
+	 * @param int                   $max_fields     Max base fields per tick.
+	 * @return int Number of base fields completed.
+	 */
+	private static function translate_elementor_gap_fill_stubborn_fields(
+		$post_id,
+		$lang,
+		array $source_data,
+		array &$state,
+		array &$map,
+		array $source_payload,
+		array $text_mirrors,
+		$api_key,
+		$api_endpoint,
+		$ai_model,
+		$max_fields = 2
+	) {
+		$post_id    = absint( $post_id );
+		$lang       = sanitize_key( (string) $lang );
+		$max_fields = max( 1, min( 4, absint( $max_fields ) ) );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return 0;
+		}
+
+		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining = self::sort_elementor_gap_fill_remaining(
+			self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
+		);
+
+		if ( empty( $remaining ) ) {
+			return 0;
+		}
+
+		$failures = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
+		$done     = 0;
+
+		foreach ( array_slice( $remaining, 0, $max_fields, true ) as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+				++$done;
+				continue;
+			}
+
+			$field_keys = self::expand_elementor_payload_for_ai( array( $path => $text ) );
+			$seg_count  = max( 1, count( $field_keys ) );
+			$ai_options = array(
+				'max_timeout' => min( 120, 40 + ( $seg_count * 18 ) ),
+			);
+
+			list( $aliased, $alias_map ) = self::alias_elementor_payload_keys( $field_keys );
+
+			if ( empty( $aliased ) ) {
+				continue;
+			}
+
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: 1: post ID, 2: field path, 3: API parts, 4: char count */
+					__( 'Elementor — #%1$d: ترجمه مستقیم فیلد stubborn — %2$s (%3$d بخش API، %4$d نویسه)', 'polymart-ai' ),
+					$post_id,
+					$path,
+					$seg_count,
+					self::utf8_strlen( $text )
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
+			);
+
+			\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
+
+			$result = AI_Client::translate_fields(
+				$aliased,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				$lang,
+				$ai_options
+			);
+
+			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
+
+			if ( is_wp_error( $result ) ) {
+				\PolymartAI\Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post ID, 2: field path, 3: error */
+						__( 'Elementor — #%1$d: stubborn %2$s — خطای API: %3$s', 'polymart-ai' ),
+						$post_id,
+						$path,
+						\PolymartAI\Activity_Logger::humanize_api_error_message( $result->get_error_message() )
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
+				);
+				continue;
+			}
+
+			$raw_mapped = self::unmap_elementor_aliases(
+				is_array( $result ) ? $result : array(),
+				$alias_map
+			);
+			$field_map  = array_merge(
+				$raw_mapped,
+				self::collapse_payload_parts( $raw_mapped )
+			);
+
+			foreach ( $field_map as $map_path => $translated ) {
+				$map_path   = (string) $map_path;
+				$translated = trim( (string) $translated );
+
+				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: map path, 3: reason */
+							__( 'Elementor — #%1$d: stubborn رد شد — %2$s (%3$s)', 'polymart-ai' ),
+							$post_id,
+							$map_path,
+							'' === $translated ? 'empty' : 'persian'
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
+					);
+					$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+					continue;
+				}
+
+				$source_snippet = (string) ( $field_keys[ $map_path ] ?? $source_payload[ $map_path ] ?? $text );
+				if ( preg_match( '/^(.+)::__(?:part|seg)\d+$/', $map_path, $matches ) ) {
+					$source_snippet = (string) ( $field_keys[ $map_path ] ?? $source_payload[ $matches[1] ] ?? $text );
+				}
+
+				if ( ! self::elementor_map_value_is_valid_translation( $map_path, $source_snippet, $translated ) ) {
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: map path */
+							__( 'Elementor — #%1$d: stubborn رد شد — %2$s (unchanged/invalid)', 'polymart-ai' ),
+							$post_id,
+							$map_path
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
+					);
+					continue;
+				}
+
+				$map[ $map_path ] = $translated;
+			}
+
+			$map                    = self::expand_elementor_map_mirrors( $map, $text_mirrors );
+			$map                    = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+			$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
+			$state['elementor_map'] = $map;
+
+			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+				++$done;
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: post ID, 2: field path */
+						__( 'Elementor — #%1$d: stubborn تکمیل شد — %2$s', 'polymart-ai' ),
+						$post_id,
+						$path
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
+				);
+			} else {
+				self::log_elementor_remaining_field_diagnostics(
+					$post_id,
+					$lang,
+					$source_payload,
+					$map,
+					$skipped,
+					'stubborn-incomplete-' . $path
+				);
+			}
+		}
+
+		$state['elementor_failures'] = $failures;
+
+		return $done;
 	}
 
 	/**
