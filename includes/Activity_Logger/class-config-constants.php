@@ -48,6 +48,8 @@ final class Config_Constants {
 	const AS_CRON_SAFETY_SEC   = 3;
 	/** Self-rescheduling keep-alive between AS batches (when wp-cron is available). */
 	const CRON_FAST_INTERVAL_SEC = 12;
+	/** Idle age before wp-cron runs the same recovery path as the admin ensure button. */
+	const CRON_HEAL_STALE_SEC    = 35;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per Action Scheduler / cron batch. */
 	const CRON_STEP_BUDGET_SEC = 55;

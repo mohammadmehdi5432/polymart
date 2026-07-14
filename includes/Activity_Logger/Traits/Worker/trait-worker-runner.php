@@ -291,32 +291,55 @@ trait Trait_Worker_Runner {
 	}
 
 	public static function maybe_heal_background_worker() {
+		if (
+			! wp_doing_cron()
+			&& ! self::$trusted_loopback_tick
+			&& ! self::$trusted_job_tick
+			&& ! self::$trusted_as_tick
+			&& ! self::$trusted_admin_worker
+		) {
+			return null;
+		}
+
 		$job = get_option( self::JOB_OPTION, array() );
 
 		if ( ! is_array( $job ) || 'running' !== ( $job['status'] ?? '' ) ) {
-			return;
+			self::unschedule_background_worker();
+			return null;
 		}
 
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::ensure_scheduled();
 
+		$job  = self::get_job_raw();
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-		$last = max(
-			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 )
-		);
+		$last = self::get_worker_real_activity_at( $job );
 		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
+		$stale_sec = max(
+			25,
+			min(
+				90,
+				(int) apply_filters( 'polymart_ai_cron_heal_stale_sec', self::CRON_HEAL_STALE_SEC )
+			)
+		);
+
 		if ( $age >= self::PICK_STALL_SEC || self::is_step_lock_held_fresh() ) {
-			$job = self::get_job_raw();
 			if ( self::recover_stalled_job_picker( $job, $lang, false ) ) {
 				self::save_job( $job );
 			}
 		}
 
-		if ( $age >= self::get_ensure_inline_idle_sec() || ! Job_Action_Scheduler::has_pending_or_running() ) {
-			self::keep_alive_as_worker();
+		// Stalled worker: run the same recovery path as the auto-translate "ensure" REST call.
+		if ( $age >= $stale_sec ) {
+			return self::ensure_background_worker();
 		}
+
+		if ( $age >= self::get_ensure_inline_idle_sec() || ! Job_Action_Scheduler::has_pending_or_running() ) {
+			return self::keep_alive_as_worker();
+		}
+
+		return self::normalize_job_for_response( $job, false );
 	}
 
 	private static function get_next_worker_cron() {
@@ -335,11 +358,17 @@ trait Trait_Worker_Runner {
 			return;
 		}
 
-		if ( wp_next_scheduled( self::CRON_PULSE_HOOK ) ) {
+		$next = wp_next_scheduled( self::CRON_PULSE_HOOK );
+
+		if ( ! $next ) {
+			wp_schedule_event( time() + 5, self::CRON_PULSE_SCHEDULE, self::CRON_PULSE_HOOK );
 			return;
 		}
 
-		wp_schedule_event( time() + 5, self::CRON_PULSE_SCHEDULE, self::CRON_PULSE_HOOK );
+		// Recurring pulse missed beats — schedule an immediate safety tick on wp-cron.
+		if ( ( (int) $next - time() ) > 90 && ! wp_next_scheduled( self::CRON_HOOK ) ) {
+			wp_schedule_single_event( time() + 2, self::CRON_HOOK );
+		}
 	}
 
 	private static function clear_chain_events() {

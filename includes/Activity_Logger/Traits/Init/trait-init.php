@@ -26,8 +26,8 @@ trait Trait_Init {
 
 		add_filter( 'cron_schedules', array( __CLASS__, 'register_cron_schedules' ) );
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
-		add_action( self::CRON_HOOK, array( __CLASS__, 'keep_alive_as_worker' ) );
-		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'keep_alive_as_worker' ) );
+		add_action( self::CRON_HOOK, array( __CLASS__, 'maybe_heal_background_worker' ) );
+		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'maybe_heal_background_worker' ) );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_during_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_worker_heartbeat', array( __CLASS__, 'on_ai_http_heartbeat' ) );
