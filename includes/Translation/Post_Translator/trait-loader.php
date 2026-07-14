@@ -9,7 +9,8 @@
 
 defined( 'ABSPATH' ) || exit;
 
-require_once dirname( __DIR__, 2 ) . '/trait-path.php';
+$polymart_ai_trait_path = ( defined( 'POLYMART_AI_PLUGIN_DIR' ) ? POLYMART_AI_PLUGIN_DIR : dirname( __DIR__, 2 ) . '/' ) . 'includes/trait-path.php';
+require_once $polymart_ai_trait_path;
 
 $traits_root = polymart_ai_resolve_traits_root( __DIR__ );
 
