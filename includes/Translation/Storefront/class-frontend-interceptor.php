@@ -8,6 +8,8 @@
 namespace PolymartAI\Translation\Storefront;
 
 use PolymartAI\Routing\Url_Router;
+use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Post_Translator;
 
 defined( 'ABSPATH' ) || exit;
 

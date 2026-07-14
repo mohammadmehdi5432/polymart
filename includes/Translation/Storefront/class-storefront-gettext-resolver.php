@@ -8,6 +8,8 @@
 namespace PolymartAI\Translation\Storefront;
 
 use PolymartAI\Language_Registry;
+use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\UI_String\UI_String_Registry;
 
 defined( 'ABSPATH' ) || exit;
 
