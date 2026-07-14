@@ -4829,12 +4829,41 @@ final class Post_Translator {
 			$gap_done  = absint( $state['elementor_gap_fill_done'] ?? 0 );
 			$gap_total = max( 1, absint( $state['elementor_gap_fill_total'] ?? 0 ), $gap_done );
 
-			$marker .= ' · ' . sprintf(
-				/* translators: 1: completed gap-fill batches, 2: total gap-fill batches */
-				__( 'تکمیل %1$d/%2$d', 'polymart-ai' ),
-				min( $gap_done, $gap_total ),
-				$gap_total
-			);
+			if ( ! empty( $state['elementor_gap_fill_stubborn_only'] ) ) {
+				$stubborn_left = 0;
+				$raw           = get_post_meta( $post_id, '_elementor_data', true );
+
+				if ( is_string( $raw ) && '' !== trim( $raw ) ) {
+					$data = json_decode( $raw, true );
+
+					if ( is_array( $data ) ) {
+						$source_payload = self::collect_elementor_translation_payload( $data );
+						$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+						$remaining      = self::filter_remaining_elementor_payload( $source_payload, $state['elementor_map'] ?? array(), $skipped );
+
+						foreach ( $remaining as $path => $text ) {
+							if ( self::stubborn_elementor_field_is_long( (string) $path, (string) $text ) ) {
+								++$stubborn_left;
+							}
+						}
+					}
+				}
+
+				$marker .= ' · ' . sprintf(
+					/* translators: 1: completed short gap-fill batches, 2: total short gap-fill batches, 3: stubborn field count */
+					__( 'تکمیل %1$d/%2$d · stubborn: %3$d فیلد', 'polymart-ai' ),
+					min( $gap_done, $gap_total ),
+					$gap_total,
+					$stubborn_left
+				);
+			} else {
+				$marker .= ' · ' . sprintf(
+					/* translators: 1: completed gap-fill batches, 2: total gap-fill batches */
+					__( 'تکمیل %1$d/%2$d', 'polymart-ai' ),
+					min( $gap_done, $gap_total ),
+					$gap_total
+				);
+			}
 		}
 
 		return $marker;
@@ -6391,23 +6420,33 @@ final class Post_Translator {
 					$resuming_gap_fill = $stored_total > 0 && $stored_cursor >= $stored_total;
 
 					if ( $resuming_gap_fill ) {
-						$state['elementor_gap_fill_total'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks );
+						self::resolve_elementor_gap_fill_totals( $state, $gap_chunks );
 					} else {
-						$state['elementor_gap_fill_total'] = count( $gap_chunks );
+						$state['elementor_gap_fill_total'] = max( 1, count( $gap_chunks ) );
 						$state['elementor_gap_fill_done']  = 0;
 
 						$remaining_count = count(
 							self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
 						);
+						$stubborn_count  = count(
+							array_filter(
+								self::filter_remaining_elementor_payload( $source_payload, $map, $skipped ),
+								static function ( $text, $path ) {
+									return self::stubborn_elementor_field_is_long( (string) $path, (string) $text );
+								},
+								ARRAY_FILTER_USE_BOTH
+							)
+						);
 
 						\PolymartAI\Activity_Logger::log(
 							'info',
 							sprintf(
-								/* translators: 1: post ID, 2: remaining fields, 3: gap batches */
-								__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد در %3$d بخش', 'polymart-ai' ),
+								/* translators: 1: post ID, 2: remaining fields, 3: gap batches, 4: stubborn field count */
+								__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد (%3$d بخش کوتاه + %4$d بلند/stubborn)', 'polymart-ai' ),
 								$post_id,
 								$remaining_count,
-								count( $gap_chunks )
+								count( $gap_chunks ),
+								$stubborn_count
 							),
 							array( 'post_id' => $post_id, 'lang' => $lang )
 						);
@@ -6422,12 +6461,25 @@ final class Post_Translator {
 						);
 					}
 				} else {
-					$state['elementor_gap_fill_total'] = absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks );
+					self::resolve_elementor_gap_fill_totals( $state, $gap_chunks );
 				}
 
 				$state['elementor_gap_fill'] = true;
 
-				if ( self::elementor_gap_fill_remaining_is_long_tail_only( $source_payload, $map, $skipped ) ) {
+				$stubborn_remaining = count(
+					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
+				) - count( self::filter_elementor_gap_fill_batch_remaining(
+					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
+				) );
+
+				if ( empty( $gap_chunks ) && $stubborn_remaining > 0 ) {
+					$chunks                                    = array();
+					$state['elementor_gap_fill_stubborn_only'] = true;
+					$state['elementor_gap_fill_total']         = max(
+						absint( $state['elementor_gap_fill_done'] ?? 0 ),
+						absint( $state['elementor_gap_fill_total'] ?? 0 )
+					);
+				} elseif ( self::elementor_gap_fill_remaining_is_long_tail_only( $source_payload, $map, $skipped ) ) {
 					$chunks                                  = array();
 					$state['elementor_gap_fill_stubborn_only'] = true;
 				} else {
@@ -6630,10 +6682,13 @@ final class Post_Translator {
 				@set_time_limit( max( 120, $budget * 50 ) );
 			}
 
-			$gap_fill_total = $gap_fill_done + count( $chunks );
-			$state['elementor_gap_fill_total'] = max( 1, $gap_fill_total );
+			$gap_schedule    = self::resolve_elementor_gap_fill_totals( $state, $chunks );
+			$gap_fill_done   = (int) $gap_schedule['done'];
+			$gap_fill_total  = (int) $gap_schedule['total'];
 
-			if ( empty( $chunks ) && self::elementor_gap_fill_remaining_is_long_tail_only( $source_payload, $map, $skipped_list ) ) {
+			if ( empty( $chunks ) && ! empty( $state['elementor_gap_fill_stubborn_only'] ) ) {
+				$state['elementor_gap_fill_stubborn_only'] = true;
+			} elseif ( empty( $chunks ) && self::elementor_gap_fill_remaining_is_long_tail_only( $source_payload, $map, $skipped_list ) ) {
 				$state['elementor_gap_fill_stubborn_only'] = true;
 			}
 		}
@@ -6711,19 +6766,43 @@ final class Post_Translator {
 				$remaining_fields = count(
 					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped_list )
 				);
-
-				\PolymartAI\Activity_Logger::log(
-					'info',
-					sprintf(
-						/* translators: 1: post label, 2: gap chunk index, 3: gap chunk total, 4: remaining fields */
-						__( 'Elementor — %1$s: تکمیل نهایی — ارسال بخش %2$d از %3$d به API آروان (%4$d فیلد باقی)…', 'polymart-ai' ),
-						$post_label,
-						$attempt_index,
-						$attempt_total,
-						$remaining_fields
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang )
+				$stubborn_fields  = count(
+					array_filter(
+						self::filter_remaining_elementor_payload( $source_payload, $map, $skipped_list ),
+						static function ( $text, $path ) {
+							return self::stubborn_elementor_field_is_long( (string) $path, (string) $text );
+						},
+						ARRAY_FILTER_USE_BOTH
+					)
 				);
+
+				if ( ! empty( $state['elementor_gap_fill_stubborn_only'] ) ) {
+					\PolymartAI\Activity_Logger::log(
+						'info',
+						sprintf(
+							/* translators: 1: post label, 2: remaining fields, 3: stubborn field count */
+							__( 'Elementor — %1$s: stubborn — %2$d فیلد باقی (%3$d بلند)…', 'polymart-ai' ),
+							$post_label,
+							$remaining_fields,
+							$stubborn_fields
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+				} else {
+					\PolymartAI\Activity_Logger::log(
+						'info',
+						sprintf(
+							/* translators: 1: post label, 2: gap chunk index, 3: gap chunk total, 4: remaining fields, 5: stubborn field count */
+							__( 'Elementor — %1$s: تکمیل نهایی — ارسال بخش %2$d از %3$d (فیلدهای کوتاه) — %4$d فیلد باقی (%5$d بلند/stubborn)…', 'polymart-ai' ),
+							$post_label,
+							$attempt_index,
+							$attempt_total,
+							$remaining_fields,
+							$stubborn_fields
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+				}
 			} else {
 				\PolymartAI\Activity_Logger::log(
 					'info',
@@ -8223,9 +8302,65 @@ final class Post_Translator {
 			return array();
 		}
 
+		$remaining = self::filter_elementor_gap_fill_batch_remaining( $remaining );
+
+		if ( empty( $remaining ) ) {
+			return array();
+		}
+
 		$remaining = self::sort_elementor_gap_fill_remaining( $remaining );
 
 		return self::chunk_elementor_gap_fill_payload( $remaining );
+	}
+
+	/**
+	 * Gap-fill API batches only cover short fields — long/segmented paths use stubborn passes.
+	 *
+	 * @param array<string, string> $remaining Path => source text.
+	 * @return array<string, string>
+	 */
+	private static function filter_elementor_gap_fill_batch_remaining( array $remaining ) {
+		$batch_remaining = array();
+
+		foreach ( $remaining as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( self::stubborn_elementor_field_is_long( $path, $text ) ) {
+				continue;
+			}
+
+			$batch_remaining[ $path ] = $text;
+		}
+
+		return $batch_remaining;
+	}
+
+	/**
+	 * Keep gap-fill batch totals monotonic — never re-sum done + pending every tick.
+	 *
+	 * @param array<string, mixed>        $state  Partial state (by reference).
+	 * @param array<int, array<string, string>> $chunks Pending gap-fill chunks this tick.
+	 * @return array{done: int, total: int, pending: int}
+	 */
+	private static function resolve_elementor_gap_fill_totals( array &$state, array $chunks ) {
+		$done    = absint( $state['elementor_gap_fill_done'] ?? 0 );
+		$total   = absint( $state['elementor_gap_fill_total'] ?? 0 );
+		$pending = count( $chunks );
+
+		if ( $total <= 0 ) {
+			$total = max( 1, $pending );
+		} elseif ( ( $done + $pending ) > $total ) {
+			$total = $done + $pending;
+		}
+
+		$state['elementor_gap_fill_total'] = max( 1, $total );
+
+		return array(
+			'done'    => $done,
+			'total'   => max( 1, $total ),
+			'pending' => $pending,
+		);
 	}
 
 	/**

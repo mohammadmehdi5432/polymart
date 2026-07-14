@@ -2139,8 +2139,13 @@ final class Activity_Logger {
 
 		$marker = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang );
 
-		if ( '' === $marker || ! preg_match( '/^\d+\/\d+$/', $marker ) ) {
+		if ( '' === $marker || ! preg_match( '/^\d+\/\d+/', $marker ) ) {
 			return;
+		}
+
+		// Keep only the primary API slice for the bulk-job option (before any gap-fill suffix).
+		if ( preg_match( '/^(\d+\/\d+)/', $marker, $primary_matches ) ) {
+			$marker = (string) $primary_matches[1];
 		}
 
 		$current    = (string) ( $job['partial_progress'] ?? '' );
@@ -2352,7 +2357,7 @@ final class Activity_Logger {
 	private static function parse_job_phase_progress( $progress ) {
 		$progress = trim( (string) $progress );
 
-		if ( ! preg_match( '/^(\d+)\/(\d+)$/', $progress, $matches ) ) {
+		if ( ! preg_match( '/^(\d+)\/(\d+)/', $progress, $matches ) ) {
 			return null;
 		}
 
