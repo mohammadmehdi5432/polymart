@@ -605,8 +605,67 @@ trait Trait_Storage {
 		return self::$elementor_persian_cache[ $post_id ];
 	}
 
+	public static function elementor_translation_is_storefront_ready( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return true;
+		}
+
+		if ( ! self::should_require_elementor_translation( $post_id ) ) {
+			return true;
+		}
+
+		if ( ! self::has_elementor_persian_content( $post_id ) ) {
+			return true;
+		}
+
+		return self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
+	}
+
 	private static function has_stored_elementor_translation( $post_id, $lang ) {
-		return self::is_elementor_translation_current( $post_id, $lang );
+		return self::elementor_translation_is_storefront_ready( $post_id, $lang );
+	}
+
+	/**
+	 * Drop stale source-hash / finalized markers from partial Elementor runs (pre-finalize bug).
+	 *
+	 * @return bool True when stale completion meta was cleared.
+	 */
+	public static function repair_stale_elementor_completion_meta( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! self::should_require_elementor_translation( $post_id ) || ! self::has_elementor_persian_content( $post_id ) ) {
+			return false;
+		}
+
+		if ( self::elementor_job_has_durable_partial_state( $post_id, $lang ) ) {
+			return false;
+		}
+
+		if ( self::elementor_translation_is_storefront_ready( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$stored_hash = trim( (string) get_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), true ) );
+		$finalized   = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
+
+		if ( '' === $stored_hash && ! is_numeric( $finalized ) ) {
+			return false;
+		}
+
+		delete_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ) );
+		delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
+		unset( self::$elementor_current_cache, self::$elementor_storefront_serve_cache );
+		self::flush_translation_status_cache( $post_id );
+
+		return true;
 	}
 
 }

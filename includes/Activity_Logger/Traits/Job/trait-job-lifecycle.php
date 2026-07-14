@@ -244,6 +244,18 @@ trait Trait_Job_Lifecycle {
 		$total      = $needs_work;
 		$probe_ids  = $issue_ids;
 
+		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
+
+		if ( ! empty( $priority_probe ) ) {
+			$probe_ids = array_values( array_unique( array_merge( $probe_ids, $priority_probe ) ) );
+		}
+
+		$front = absint( get_option( 'page_on_front' ) );
+
+		if ( $front > 0 && Post_Translator::post_needs_translation_work( $front, $lang ) ) {
+			$probe_ids = array_values( array_unique( array_merge( array( $front ), $probe_ids ) ) );
+		}
+
 		if ( $total <= 0 && ! empty( $probe_ids ) ) {
 			$needs_work = max( count( $probe_ids ), $menu_needs );
 			$total      = $needs_work;
@@ -426,8 +438,8 @@ trait Trait_Job_Lifecycle {
 		}
 
 		Job_Action_Scheduler::cancel_all();
-		self::bootstrap_background_worker( true );
-		self::ping_wp_cron( false );
+		self::bootstrap_background_worker( false );
+		self::ping_wp_cron( true );
 		self::log(
 			'info',
 			sprintf(
@@ -536,6 +548,7 @@ trait Trait_Job_Lifecycle {
 
 		$cleared = self::empty_job();
 		$cleared['updated_at'] = time();
+		$cleared['api_cooldown_until'] = null;
 
 		return self::save_job( $cleared );
 	}

@@ -372,16 +372,20 @@ final class Translation_Query {
 	 * @return bool
 	 */
 	private static function post_listing_needs_translation_work( \WP_Post $post, $lang ) {
-		if ( ! Post_Translator::post_has_persian_content( $post ) ) {
-			return false;
-		}
-
 		if ( Post_Translator::post_needs_translation_work( $post->ID, $lang ) ) {
 			return true;
 		}
 
 		if ( Post_Translator::post_is_actionable_for_job( $post->ID, $lang ) ) {
 			return true;
+		}
+
+		if ( Post_Translator::storefront_would_show_persian_source( $post->ID, $lang ) ) {
+			return true;
+		}
+
+		if ( ! Post_Translator::post_has_persian_content( $post ) ) {
+			return false;
 		}
 
 		$status = Post_Translator::get_translation_status( $post->ID, $lang );

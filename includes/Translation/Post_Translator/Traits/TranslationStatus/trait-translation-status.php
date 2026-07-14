@@ -157,6 +157,12 @@ trait Trait_Translation_Status {
 				$status = 'partial';
 			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
 				$status = 'partial';
+			} elseif (
+				self::uses_elementor_builder( $post_id )
+				&& self::has_elementor_persian_content( $post_id )
+				&& ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang )
+			) {
+				$status = 'partial';
 			} elseif ( self::storefront_would_show_persian_source( $post_id, $lang ) ) {
 				$status = 'partial';
 			}
@@ -237,8 +243,7 @@ trait Trait_Translation_Status {
 					'label'      => __( 'بخش‌های Elementor', 'polymart-ai' ),
 					'meta_key'   => self::get_elementor_meta_key( $lang ),
 					'has_source' => true,
-					'translated' => self::has_stored_elementor_translation( $post_id, $lang )
-						&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+					'translated' => self::elementor_translation_is_storefront_ready( $post_id, $lang )
 						&& ! self::elementor_job_has_remaining_payload( $post_id, $lang ),
 				);
 			} else {
