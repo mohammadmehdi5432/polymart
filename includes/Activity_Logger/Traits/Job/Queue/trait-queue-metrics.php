@@ -436,8 +436,7 @@ trait Trait_Queue_Metrics {
 		$job['elementor_priority'] = self::should_prioritize_elementor_partial( $job );
 		$job['elementor_progress_stalled'] = self::is_elementor_progress_stalled( $job );
 		$gap_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
-		$job['elementor_gap_fill_pending'] = $gap_post_id > 0 && '' !== $lang
-			&& Post_Translator::elementor_needs_gap_fill_work( $gap_post_id, $lang );
+		$job['elementor_gap_fill_pending'] = self::resolve_elementor_gap_fill_pending_flag( $job, $lang, $gap_post_id );
 		$job['cli_alive']      = false;
 		$job['cli_spawn_ok']   = false;
 		$job['recent_logs']    = self::get_recent_job_logs( $job, 60 );
@@ -451,10 +450,51 @@ trait Trait_Queue_Metrics {
 		return $job;
 	}
 
+	private static function resolve_elementor_gap_fill_pending_flag( array $job, $lang, $gap_post_id ) {
+		$lang        = sanitize_key( (string) $lang );
+		$gap_post_id = absint( $gap_post_id );
+
+		if ( $gap_post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( self::is_job_poll_request() ) {
+			if ( Post_Translator::is_elementor_translation_finalized( $gap_post_id, $lang ) ) {
+				return false;
+			}
+
+			$state = Post_Translator::get_job_partial_state( $gap_post_id, $lang );
+
+			if ( ! empty( $state['elementor_gap_fill'] ) || ! empty( $state['elementor_gap_fill_stubborn_only'] ) ) {
+				return true;
+			}
+
+			$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
+
+			if (
+				is_array( $parsed )
+				&& $parsed['total'] > 0
+				&& $parsed['done'] >= $parsed['total']
+				&& Post_Translator::elementor_job_primary_batches_exhausted( $gap_post_id, $lang )
+			) {
+				return true;
+			}
+
+			return false;
+		}
+
+		return Post_Translator::elementor_needs_gap_fill_work( $gap_post_id, $lang );
+	}
+
 	private static function get_recent_job_logs( array $job, $limit = 60 ) {
 		$limit   = max( 1, min( 100, absint( $limit ) ) );
+
+		if ( self::is_job_poll_request() ) {
+			$limit = min( $limit, 25 );
+		}
+
 		$started = absint( $job['started_at'] ?? 0 );
-		$logs    = self::get_logs( 200 );
+		$logs    = self::get_logs( self::is_job_poll_request() ? 80 : 200 );
 		$out     = array();
 
 		foreach ( $logs as $entry ) {

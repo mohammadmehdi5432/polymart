@@ -71,7 +71,7 @@ trait Trait_Job_Lifecycle {
 
 		$job = wp_parse_args( $job, self::empty_job() );
 
-		if ( 'running' === ( $job['status'] ?? '' ) ) {
+		if ( 'running' === ( $job['status'] ?? '' ) && ! self::$job_poll_request ) {
 			Job_Action_Scheduler::maybe_heal_ghost_actions_on_poll();
 
 			if ( ! self::get_next_worker_cron() ) {
@@ -80,6 +80,24 @@ trait Trait_Job_Lifecycle {
 		}
 
 		return self::normalize_job_for_response( $job, $deep_sync );
+	}
+
+	public static function mark_job_poll_request() {
+		self::$job_poll_request = true;
+	}
+
+	public static function is_job_poll_request() {
+		return self::$job_poll_request;
+	}
+
+	public static function get_job_for_poll() {
+		self::mark_job_poll_request();
+
+		try {
+			return self::get_job( false );
+		} finally {
+			self::$job_poll_request = false;
+		}
 	}
 
 	private static function get_cron_chain_delay_sec() {

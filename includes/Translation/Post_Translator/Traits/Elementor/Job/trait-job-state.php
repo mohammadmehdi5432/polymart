@@ -188,17 +188,26 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		if ( empty( $state ) ) {
+			$state = self::get_job_partial_state( $post_id, $lang );
+		}
+
+		if (
+			( ! empty( $state['elementor_gap_fill'] ) || ! empty( $state['elementor_gap_fill_stubborn_only'] ) )
+			&& ! self::is_elementor_translation_finalized( $post_id, $lang )
+		) {
+			return true;
+		}
+
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			return false;
 		}
 
-		if ( empty( $state ) ) {
-			$state = self::hydrate_elementor_job_partial_state(
-				$post_id,
-				$lang,
-				self::get_job_partial_state( $post_id, $lang )
-			);
-		}
+		$state = self::hydrate_elementor_job_partial_state(
+			$post_id,
+			$lang,
+			$state
+		);
 
 		$progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
 		$done     = self::resolve_elementor_done_count( $state, $progress['done'], $post_id, $lang );
@@ -372,16 +381,7 @@ trait Trait_Job_State {
 			! empty( $state['elementor_gap_fill'] )
 			|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
 		) {
-			if ( self::is_elementor_translation_finalized( $post_id, $lang ) ) {
-				return false;
-			}
-
-			if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
-				return true;
-			}
-
-			// Map is empty but finalize has not run yet — one more worker tick must persist.
-			return true;
+			return ! self::is_elementor_translation_finalized( $post_id, $lang );
 		}
 
 		if ( ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {

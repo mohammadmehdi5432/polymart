@@ -608,8 +608,13 @@ trait Trait_Worker_Runner {
 				|| $age >= self::PICK_STALL_SEC
 				|| ( $as_pending && ! $slice_active && $age >= 20 );
 			$force_inline   = ! $slice_active && $needs_recovery;
+			$as_status      = Job_Action_Scheduler::status_payload();
 
-			Job_Action_Scheduler::run_queue_inline( $force_inline );
+			if ( ! empty( $as_status['slice_active'] ) && ! $worker_dead ) {
+				Job_Action_Scheduler::enqueue_next( true, 0 );
+			} else {
+				Job_Action_Scheduler::run_queue_inline( $force_inline );
+			}
 
 			$job = self::get_job_raw();
 			$job['worker_inline_tick'] = true;

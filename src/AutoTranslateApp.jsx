@@ -575,7 +575,7 @@ export default function AutoTranslateApp() {
 
   const loadJob = useCallback(async () => {
     try {
-      const data = await fetchJob();
+      const data = await fetchJob({ initial: true });
       pollErrorCountRef.current = 0;
       const merged = mergeJobSnapshot(null, data);
       setJob(merged);

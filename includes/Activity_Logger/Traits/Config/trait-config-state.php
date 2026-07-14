@@ -52,4 +52,9 @@ trait Trait_Config_State {
 	 * @var bool
 	 */
 	private static $skip_chain_after_tick = false;
+	/**
+	 * True during lightweight GET /translation-job polls (no JSON audits).
+	 * @var bool
+	 */
+	private static $job_poll_request = false;
 }

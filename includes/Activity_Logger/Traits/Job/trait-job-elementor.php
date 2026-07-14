@@ -25,6 +25,10 @@ trait Trait_Job_Elementor {
 			return $job;
 		}
 
+		if ( self::is_job_poll_request() ) {
+			return $job;
+		}
+
 		$post_id = absint( $job['partial_post_id'] ?? 0 );
 		$lang    = sanitize_key( (string) ( $job['lang'] ?? '' ) );
 

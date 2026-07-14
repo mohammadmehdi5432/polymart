@@ -1629,7 +1629,7 @@ final class REST_API {
 	 * @return \WP_REST_Response
 	 */
 	public function get_translation_job() {
-		return rest_ensure_response( self::enrich_translation_job_response( Activity_Logger::get_job( false ) ) );
+		return rest_ensure_response( self::enrich_translation_job_response( Activity_Logger::get_job_for_poll() ) );
 	}
 
 	/**
