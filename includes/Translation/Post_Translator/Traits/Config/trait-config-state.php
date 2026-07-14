@@ -168,4 +168,15 @@ trait Trait_Config_State {
 	 * @var string[]
 	 */
 	private static $current_elementor_accepted_paths = array();
+
+	/**
+	 * Reset Elementor runtime caches (PHP 8.2+ — cannot unset static properties).
+	 *
+	 * @return void
+	 */
+	private static function reset_elementor_runtime_caches() {
+		self::$elementor_current_cache          = array();
+		self::$elementor_storefront_serve_cache = array();
+		self::$stored_elementor_json_cache      = array();
+	}
 }

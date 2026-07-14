@@ -386,6 +386,16 @@ trait Trait_Job_Lifecycle {
 			);
 		}
 
+		if ( $front > 0 && Post_Translator::post_needs_translation_work( $front, $lang ) ) {
+			$seed_ids = array_values(
+				array_unique(
+					array_merge( array( $front ), $seed_ids )
+				)
+			);
+			$needs_work = max( $needs_work, 1 );
+			$total      = max( $total, $needs_work );
+		}
+
 		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
 			return new \WP_Error(
 				'polymart_ai_no_queue',

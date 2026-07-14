@@ -63,7 +63,7 @@ trait Trait_Storage {
 		}
 
 		update_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), time() );
-		unset( self::$elementor_current_cache, self::$elementor_storefront_serve_cache );
+		self::reset_elementor_runtime_caches();
 	}
 
 	private static function clear_elementor_translation_finalized( $post_id, $lang ) {
@@ -533,7 +533,7 @@ trait Trait_Storage {
 		}
 
 		self::$elementor_source_hash_cache[ $post_id ] = $new_hash;
-		unset( self::$elementor_current_cache );
+		self::reset_elementor_runtime_caches();
 
 		self::invalidate_elementor_translations( $post_id );
 	}
@@ -691,7 +691,7 @@ trait Trait_Storage {
 			return false;
 		}
 
-		unset( self::$elementor_current_cache, self::$elementor_storefront_serve_cache );
+		self::reset_elementor_runtime_caches();
 		self::flush_translation_status_cache( $post_id );
 		self::repair_completed_elementor_job_meta( $post_id, $lang );
 
