@@ -172,4 +172,72 @@ trait Trait_Worker_Recovery {
 		return self::normalize_job_for_response( $job, false );
 	}
 
+	/**
+	 * Break AS/step-lock deadlocks after prolonged silence (cron + admin ensure).
+	 *
+	 * @param string $reason Short diagnostic tag.
+	 * @return bool True when recovery actions ran.
+	 */
+	public static function force_recover_stalled_bulk_worker( $reason = '' ) {
+		if ( ! self::is_bulk_job_running() ) {
+			return false;
+		}
+
+		$job  = self::get_job_raw();
+		$age  = self::get_bulk_worker_activity_age();
+		$need = max(
+			45,
+			min(
+				120,
+				(int) apply_filters( 'polymart_ai_worker_force_recover_sec', self::WORKER_FORCE_RECOVER_SEC )
+			)
+		);
+
+		if ( $age < $need ) {
+			return false;
+		}
+
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+		Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
+		Job_Action_Scheduler::clear_slice_mutex();
+		self::release_stale_locks_for_as( min( $age, Job_Action_Scheduler::STALE_RUNNING_SEC ) );
+		self::force_unlock_step_now();
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_stale_translation_lock( $post_id, $lang, min( $age, 90 ) );
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+		}
+
+		$job = self::get_job_raw();
+		self::recover_stalled_job_picker( $job, $lang, true );
+		unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
+		$job['worker_heartbeat_at'] = time();
+		$job['last_cron_at']        = time();
+		$job['last_worker']         = wp_doing_cron() ? 'cron' : self::resolve_last_worker_label();
+		$job['worker_recovered_at'] = time();
+		$job['worker_recover_reason'] = sanitize_key( (string) $reason );
+		self::save_job( $job );
+
+		self::ensure_recurring_pulse();
+
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::enqueue_next( true, 0 );
+			Job_Action_Scheduler::run_queue_inline( true );
+		}
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: 1: idle seconds, 2: reason tag */
+				__( 'کارگر ترجمه پس از %1$dث سکوت بازیابی شد (%2$s) — صف دوباره زنجیره شد.', 'polymart-ai' ),
+				$age,
+				'' !== $reason ? $reason : 'stale'
+			)
+		);
+
+		return true;
+	}
+
 }

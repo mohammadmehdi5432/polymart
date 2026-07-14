@@ -250,6 +250,8 @@ trait Trait_Queue_Run {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		self::force_recover_stalled_bulk_worker( 'kick' );
+
 		if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {
 			self::force_release_step_lock_if_idle();
 		}

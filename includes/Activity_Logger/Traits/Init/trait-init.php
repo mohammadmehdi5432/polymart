@@ -28,6 +28,7 @@ trait Trait_Init {
 		add_action( 'admin_notices', array( __CLASS__, 'render_admin_notices' ) );
 		add_action( self::CRON_HOOK, array( __CLASS__, 'maybe_heal_background_worker' ) );
 		add_action( self::CRON_PULSE_HOOK, array( __CLASS__, 'maybe_heal_background_worker' ) );
+		add_action( 'action_scheduler_run_queue', array( __CLASS__, 'maybe_heal_on_as_queue' ), 999 );
 		add_action( 'polymart_ai_before_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_during_ai_http', array( __CLASS__, 'on_ai_http_heartbeat' ) );
 		add_action( 'polymart_ai_worker_heartbeat', array( __CLASS__, 'on_ai_http_heartbeat' ) );
@@ -39,6 +40,32 @@ trait Trait_Init {
 			self::maybe_heal_background_worker();
 		} else {
 			self::maybe_ensure_pulse_quietly();
+		}
+	}
+
+	/**
+	 * Heal stalled bulk jobs whenever Action Scheduler runs (wp-cron / CLI / admin).
+	 *
+	 * @return void
+	 */
+	public static function maybe_heal_on_as_queue() {
+		if ( ! self::is_bulk_job_running() ) {
+			return;
+		}
+
+		$age = self::get_bulk_worker_activity_age();
+
+		if ( $age < self::WORKER_FORCE_RECOVER_SEC ) {
+			return;
+		}
+
+		self::$trusted_as_tick = true;
+
+		try {
+			self::force_recover_stalled_bulk_worker( 'as_queue' );
+			self::kick_worker();
+		} finally {
+			self::$trusted_as_tick = false;
 		}
 	}
 

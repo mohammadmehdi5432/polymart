@@ -497,6 +497,22 @@ trait Trait_Queue_Metrics {
 		);
 	}
 
+	/**
+	 * Seconds since the bulk worker last made real progress.
+	 *
+	 * @return int
+	 */
+	public static function get_bulk_worker_activity_age() {
+		if ( ! self::is_bulk_job_running() ) {
+			return 0;
+		}
+
+		$job  = self::get_job_raw();
+		$last = self::get_worker_real_activity_at( $job );
+
+		return $last > 0 ? max( 0, time() - $last ) : PHP_INT_MAX;
+	}
+
 	private static function is_worker_heartbeat_fresh( array $job ) {
 		$last = self::get_worker_real_activity_at( $job );
 

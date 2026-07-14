@@ -825,46 +825,58 @@ export default function AutoTranslateApp() {
           if (!lockBlocks) {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
-            const useHeavyTick =
-              !data?.as_slice_active &&
-              !data?.as_running &&
-              (isElementorPartialJob(data) ||
-              activityAge >= CRON_STALE_SEC ||
-              elementorNeedsKick ||
-              Boolean(data.elementor_progress_stalled));
-            const recovered = useHeavyTick
-              ? await jobStep().catch(() => ensureServerWorker())
-              : await ensureServerWorker();
-            if (recovered?.worker_direct_tick && isActiveRef.current) {
-              appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
-            } else if (recovered?.worker_inline_tick && isActiveRef.current) {
-              appendLog('تیک بازیابی اجرا شد — صف دوباره جلو می‌رود.', 'success');
-            } else if (recovered?.lock_recovered && isActiveRef.current) {
-              appendLog('قفل گیرکرده آزاد شد — تیک بعدی شروع می‌شود…', 'warning');
-            } else if (recovered?.loopback_spawned && isActiveRef.current) {
-              appendLog('کارگر پس‌زمینه بیدار شد — ادامه صف…', 'info');
-            }
-            ensureInFlight = false;
-
-            const tickJob = recovered || data;
-            const nowMs = Date.now();
-
-            if (
-              tickJob?.status === 'running' &&
-              nowMs - lastWorkerTickLogAtRef.current >= 15000
-            ) {
-              lastWorkerTickLogAtRef.current = nowMs;
-
-              if (isElementorPartialJob(tickJob)) {
-                appendLog(
-                  `تیک کارگر — Elementor ${tickJob.partial_progress || '…'} (#${tickJob.partial_post_id})`,
-                  'info'
-                );
-              } else if (tickJob?.worker_direct_tick) {
-                appendLog('تیک کارگر — اجرای مستقیم Elementor', 'info');
-              } else if (tickJob?.worker_inline_tick) {
-                appendLog('تیک کارگر — ادامه صف ترجمه', 'info');
+            try {
+              const useHeavyTick =
+                !data?.as_slice_active &&
+                !data?.as_running &&
+                (activityAge >= 60 ||
+                  isElementorPartialJob(data) ||
+                  activityAge >= CRON_STALE_SEC ||
+                  elementorNeedsKick ||
+                  Boolean(data.elementor_progress_stalled));
+              const recovered = useHeavyTick
+                ? await jobStep().catch(() => ensureServerWorker())
+                : await ensureServerWorker();
+              if (recovered?.worker_direct_tick && isActiveRef.current) {
+                appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
+              } else if (recovered?.worker_kicked && isActiveRef.current) {
+                appendLog('تیک kick اجرا شد — صف دوباره جلو می‌رود.', 'success');
+              } else if (recovered?.worker_inline_tick && isActiveRef.current) {
+                appendLog('تیک بازیابی اجرا شد — صف دوباره جلو می‌رود.', 'success');
+              } else if (recovered?.lock_recovered && isActiveRef.current) {
+                appendLog('قفل گیرکرده آزاد شد — تیک بعدی شروع می‌شود…', 'warning');
+              } else if (recovered?.worker_recovered_at && isActiveRef.current) {
+                appendLog('کارگر پس از سکوت بازیابی شد — ادامه ترجمه…', 'warning');
+              } else if (recovered?.loopback_spawned && isActiveRef.current) {
+                appendLog('کارگر پس‌زمینه بیدار شد — ادامه صف…', 'info');
               }
+
+              const tickJob = recovered || data;
+              const nowMs = Date.now();
+
+              if (
+                tickJob?.status === 'running' &&
+                nowMs - lastWorkerTickLogAtRef.current >= 15000
+              ) {
+                lastWorkerTickLogAtRef.current = nowMs;
+
+                if (isElementorPartialJob(tickJob)) {
+                  appendLog(
+                    `تیک کارگر — Elementor ${tickJob.partial_progress || '…'} (#${tickJob.partial_post_id})`,
+                    'info'
+                  );
+                } else if (tickJob?.worker_direct_tick) {
+                  appendLog('تیک کارگر — اجرای مستقیم Elementor', 'info');
+                } else if (tickJob?.worker_inline_tick) {
+                  appendLog('تیک کارگر — inline', 'info');
+                }
+              }
+
+              if (recovered && isActiveRef.current) {
+                applyJobUpdate(recovered);
+              }
+            } finally {
+              ensureInFlight = false;
             }
           }
         }

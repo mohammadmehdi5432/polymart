@@ -122,20 +122,18 @@ trait Trait_Worker_Lock {
 		$current = absint( $job['current_post_id'] ?? 0 );
 		$partial = absint( $job['partial_post_id'] ?? 0 );
 
-		// Elementor burst can run many API calls in one request — allow a longer silence window.
+		// Elementor burst can run many API calls in one request — but never block recovery past STEP_LOCK_TTL.
 		if ( $partial > 0 && self::should_prioritize_elementor_partial( $job ) ) {
-			$idle_sec = max( $idle_sec, (int) apply_filters( 'polymart_ai_elementor_burst_lock_idle_sec', 150 ) );
+			$idle_sec = max(
+				$idle_sec,
+				min(
+					(int) apply_filters( 'polymart_ai_elementor_burst_lock_idle_sec', 95 ),
+					self::STEP_LOCK_TTL
+				)
+			);
 		}
 
-		// Actively translating a known post — never force-unlock before full TTL.
-		if ( $current > 0 ) {
-			$idle_sec = max( $idle_sec, self::STEP_LOCK_TTL );
-		}
-
-		$last = max(
-			absint( $job['last_cron_at'] ?? 0 ),
-			absint( $job['worker_heartbeat_at'] ?? 0 )
-		);
+		$last = self::get_worker_real_activity_at( $job );
 		$idle_for = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
 		if ( $idle_for < $idle_sec && ( get_transient( self::STEP_LOCK_KEY ) || get_option( self::STEP_LOCK_CLAIM_KEY ) ) ) {

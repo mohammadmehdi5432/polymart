@@ -330,9 +330,11 @@ trait Trait_Worker_Runner {
 			}
 		}
 
-		// Stalled worker: run the same recovery path as the auto-translate "ensure" REST call.
+		// Stalled worker: force recovery then run the full ensure/kick path.
 		if ( $age >= $stale_sec ) {
-			return self::ensure_background_worker();
+			self::force_recover_stalled_bulk_worker( 'cron_heal' );
+
+			return self::kick_worker();
 		}
 
 		if ( $age >= self::get_ensure_inline_idle_sec() || ! Job_Action_Scheduler::has_pending_or_running() ) {
@@ -500,6 +502,10 @@ trait Trait_Worker_Runner {
 			}
 
 			return self::normalize_job_for_response( $job, false );
+		}
+
+		if ( self::force_recover_stalled_bulk_worker( 'ensure' ) ) {
+			return self::kick_worker();
 		}
 
 		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {

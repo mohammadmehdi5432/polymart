@@ -264,7 +264,7 @@ final class Job_Action_Scheduler {
 		// Never stack a second action while one is actively running.
 		if (
 			self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0
-			&& \PolymartAI\Activity_Logger::is_bulk_worker_lively( 120 )
+			&& \PolymartAI\Activity_Logger::get_bulk_worker_activity_age() < self::STALE_RUNNING_SEC
 		) {
 			return 0;
 		}
@@ -1229,15 +1229,21 @@ final class Job_Action_Scheduler {
 	 * @return bool
 	 */
 	public static function is_slice_execution_active() {
+		$activity_age = \PolymartAI\Activity_Logger::get_bulk_worker_activity_age();
+
+		if ( $activity_age >= self::SLICE_BUDGET_SEC ) {
+			return false;
+		}
+
 		$held = get_transient( self::SLICE_MUTEX_KEY );
 
-		if ( false !== $held && \PolymartAI\Activity_Logger::is_bulk_worker_lively( 180 ) ) {
+		if ( false !== $held && $activity_age < self::SLICE_BUDGET_SEC ) {
 			return true;
 		}
 
 		if (
 			self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0
-			&& \PolymartAI\Activity_Logger::is_bulk_worker_lively( 120 )
+			&& $activity_age < self::STALE_RUNNING_SEC
 		) {
 			return true;
 		}
