@@ -92,9 +92,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	);
 }
 
-// Load production debug tool in admin
-if ( is_admin() ) {
-	require_once POLYMART_AI_PLUGIN_DIR . 'tools/production-debug.php';
+// Optional admin debug tool (not shipped in production builds).
+$polymart_ai_production_debug = POLYMART_AI_PLUGIN_DIR . 'tools/production-debug.php';
+if ( is_admin() && is_readable( $polymart_ai_production_debug ) ) {
+	require_once $polymart_ai_production_debug;
 }
 
 register_activation_hook( __FILE__, array( 'PolymartAI\Routing\Url_Router', 'activate' ) );

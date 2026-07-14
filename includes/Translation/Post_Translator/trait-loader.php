@@ -26,7 +26,7 @@ foreach ( $iterator as $file_info ) {
 	}
 
 	$name = $file_info->getFilename();
-	if ( str_starts_with( $name, 'trait-' ) && str_ends_with( $name, '.php' ) ) {
+	if ( 0 === strpos( $name, 'trait-' ) && '.php' === substr( $name, -4 ) ) {
 		$files[] = $file_info->getPathname();
 	}
 }
