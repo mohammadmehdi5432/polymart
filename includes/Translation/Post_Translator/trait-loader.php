@@ -9,9 +9,15 @@
 
 defined( 'ABSPATH' ) || exit;
 
-$traits_root = __DIR__ . '/Traits';
+require_once dirname( __DIR__, 2 ) . '/trait-path.php';
 
-if ( ! is_dir( $traits_root ) ) {
+$traits_root = polymart_ai_resolve_traits_root( __DIR__ );
+
+if ( null === $traits_root ) {
+	trigger_error(
+		'PolyMartAI trait-loader: Traits directory not found beside ' . __DIR__,
+		E_USER_ERROR
+	);
 	return;
 }
 

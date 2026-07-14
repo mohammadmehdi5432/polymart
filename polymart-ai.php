@@ -79,6 +79,18 @@ define( 'POLYMART_AI_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'POLYMART_AI_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'POLYMART_AI_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );
 
+if ( version_compare( PHP_VERSION, '7.4', '<' ) ) {
+	add_action(
+		'admin_notices',
+		static function () {
+			echo '<div class="notice notice-error"><p>'
+				. esc_html__( 'مترجم پلی‌مارت به PHP 7.4 یا بالاتر نیاز دارد.', 'polymart-ai' )
+				. '</p></div>';
+		}
+	);
+	return;
+}
+
 require_once POLYMART_AI_PLUGIN_DIR . 'includes/class-autoloader.php';
 
 PolymartAI\Autoloader::register();
@@ -106,10 +118,23 @@ register_deactivation_hook( __FILE__, array( 'PolymartAI\Frontend\Currency', 'un
 /**
  * Returns the main plugin instance.
  *
- * @return PolymartAI\Plugin
+ * @return PolymartAI\Plugin|null
  */
 function polymart_ai() {
 	return PolymartAI\Plugin::instance();
 }
 
-polymart_ai();
+/**
+ * Boot the plugin once WordPress and other plugins are loaded.
+ *
+ * @return void
+ */
+function polymart_ai_boot() {
+	polymart_ai();
+}
+
+if ( did_action( 'plugins_loaded' ) ) {
+	polymart_ai_boot();
+} else {
+	add_action( 'plugins_loaded', 'polymart_ai_boot', 5 );
+}
