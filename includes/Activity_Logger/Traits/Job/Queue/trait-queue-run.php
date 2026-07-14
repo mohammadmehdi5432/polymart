@@ -1095,6 +1095,9 @@ trait Trait_Queue_Run {
 
 		$status = self::resolve_post_job_status( $post_id, $lang );
 		$already_counted = self::job_already_counted_success( $job, $post_id );
+		$gaps            = Post_Translator::get_translation_gaps( $post_id, $lang );
+		$elementor_done  = Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
 
 		if ( 'translated' === $status ) {
 			self::track_succeeded_post( $job, $post_id );
@@ -1108,6 +1111,7 @@ trait Trait_Queue_Run {
 
 			if (
 				! $elementor_api_done
+				&& ! $elementor_done
 				&& (
 					Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
 					|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
@@ -1125,7 +1129,7 @@ trait Trait_Queue_Run {
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);
-			} elseif ( $elementor_api_done ) {
+			} elseif ( $elementor_api_done || $elementor_done ) {
 				$job['partial_post_id']  = null;
 				$job['partial_phase']    = null;
 				$job['partial_progress'] = null;
@@ -1143,7 +1147,6 @@ trait Trait_Queue_Run {
 			} else {
 				self::defer_job_post( $job, $post_id, $lang );
 
-				$gaps     = Post_Translator::get_translation_gaps( $post_id, $lang );
 				$attempts = (int) ( $job['retry_attempts'][ $post_id ] ?? 0 );
 				$missing  = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'نامشخص', 'polymart-ai' );
 

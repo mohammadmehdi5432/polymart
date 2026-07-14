@@ -152,6 +152,13 @@ trait Trait_Job_Elementor {
 			return;
 		}
 
+		if (
+			Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return;
+		}
+
 		$state = Post_Translator::get_job_partial_state( $post_id, $lang );
 		$state = Post_Translator::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		Post_Translator::save_job_partial_state( $post_id, $lang, $state );

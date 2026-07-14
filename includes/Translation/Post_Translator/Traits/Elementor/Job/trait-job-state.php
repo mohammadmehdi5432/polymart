@@ -70,6 +70,13 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return false;
+		}
+
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			return false;
 		}
@@ -170,6 +177,13 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return false;
+		}
+
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			return false;
 		}
@@ -203,6 +217,14 @@ trait Trait_Job_State {
 			&& self::is_elementor_translation_current( $post_id, $lang )
 			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+		) {
+			return true;
+		}
+
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& self::is_elementor_translation_current( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
 		) {
 			return true;
 		}

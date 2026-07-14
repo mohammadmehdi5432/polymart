@@ -659,6 +659,14 @@ trait Trait_Storage {
 			return false;
 		}
 
+		// A legitimate finalize clears partial state; do not strip the marker when API work is done.
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return false;
+		}
+
 		if ( self::elementor_translation_is_storefront_ready( $post_id, $lang ) ) {
 			return false;
 		}
