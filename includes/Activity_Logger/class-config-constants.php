@@ -1,16 +1,18 @@
 <?php
 /**
- * Activity_Logger Config Constants (auto-split).
+ * Activity_Logger configuration constants (PHP 8.1-safe; not in a trait).
  *
- * @package PolymartAI\Activity_Logger\Traits
+ * @package PolymartAI\Activity_Logger
  */
 
-namespace PolymartAI\Activity_Logger\Traits\Config;
-
+namespace PolymartAI\Activity_Logger;
 
 defined( 'ABSPATH' ) || exit;
 
-trait Trait_Config_Constants {
+/**
+ * Class Config_Constants
+ */
+final class Config_Constants {
 
 	const LOG_OPTION           = 'polymart_ai_logs';
 	const REPORT_OPTION        = 'polymart_ai_translation_report';

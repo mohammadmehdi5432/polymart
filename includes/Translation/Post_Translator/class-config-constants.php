@@ -1,24 +1,18 @@
 <?php
 /**
- * Post_Translator Config Constants (auto-split).
+ * Post_Translator configuration constants (PHP 8.1-safe; not in a trait).
  *
- * Re-exports shared constants from helper classes so Post_Translator::CONST
- * remains stable. Job/AI tuning constants live here only.
- *
- * @package PolymartAI\Translation\Post_Translator\Traits
+ * @package PolymartAI\Translation\Post_Translator
  */
 
-namespace PolymartAI\Translation\Post_Translator\Traits\Config;
-
-use PolymartAI\Translation\Post_Translator\Meta_Keys;
-use PolymartAI\Translation\Post_Translator\Persistence_Guard;
-use PolymartAI\Translation\Post_Translator\Storefront_Resolver;
-use PolymartAI\Translation\Post_Translator\Translation_Lock;
-
+namespace PolymartAI\Translation\Post_Translator;
 
 defined( 'ABSPATH' ) || exit;
 
-trait Trait_Config_Constants {
+/**
+ * Class Config_Constants
+ */
+final class Config_Constants {
 
 	const META_BOX_NONCE_ACTION = Persistence_Guard::META_BOX_NONCE_ACTION;
 	const META_BOX_NONCE_NAME     = Persistence_Guard::META_BOX_NONCE_NAME;
@@ -30,18 +24,14 @@ trait Trait_Config_Constants {
 	const PERSIAN_CONTENT_FLAG_META = Meta_Keys::PERSIAN_CONTENT_FLAG_META;
 	const STATUS_INDEX_META_PREFIX  = Meta_Keys::STATUS_INDEX_META_PREFIX;
 
-	/**
-	 * Maximum `_elementor_data_{lang}` payload served on the storefront (bytes).
-	 */
+	/** Maximum `_elementor_data_{lang}` payload served on the storefront (bytes). */
 	const MAX_STOREFRONT_ELEMENTOR_JSON_BYTES = 2097152;
 
 	const META_KEY_TITLE_EN   = Meta_Keys::META_KEY_TITLE_EN;
 	const META_KEY_CONTENT_EN = Meta_Keys::META_KEY_CONTENT_EN;
 	const META_KEY_EXCERPT_EN = Meta_Keys::META_KEY_EXCERPT_EN;
 
-	/**
-	 * Default ArvanCloud AI model when none is configured.
-	 */
+	/** Default ArvanCloud AI model when none is configured. */
 	const DEFAULT_AI_MODEL = 'DeepSeek-V3-2-g6zde';
 
 	/** @var string[] */
@@ -53,81 +43,43 @@ trait Trait_Config_Constants {
 	/** @var string[] */
 	const SUPPORTED_POST_TYPES = Meta_Keys::SUPPORTED_POST_TYPES;
 
-	/**
-	 * Maximum string fields sent to AI per request (large posts are chunked).
-	 */
+	/** Maximum string fields sent to AI per request (large posts are chunked). */
 	const AI_FIELD_CHUNK_SIZE = 6;
-	/**
-	 * Core field batches per auto-translate job slice (smaller than manual translate).
-	 */
+	/** Core field batches per auto-translate job slice (smaller than manual translate). */
 	const JOB_CORE_FIELD_CHUNK_SIZE = 3;
-	/**
-	 * Maximum combined characters per AI request batch.
-	 */
+	/** Maximum combined characters per AI request batch. */
 	const AI_MAX_CHUNK_CHARS = 3500;
-	/**
-	 * Maximum characters for a single field before it is split across requests.
-	 */
+	/** Maximum characters for a single field before it is split across requests. */
 	const AI_MAX_SINGLE_FIELD_CHARS = 2800;
-	/**
-	 * Smaller Elementor JSON batches — paths are long and widgets nest deeply.
-	 */
+	/** Smaller Elementor JSON batches — paths are long and widgets nest deeply. */
 	const ELEMENTOR_AI_FIELD_CHUNK_SIZE = 3;
-	/**
-	 * Maximum combined characters per Elementor AI batch.
-	 */
+	/** Maximum combined characters per Elementor AI batch. */
 	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 2500;
-	/**
-	 * Elementor job batches: 1 field for bulk (timeout-safe), more for manual metabox.
-	 */
+	/** Elementor job batches: 1 field for bulk (timeout-safe), more for manual metabox. */
 	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 6;
-	/**
-	 * Maximum characters per Elementor job-step API call.
-	 */
+	/** Maximum characters per Elementor job-step API call. */
 	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1500;
-	/**
-	 * Split very long Elementor text fields before calling the AI.
-	 */
+	/** Split very long Elementor text fields before calling the AI. */
 	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = 1000;
-	/**
-	 * Max API attempts per Elementor __segN key before source-text fallback.
-	 */
+	/** Max API attempts per Elementor __segN key before source-text fallback. */
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = 3;
-	/**
-	 * Empty stubborn hand-off ticks before force-saving with source-text fallback.
-	 */
+	/** Empty stubborn hand-off ticks before force-saving with source-text fallback. */
 	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 5;
-	/**
-	 * HTTP timeout cap (seconds) for a single Elementor job-step AI call.
-	 */
+	/** HTTP timeout cap (seconds) for a single Elementor job-step AI call. */
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 30;
-	/**
-	 * Minimum HTTP timeout (seconds) for auto-translate job AI calls.
-	 */
+	/** Minimum HTTP timeout (seconds) for auto-translate job AI calls. */
 	const JOB_REQUEST_MIN_TIMEOUT = 20;
-	/**
-	 * Maximum HTTP timeout (seconds) for a single auto-translate job AI call.
-	 */
+	/** Maximum HTTP timeout (seconds) for a single auto-translate job AI call. */
 	const JOB_REQUEST_MAX_TIMEOUT = 30;
-	/**
-	 * Variation title batches — variable products may have 100+ rows.
-	 */
+	/** Variation title batches — variable products may have 100+ rows. */
 	const VARIATION_AI_FIELD_CHUNK_SIZE = 2;
-	/**
-	 * Maximum combined characters per variation AI batch.
-	 */
+	/** Maximum combined characters per variation AI batch. */
 	const VARIATION_AI_MAX_CHUNK_CHARS = 1800;
-	/**
-	 * Commerce attribute/term batches.
-	 */
+	/** Commerce attribute/term batches. */
 	const COMMERCE_AI_FIELD_CHUNK_SIZE = 2;
-	/**
-	 * Maximum combined characters per commerce AI batch.
-	 */
+	/** Maximum combined characters per commerce AI batch. */
 	const COMMERCE_AI_MAX_CHUNK_CHARS = 2800;
-	/**
-	 * Maximum characters per discovered meta value sent to AI.
-	 */
+	/** Maximum characters per discovered meta value sent to AI. */
 	const MAX_META_VALUE_LENGTH = 12000;
 
 	/** @var string[] */
@@ -140,8 +92,6 @@ trait Trait_Config_Constants {
 	const DERIVED_TITLE_MAX_LENGTH         = Storefront_Resolver::DERIVED_TITLE_MAX_LENGTH;
 	const STOREFRONT_TITLE_HARD_MAX_LENGTH = Storefront_Resolver::STOREFRONT_TITLE_HARD_MAX_LENGTH;
 
-	/**
-	 * Post meta prefix for in-progress auto-translate job slices (per post + language).
-	 */
+	/** Post meta prefix for in-progress auto-translate job slices (per post + language). */
 	const JOB_PARTIAL_META_PREFIX = '_polymart_ai_job_partial_';
 }

@@ -7,6 +7,7 @@
 
 namespace PolymartAI\Translation;
 
+use PolymartAI\Translation\Post_Translator\Config_Constants as Post_Translator_Config;
 use PolymartAI\Translation\Post_Translator\Meta_Keys;
 use PolymartAI\Translation\Post_Translator\Persistence_Guard;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
@@ -24,6 +25,7 @@ use PolymartAI\Translation\Post_Translator\Traits\Term\Trait_Term;
 use PolymartAI\Translation\Post_Translator\Traits\TranslationStatus\Trait_Translation_Status;
 use PolymartAI\Translation\Post_Translator\Traits\Variation\Trait_Variation;
 
+require_once __DIR__ . '/Post_Translator/class-config-constants.php';
 require_once __DIR__ . '/Post_Translator/trait-loader.php';
 
 defined( 'ABSPATH' ) || exit;
@@ -32,6 +34,48 @@ defined( 'ABSPATH' ) || exit;
  * Class Post_Translator
  */
 final class Post_Translator {
+
+	const META_BOX_NONCE_ACTION = Post_Translator_Config::META_BOX_NONCE_ACTION;
+	const META_BOX_NONCE_NAME     = Post_Translator_Config::META_BOX_NONCE_NAME;
+	const TRANSLATION_LOCK_PREFIX       = Post_Translator_Config::TRANSLATION_LOCK_PREFIX;
+	const TRANSLATION_LOCK_TTL          = Post_Translator_Config::TRANSLATION_LOCK_TTL;
+	const TRANSLATION_LOCK_OWNER_SUFFIX = Post_Translator_Config::TRANSLATION_LOCK_OWNER_SUFFIX;
+	const PERSIAN_CONTENT_FLAG_META = Post_Translator_Config::PERSIAN_CONTENT_FLAG_META;
+	const STATUS_INDEX_META_PREFIX  = Post_Translator_Config::STATUS_INDEX_META_PREFIX;
+	const MAX_STOREFRONT_ELEMENTOR_JSON_BYTES = Post_Translator_Config::MAX_STOREFRONT_ELEMENTOR_JSON_BYTES;
+	const META_KEY_TITLE_EN   = Post_Translator_Config::META_KEY_TITLE_EN;
+	const META_KEY_CONTENT_EN = Post_Translator_Config::META_KEY_CONTENT_EN;
+	const META_KEY_EXCERPT_EN = Post_Translator_Config::META_KEY_EXCERPT_EN;
+	const DEFAULT_AI_MODEL = Post_Translator_Config::DEFAULT_AI_MODEL;
+	const CUSTOM_META_KEYS = Post_Translator_Config::CUSTOM_META_KEYS;
+	const WVE_VARIATION_CUSTOM_TITLE_META       = Post_Translator_Config::WVE_VARIATION_CUSTOM_TITLE_META;
+	const WVE_VARIATION_CUSTOM_DESCRIPTION_META = Post_Translator_Config::WVE_VARIATION_CUSTOM_DESCRIPTION_META;
+	const SUPPORTED_POST_TYPES = Post_Translator_Config::SUPPORTED_POST_TYPES;
+	const AI_FIELD_CHUNK_SIZE = Post_Translator_Config::AI_FIELD_CHUNK_SIZE;
+	const JOB_CORE_FIELD_CHUNK_SIZE = Post_Translator_Config::JOB_CORE_FIELD_CHUNK_SIZE;
+	const AI_MAX_CHUNK_CHARS = Post_Translator_Config::AI_MAX_CHUNK_CHARS;
+	const AI_MAX_SINGLE_FIELD_CHARS = Post_Translator_Config::AI_MAX_SINGLE_FIELD_CHARS;
+	const ELEMENTOR_AI_FIELD_CHUNK_SIZE = Post_Translator_Config::ELEMENTOR_AI_FIELD_CHUNK_SIZE;
+	const ELEMENTOR_AI_MAX_CHUNK_CHARS = Post_Translator_Config::ELEMENTOR_AI_MAX_CHUNK_CHARS;
+	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = Post_Translator_Config::ELEMENTOR_JOB_FIELD_CHUNK_SIZE;
+	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = Post_Translator_Config::ELEMENTOR_JOB_MAX_CHUNK_CHARS;
+	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = Post_Translator_Config::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS;
+	const ELEMENTOR_SEGMENT_MAX_RETRIES = Post_Translator_Config::ELEMENTOR_SEGMENT_MAX_RETRIES;
+	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = Post_Translator_Config::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT;
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT = Post_Translator_Config::ELEMENTOR_JOB_REQUEST_TIMEOUT;
+	const JOB_REQUEST_MIN_TIMEOUT = Post_Translator_Config::JOB_REQUEST_MIN_TIMEOUT;
+	const JOB_REQUEST_MAX_TIMEOUT = Post_Translator_Config::JOB_REQUEST_MAX_TIMEOUT;
+	const VARIATION_AI_FIELD_CHUNK_SIZE = Post_Translator_Config::VARIATION_AI_FIELD_CHUNK_SIZE;
+	const VARIATION_AI_MAX_CHUNK_CHARS = Post_Translator_Config::VARIATION_AI_MAX_CHUNK_CHARS;
+	const COMMERCE_AI_FIELD_CHUNK_SIZE = Post_Translator_Config::COMMERCE_AI_FIELD_CHUNK_SIZE;
+	const COMMERCE_AI_MAX_CHUNK_CHARS = Post_Translator_Config::COMMERCE_AI_MAX_CHUNK_CHARS;
+	const MAX_META_VALUE_LENGTH = Post_Translator_Config::MAX_META_VALUE_LENGTH;
+	const FEATURED_IMAGE_POST_TYPES = Post_Translator_Config::FEATURED_IMAGE_POST_TYPES;
+	const SUPPORTED_TAXONOMIES = Post_Translator_Config::SUPPORTED_TAXONOMIES;
+	const STOREFRONT_TITLE_MAX_LENGTH      = Post_Translator_Config::STOREFRONT_TITLE_MAX_LENGTH;
+	const DERIVED_TITLE_MAX_LENGTH         = Post_Translator_Config::DERIVED_TITLE_MAX_LENGTH;
+	const STOREFRONT_TITLE_HARD_MAX_LENGTH = Post_Translator_Config::STOREFRONT_TITLE_HARD_MAX_LENGTH;
+	const JOB_PARTIAL_META_PREFIX = Post_Translator_Config::JOB_PARTIAL_META_PREFIX;
 
 	use Trait_Admin_Save;
 	use Trait_Ai_Persistence;
