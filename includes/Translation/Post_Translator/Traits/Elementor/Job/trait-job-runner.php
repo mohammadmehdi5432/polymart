@@ -735,6 +735,22 @@ trait Trait_Job_Runner {
 
 			if ( is_wp_error( $chunk_result ) ) {
 				if ( ! empty( $aliased_payload ) && AI_Client::is_transient_parse_response_error( $chunk_result ) ) {
+					$error_data = $chunk_result->get_error_data();
+
+					if ( is_array( $error_data ) && ! empty( $error_data['body_excerpt'] ) ) {
+						\PolymartAI\Activity_Logger::log(
+							'warning',
+							sprintf(
+								/* translators: 1: post ID, 2: chunk index, 3: API body excerpt */
+								__( 'Elementor — #%1$d: پاسخ API بخش %2$d قابل پارس نبود — %3$s', 'polymart-ai' ),
+								$post_id,
+								$attempt_index,
+								\PolymartAI\Activity_Logger::truncate_api_error_message( (string) $error_data['body_excerpt'], 220 )
+							),
+							array( 'post_id' => $post_id, 'lang' => $lang )
+						);
+					}
+
 					\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
 
 					$recovered = self::translate_job_chunk_with_single_field_fallback(
@@ -1266,9 +1282,18 @@ trait Trait_Job_Runner {
 			);
 		}
 
-		\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $error );
+		$non_throttle_error = AI_Client::is_transient_parse_response_error( $error );
 
-		if ( \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
+		if ( $non_throttle_error ) {
+			\PolymartAI\Activity_Logger::maybe_clear_stale_api_cooldown( $error );
+		} else {
+			\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $error );
+		}
+
+		if (
+			\PolymartAI\Activity_Logger::is_job_api_cooldown_active()
+			&& ! $non_throttle_error
+		) {
 			$short_error = \PolymartAI\Activity_Logger::format_api_cooldown_message(
 				\PolymartAI\Activity_Logger::get_job_api_cooldown_remaining()
 			);
@@ -1295,6 +1320,17 @@ trait Trait_Job_Runner {
 		}
 
 		$state['elementor_failures'] = $failures;
+
+		update_post_meta(
+			$post_id,
+			'_polymart_ai_elementor_error_' . $lang,
+			sprintf(
+				/* translators: 1: chunk progress marker, 2: error detail */
+				__( 'Elementor — %1$s: %2$s', 'polymart-ai' ),
+				$progress,
+				$short_error
+			)
+		);
 
 		if ( ! empty( $map ) ) {
 			$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );

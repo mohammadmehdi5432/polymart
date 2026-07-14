@@ -1002,6 +1002,35 @@ final class AI_Client {
 					if ( null !== $text ) {
 						return $text;
 					}
+
+					if ( isset( $choice['message']['parsed'] ) ) {
+						$text = self::normalize_message_content_value( $choice['message']['parsed'] );
+
+						if ( null !== $text ) {
+							return $text;
+						}
+					}
+
+					if ( ! empty( $choice['message']['tool_calls'] ) && is_array( $choice['message']['tool_calls'] ) ) {
+						foreach ( $choice['message']['tool_calls'] as $tool_call ) {
+							if ( ! is_array( $tool_call ) ) {
+								continue;
+							}
+
+							$arguments = $tool_call['function']['arguments'] ?? null;
+							$text      = self::normalize_message_content_value( $arguments );
+
+							if ( null !== $text ) {
+								return $text;
+							}
+						}
+					}
+
+					$text = self::normalize_message_content_value( $choice['message']['reasoning_content'] ?? null );
+
+					if ( null !== $text ) {
+						return $text;
+					}
 				}
 
 				if ( isset( $choice['text'] ) ) {
@@ -1052,6 +1081,12 @@ final class AI_Client {
 			return null;
 		}
 
+		if ( self::is_string_map_array( $value ) ) {
+			$encoded = wp_json_encode( $value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+			return false !== $encoded ? $encoded : null;
+		}
+
 		$parts = array();
 
 		foreach ( $value as $part ) {
@@ -1061,6 +1096,15 @@ final class AI_Client {
 			}
 
 			if ( ! is_array( $part ) ) {
+				continue;
+			}
+
+			if ( self::is_string_map_array( $part ) ) {
+				$encoded = wp_json_encode( $part, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+				if ( false !== $encoded ) {
+					$parts[] = $encoded;
+				}
 				continue;
 			}
 
@@ -1079,6 +1123,28 @@ final class AI_Client {
 		}
 
 		return implode( "\n", $parts );
+	}
+
+	/**
+	 * @param array<mixed> $value Candidate decoded JSON object.
+	 * @return bool
+	 */
+	private static function is_string_map_array( array $value ) {
+		if ( empty( $value ) ) {
+			return false;
+		}
+
+		foreach ( $value as $key => $item ) {
+			if ( ! is_string( $key ) ) {
+				return false;
+			}
+
+			if ( ! is_string( $item ) && ! is_numeric( $item ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**

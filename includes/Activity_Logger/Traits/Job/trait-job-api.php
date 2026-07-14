@@ -11,6 +11,7 @@ use PolymartAI\Activity_Logger\Job_Action_Scheduler;
 use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
+use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\Content\Menu_Translator;
 use PolymartAI\Translation\Post_Translator;
 use PolymartAI\Translation\Pipeline\Translation_Query;
@@ -315,6 +316,71 @@ trait Trait_Job_Api {
 		return false;
 	}
 
+	/**
+	 * Recoverable slice failures that must not trigger or preserve API throttle cooldown.
+	 *
+	 * @param string|\WP_Error $error Message or error object.
+	 * @return bool
+	 */
+	public static function is_non_throttle_recoverable_slice_error( $error ) {
+		if ( $error instanceof \WP_Error ) {
+			if ( Post_Translator::is_api_transport_timeout_error( $error ) ) {
+				return true;
+			}
+
+			return AI_Client::is_transient_parse_response_error( $error );
+		}
+
+		return self::is_timeout_slice_message( $error )
+			|| self::is_transient_parse_slice_message( $error );
+	}
+
+	/**
+	 * @param string $message Slice status / log message.
+	 * @return bool
+	 */
+	public static function is_transient_parse_slice_message( $message ) {
+		$message = strtolower( (string) $message );
+
+		if ( '' === $message ) {
+			return false;
+		}
+
+		foreach ( array(
+			'polymart_ai_missing_choices',
+			'polymart_ai_empty_response',
+			'polymart_ai_invalid_json',
+			'polymart_ai_no_translations',
+			'polymart_ai_chunk_empty',
+			'شامل محتوای ترجمه نبود',
+			'json نامعتبر',
+			'پاسخ خالی',
+			'finish_reason',
+		) as $needle ) {
+			if ( false !== strpos( $message, $needle ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Clear a stale cooldown when the gateway responded without a real rate limit.
+	 *
+	 * @param \WP_Error $error Last API error.
+	 * @return void
+	 */
+	public static function maybe_clear_stale_api_cooldown( \WP_Error $error ) {
+		if ( self::is_rate_limit_or_bot_error( $error ) ) {
+			return;
+		}
+
+		if ( self::is_non_throttle_recoverable_slice_error( $error ) ) {
+			self::touch_successful_api_call();
+		}
+	}
+
 	public static function is_synthetic_api_throttle_message( $message ) {
 		$message = strtolower( (string) $message );
 
@@ -393,6 +459,11 @@ trait Trait_Job_Api {
 
 	public static function maybe_apply_api_throttle_cooldown( \WP_Error $error, $cooldown_sec = null ) {
 		if ( self::is_synthetic_api_throttle_message( $error->get_error_message() ) ) {
+			return false;
+		}
+
+		if ( self::is_non_throttle_recoverable_slice_error( $error ) ) {
+			self::maybe_clear_stale_api_cooldown( $error );
 			return false;
 		}
 

@@ -585,7 +585,11 @@ trait Trait_Queue_Run {
 				$job['current_post_id']   = null;
 				$job['step_started_at']   = null;
 				if ( ! Post_Translator::is_api_transport_timeout_error( $slice ) ) {
-					self::maybe_apply_api_throttle_cooldown( $slice );
+					if ( self::is_non_throttle_recoverable_slice_error( $slice ) ) {
+						self::maybe_clear_stale_api_cooldown( $slice );
+					} else {
+						self::maybe_apply_api_throttle_cooldown( $slice );
+					}
 				} else {
 					self::touch_successful_api_call();
 				}
@@ -593,7 +597,7 @@ trait Trait_Queue_Run {
 
 				if (
 					self::is_job_api_cooldown_active( $job )
-					&& ! Post_Translator::is_api_transport_timeout_error( $slice )
+					&& ! self::is_non_throttle_recoverable_slice_error( $slice )
 				) {
 					$remaining                      = self::get_job_api_cooldown_remaining( $job );
 					$job['step_deferred']           = true;
@@ -705,9 +709,9 @@ trait Trait_Queue_Run {
 			if ( ! empty( $slice['recoverable'] ) ) {
 				$job['recoverable'] = true;
 				$err_msg            = (string) ( $slice['message'] ?? '' );
-				$timeout_slice      = self::is_timeout_slice_message( $err_msg );
+				$non_throttle_slice = self::is_non_throttle_recoverable_slice_error( $err_msg );
 
-				if ( $timeout_slice ) {
+				if ( $non_throttle_slice ) {
 					self::touch_successful_api_call();
 				} elseif ( '' !== $err_msg && ! self::is_synthetic_api_throttle_message( $err_msg ) ) {
 					self::maybe_apply_api_throttle_cooldown(
@@ -717,7 +721,7 @@ trait Trait_Queue_Run {
 
 				$job = self::get_job_raw();
 
-				if ( self::is_job_api_cooldown_active( $job ) && ! $timeout_slice ) {
+				if ( self::is_job_api_cooldown_active( $job ) && ! $non_throttle_slice ) {
 					$remaining                      = self::get_job_api_cooldown_remaining( $job );
 					$job['step_deferred']           = true;
 					$job['step_deferred_reason']    = 'api_cooldown';
