@@ -196,6 +196,16 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& self::is_elementor_translation_current( $post_id, $lang )
+			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+		) {
+			return true;
+		}
+
 		$stored = get_post_meta( $post_id, self::get_elementor_slice_cursor_meta_key( $lang ), true );
 		$cursor = is_array( $stored ) ? absint( $stored['cursor'] ?? 0 ) : absint( $stored );
 		$total  = is_array( $stored ) ? absint( $stored['total'] ?? 0 ) : 0;
@@ -454,6 +464,12 @@ trait Trait_Job_State {
 
 		if ( ! is_array( $data ) ) {
 			return false;
+		}
+
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+		if ( self::repair_completed_elementor_job_meta( $post_id, $lang ) ) {
+			return true;
 		}
 
 		$state     = self::get_job_partial_state( $post_id, $lang );
@@ -781,6 +797,8 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			return false;
 		}
@@ -822,7 +840,17 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
+			return false;
+		}
+
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& self::is_elementor_translation_current( $post_id, $lang )
+			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+		) {
 			return false;
 		}
 

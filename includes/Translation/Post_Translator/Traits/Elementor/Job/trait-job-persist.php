@@ -96,6 +96,7 @@ trait Trait_Job_Persist {
 
 		if ( $complete ) {
 			self::save_elementor_source_hash( $post_id, $lang );
+			self::mark_elementor_translation_finalized( $post_id, $lang );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 			self::clear_elementor_primary_batches_lock( $post_id, $lang );
@@ -103,10 +104,6 @@ trait Trait_Job_Persist {
 			self::flush_translation_status_cache( $post_id );
 
 			return true;
-		}
-
-		if ( '' === trim( (string) get_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), true ) ) ) {
-			self::save_elementor_source_hash( $post_id, $lang );
 		}
 
 		self::write_elementor_slice_cursor( $post_id, $lang, $done_count, $total_chunks );

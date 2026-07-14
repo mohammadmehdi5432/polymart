@@ -25,6 +25,8 @@ trait Trait_Job_Runner {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+		self::repair_completed_elementor_job_meta( $post_id, $lang );
 
 		$raw = get_post_meta( $post_id, '_elementor_data', true );
 
@@ -400,9 +402,41 @@ trait Trait_Job_Runner {
 							);
 						}
 					} else {
-						self::save_elementor_source_hash( $post_id, $lang );
-						delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
-						self::clear_elementor_slice_cursor( $post_id, $lang );
+						$done_count_pre = self::resolve_elementor_done_count(
+							$state,
+							self::get_elementor_chunk_progress( $post_id, $lang, $state )['done'],
+							$post_id,
+							$lang
+						);
+						$blocker = self::get_elementor_job_finalize_blockers( $post_id, $lang, $data, $map, $state );
+
+						if ( null !== $blocker ) {
+							return self::respond_elementor_blocked_finalize(
+								$post_id,
+								$lang,
+								$data,
+								$map,
+								$state,
+								max( $done_count_pre, $progress_total ),
+								$progress_total,
+								$blocker
+							);
+						}
+
+						$persisted = self::persist_elementor_job_progress(
+							$post_id,
+							$lang,
+							$data,
+							$map,
+							max( $done_count_pre, $progress_total ),
+							$progress_total,
+							true
+						);
+
+						if ( is_wp_error( $persisted ) ) {
+							return $persisted;
+						}
+
 						self::clear_job_partial_state( $post_id, $lang, true );
 
 						return array(

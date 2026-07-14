@@ -163,4 +163,9 @@ trait Trait_Config_State {
 	 * @var string[]
 	 */
 	private static $current_elementor_field_passthrough = array();
+	/**
+	 * Accepted leftover paths (force-fallback) for the active Elementor job context.
+	 * @var string[]
+	 */
+	private static $current_elementor_accepted_paths = array();
 }

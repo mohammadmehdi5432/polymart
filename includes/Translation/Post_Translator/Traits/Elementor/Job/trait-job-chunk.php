@@ -235,6 +235,11 @@ trait Trait_Job_Chunk {
 
 			$translated = trim( $translated );
 
+			if ( self::is_elementor_path_accepted( $post_id, $lang, $path ) ) {
+				$map[ $path ] = $translated;
+				continue;
+			}
+
 			// Still the Persian source — not a completed translation.
 			if ( $translated === trim( (string) $source_raw ) ) {
 				continue;

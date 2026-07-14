@@ -208,6 +208,16 @@ trait Trait_Chunking {
 			: array();
 	}
 
+	private static function bind_elementor_accepted_paths_context( $post_id, $lang ) {
+		self::$current_elementor_accepted_paths = self::get_elementor_accepted_paths( $post_id, $lang );
+	}
+
+	private static function elementor_path_is_accepted( $path ) {
+		$path = (string) $path;
+
+		return '' !== $path && in_array( $path, self::$current_elementor_accepted_paths, true );
+	}
+
 	private static function remember_elementor_segment_progress( $post_id, $lang, array &$state, array $map, array $source_payload ) {
 		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
 		$state['elementor_map'] = $map;
@@ -753,6 +763,10 @@ trait Trait_Chunking {
 	private static function elementor_field_translation_complete( $path, $text, array $map ) {
 		$path = (string) $path;
 		$text = (string) $text;
+
+		if ( self::elementor_path_is_accepted( $path ) ) {
+			return true;
+		}
 
 		if (
 			in_array( $path, self::$current_elementor_field_passthrough, true )

@@ -29,6 +29,200 @@ trait Trait_Storage {
 		return '_polymart_ai_elementor_src_hash_' . sanitize_key( (string) $lang );
 	}
 
+	public static function get_elementor_finalized_meta_key( $lang ) {
+		return '_polymart_ai_elementor_finalized_' . sanitize_key( (string) $lang );
+	}
+
+	public static function get_elementor_accepted_paths_meta_key( $lang ) {
+		return '_polymart_ai_elementor_accepted_' . sanitize_key( (string) $lang );
+	}
+
+	public static function is_elementor_translation_finalized( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$finalized = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
+
+		if ( is_numeric( $finalized ) && absint( $finalized ) > 0 ) {
+			return true;
+		}
+
+		return self::maybe_backfill_elementor_finalized_meta( $post_id, $lang );
+	}
+
+	public static function mark_elementor_translation_finalized( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		update_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), time() );
+		unset( self::$elementor_current_cache, self::$elementor_storefront_serve_cache );
+	}
+
+	private static function clear_elementor_translation_finalized( $post_id, $lang ) {
+		delete_post_meta( absint( $post_id ), self::get_elementor_finalized_meta_key( sanitize_key( (string) $lang ) ) );
+	}
+
+	public static function get_elementor_accepted_paths( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return array();
+		}
+
+		$raw = get_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ), true );
+
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		return array_values( array_unique( array_filter( array_map( 'strval', $raw ) ) ) );
+	}
+
+	public static function save_elementor_accepted_paths( $post_id, $lang, array $paths ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$paths   = array_values( array_unique( array_filter( array_map( 'strval', $paths ) ) ) );
+
+		if ( $post_id <= 0 || '' === $lang || empty( $paths ) ) {
+			return;
+		}
+
+		$existing = self::get_elementor_accepted_paths( $post_id, $lang );
+		$merged   = array_values( array_unique( array_merge( $existing, $paths ) ) );
+
+		update_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ), $merged );
+	}
+
+	public static function is_elementor_path_accepted( $post_id, $lang, $path ) {
+		$path = (string) $path;
+
+		if ( '' === $path ) {
+			return false;
+		}
+
+		return in_array( $path, self::get_elementor_accepted_paths( $post_id, $lang ), true );
+	}
+
+	private static function maybe_backfill_elementor_finalized_meta( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$stored_hash = trim( (string) get_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), true ) );
+
+		if ( '' === $stored_hash ) {
+			return false;
+		}
+
+		if ( ! hash_equals( $stored_hash, self::compute_elementor_source_hash( $post_id ) ) ) {
+			return false;
+		}
+
+		$progress = trim( (string) get_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), true ) );
+
+		if ( '' !== $progress ) {
+			return false;
+		}
+
+		$error = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ) );
+
+		if ( '' !== $error && ! self::is_elementor_progress_message( $error ) ) {
+			return false;
+		}
+
+		if ( ! is_string( self::get_stored_elementor_json( $post_id, $lang ) ) ) {
+			return false;
+		}
+
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return false;
+		}
+
+		if ( self::elementor_job_has_durable_partial_state( $post_id, $lang ) ) {
+			return false;
+		}
+
+		self::mark_elementor_translation_finalized( $post_id, $lang );
+
+		return true;
+	}
+
+	private static function elementor_job_has_durable_partial_state( $post_id, $lang ) {
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		if ( ! is_array( $state ) || empty( $state['phase'] ) ) {
+			return false;
+		}
+
+		return 'elementor' === sanitize_key( (string) $state['phase'] )
+			&& self::elementor_job_partial_state_is_durable( $post_id, $lang );
+	}
+
+	public static function repair_completed_elementor_job_meta( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! is_string( self::get_stored_elementor_json( $post_id, $lang ) ) ) {
+			return false;
+		}
+
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return false;
+		}
+
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+
+		$map       = self::merge_elementor_job_path_map( $post_id, $lang, $data, array() );
+		$remaining = self::filter_remaining_elementor_payload(
+			self::collect_elementor_translation_payload( $data ),
+			$map,
+			array()
+		);
+
+		if ( ! empty( $remaining ) ) {
+			return false;
+		}
+
+		self::clear_job_partial_state( $post_id, $lang, true );
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		self::clear_elementor_primary_batches_lock( $post_id, $lang );
+		delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+		self::save_elementor_source_hash( $post_id, $lang );
+		self::mark_elementor_translation_finalized( $post_id, $lang );
+		self::flush_translation_status_cache( $post_id );
+
+		return true;
+	}
+
 	public static function compute_elementor_source_hash( $post_id ) {
 		$post_id = absint( $post_id );
 
@@ -100,11 +294,9 @@ trait Trait_Storage {
 		$stored_hash = (string) get_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), true );
 
 		if ( '' === trim( $stored_hash ) ) {
-			// Legacy rows saved before source fingerprints — backfill and serve.
-			self::save_elementor_source_hash( $post_id, $lang );
-			self::$elementor_current_cache[ $cache_key ] = true;
+			self::$elementor_current_cache[ $cache_key ] = false;
 
-			return true;
+			return false;
 		}
 
 		$is_current = hash_equals( $stored_hash, $current_hash );
@@ -166,7 +358,6 @@ trait Trait_Storage {
 			return false;
 		}
 
-		// Partial Elementor saves must not block serving a usable companion JSON.
 		$elementor_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
 
 		if ( '' !== trim( $elementor_error ) && ! self::is_elementor_progress_message( $elementor_error ) ) {
@@ -175,9 +366,23 @@ trait Trait_Storage {
 			return false;
 		}
 
+		$progress = trim( (string) get_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), true ) );
+
+		if ( '' !== $progress ) {
+			self::$elementor_storefront_serve_cache[ $key ] = false;
+
+			return false;
+		}
+
 		$decoded = json_decode( $stored, true );
 
 		if ( ! is_array( $decoded ) ) {
+			self::$elementor_storefront_serve_cache[ $key ] = false;
+
+			return false;
+		}
+
+		if ( ! self::is_elementor_translation_finalized( $post_id, $lang ) ) {
 			self::$elementor_storefront_serve_cache[ $key ] = false;
 
 			return false;
@@ -225,6 +430,8 @@ trait Trait_Storage {
 
 			delete_post_meta( $post_id, self::get_elementor_meta_key( $lang ) );
 			delete_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ) );
+			delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
+			delete_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ) );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		}
 
@@ -357,6 +564,13 @@ trait Trait_Storage {
 		}
 
 		$payload = self::collect_elementor_translation_payload( $data );
+		$accepted = self::get_elementor_accepted_paths( $post_id, $lang );
+
+		if ( ! empty( $accepted ) ) {
+			foreach ( $accepted as $path ) {
+				unset( $payload[ $path ] );
+			}
+		}
 
 		self::$stored_elementor_persian_cache[ $key ] = implode(
 			"\n\n",

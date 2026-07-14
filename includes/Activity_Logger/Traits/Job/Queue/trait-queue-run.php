@@ -799,6 +799,7 @@ trait Trait_Queue_Run {
 
 		if (
 			! empty( $slice['done'] )
+			&& 'complete' !== sanitize_key( (string) ( $slice['phase'] ?? '' ) )
 			&& 'elementor' !== sanitize_key( (string) ( $slice['phase'] ?? '' ) )
 			&& Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
 		) {

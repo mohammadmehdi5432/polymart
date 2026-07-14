@@ -304,6 +304,7 @@ trait Trait_Job_Gap_Fill {
 		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$remaining      = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
 		$forced         = 0;
+		$accepted_paths = array();
 
 		foreach ( $remaining as $path => $text ) {
 			$path = (string) $path;
@@ -314,7 +315,13 @@ trait Trait_Job_Gap_Fill {
 			}
 
 			self::apply_elementor_field_source_fallback( $path, $text, $map, $state );
+			$accepted_paths[] = $path;
 			++$forced;
+		}
+
+		if ( ! empty( $accepted_paths ) ) {
+			self::save_elementor_accepted_paths( $post_id, $lang, $accepted_paths );
+			self::bind_elementor_accepted_paths_context( $post_id, $lang );
 		}
 
 		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
