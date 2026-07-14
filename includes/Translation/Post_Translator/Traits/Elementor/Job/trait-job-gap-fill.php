@@ -108,6 +108,13 @@ trait Trait_Job_Gap_Fill {
 		);
 
 		if ( $stubborn_left > 0 ) {
+			$stubborn_field_cap = min( 4, $stubborn_left );
+
+			if ( \PolymartAI\Activity_Logger::is_trusted_as_tick() ) {
+				// One GapGPT call per AS action — avoids 90–120s batch kills mid-stubborn.
+				$stubborn_field_cap = 1;
+			}
+
 			\PolymartAI\Activity_Logger::log(
 				'info',
 				sprintf(
@@ -132,7 +139,7 @@ trait Trait_Job_Gap_Fill {
 				$api_key,
 				$api_endpoint,
 				$ai_model,
-				min( 4, $stubborn_left )
+				$stubborn_field_cap
 			);
 		}
 
@@ -199,7 +206,7 @@ trait Trait_Job_Gap_Fill {
 			);
 		}
 
-		\PolymartAI\Activity_Logger::schedule_elementor_partial_follow_up( 4 );
+		\PolymartAI\Activity_Logger::schedule_elementor_partial_follow_up( 0 );
 
 		return array(
 			'done'           => false,
@@ -230,20 +237,36 @@ trait Trait_Job_Gap_Fill {
 		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
 		$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$map = self::prepare_elementor_map_for_persist( $map, $source_payload );
 		$state['elementor_map'] = $map;
 
 		if ( ! self::elementor_job_map_has_no_remaining( $source_payload, $map, $skipped ) ) {
-			return array(
-				'done'           => false,
-				'phase'          => 'elementor',
-				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-				'message'        => self::format_elementor_gap_fill_remaining_message(
-					$post_id,
-					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped ),
+			$remaining_blocked = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+			if (
+				1 === count( $remaining_blocked )
+				&& self::elementor_field_translation_complete(
+					(string) array_key_first( $remaining_blocked ),
+					(string) reset( $remaining_blocked ),
 					$map
-				),
-				'recoverable'    => true,
-			);
+				)
+			) {
+				$remaining_blocked = array();
+			}
+
+			if ( ! empty( $remaining_blocked ) ) {
+				return array(
+					'done'           => false,
+					'phase'          => 'elementor',
+					'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+					'message'        => self::format_elementor_gap_fill_remaining_message(
+						$post_id,
+						$remaining_blocked,
+						$map
+					),
+					'recoverable'    => true,
+				);
+			}
 		}
 
 		\PolymartAI\Activity_Logger::log(
@@ -926,7 +949,7 @@ trait Trait_Job_Gap_Fill {
 		$short       = array();
 		$long        = array();
 		$persist_map = is_array( $state['elementor_persist_map'] ?? null ) ? $state['elementor_persist_map'] : array();
-		$api_budget  = max( 2, min( 8, absint( $max_fields ) * 2 ) );
+		$api_budget  = self::resolve_elementor_stubborn_api_budget( $max_fields );
 		$spent       = 0;
 
 		foreach ( $remaining as $path => $text ) {
@@ -1353,6 +1376,18 @@ trait Trait_Job_Gap_Fill {
 		}
 
 		return compact( 'completed', 'touched' );
+	}
+
+	private static function resolve_elementor_stubborn_api_budget( $max_fields ) {
+		if ( \PolymartAI\Activity_Logger::is_trusted_as_tick() ) {
+			return 1;
+		}
+
+		if ( wp_doing_cron() ) {
+			return 2;
+		}
+
+		return max( 2, min( 8, absint( $max_fields ) * 2 ) );
 	}
 
 	private static function elementor_gap_fill_remaining_is_long_tail_only( array $source_payload, array $map, array $skipped ) {

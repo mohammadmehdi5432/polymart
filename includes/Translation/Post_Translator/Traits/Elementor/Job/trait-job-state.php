@@ -77,6 +77,10 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		if ( self::elementor_needs_gap_fill_work( $post_id, $lang ) ) {
+			return true;
+		}
+
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			return false;
 		}
@@ -360,6 +364,24 @@ trait Trait_Job_State {
 
 		if ( $post_id <= 0 || '' === $lang ) {
 			return false;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		if (
+			! empty( $state['elementor_gap_fill'] )
+			|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
+		) {
+			if ( self::is_elementor_translation_finalized( $post_id, $lang ) ) {
+				return false;
+			}
+
+			if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+				return true;
+			}
+
+			// Map is empty but finalize has not run yet — one more worker tick must persist.
+			return true;
 		}
 
 		if ( ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
