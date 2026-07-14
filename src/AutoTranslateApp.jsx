@@ -39,6 +39,26 @@ function isElementorPartialJob(job) {
   );
 }
 
+function apiCooldownRemaining(job) {
+  return Math.max(0, Number(job?.api_cooldown_remaining || 0));
+}
+
+function isApiCooldownActive(job) {
+  return job?.status === 'running' && apiCooldownRemaining(job) > 0;
+}
+
+function formatApiCooldownLabel(seconds) {
+  if (seconds >= 60) {
+    return `API آروان محدود — ${Math.ceil(seconds / 60)} دقیقه تا ادامه`;
+  }
+  return `API آروان محدود — ${seconds} ثانیه تا ادامه`;
+}
+
+function isSyntheticCooldownMessage(message) {
+  const text = String(message || '');
+  return /API آروان محدود|تا ادامه|بدون مصرف توکن|API آماده تلاش مجدد/i.test(text);
+}
+
 /** Top status line while Elementor chunks are in flight (lock is only held a few seconds per tick). */
 function formatElementorPartialStatus(job, cronAgeSec, workerLabel) {
   const progress = job?.partial_progress || '';
@@ -118,7 +138,11 @@ function isCronHealthy(job) {
     return false;
   }
 
-  if (job?.status === 'running' && Number(job?.api_cooldown_remaining || 0) > 0) {
+  if (job?.status === 'running' && gapFillPending && activityAge > 35) {
+    return false;
+  }
+
+  if (job?.status === 'running' && isApiCooldownActive(job)) {
     return true;
   }
 
@@ -170,13 +194,27 @@ function isCronHealthy(job) {
 }
 
 function jobStepHeadline(lastStepStatus, displayPost, job) {
-  const cooldownRemaining = Number(job?.api_cooldown_remaining || 0);
+  const cooldownRemaining = apiCooldownRemaining(job);
+  const cooldownActive = isApiCooldownActive(job);
 
-  if (cooldownRemaining > 0 && job?.status === 'running') {
-    if (cooldownRemaining >= 60) {
-      return `API آروان محدود — ${Math.ceil(cooldownRemaining / 60)} دقیقه تا ادامه`;
+  if (cooldownActive) {
+    const progress = job?.partial_progress || displayPost?.partial_progress;
+    const phase = job?.partial_phase || displayPost?.partial_phase;
+    const stepMsg = displayPost?.step_message || job?.last_step?.message || '';
+
+    if (lastStepStatus === 'partial' && phase === 'elementor' && progress) {
+      const parsed = /^(\d+)\/(\d+)$/.exec(progress);
+      if (parsed && Number(parsed[1]) >= Number(parsed[2])) {
+        return `Elementor ${progress} — تکمیل فیلدهای باقی‌مانده (${formatApiCooldownLabel(cooldownRemaining)})`;
+      }
+      return `Elementor ${progress} — ${formatApiCooldownLabel(cooldownRemaining)}`;
     }
-    return `API آروان محدود — ${cooldownRemaining} ثانیه تا ادامه`;
+
+    if (stepMsg && !isSyntheticCooldownMessage(stepMsg)) {
+      return formatApiCooldownLabel(cooldownRemaining);
+    }
+
+    return formatApiCooldownLabel(cooldownRemaining);
   }
 
   const lockAge = Number(job?.worker_lock_age || 0);
@@ -504,8 +542,12 @@ export default function AutoTranslateApp() {
         return;
       }
 
-      // Prefer server recent_logs for completed items — partial/errors still echo here.
+      // Prefer server recent_logs — skip synthetic cooldown echoes from last_step.
       if (step.status === 'translated' || step.status === 'skipped') {
+        return;
+      }
+
+      if (isSyntheticCooldownMessage(step.message)) {
         return;
       }
 
@@ -747,8 +789,10 @@ export default function AutoTranslateApp() {
           isElementorPartialJob(data) &&
           !data?.as_slice_active &&
           !data?.as_running &&
-          activityAge > 8 &&
-          Number(data?.api_cooldown_remaining || 0) <= 0;
+          Number(data?.api_cooldown_remaining || 0) <= 0 &&
+          (Boolean(data?.elementor_gap_fill_pending)
+            ? activityAge > 5
+            : activityAge > 8);
 
         if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
           const nowMs = Date.now();
@@ -762,6 +806,7 @@ export default function AutoTranslateApp() {
           );
           const lockBlocks =
             !isElementorPartialJob(data) &&
+            !Boolean(data?.elementor_gap_fill_pending) &&
             Boolean(data.worker_lock) &&
             hasActivePost &&
             lockAge >= 0 &&
@@ -1197,6 +1242,7 @@ export default function AutoTranslateApp() {
     return Math.max(0, Math.floor(Date.now() / 1000) - stamp);
   })();
   const latestActivityAt = latestWorkerStamp(job);
+  const cooldownActive = isApiCooldownActive(job);
 
   const workerLabel =
     job?.last_worker === 'as'
@@ -1215,7 +1261,15 @@ export default function AutoTranslateApp() {
     ? actionPendingLabel
     : isRunning
       ? (() => {
-          if (Number(job?.api_cooldown_remaining || 0) <= 0 && isElementorPartialJob(job)) {
+          if (isApiCooldownActive(job)) {
+            const sec = apiCooldownRemaining(job);
+            if (sec >= 60) {
+              return `انتظار محدودیت API — ${Math.ceil(sec / 60)} دقیقه (بدون مصرف توکن)`;
+            }
+            return `انتظار محدودیت API — ${sec} ثانیه`;
+          }
+
+          if (!isApiCooldownActive(job) && isElementorPartialJob(job)) {
             const elementorStatus = formatElementorPartialStatus(job, cronAgeSec, workerLabel);
             if (elementorStatus) {
               return elementorStatus;
@@ -1506,12 +1560,24 @@ export default function AutoTranslateApp() {
               {(isRunning && (displayPost?.title || job?.worker_lock || job?.last_step)) && (
                 <div
                   className={`mb-4 rounded-lg border px-4 py-3 text-sm ${
-                    lastStepStatus === 'partial'
-                      ? 'border-amber-200 bg-amber-50 text-amber-950'
-                      : 'border-blue-200 bg-blue-50 text-blue-900'
+                    cooldownActive
+                      ? 'border-violet-200 bg-violet-50 text-violet-950'
+                      : lastStepStatus === 'partial'
+                        ? 'border-amber-200 bg-amber-50 text-amber-950'
+                        : 'border-blue-200 bg-blue-50 text-blue-900'
                   }`}
                 >
-                  <p className={`text-xs ${lastStepStatus === 'partial' ? 'text-amber-700' : lastStepStatus === 'deferred' ? 'text-violet-700' : 'text-blue-700'}`}>
+                  <p
+                    className={`text-xs ${
+                      cooldownActive
+                        ? 'text-violet-700'
+                        : lastStepStatus === 'partial'
+                          ? 'text-amber-700'
+                          : lastStepStatus === 'deferred'
+                            ? 'text-violet-700'
+                            : 'text-blue-700'
+                    }`}
+                  >
                     {jobStepHeadline(lastStepStatus, displayPost, job)}
                   </p>
                   {displayPost?.title ? (
@@ -1520,18 +1586,22 @@ export default function AutoTranslateApp() {
                         #{displayPost.post_id} — {displayPost.title}
                       </p>
                       {(() => {
-                        const cooldownRemaining = Number(job?.api_cooldown_remaining || 0);
-                        if (cooldownRemaining > 0 && job?.status === 'running') {
+                        const stepMsg = displayPost.step_message || job?.last_step?.message || '';
+
+                        if (cooldownActive) {
+                          if (stepMsg && !isSyntheticCooldownMessage(stepMsg)) {
+                            return <p className="mt-1 text-xs opacity-90">{stepMsg}</p>;
+                          }
+
                           return (
                             <p className="mt-1 text-xs opacity-90">
-                              {cooldownRemaining >= 60
-                                ? `API آروان محدود — ${Math.ceil(cooldownRemaining / 60)} دقیقه تا ادامه (بدون مصرف توکن)`
-                                : `API آروان محدود — ${cooldownRemaining} ثانیه تا ادامه`}
+                              بدون مصرف توکن — پس از اتمام محدودیت، ترجمه از همان نقطه ادامه می‌یابد
                             </p>
                           );
                         }
-                        return displayPost.step_message ? (
-                          <p className="mt-1 text-xs opacity-90">{displayPost.step_message}</p>
+
+                        return stepMsg ? (
+                          <p className="mt-1 text-xs opacity-90">{stepMsg}</p>
                         ) : null;
                       })()}
                     </>
@@ -1546,7 +1616,11 @@ export default function AutoTranslateApp() {
                     <p className="mt-2 text-xs opacity-80">
                       آخرین فعالیت کارگر: {formatTime(latestActivityAt)}
                       {job.last_cron_steps ? ` · ${job.last_cron_steps} مرحله` : ''}
-                      {job.worker_lock ? ' · قفل فعال' : ''}
+                      {cooldownActive
+                        ? ' · منتظر محدودیت API'
+                        : job.worker_lock
+                          ? ' · قفل فعال'
+                          : ''}
                       {job.cron_scheduled ? ' · event بعدی زمان‌بندی شده' : ''}
                     </p>
                   ) : null}
@@ -1671,10 +1745,16 @@ export default function AutoTranslateApp() {
                 شروع: {formatTime(job?.started_at)} — آخرین به‌روزرسانی: {formatTime(job?.updated_at)}
               </p>
 
-              {job?.last_error && (
+              {job?.last_error && !(cooldownActive && isSyntheticCooldownMessage(job.last_error)) && (
                 <div className="mt-2 space-y-2">
-                  <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
-                    آخرین خطا: {job.last_error}
+                  <p
+                    className={`rounded border px-3 py-2 text-sm ${
+                      cooldownActive
+                        ? 'border-violet-200 bg-violet-50 text-violet-900'
+                        : 'border-red-200 bg-red-50 text-red-800'
+                    }`}
+                  >
+                    {cooldownActive ? 'وضعیت API' : 'آخرین خطا'}: {job.last_error}
                   </p>
                   {canSkip && (
                     <button

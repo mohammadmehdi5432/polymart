@@ -166,13 +166,27 @@ trait Trait_Job_Api {
 		$job['step_deferred']         = true;
 		$job['step_deferred_reason']  = 'api_cooldown';
 		$job['step_deferred_message'] = $cooldown_message;
-		$job['last_error']            = $cooldown_message;
+		$job['api_cooldown_message']  = $cooldown_message;
 
-		if ( is_array( $job['last_step'] ?? null ) ) {
+		// Keep real Elementor/step progress in last_step — do not replace with cooldown text.
+		if (
+			empty( $job['last_error'] )
+			|| self::is_synthetic_api_throttle_message( (string) $job['last_error'] )
+		) {
+			$job['last_error'] = $cooldown_message;
+		}
+
+		if (
+			is_array( $job['last_step'] ?? null )
+			&& '' === trim( (string) ( $job['last_step']['message'] ?? '' ) )
+		) {
 			$job['last_step']['message'] = $cooldown_message;
 		}
 
-		if ( is_array( $job['current_post'] ?? null ) ) {
+		if (
+			is_array( $job['current_post'] ?? null )
+			&& '' === trim( (string) ( $job['current_post']['step_message'] ?? '' ) )
+		) {
 			$job['current_post']['step_message'] = $cooldown_message;
 		}
 

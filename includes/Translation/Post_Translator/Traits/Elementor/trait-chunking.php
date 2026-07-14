@@ -779,6 +779,14 @@ trait Trait_Chunking {
 		// For very long Elementor fields, require all __segN pieces (or one collapsed base value).
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
 		if ( ! empty( $seg_lookup ) ) {
+			if (
+				isset( $map[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
+				&& self::utf8_strlen( (string) $map[ $path ] ) >= (int) floor( self::utf8_strlen( $text ) * 0.85 )
+			) {
+				return true;
+			}
+
 			$all_segs_ok = true;
 
 			foreach ( $seg_lookup as $seg_key => $seg_source ) {

@@ -45,22 +45,30 @@ trait Trait_Worker_Heartbeat {
 			? Job_Action_Scheduler::STALE_RUNNING_SEC
 			: max( 30, absint( $max_silent_sec ) );
 
-		$lock  = get_transient( self::STEP_LOCK_KEY );
-		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
-		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
-
-		if ( $stamp > 0 && ( time() - $stamp ) < $max_silent_sec ) {
-			return true;
-		}
-
 		$job  = self::get_job_raw();
 		$last = max(
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 ),
 			absint( $job['step_started_at'] ?? 0 )
 		);
+		$heartbeat_age = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
 
-		return $last > 0 && ( time() - $last ) < $max_silent_sec;
+		$lock  = get_transient( self::STEP_LOCK_KEY );
+		$claim = absint( get_option( self::STEP_LOCK_CLAIM_KEY, 0 ) );
+		$stamp = max( $lock ? absint( $lock ) : 0, $claim );
+
+		if ( $stamp > 0 ) {
+			$lock_age  = time() - $stamp;
+			$lock_ttl  = min( 95, max( 30, (int) apply_filters( 'polymart_ai_step_lock_lively_sec', 90 ) ) );
+			$hb_window = min( $max_silent_sec, 120 );
+
+			// A step lock alone must not mask a dead worker for the full stale window.
+			if ( $lock_age < $lock_ttl && $heartbeat_age < $hb_window ) {
+				return true;
+			}
+		}
+
+		return $last > 0 && $heartbeat_age < $max_silent_sec;
 	}
 
 	public static function touch_job_worker_heartbeat() {

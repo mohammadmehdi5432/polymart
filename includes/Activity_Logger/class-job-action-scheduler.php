@@ -308,7 +308,16 @@ final class Job_Action_Scheduler {
 		// A fresh In-progress action (< stale threshold) is actively working.
 		$running = self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING );
 		if ( $running > 0 && 0 === $recovered ) {
-			return 0;
+			$stale_sec = min( 90, self::STALE_RUNNING_SEC );
+
+			if ( ! \PolymartAI\Activity_Logger::is_bulk_worker_lively( $stale_sec ) ) {
+				$recovered = self::recover_stale_running_actions( $stale_sec );
+				\PolymartAI\Activity_Logger::release_stale_locks_for_as( $stale_sec );
+				\PolymartAI\Activity_Logger::release_step_lock();
+				self::clear_slice_mutex();
+			} else {
+				return 0;
+			}
 		}
 
 		return self::enqueue_next( false, 0 );
@@ -743,27 +752,23 @@ final class Job_Action_Scheduler {
 
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			$job_after_chain = \PolymartAI\Activity_Logger::get_job_for_as_debug();
+			$needs_gap_chain = self::job_needs_elementor_gap_fill_chain( $job_after_chain )
+				|| \PolymartAI\Activity_Logger::should_prioritize_elementor_partial( $job_after_chain );
+			$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
+			$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
 
-			if ( $any_productive ) {
-				\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
+			if ( $any_productive || $needs_gap_chain ) {
+				if ( $any_productive ) {
+					\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 
-				$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
-				$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
-
-				if ( $post_id > 0 && '' !== $lang ) {
-					\PolymartAI\Activity_Logger::sync_elementor_partial_progress( $post_id, $lang );
+					if ( $post_id > 0 && '' !== $lang ) {
+						\PolymartAI\Activity_Logger::sync_elementor_partial_progress( $post_id, $lang );
+					}
 				}
 
-				self::chain_next_slice_immediately();
-			} elseif (
-				\PolymartAI\Activity_Logger::should_prioritize_elementor_partial( $job_after_chain )
-				|| self::job_needs_elementor_gap_fill_chain( $job_after_chain )
-			) {
-				$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
-				$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
-
 				if (
-					! empty( $job_after['step_deferred'] )
+					$needs_gap_chain
+					&& ! empty( $job_after['step_deferred'] )
 					&& 'translation_in_progress' === (string) ( $job_after['step_deferred_reason'] ?? '' )
 					&& $post_id > 0
 					&& '' !== $lang
@@ -771,10 +776,10 @@ final class Job_Action_Scheduler {
 					Post_Translator::release_stale_translation_lock( $post_id, $lang, 25 );
 				}
 
-				if ( ! self::has_pending_or_running() ) {
-					self::chain_next_after_recovery();
-				} else {
+				if ( $needs_gap_chain && ! $any_productive && self::has_pending_or_running() ) {
 					self::run_queue_inline( true );
+				} else {
+					self::chain_next_slice_immediately();
 				}
 			} else {
 				\PolymartAI\Activity_Logger::nudge_as_queue_runner();
@@ -1368,7 +1373,16 @@ final class Job_Action_Scheduler {
 		if ( $done <= 0 && $force_inline && \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			// Never spawn a parallel inline batch while AS or the slice mutex owns the job.
 			if ( self::is_slice_execution_active() && self::$current_action_id <= 0 ) {
-				return $done;
+				$job         = \PolymartAI\Activity_Logger::get_job_for_as_debug();
+				$progress_at = absint( $job['partial_progress_at'] ?? 0 );
+				$stale_gap   = $progress_at > 0 && ( time() - $progress_at ) > 90;
+
+				if ( $stale_gap || ! \PolymartAI\Activity_Logger::is_bulk_worker_lively( 75 ) ) {
+					self::clear_slice_mutex();
+					\PolymartAI\Activity_Logger::release_step_lock();
+				} else {
+					return $done;
+				}
 			}
 
 			self::clear_slice_mutex_if_stale();

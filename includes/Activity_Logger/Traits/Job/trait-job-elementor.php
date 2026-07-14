@@ -240,13 +240,15 @@ trait Trait_Job_Elementor {
 
 		// Same pattern as metabox AS: enqueue ASAP + run the queue inline in this request.
 		if ( Job_Action_Scheduler::is_available() ) {
+			$force_inline = ! self::is_bulk_worker_lively( 45 );
+
 			if ( Job_Action_Scheduler::has_pending_or_running() ) {
-				Job_Action_Scheduler::run_queue_inline( false );
+				Job_Action_Scheduler::run_queue_inline( $force_inline );
 				return;
 			}
 
 			Job_Action_Scheduler::enqueue_next( false, 0 );
-			Job_Action_Scheduler::run_queue_inline( false );
+			Job_Action_Scheduler::run_queue_inline( true );
 		}
 	}
 

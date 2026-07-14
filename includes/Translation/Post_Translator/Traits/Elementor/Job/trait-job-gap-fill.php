@@ -137,8 +137,9 @@ trait Trait_Job_Gap_Fill {
 		}
 
 		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
-		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+		$map = self::merge_elementor_job_path_map( $post_id, $lang, $source_data, $state, $map );
 		$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$map = self::prepare_elementor_map_for_persist( $map, $source_payload );
 		$state['elementor_map'] = $map;
 
 		if ( empty( $stubborn_result['touched'] ) && empty( $stubborn_result['completed'] ) ) {
@@ -197,6 +198,8 @@ trait Trait_Job_Gap_Fill {
 				$progress_total
 			);
 		}
+
+		\PolymartAI\Activity_Logger::schedule_elementor_partial_follow_up( 4 );
 
 		return array(
 			'done'           => false,
@@ -1008,16 +1011,6 @@ trait Trait_Job_Gap_Fill {
 
 			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
 				++$done;
-				\PolymartAI\Activity_Logger::log(
-					'info',
-					sprintf(
-						/* translators: 1: post ID, 2: field path */
-						__( 'Elementor — #%1$d: stubborn تکمیل شد — %2$s', 'polymart-ai' ),
-						$post_id,
-						$path
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
-				);
 			} elseif ( $touched ) {
 				$blocker = self::describe_elementor_field_translation_blocker( $path, $text, $map );
 				self::log_elementor_remaining_field_diagnostics(
@@ -1236,6 +1229,14 @@ trait Trait_Job_Gap_Fill {
 					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
 				);
 
+				\PolymartAI\Activity_Logger::maybe_apply_api_throttle_cooldown( $result );
+
+				if ( \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
+					$state['elementor_segment_failures'] = $seg_failures;
+
+					return compact( 'completed', 'touched' );
+				}
+
 				foreach ( array_keys( $pending ) as $pending_key ) {
 					$pending_key = (string) $pending_key;
 
@@ -1329,9 +1330,11 @@ trait Trait_Job_Gap_Fill {
 		$map                    = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$map                    = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
 		$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$map                    = self::prepare_elementor_map_for_persist( $map, $source_payload );
 		$state['elementor_map'] = $map;
 
 		if ( $touched ) {
+			\PolymartAI\Activity_Logger::touch_successful_api_call();
 			self::remember_elementor_segment_progress( $post_id, $lang, $state, $map, $source_payload );
 		}
 
