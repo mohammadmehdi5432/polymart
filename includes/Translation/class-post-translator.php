@@ -6298,41 +6298,50 @@ final class Post_Translator {
 			$gap_chunks = self::build_elementor_gap_fill_chunks( $data, $map, $skipped );
 
 			if ( ! empty( $gap_chunks ) ) {
-				$chunks                      = $gap_chunks;
-				$state['elementor_map']      = $map;
-				$state['elementor_gap_fill'] = true;
-				$stored_total                = self::read_elementor_slice_cursor_total( $post_id, $lang );
-				$stored_cursor               = self::read_elementor_slice_cursor( $post_id, $lang );
+				$chunks                 = $gap_chunks;
+				$state['elementor_map'] = $map;
+				$was_gap_fill           = ! empty( $state['elementor_gap_fill'] );
+				$stored_total           = self::read_elementor_slice_cursor_total( $post_id, $lang );
+				$stored_cursor          = self::read_elementor_slice_cursor( $post_id, $lang );
 
 				if ( $stored_total > 0 ) {
-					$progress_total                        = $stored_total;
-					$state['elementor_chunks_total']       = $stored_total;
+					$progress_total                          = $stored_total;
+					$state['elementor_chunks_total']         = $stored_total;
 					$state['elementor_primary_batches_done'] = $stored_total;
-					$slice_cursor                          = min( $stored_total, max( $stored_cursor, $stored_total ) );
+					$slice_cursor                            = min( $stored_total, max( $stored_cursor, $stored_total ) );
 					self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $stored_total );
 				} else {
 					$state['elementor_primary_batches_done'] = $progress_total;
 					$slice_cursor                          = $progress_total;
 				}
 
-				$state['elementor_gap_fill_total'] = count( $gap_chunks );
-				$state['elementor_gap_fill_done']  = 0;
+				if ( ! $was_gap_fill ) {
+					$state['elementor_gap_fill_total'] = count( $gap_chunks );
+					$state['elementor_gap_fill_done']  = 0;
 
-				$remaining_count = count(
-					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
-				);
+					$remaining_count = count(
+						self::filter_remaining_elementor_payload( $source_payload, $map, $skipped )
+					);
 
-				\PolymartAI\Activity_Logger::log(
-					'info',
-					sprintf(
-						/* translators: 1: post ID, 2: remaining fields, 3: gap batches */
-						__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد در %3$d بخش', 'polymart-ai' ),
-						$post_id,
-						$remaining_count,
-						count( $gap_chunks )
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang )
-				);
+					\PolymartAI\Activity_Logger::log(
+						'info',
+						sprintf(
+							/* translators: 1: post ID, 2: remaining fields, 3: gap batches */
+							__( 'Elementor — #%1$d: تکمیل نهایی — %2$d فیلد در %3$d بخش', 'polymart-ai' ),
+							$post_id,
+							$remaining_count,
+							count( $gap_chunks )
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+				} else {
+					$state['elementor_gap_fill_total'] = max(
+						absint( $state['elementor_gap_fill_total'] ?? 0 ),
+						absint( $state['elementor_gap_fill_done'] ?? 0 ) + count( $gap_chunks )
+					);
+				}
+
+				$state['elementor_gap_fill'] = true;
 
 				self::save_job_partial_state( $post_id, $lang, $state );
 			}
@@ -6523,6 +6532,11 @@ final class Post_Translator {
 				self::read_elementor_slice_cursor_total( $post_id, $lang )
 			);
 			$slice_cursor = min( $slice_cursor, $progress_total );
+			$ai_options   = array( 'max_timeout' => 45 );
+
+			if ( function_exists( 'set_time_limit' ) ) {
+				@set_time_limit( max( 120, $budget * 45 ) );
+			}
 		}
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
@@ -7638,24 +7652,11 @@ final class Post_Translator {
 			return array();
 		}
 
-		$total_chars = 0;
-
-		foreach ( $expanded as $text ) {
-			$total_chars += function_exists( 'mb_strlen' ) ? mb_strlen( (string) $text, 'UTF-8' ) : strlen( (string) $text );
-		}
-
-		// Finish stubborn tail fields in as few API calls as possible.
-		if ( count( $expanded ) <= 24 && $total_chars <= 14000 ) {
-			return array( $expanded );
-		}
-
-		$count      = max( 1, count( $expanded ) );
-		$chunk_size = max( 8, min( 16, $count ) );
-
+		// Small batches only — one translate_fields() call must stay a single HTTP round-trip.
 		return self::chunk_payload_with_limits(
 			$expanded,
-			$chunk_size,
-			max( self::ELEMENTOR_JOB_MAX_CHUNK_CHARS, 3500 )
+			3,
+			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
 		);
 	}
 
