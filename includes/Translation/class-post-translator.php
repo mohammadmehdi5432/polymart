@@ -770,6 +770,16 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Durable meta key: primary Elementor API batches finished (immutable 24/24 lock).
+	 *
+	 * @param string $lang Language code.
+	 * @return string
+	 */
+	private static function get_elementor_primary_done_meta_key( $lang ) {
+		return '_polymart_ai_elementor_primary_done_' . sanitize_key( (string) $lang );
+	}
+
+	/**
 	 * Meta key storing the source hash for a translated post meta field.
 	 *
 	 * @param string $source_key Source field identifier.
@@ -4276,6 +4286,13 @@ final class Post_Translator {
 			return true;
 		}
 
+		$primary_done = absint( $state['elementor_primary_batches_done'] ?? 0 );
+		$chunk_total  = max( absint( $state['elementor_chunks_total'] ?? 0 ), $primary_done );
+
+		if ( $primary_done > 0 && $chunk_total > 0 && $primary_done >= $chunk_total ) {
+			return true;
+		}
+
 		return absint( $state['elementor_chunk_index'] ?? 0 ) > 0;
 	}
 
@@ -4624,6 +4641,24 @@ final class Post_Translator {
 		$partial['elementor_slices_completed']     = max( absint( $partial['elementor_slices_completed'] ?? 0 ), $total );
 
 		self::save_job_partial_state( $post_id, $lang, $partial );
+
+		update_post_meta(
+			$post_id,
+			self::get_elementor_primary_done_meta_key( $lang ),
+			array(
+				'done'  => $total,
+				'total' => max( $total, absint( $partial['elementor_chunks_total'] ?? 0 ) ),
+			)
+		);
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return void
+	 */
+	private static function clear_elementor_primary_batches_lock( $post_id, $lang ) {
+		delete_post_meta( absint( $post_id ), self::get_elementor_primary_done_meta_key( sanitize_key( (string) $lang ) ) );
 	}
 
 	/**
@@ -4980,13 +5015,60 @@ final class Post_Translator {
 			return true;
 		}
 
+		$lock = get_post_meta( $post_id, self::get_elementor_primary_done_meta_key( $lang ), true );
+
+		if ( is_array( $lock ) ) {
+			$lock_done  = absint( $lock['done'] ?? 0 );
+			$lock_total = absint( $lock['total'] ?? 0 );
+
+			if ( $lock_done > 0 && $lock_total > 0 && $lock_done >= $lock_total ) {
+				return true;
+			}
+		}
+
 		// Durable hand-off flag survives accidental cursor clears during gap-fill/stubborn.
-		$state       = self::get_job_partial_state( $post_id, $lang );
+		$state        = self::get_job_partial_state( $post_id, $lang );
 		$primary_done = is_array( $state ) ? absint( $state['elementor_primary_batches_done'] ?? 0 ) : 0;
 		$chunk_total  = is_array( $state ) ? absint( $state['elementor_chunks_total'] ?? 0 ) : 0;
 		$chunk_total  = max( $chunk_total, $total, $primary_done );
 
 		return $primary_done > 0 && $chunk_total > 0 && $primary_done >= $chunk_total;
+	}
+
+	/**
+	 * Immutable lock: primary Elementor API schedule must never be rebuilt.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Optional hydrated partial state.
+	 * @return bool
+	 */
+	private static function elementor_primary_schedule_locked( $post_id, $lang, array $state = array() ) {
+		if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			return true;
+		}
+
+		$primary_done = absint( $state['elementor_primary_batches_done'] ?? 0 );
+		$chunk_total  = max(
+			absint( $state['elementor_chunks_total'] ?? 0 ),
+			self::read_elementor_slice_cursor_total( $post_id, $lang ),
+			$primary_done,
+			1
+		);
+
+		return $primary_done > 0 && $primary_done >= $chunk_total;
+	}
+
+	/**
+	 * Whether the in-memory Elementor map covers every source field.
+	 *
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string> $map            Translation path map.
+	 * @param array<string>         $skipped        Skipped base paths.
+	 * @return bool
+	 */
+	private static function elementor_job_map_has_no_remaining( array $source_payload, array $map, array $skipped = array() ) {
+		return empty( self::filter_remaining_elementor_payload( $source_payload, $map, $skipped ) );
 	}
 
 	/**
@@ -5005,7 +5087,7 @@ final class Post_Translator {
 			return true;
 		}
 
-		return self::elementor_job_primary_batches_exhausted( $post_id, $lang );
+		return self::elementor_primary_schedule_locked( $post_id, $lang, $state );
 	}
 
 	/**
@@ -5087,25 +5169,17 @@ final class Post_Translator {
 
 		if ( empty( $remaining ) ) {
 			unset( $state['elementor_stubborn_ghost_ticks'] );
-			self::save_job_partial_state( $post_id, $lang, $state );
 
-			if ( self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
-				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
-
-				if ( is_wp_error( $persisted ) ) {
-					return $persisted;
-				}
-
-				self::clear_elementor_slice_cursor( $post_id, $lang );
-				self::clear_job_partial_state( $post_id, $lang, true );
-
-				return array(
-					'done'           => true,
-					'phase'          => 'elementor',
-					'phase_progress' => '',
-					'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
-				);
-			}
+			return self::finalize_elementor_stubborn_handoff_success(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_payload,
+				$text_mirrors,
+				$progress_total
+			);
 		}
 
 		$ghost_ticks = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
@@ -5207,21 +5281,16 @@ final class Post_Translator {
 			);
 		}
 
-		if ( empty( $remaining_after ) && self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
-			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
-
-			if ( is_wp_error( $persisted ) ) {
-				return $persisted;
-			}
-
-			self::clear_elementor_slice_cursor( $post_id, $lang );
-			self::clear_job_partial_state( $post_id, $lang, true );
-
-			return array(
-				'done'           => true,
-				'phase'          => 'elementor',
-				'phase_progress' => '',
-				'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
+		if ( empty( $remaining_after ) ) {
+			return self::finalize_elementor_stubborn_handoff_success(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_payload,
+				$text_mirrors,
+				$progress_total
 			);
 		}
 
@@ -5231,6 +5300,100 @@ final class Post_Translator {
 			'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
 			'message'        => self::format_elementor_gap_fill_remaining_message( $post_id, $remaining_after, $map ),
 			'recoverable'    => true,
+		);
+	}
+
+	/**
+	 * Collapse stubborn map, persist final Elementor JSON, and mark the job done.
+	 *
+	 * @param int                   $post_id        Post ID.
+	 * @param string                $lang           Language code.
+	 * @param array<string, mixed>  $source_data    Source Elementor tree.
+	 * @param array<string, mixed>  $state          Partial state (by reference).
+	 * @param array<string, string> $map            Translation map (by reference).
+	 * @param array<string, string> $source_payload Source field map.
+	 * @param array<string, string[]> $text_mirrors Mirror lookup.
+	 * @param int                   $progress_total Primary batch total.
+	 * @return array{done: bool, phase: string, phase_progress: string, message: string, recoverable?: bool}|\WP_Error
+	 */
+	private static function finalize_elementor_stubborn_handoff_success(
+		$post_id,
+		$lang,
+		array $source_data,
+		array &$state,
+		array &$map,
+		array $source_payload,
+		array $text_mirrors,
+		$progress_total
+	) {
+		$post_id        = absint( $post_id );
+		$lang           = sanitize_key( (string) $lang );
+		$progress_total = max( 1, absint( $progress_total ));
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+
+		self::bind_elementor_segment_passthrough_context( $state );
+
+		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
+		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
+		$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$state['elementor_map'] = $map;
+
+		if ( ! self::elementor_job_map_has_no_remaining( $source_payload, $map, $skipped ) ) {
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+				'message'        => self::format_elementor_gap_fill_remaining_message(
+					$post_id,
+					self::filter_remaining_elementor_payload( $source_payload, $map, $skipped ),
+					$map
+				),
+				'recoverable'    => true,
+			);
+		}
+
+		\PolymartAI\Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: 1: post ID */
+				__( 'Elementor — #%1$d: تکمیل نهایی — همه فیلدها ترجمه شد و JSON روی سایت ذخیره شد.', 'polymart-ai' ),
+				$post_id
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang )
+		);
+
+		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
+
+		if ( is_wp_error( $persisted ) ) {
+			return $persisted;
+		}
+
+		unset(
+			$state['elementor_gap_fill'],
+			$state['elementor_gap_fill_done'],
+			$state['elementor_gap_fill_total'],
+			$state['elementor_gap_fill_finished_keys'],
+			$state['elementor_gap_fill_scheduled_keys'],
+			$state['elementor_gap_fill_stubborn_only'],
+			$state['elementor_primary_batches_done'],
+			$state['elementor_persist_map'],
+			$state['elementor_seg_map'],
+			$state['elementor_stubborn_ghost_ticks'],
+			$state['elementor_stubborn_long_index'],
+			$state['elementor_segment_passthrough'],
+			$state['elementor_field_passthrough']
+		);
+
+		self::clear_elementor_primary_batches_lock( $post_id, $lang );
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		self::clear_job_partial_state( $post_id, $lang, true );
+		self::flush_translation_status_cache( $post_id );
+
+		return array(
+			'done'           => true,
+			'phase'          => 'elementor',
+			'phase_progress' => '',
+			'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
 		);
 	}
 
@@ -5316,6 +5479,7 @@ final class Post_Translator {
 			$state['elementor_field_passthrough']
 		);
 
+		self::clear_elementor_primary_batches_lock( $post_id, $lang );
 		self::clear_elementor_slice_cursor( $post_id, $lang );
 		self::clear_job_partial_state( $post_id, $lang, true );
 		self::flush_translation_status_cache( $post_id );
@@ -6397,7 +6561,7 @@ final class Post_Translator {
 		$state     = self::get_job_partial_state( $post_id, $lang );
 		$state     = is_array( $state ) ? $state : array();
 
-		if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+		if ( self::elementor_primary_schedule_locked( $post_id, $lang, $state ) ) {
 			return false;
 		}
 
@@ -6472,8 +6636,14 @@ final class Post_Translator {
 			return true;
 		}
 
-		// Primary API schedule finished — gap-fill runs without wiping cursor/progress.
-		if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+		$state = self::hydrate_elementor_job_partial_state(
+			$post_id,
+			$lang,
+			self::get_job_partial_state( $post_id, $lang )
+		);
+
+		// Primary API schedule finished — gap-fill/stubborn runs without wiping cursor/progress.
+		if ( self::elementor_primary_schedule_locked( $post_id, $lang, $state ) ) {
 			return false;
 		}
 
@@ -6489,11 +6659,6 @@ final class Post_Translator {
 			return false;
 		}
 
-		$state = self::hydrate_elementor_job_partial_state(
-			$post_id,
-			$lang,
-			self::get_job_partial_state( $post_id, $lang )
-		);
 		$map       = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
 		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$source    = self::collect_elementor_translation_payload( $data );
@@ -7228,7 +7393,7 @@ final class Post_Translator {
 			}
 		}
 
-		if ( ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+		if ( ! self::elementor_primary_schedule_locked( $post_id, $lang, $state ) ) {
 			self::unblock_elementor_chunk_queue( $post_id, $lang );
 			$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		}
@@ -7273,7 +7438,7 @@ final class Post_Translator {
 		$map            = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$state['elementor_map'] = $map;
 
-		$primary_exhausted = self::elementor_job_primary_batches_exhausted( $post_id, $lang );
+		$primary_exhausted = self::elementor_primary_schedule_locked( $post_id, $lang, $state );
 		$chunks            = array();
 		$slice_cursor      = self::read_elementor_slice_cursor( $post_id, $lang );
 		$progress_total    = max( 1, self::read_elementor_slice_cursor_total( $post_id, $lang ), 1 );
@@ -7433,6 +7598,46 @@ final class Post_Translator {
 			}
 
 			if ( empty( $chunks ) && ! $in_handoff ) {
+				$primary_locked = self::elementor_primary_schedule_locked( $post_id, $lang, $state );
+				$skipped_guard  = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+
+				if ( $primary_locked ) {
+					$progress_total = max(
+						absint( $state['elementor_primary_batches_done'] ?? 0 ),
+						self::read_elementor_slice_cursor_total( $post_id, $lang ),
+						absint( $state['elementor_chunks_total'] ?? 0 ),
+						absint( $progress_total ),
+						1
+					);
+
+					if ( self::elementor_job_map_has_no_remaining( $source_payload, $map, $skipped_guard ) ) {
+						return self::finalize_elementor_stubborn_handoff_success(
+							$post_id,
+							$lang,
+							$data,
+							$state,
+							$map,
+							$source_payload,
+							$text_mirrors,
+							$progress_total
+						);
+					}
+
+					return self::run_elementor_stubborn_handoff_tick(
+						$post_id,
+						$lang,
+						$data,
+						$state,
+						$map,
+						$source_payload,
+						$text_mirrors,
+						$api_key,
+						$api_endpoint,
+						$ai_model,
+						$progress_total
+					);
+				}
+
 				if ( ! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
 					\PolymartAI\Activity_Logger::log(
 						'warning',
@@ -7456,6 +7661,44 @@ final class Post_Translator {
 						)
 					);
 					$state                      = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+
+					if ( self::elementor_primary_schedule_locked( $post_id, $lang, $state ) ) {
+						$progress_total = max(
+							absint( $state['elementor_primary_batches_done'] ?? 0 ),
+							self::read_elementor_slice_cursor_total( $post_id, $lang ),
+							absint( $state['elementor_chunks_total'] ?? 0 ),
+							absint( $progress_total ),
+							1
+						);
+
+						if ( self::elementor_job_map_has_no_remaining( $source_payload, $map, $skipped ) ) {
+							return self::finalize_elementor_stubborn_handoff_success(
+								$post_id,
+								$lang,
+								$data,
+								$state,
+								$map,
+								$source_payload,
+								$text_mirrors,
+								$progress_total
+							);
+						}
+
+						return self::run_elementor_stubborn_handoff_tick(
+							$post_id,
+							$lang,
+							$data,
+							$state,
+							$map,
+							$source_payload,
+							$text_mirrors,
+							$api_key,
+							$api_endpoint,
+							$ai_model,
+							$progress_total
+						);
+					}
+
 					$chunk_queue                = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
 					$chunks                     = $chunk_queue['pending'];
 					$slice_cursor               = $chunk_queue['cursor'];
@@ -7477,7 +7720,7 @@ final class Post_Translator {
 						$chunks = array();
 					} elseif (
 						! self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state )
-						&& ! self::elementor_job_primary_batches_exhausted( $post_id, $lang )
+						&& ! self::elementor_primary_schedule_locked( $post_id, $lang, $state )
 					) {
 						self::unblock_elementor_chunk_queue( $post_id, $lang );
 						$state       = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
@@ -8189,18 +8432,16 @@ final class Post_Translator {
 		);
 		$state['elementor_failures']         = $failures;
 
-		if ( $gap_fill_mode && empty( $remaining ) && self::elementor_job_slice_is_truly_complete( $post_id, $lang, $state ) ) {
-			unset(
-				$state['elementor_gap_fill'],
-				$state['elementor_gap_fill_done'],
-				$state['elementor_gap_fill_total'],
-				$state['elementor_gap_fill_finished_keys'],
-				$state['elementor_gap_fill_scheduled_keys'],
-				$state['elementor_gap_fill_stubborn_only'],
-				$state['elementor_primary_batches_done'],
-				$state['elementor_persist_map'],
-				$state['elementor_seg_map'],
-				$state['elementor_stubborn_long_index']
+		if ( $gap_fill_mode && empty( $remaining ) ) {
+			return self::finalize_elementor_stubborn_handoff_success(
+				$post_id,
+				$lang,
+				$data,
+				$state,
+				$map,
+				self::collect_elementor_translation_payload( $data ),
+				$text_mirrors,
+				$progress_total
 			);
 		}
 
@@ -10171,7 +10412,7 @@ final class Post_Translator {
 		$total          = max( 1, count( $all_chunks ) );
 
 		// Primary 24/24 is immutable — never re-queue base chunks during gap-fill/stubborn.
-		if ( self::elementor_in_gap_fill_handoff( $post_id, $lang, $state ) ) {
+		if ( self::elementor_primary_schedule_locked( $post_id, $lang, $state ) ) {
 			$stored_total  = max(
 				$total,
 				self::read_elementor_slice_cursor_total( $post_id, $lang ),
@@ -10430,6 +10671,7 @@ final class Post_Translator {
 			self::save_elementor_source_hash( $post_id, $lang );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+			self::clear_elementor_primary_batches_lock( $post_id, $lang );
 			self::clear_elementor_slice_cursor( $post_id, $lang );
 			self::flush_translation_status_cache( $post_id );
 
