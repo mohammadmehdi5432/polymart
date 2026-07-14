@@ -299,6 +299,22 @@ trait Trait_Job_Api {
 		return self::get_job_api_cooldown_remaining( $job ) > 0;
 	}
 
+	public static function is_timeout_slice_message( $message ) {
+		$message = strtolower( (string) $message );
+
+		if ( '' === $message ) {
+			return false;
+		}
+
+		foreach ( array( 'timeout api', 'timed out', 'curl error 28', 'operation timed out', 'منقضی شد' ) as $needle ) {
+			if ( false !== strpos( $message, $needle ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	public static function is_synthetic_api_throttle_message( $message ) {
 		$message = strtolower( (string) $message );
 
@@ -377,6 +393,10 @@ trait Trait_Job_Api {
 
 	public static function maybe_apply_api_throttle_cooldown( \WP_Error $error, $cooldown_sec = null ) {
 		if ( self::is_synthetic_api_throttle_message( $error->get_error_message() ) ) {
+			return false;
+		}
+
+		if ( Post_Translator::is_api_transport_timeout_error( $error ) ) {
 			return false;
 		}
 

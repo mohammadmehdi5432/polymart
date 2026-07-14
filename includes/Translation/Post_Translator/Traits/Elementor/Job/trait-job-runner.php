@@ -1394,6 +1394,8 @@ trait Trait_Job_Runner {
 			)
 		);
 
+		\PolymartAI\Activity_Logger::touch_successful_api_call();
+
 		return self::make_recoverable_partial_slice_response(
 			'elementor',
 			$progress,

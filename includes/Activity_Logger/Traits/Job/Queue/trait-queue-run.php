@@ -584,10 +584,17 @@ trait Trait_Queue_Run {
 				$job['partial_progress']  = $partial_progress;
 				$job['current_post_id']   = null;
 				$job['step_started_at']   = null;
-				self::maybe_apply_api_throttle_cooldown( $slice );
+				if ( ! Post_Translator::is_api_transport_timeout_error( $slice ) ) {
+					self::maybe_apply_api_throttle_cooldown( $slice );
+				} else {
+					self::touch_successful_api_call();
+				}
 				$job = self::get_job_raw();
 
-				if ( self::is_job_api_cooldown_active( $job ) ) {
+				if (
+					self::is_job_api_cooldown_active( $job )
+					&& ! Post_Translator::is_api_transport_timeout_error( $slice )
+				) {
 					$remaining                      = self::get_job_api_cooldown_remaining( $job );
 					$job['step_deferred']           = true;
 					$job['step_deferred_reason']    = 'api_cooldown';
@@ -698,8 +705,11 @@ trait Trait_Queue_Run {
 			if ( ! empty( $slice['recoverable'] ) ) {
 				$job['recoverable'] = true;
 				$err_msg            = (string) ( $slice['message'] ?? '' );
+				$timeout_slice      = self::is_timeout_slice_message( $err_msg );
 
-				if ( '' !== $err_msg && ! self::is_synthetic_api_throttle_message( $err_msg ) ) {
+				if ( $timeout_slice ) {
+					self::touch_successful_api_call();
+				} elseif ( '' !== $err_msg && ! self::is_synthetic_api_throttle_message( $err_msg ) ) {
 					self::maybe_apply_api_throttle_cooldown(
 						new \WP_Error( 'polymart_ai_api_error', $err_msg )
 					);
@@ -707,7 +717,7 @@ trait Trait_Queue_Run {
 
 				$job = self::get_job_raw();
 
-				if ( self::is_job_api_cooldown_active( $job ) ) {
+				if ( self::is_job_api_cooldown_active( $job ) && ! $timeout_slice ) {
 					$remaining                      = self::get_job_api_cooldown_remaining( $job );
 					$job['step_deferred']           = true;
 					$job['step_deferred_reason']    = 'api_cooldown';

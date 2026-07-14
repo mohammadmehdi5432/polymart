@@ -103,6 +103,10 @@ trait Trait_Job_Persist {
 			self::clear_elementor_slice_cursor( $post_id, $lang );
 			self::flush_translation_status_cache( $post_id );
 
+			if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+				\PolymartAI\Activity_Logger::touch_successful_api_call();
+			}
+
 			return true;
 		}
 
