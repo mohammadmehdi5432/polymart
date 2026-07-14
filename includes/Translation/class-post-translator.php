@@ -4449,6 +4449,28 @@ final class Post_Translator {
 	}
 
 	/**
+	 * Primary API batches are done but Persian Elementor fields still need translation.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function elementor_needs_gap_fill_work( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		if ( ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+			return false;
+		}
+
+		return self::elementor_job_has_remaining_payload( $post_id, $lang );
+	}
+
+	/**
 	 * Reasons Elementor job finalization must not mark the post complete yet.
 	 *
 	 * @param int                   $post_id     Post ID.
@@ -6250,13 +6272,26 @@ final class Post_Translator {
 		$map            = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$state['elementor_map'] = $map;
 
-		$chunk_queue     = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
-		$chunks          = $chunk_queue['pending'];
-		$slice_cursor    = $chunk_queue['cursor'];
-		$progress_total  = max( $chunk_queue['total'], 1 );
-		$state['elementor_chunks_total'] = $progress_total;
+		$primary_exhausted = self::elementor_job_primary_batches_exhausted( $post_id, $lang );
+		$chunks            = array();
+		$slice_cursor      = self::read_elementor_slice_cursor( $post_id, $lang );
+		$progress_total    = max( 1, self::read_elementor_slice_cursor_total( $post_id, $lang ), 1 );
 
-		if ( empty( $chunks ) && self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+		if ( $primary_exhausted ) {
+			if ( self::read_elementor_slice_cursor_total( $post_id, $lang ) > 0 ) {
+				$progress_total = self::read_elementor_slice_cursor_total( $post_id, $lang );
+				self::write_elementor_slice_cursor( $post_id, $lang, $progress_total, $progress_total );
+				$slice_cursor = $progress_total;
+			}
+		} else {
+			$chunk_queue                     = self::build_elementor_job_chunk_queue( $post_id, $lang, $data, $state );
+			$chunks                          = $chunk_queue['pending'];
+			$slice_cursor                    = $chunk_queue['cursor'];
+			$progress_total                  = max( $chunk_queue['total'], 1 );
+			$state['elementor_chunks_total'] = $progress_total;
+		}
+
+		if ( $primary_exhausted && ! empty( $payload ) ) {
 			$map     = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
 			$map     = self::sanitize_elementor_translation_map( $map, $source_payload );
 			$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
@@ -7598,13 +7633,29 @@ final class Post_Translator {
 	private static function chunk_elementor_gap_fill_payload( array $payload ) {
 		$collapsed = self::collapse_duplicate_elementor_payload( $payload );
 		$expanded  = self::expand_elementor_payload_for_ai( $collapsed['payload'] );
-		$count     = max( 1, count( $expanded ) );
-		$chunk_size = max( 4, min( 12, $count ) );
+
+		if ( empty( $expanded ) ) {
+			return array();
+		}
+
+		$total_chars = 0;
+
+		foreach ( $expanded as $text ) {
+			$total_chars += function_exists( 'mb_strlen' ) ? mb_strlen( (string) $text, 'UTF-8' ) : strlen( (string) $text );
+		}
+
+		// Finish stubborn tail fields in as few API calls as possible.
+		if ( count( $expanded ) <= 24 && $total_chars <= 14000 ) {
+			return array( $expanded );
+		}
+
+		$count      = max( 1, count( $expanded ) );
+		$chunk_size = max( 8, min( 16, $count ) );
 
 		return self::chunk_payload_with_limits(
 			$expanded,
 			$chunk_size,
-			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
+			max( self::ELEMENTOR_JOB_MAX_CHUNK_CHARS, 3500 )
 		);
 	}
 

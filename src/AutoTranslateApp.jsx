@@ -34,6 +34,7 @@ function isElementorPartialJob(job) {
   return (
     job?.status === 'running' &&
     (Boolean(job?.elementor_priority) ||
+      Boolean(job?.elementor_gap_fill_pending) ||
       (job?.partial_phase === 'elementor' && Boolean(job?.partial_post_id)))
   );
 }
@@ -111,8 +112,9 @@ function isCronHealthy(job) {
     progressMatch &&
     Number(progressMatch[1]) >= Number(progressMatch[2]) &&
     Number(progressMatch[2]) > 0;
+  const gapFillPending = Boolean(job?.elementor_gap_fill_pending);
 
-  if (job?.status === 'running' && elementorBatchesDone && activityAge > 6) {
+  if (job?.status === 'running' && (gapFillPending || (elementorBatchesDone && elementorPartial)) && activityAge > 4) {
     return false;
   }
 
@@ -222,6 +224,16 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
   if (lastStepStatus === 'partial' && phase) {
     const label = jobPhaseLabel(phase);
     const parsed = progress && /^(\d+)\/(\d+)$/.exec(progress);
+    const gapMsg = job?.last_step?.message || displayPost?.step_message || '';
+    const gapFillActive =
+      Boolean(job?.elementor_gap_fill_pending) || /باقی|تکمیل نهایی/i.test(gapMsg);
+
+    if (parsed && Number(parsed[1]) >= Number(parsed[2]) && gapFillActive) {
+      return progress
+        ? `Elementor ${progress} — تکمیل فیلدهای باقی‌مانده…`
+        : 'تکمیل فیلدهای Elementor…';
+    }
+
     if (parsed && Number(parsed[1]) >= Number(parsed[2])) {
       return `Elementor تمام شد (${parsed[2]}/${parsed[2]}) — مورد بعدی…`;
     }

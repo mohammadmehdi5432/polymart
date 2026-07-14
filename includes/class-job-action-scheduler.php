@@ -726,6 +726,7 @@ final class Job_Action_Scheduler {
 				self::chain_next_slice_immediately();
 			} elseif (
 				Activity_Logger::should_prioritize_elementor_partial( $job_after_chain )
+				|| self::job_needs_elementor_gap_fill_chain( $job_after_chain )
 			) {
 				$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
 				$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
@@ -1127,6 +1128,27 @@ final class Job_Action_Scheduler {
 		}
 
 		return false;
+	}
+
+	/**
+	 * Whether the bulk job still needs post-21/21 Elementor gap-fill API work.
+	 *
+	 * @param array<string, mixed> $job Job state.
+	 * @return bool
+	 */
+	private static function job_needs_elementor_gap_fill_chain( array $job ) {
+		if ( 'running' !== (string) ( $job['status'] ?? '' ) ) {
+			return false;
+		}
+
+		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		return Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang );
 	}
 
 	/**

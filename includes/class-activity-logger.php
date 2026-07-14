@@ -1807,6 +1807,9 @@ final class Activity_Logger {
 		$job['worker_mode']    = ! empty( $as_status['available'] ) ? 'as' : 'cron';
 		$job['elementor_priority'] = self::should_prioritize_elementor_partial( $job );
 		$job['elementor_progress_stalled'] = self::is_elementor_progress_stalled( $job );
+		$gap_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+		$job['elementor_gap_fill_pending'] = $gap_post_id > 0 && '' !== $lang
+			&& Post_Translator::elementor_needs_gap_fill_work( $gap_post_id, $lang );
 		$job['cli_alive']      = false;
 		$job['cli_spawn_ok']   = false;
 		$job['recent_logs']    = self::get_recent_job_logs( $job, 60 );
@@ -2637,6 +2640,14 @@ final class Activity_Logger {
 		}
 
 		if ( self::$trusted_as_tick && self::should_prioritize_elementor_partial( self::get_job_raw() ) ) {
+			$job     = self::get_job_raw();
+			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+			$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+			if ( $post_id > 0 && '' !== $lang && Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang ) ) {
+				return 8;
+			}
+
 			return 3;
 		}
 
@@ -4550,14 +4561,22 @@ final class Activity_Logger {
 			&& 'running' === ( $job['status'] ?? '' )
 		) {
 			$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
+			$gap_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+			$gap_lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+			$gap_pending = $gap_post_id > 0 && '' !== $gap_lang
+				&& Post_Translator::elementor_needs_gap_fill_work( $gap_post_id, $gap_lang );
 
 			if (
-				is_array( $parsed )
-				&& $parsed['total'] > 0
-				&& $parsed['done'] >= $parsed['total']
-				&& $age >= 8
+				$gap_pending
+				|| (
+					is_array( $parsed )
+					&& $parsed['total'] > 0
+					&& $parsed['done'] >= $parsed['total']
+				)
 			) {
-				self::schedule_elementor_partial_follow_up( 0 );
+				if ( $age >= ( $gap_pending ? 4 : 8 ) ) {
+					self::schedule_elementor_partial_follow_up( 0 );
+				}
 			}
 		}
 
@@ -5450,6 +5469,11 @@ final class Activity_Logger {
 				&& is_array( $parsed_done )
 				&& $parsed_done['total'] > 0
 				&& $parsed_done['done'] >= $parsed_done['total']
+			) {
+				self::schedule_elementor_partial_follow_up( 0 );
+			} elseif (
+				'elementor' === sanitize_key( (string) ( $slice['phase'] ?? '' ) )
+				&& Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
 			) {
 				self::schedule_elementor_partial_follow_up( 0 );
 			}
