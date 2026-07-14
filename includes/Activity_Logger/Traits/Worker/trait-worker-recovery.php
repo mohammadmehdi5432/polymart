@@ -197,6 +197,11 @@ trait Trait_Worker_Recovery {
 			return false;
 		}
 
+		$last_recover = absint( $job['worker_recovered_at'] ?? 0 );
+		if ( $last_recover > 0 && ( time() - $last_recover ) < min( 55, $need ) ) {
+			return false;
+		}
+
 		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
 

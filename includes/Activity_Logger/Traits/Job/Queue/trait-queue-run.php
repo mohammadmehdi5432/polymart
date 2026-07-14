@@ -250,7 +250,8 @@ trait Trait_Queue_Run {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		self::force_recover_stalled_bulk_worker( 'kick' );
+		$before_progress = (string) ( $job['partial_progress'] ?? '' );
+		$did_recover     = self::force_recover_stalled_bulk_worker( 'kick' );
 
 		if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {
 			self::force_release_step_lock_if_idle();
@@ -270,8 +271,7 @@ trait Trait_Queue_Run {
 		$result = self::run_inline_worker_tick();
 
 		if ( is_array( $result ) ) {
-			$result['worker_kicked'] = true;
-			$result['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
+			$result['worker_mode'] = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
 
 			$post_id = absint( $result['partial_post_id'] ?? 0 ) ?: absint( $result['current_post_id'] ?? 0 );
 			$lang    = sanitize_key( (string) ( $result['lang'] ?? 'en' ) );
@@ -285,19 +285,46 @@ trait Trait_Queue_Run {
 			) {
 				self::run_pinned_elementor_work( true );
 				$result = self::normalize_job_for_response( self::get_job_raw(), false );
-				$result['worker_kicked'] = true;
 				$result['worker_direct_tick'] = true;
+				$result['worker_mode']        = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
 			}
+
+			$result['worker_kicked'] = self::kick_worker_moved_queue(
+				$before_progress,
+				$result,
+				$did_recover,
+				(bool) ( $result['worker_direct_tick'] ?? false ),
+				(bool) ( $result['worker_inline_tick'] ?? false )
+			);
 
 			return $result;
 		}
 
 		$out = self::normalize_job_for_response( self::get_job_raw(), false );
-		$out['worker_kicked'] = true;
+		$out['worker_kicked'] = self::kick_worker_moved_queue( $before_progress, $out, $did_recover, false, false );
 		$out['as_pending']    = Job_Action_Scheduler::has_pending_or_running();
 		$out['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
 
 		return $out;
+	}
+
+	/**
+	 * True when kick actually advanced or recovered the queue (not a no-op poll).
+	 *
+	 * @param string               $before_progress Progress before kick.
+	 * @param array<string, mixed> $after           Job snapshot after kick.
+	 * @param bool                 $did_recover     force_recover ran.
+	 * @param bool                 $direct_tick     Pinned Elementor burst ran.
+	 * @param bool                 $inline_tick     Inline worker tick processed work.
+	 */
+	private static function kick_worker_moved_queue( $before_progress, $after, $did_recover, $direct_tick, $inline_tick ) {
+		if ( $did_recover || $direct_tick || $inline_tick ) {
+			return true;
+		}
+
+		$after_progress = (string) ( $after['partial_progress'] ?? '' );
+
+		return '' !== $after_progress && $before_progress !== $after_progress;
 	}
 
 	public static function process_job_step() {

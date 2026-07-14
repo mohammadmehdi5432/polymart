@@ -20,8 +20,15 @@ const CRON_STALE_SEC = 45;
 const LOCK_HEALTHY_SEC = 200;
 /** Between-item lock with no progress — force ensure. */
 const LOCK_IDLE_STALE_SEC = 30;
-/** Do not hammer ensure more than once per this interval. */
-const ENSURE_MIN_INTERVAL_MS = 3000;
+/** Light ensure (schedule/unlock only) — not inline AI. */
+const ENSURE_MIN_INTERVAL_MS = 15000;
+/** Heavy kick (inline step) — Elementor batches often idle 30–90s between ticks. */
+const KICK_MIN_INTERVAL_MS = 45000;
+/** Same progress + repeated kick log suppression. */
+const KICK_LOG_MIN_INTERVAL_MS = 45000;
+/** Elementor chunk idle before monitor treats worker as stale (seconds). */
+const ELEMENTOR_BATCH_IDLE_SEC = 45;
+const ELEMENTOR_GAP_FILL_IDLE_SEC = 12;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
 const JOB_CACHE_STORAGE_KEY = 'polymart_ai_autotranslate_job_cache';
 const JOB_LOGS_CACHE_KEY = 'polymart_ai_autotranslate_logs_cache';
@@ -149,11 +156,20 @@ function isCronHealthy(job) {
     Number(progressMatch[2]) > 0;
   const gapFillPending = Boolean(job?.elementor_gap_fill_pending);
 
-  if (job?.status === 'running' && (gapFillPending || (elementorBatchesDone && elementorPartial)) && activityAge > 4) {
+  if (
+    job?.status === 'running' &&
+    gapFillPending &&
+    activityAge > ELEMENTOR_GAP_FILL_IDLE_SEC
+  ) {
     return false;
   }
 
-  if (job?.status === 'running' && gapFillPending && activityAge > 35) {
+  if (
+    job?.status === 'running' &&
+    elementorBatchesDone &&
+    elementorPartial &&
+    activityAge > 20
+  ) {
     return false;
   }
 
@@ -169,17 +185,25 @@ function isCronHealthy(job) {
     return false;
   }
 
-  // AS action queued but worker silent — wake the queue quickly (metabox pattern).
-  if (job?.status === 'running' && job?.as_pending && activityAge > 3) {
+  // AS action queued but worker silent — wake the queue (Elementor batches need longer idle).
+  if (job?.status === 'running' && job?.as_pending && activityAge > (elementorPartial ? 20 : 3)) {
     return false;
   }
 
-  if (job?.status === 'running' && job?.elementor_priority && activityAge > 5) {
+  if (
+    job?.status === 'running' &&
+    job?.elementor_priority &&
+    activityAge > (gapFillPending ? ELEMENTOR_GAP_FILL_IDLE_SEC : ELEMENTOR_BATCH_IDLE_SEC)
+  ) {
     return false;
   }
 
-  // Between elementor chunks the PHP lock is released — nudge ensure sooner than generic idle.
-  if (job?.status === 'running' && !job?.worker_lock && activityAge > (elementorPartial ? 6 : 18)) {
+  // Between elementor chunks the PHP lock is released — one AI batch routinely takes 30–90s.
+  if (
+    job?.status === 'running' &&
+    !job?.worker_lock &&
+    activityAge > (elementorPartial ? (gapFillPending ? 15 : ELEMENTOR_BATCH_IDLE_SEC) : 18)
+  ) {
     return false;
   }
 
@@ -520,6 +544,9 @@ export default function AutoTranslateApp() {
   const lastPartialProgressRef = useRef('');
   const seenServerLogIdsRef = useRef(new Set());
   const lastWorkerTickLogAtRef = useRef(0);
+  const lastKickAtRef = useRef(0);
+  const lastKickLogAtRef = useRef(0);
+  const lastKickProgressRef = useRef('');
   const pollErrorCountRef = useRef(0);
   const lastEnsureErrorAtRef = useRef(0);
   const logsRef = useRef(null);
@@ -935,18 +962,28 @@ export default function AutoTranslateApp() {
 
         const now = Math.floor(Date.now() / 1000);
         const activityAge = Math.max(0, now - latestWorkerStamp(data));
+        const elementorStalled = Boolean(data?.elementor_progress_stalled);
         const elementorNeedsKick =
           isElementorPartialJob(data) &&
           !data?.as_slice_active &&
           !data?.as_running &&
           Number(data?.api_cooldown_remaining || 0) <= 0 &&
           (Boolean(data?.elementor_gap_fill_pending)
-            ? activityAge > 5
-            : activityAge > 8);
+            ? activityAge > ELEMENTOR_GAP_FILL_IDLE_SEC
+            : elementorStalled || activityAge > ELEMENTOR_BATCH_IDLE_SEC);
 
         if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
           const nowMs = Date.now();
-          if (nowMs - lastEnsureAt < ENSURE_MIN_INTERVAL_MS) {
+          const progressKey = `${data.partial_post_id ?? ''}:${data.partial_progress ?? ''}`;
+          const canKick =
+            !data?.as_slice_active &&
+            !data?.as_running &&
+            (elementorStalled || activityAge >= CRON_STALE_SEC) &&
+            nowMs - lastKickAtRef.current >= KICK_MIN_INTERVAL_MS &&
+            (lastKickProgressRef.current !== progressKey || activityAge >= CRON_STALE_SEC + 15);
+          const canEnsure = nowMs - lastEnsureAt >= ENSURE_MIN_INTERVAL_MS;
+
+          if (!canKick && !canEnsure) {
             return;
           }
 
@@ -962,27 +999,26 @@ export default function AutoTranslateApp() {
             lockAge >= 0 &&
             lockAge < LOCK_HEALTHY_SEC &&
             activityAge < LOCK_HEALTHY_SEC &&
-            !Boolean(data.elementor_progress_stalled);
+            !elementorStalled;
 
           if (!lockBlocks) {
             ensureInFlight = true;
             lastEnsureAt = nowMs;
             try {
-              const useHeavyTick =
-                !data?.as_slice_active &&
-                !data?.as_running &&
-                (activityAge >= 60 ||
-                  isElementorPartialJob(data) ||
-                  activityAge >= CRON_STALE_SEC ||
-                  elementorNeedsKick ||
-                  Boolean(data.elementor_progress_stalled));
-              const recovered = useHeavyTick
+              const recovered = canKick
                 ? await jobStep().catch(() => ensureServerWorker())
                 : await ensureServerWorker();
+              if (canKick) {
+                lastKickAtRef.current = nowMs;
+                lastKickProgressRef.current = progressKey;
+              }
               if (recovered?.worker_direct_tick && isActiveRef.current) {
                 appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
               } else if (recovered?.worker_kicked && isActiveRef.current) {
-                appendLog('تیک kick اجرا شد — صف دوباره جلو می‌رود.', 'success');
+                if (nowMs - lastKickLogAtRef.current >= KICK_LOG_MIN_INTERVAL_MS) {
+                  lastKickLogAtRef.current = nowMs;
+                  appendLog('تیک kick اجرا شد — صف دوباره جلو می‌رود.', 'success');
+                }
               } else if (recovered?.worker_inline_tick && isActiveRef.current) {
                 appendLog('تیک بازیابی اجرا شد — صف دوباره جلو می‌رود.', 'success');
               } else if (recovered?.lock_recovered && isActiveRef.current) {
@@ -1074,6 +1110,9 @@ export default function AutoTranslateApp() {
     lastPartialProgressRef.current = '';
     seenServerLogIdsRef.current = new Set();
     lastWorkerTickLogAtRef.current = 0;
+    lastKickAtRef.current = 0;
+    lastKickLogAtRef.current = 0;
+    lastKickProgressRef.current = '';
     setActionPending('start');
     appendLog(`در حال آماده‌سازی صف ترجمه برای ${targetLabel}…`);
 
