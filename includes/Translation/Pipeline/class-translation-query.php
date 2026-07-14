@@ -310,6 +310,15 @@ final class Translation_Query {
 		}
 
 		self::maybe_backfill_translation_index( $lang );
+
+		$front = absint( get_option( 'page_on_front' ) );
+
+		if ( $front > 0 ) {
+			Post_Translator::repair_stale_elementor_completion_meta( $front, $lang );
+			Post_Translator::repair_completed_elementor_job_meta( $front, $lang );
+		}
+
+		Post_Translator::reconcile_stale_translation_indexes( $lang, 200 );
 		Post_Translator::reconcile_all_flagged_translation_indexes( $lang );
 		Post_Translator::flush_translation_status_cache();
 
@@ -412,64 +421,25 @@ final class Translation_Query {
 	 * @return int Post ID or 0 when none remain.
 	 */
 	public static function find_next_untranslated_post_id( $lang, $after_id = 0, array $exclude_ids = array() ) {
-		$fast = self::find_next_actionable_post_id( $lang, $after_id, $exclude_ids );
+		return self::find_next_needs_work_post_id( $lang, $after_id, $exclude_ids );
+	}
 
-		if ( $fast > 0 ) {
-			return $fast;
-		}
-
-		$lang         = sanitize_key( (string) $lang );
-		$after_id     = absint( $after_id );
-		$exclude_ids  = array_filter( array_map( 'absint', $exclude_ids ) );
+	/**
+	 * Live scan for the next post that still needs translation work (includes false "translated" index).
+	 *
+	 * @param string $lang        Target language code.
+	 * @param int    $after_id    Last processed post ID (0 = from start).
+	 * @param int[]  $exclude_ids Post IDs to skip (e.g. exhausted retries).
+	 * @return int Post ID or 0 when none remain.
+	 */
+	private static function find_next_needs_work_post_id( $lang, $after_id = 0, array $exclude_ids = array() ) {
+		$lang           = sanitize_key( (string) $lang );
+		$after_id       = absint( $after_id );
+		$exclude_ids    = array_values( array_filter( array_map( 'absint', $exclude_ids ) ) );
 		$exclude_lookup = array_fill_keys( $exclude_ids, true );
-		$query_args   = array(
-			'post_type' => Post_Translator::get_supported_post_types(),
-		);
-
-		$cursor_filter = static function ( $where ) use ( $after_id ) {
-			if ( $after_id > 0 ) {
-				global $wpdb;
-				$where .= $wpdb->prepare( " AND {$wpdb->posts}.ID > %d", $after_id );
-			}
-
-			return $where;
-		};
-
-		add_filter( 'posts_where', $cursor_filter, 10, 1 );
-
-		$query = new \WP_Query(
-			self::build_wp_query_args(
-				$query_args,
-				array(
-					'posts_per_page'         => 1,
-					'orderby'                => 'ID',
-					'order'                  => 'ASC',
-					'fields'                 => 'ids',
-					'no_found_rows'          => true,
-					'update_post_meta_cache' => false,
-					'update_post_term_cache' => false,
-				)
-			)
-		);
-
-		remove_filter( 'posts_where', $cursor_filter, 10 );
-
-		foreach ( $query->posts as $post_id ) {
-			$post_id = absint( $post_id );
-
-			if ( isset( $exclude_lookup[ $post_id ] ) ) {
-				continue;
-			}
-
-			if ( $post_id && Post_Translator::has_persian_content( $post_id ) && 'translated' !== Post_Translator::get_translation_status( $post_id, $lang ) ) {
-				return $post_id;
-			}
-		}
-
-		// First candidate may lack Persian content; scan forward in small batches.
-		$scan_after = $after_id;
-		$attempts   = 0;
-		$max_scan   = 8;
+		$scan_after     = $after_id;
+		$attempts       = 0;
+		$max_scan       = 12;
 
 		while ( $attempts < $max_scan ) {
 			++$attempts;
@@ -486,7 +456,7 @@ final class Translation_Query {
 					continue;
 				}
 
-				if ( Post_Translator::has_persian_content( $post_id ) && 'translated' !== Post_Translator::get_translation_status( $post_id, $lang ) ) {
+				if ( Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
 					return $post_id;
 				}
 			}
@@ -518,7 +488,7 @@ final class Translation_Query {
 			return $indexed;
 		}
 
-		return 0;
+		return self::find_next_needs_work_post_id( $lang, $after_id, $exclude_ids );
 	}
 
 	/**
@@ -558,10 +528,6 @@ final class Translation_Query {
 
 			$found[] = $next;
 			$cursor  = $next;
-
-			if ( count( $found ) >= 3 ) {
-				break;
-			}
 		}
 
 		return $found;
@@ -959,7 +925,7 @@ final class Translation_Query {
 				$post_id = absint( $post_id );
 				$scanned_through = max( $scanned_through, $post_id );
 
-				if ( ! $post_id || ! Post_Translator::has_persian_content( $post_id ) || 'translated' === Post_Translator::get_translation_status( $post_id, $lang ) ) {
+				if ( ! $post_id || ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
 					continue;
 				}
 

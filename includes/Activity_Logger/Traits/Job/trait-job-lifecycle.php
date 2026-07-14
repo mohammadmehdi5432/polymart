@@ -235,10 +235,13 @@ trait Trait_Job_Lifecycle {
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
-		// Fast bootstrap: indexed stats + light storefront probe only (heavy reconcile runs on worker ticks).
-		$issues         = Translation_Query::collect_storefront_translation_issues( $lang, 8, true );
+		// Reconcile falsely "translated" index rows before stats/queue seeding.
+		Post_Translator::reconcile_stale_translation_indexes( $lang, 500 );
+		Post_Translator::flush_translation_status_cache();
+
+		$issues         = Translation_Query::collect_storefront_translation_issues( $lang, 12, false );
 		$issue_ids      = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
-		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
+		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, false );
 		$front          = absint( get_option( 'page_on_front' ) );
 		$repair_ids     = array_values(
 			array_unique(
@@ -261,7 +264,17 @@ trait Trait_Job_Lifecycle {
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
-		$probe_ids = $issue_ids;
+		$probe_ids  = $issue_ids;
+
+		if ( ! empty( $priority_probe ) ) {
+			$needs_work = max( $needs_work, count( $priority_probe ) );
+			$total      = max( $total, $needs_work );
+		}
+
+		if ( ! empty( $issue_ids ) ) {
+			$needs_work = max( $needs_work, count( $issue_ids ) );
+			$total      = max( $total, $needs_work );
+		}
 
 		if ( ! empty( $priority_probe ) ) {
 			$probe_ids = array_values( array_unique( array_merge( $probe_ids, $priority_probe ) ) );
@@ -277,7 +290,7 @@ trait Trait_Job_Lifecycle {
 		}
 
 		if ( $total <= 0 ) {
-			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
+			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, false );
 
 			if ( ! empty( $probe_ids ) ) {
 				$stats      = Translation_Query::compute_translation_stats( $lang, false );
@@ -325,7 +338,7 @@ trait Trait_Job_Lifecycle {
 		}
 
 		if ( empty( $seed_ids ) ) {
-			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, true );
+			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, false );
 		}
 
 		if ( empty( $seed_ids ) ) {
@@ -379,6 +392,11 @@ trait Trait_Job_Lifecycle {
 				self::format_no_queue_diagnostic( $lang, $issues ),
 				array( 'issues' => $issues )
 			);
+		}
+
+		if ( ! empty( $seed_ids ) ) {
+			$needs_work = max( $needs_work, count( $seed_ids ), 1 );
+			$total      = max( $total, $needs_work );
 		}
 
 		if ( ! empty( $issues ) ) {
