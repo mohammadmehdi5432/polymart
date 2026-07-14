@@ -355,6 +355,9 @@ final class Post_Translator {
 		'wd_title'            => true,
 		'wd_subtitle'         => true,
 		'wd_text'             => true,
+		'text_content'        => true,
+		'button_text_closed'  => true,
+		'button_text_open'    => true,
 	);
 
 	/**
@@ -6251,11 +6254,29 @@ final class Post_Translator {
 		$lang    = sanitize_key( (string) $lang );
 		$state   = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( is_string( $raw ) && '' !== trim( $raw ) ) {
+			$data_early = json_decode( $raw, true );
+
+			if ( is_array( $data_early ) ) {
+				$source_payload_early = self::collect_elementor_translation_payload( $data_early );
+				$state['elementor_map'] = self::sanitize_elementor_translation_map(
+					self::merge_elementor_path_map(
+						$post_id,
+						$lang,
+						$data_early,
+						is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array()
+					),
+					$source_payload_early
+				);
+			}
+		}
+
 		if ( ! self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
 			self::unblock_elementor_chunk_queue( $post_id, $lang );
 			$state = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		}
-		$raw     = get_post_meta( $post_id, '_elementor_data', true );
 
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() && \PolymartAI\Activity_Logger::is_job_api_cooldown_active() ) {
 			return self::make_recoverable_partial_slice_response(
@@ -6379,6 +6400,13 @@ final class Post_Translator {
 				}
 
 				$state['elementor_gap_fill'] = true;
+
+				if ( self::elementor_gap_fill_remaining_is_long_tail_only( $source_payload, $map, $skipped ) ) {
+					$chunks                                  = array();
+					$state['elementor_gap_fill_stubborn_only'] = true;
+				} else {
+					unset( $state['elementor_gap_fill_stubborn_only'] );
+				}
 
 				self::save_job_partial_state( $post_id, $lang, $state );
 			}
@@ -6578,6 +6606,10 @@ final class Post_Translator {
 
 			$gap_fill_total = $gap_fill_done + count( $chunks );
 			$state['elementor_gap_fill_total'] = max( 1, $gap_fill_total );
+
+			if ( empty( $chunks ) && self::elementor_gap_fill_remaining_is_long_tail_only( $source_payload, $map, $skipped_list ) ) {
+				$state['elementor_gap_fill_stubborn_only'] = true;
+			}
 		}
 
 		while ( $processed < $budget && ! empty( $chunks ) ) {
@@ -8137,7 +8169,7 @@ final class Post_Translator {
 					}
 				}
 
-				$seg_budget = 2;
+				$seg_budget = ( 1 === count( $long ) && empty( $short ) ) ? 3 : 2;
 
 				foreach ( array_slice( $pending, 0, $seg_budget ) as $index => $batch ) {
 					$progress = self::translate_elementor_stubborn_field_batch(
@@ -9177,7 +9209,7 @@ final class Post_Translator {
 			$child_path = $path . '.' . (string) $key;
 
 			if ( is_string( $item ) ) {
-				if ( self::should_skip_elementor_setting_key( (string) $key, $item ) ) {
+				if ( ! self::should_collect_elementor_setting_for_translation( (string) $key, $item ) ) {
 					continue;
 				}
 
@@ -9193,6 +9225,53 @@ final class Post_Translator {
 				self::walk_elementor_settings_payload( $item, $payload, $child_path );
 			}
 		}
+	}
+
+	/**
+	 * Whether a widget settings key is user-visible copy (not internal Elementor config).
+	 *
+	 * Elementor stores on-page text in settings.* — this whitelist keeps buttons, titles,
+	 * editor HTML, accordion labels, etc. and skips CSS/animation/ID-style keys.
+	 *
+	 * @param string $key   Setting key.
+	 * @param string $value Setting value.
+	 * @return bool
+	 */
+	private static function should_collect_elementor_setting_for_translation( $key, $value ) {
+		$key = (string) $key;
+
+		if ( self::should_skip_elementor_setting_key( $key, $value ) ) {
+			return false;
+		}
+
+		if ( self::is_elementor_user_text_setting_key( $key ) ) {
+			return true;
+		}
+
+		/**
+		 * Include extra visible Elementor setting keys for this site.
+		 *
+		 * @param bool   $include Default false — only whitelisted user-text keys are translated.
+		 * @param string $key     Setting key.
+		 * @param string $value   Setting value.
+		 */
+		return (bool) apply_filters( 'polymart_ai_elementor_include_setting_key', false, $key, (string) $value );
+	}
+
+	private static function elementor_gap_fill_remaining_is_long_tail_only( array $source_payload, array $map, array $skipped ) {
+		$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		if ( empty( $remaining ) || count( $remaining ) > 3 ) {
+			return false;
+		}
+
+		foreach ( $remaining as $path => $text ) {
+			if ( ! self::stubborn_elementor_field_is_long( (string) $path, (string) $text ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	private static function is_elementor_user_text_setting_key( $key ) {
