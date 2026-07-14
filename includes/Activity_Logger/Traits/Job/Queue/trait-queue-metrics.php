@@ -105,7 +105,7 @@ trait Trait_Queue_Metrics {
 
 		$job = self::attach_job_metrics( $job, $lang, false );
 
-		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) ) {
+		if ( '' !== $lang && 'paused' === ( $job['status'] ?? '' ) && ! self::is_job_poll_request() ) {
 			$job = self::attach_stalled_job_details( $job, $lang );
 		}
 
@@ -421,12 +421,17 @@ trait Trait_Queue_Metrics {
 			$job['worker_phase'] = 'idle';
 		}
 
-		$next_cron = self::get_next_worker_cron();
-		$job['cron_scheduled'] = (bool) $next_cron;
-		$job['next_cron_at']   = $next_cron ? (int) $next_cron : null;
 		$job['cron_disabled']  = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
 		$job['cron_pulse']     = (bool) wp_next_scheduled( self::CRON_PULSE_HOOK );
 		$job['worker_alive']   = self::is_worker_heartbeat_fresh( $job );
+
+		if ( self::is_job_poll_request() ) {
+			return self::attach_job_poll_snapshot_fields( $job, $lang );
+		}
+
+		$next_cron = self::get_next_worker_cron();
+		$job['cron_scheduled'] = (bool) $next_cron;
+		$job['next_cron_at']   = $next_cron ? (int) $next_cron : null;
 		$as_status             = Job_Action_Scheduler::status_payload();
 		$job['as_available']   = ! empty( $as_status['available'] );
 		$job['as_pending']     = ! empty( $as_status['pending'] );
@@ -445,6 +450,48 @@ trait Trait_Queue_Metrics {
 		if ( $cooldown_remaining > 0 ) {
 			$job['api_cooldown_remaining'] = $cooldown_remaining;
 			$job                         = self::apply_api_cooldown_job_presentation( $job, $cooldown_remaining );
+		}
+
+		return $job;
+	}
+
+	private static function attach_job_poll_snapshot_fields( array $job, $lang ) {
+		$gap_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+		$job['as_available']               = array_key_exists( 'as_available', $job )
+			? (bool) $job['as_available']
+			: Job_Action_Scheduler::is_available();
+		$job['as_pending']                 = (bool) ( $job['as_pending'] ?? false );
+		$job['as_running']                 = (bool) ( $job['as_running'] ?? false );
+		$job['as_slice_active']            = (bool) ( $job['as_slice_active'] ?? false );
+		$job['worker_mode']                = (string) ( $job['worker_mode'] ?? 'as' );
+		$job['elementor_priority']         = (bool) ( $job['elementor_priority'] ?? ( 'elementor' === sanitize_key( (string) ( $job['partial_phase'] ?? '' ) ) ) );
+		$job['elementor_progress_stalled'] = (bool) ( $job['elementor_progress_stalled'] ?? false );
+		$job['elementor_gap_fill_pending'] = self::resolve_elementor_gap_fill_pending_flag( $job, $lang, $gap_post_id );
+		$job['recent_logs']                = array();
+		$job['poll_snapshot']              = true;
+		$job['cli_alive']                  = false;
+		$job['cli_spawn_ok']               = false;
+		$job['cron_disabled']              = defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON;
+
+		if ( ! isset( $job['cron_scheduled'] ) ) {
+			$next_cron             = self::get_next_worker_cron();
+			$job['cron_scheduled'] = (bool) $next_cron;
+			$job['next_cron_at']   = $next_cron ? (int) $next_cron : null;
+		}
+
+		if ( ! isset( $job['cron_pulse'] ) ) {
+			$job['cron_pulse'] = (bool) wp_next_scheduled( self::CRON_PULSE_HOOK );
+		}
+
+		if ( ! isset( $job['worker_alive'] ) ) {
+			$job['worker_alive'] = self::is_worker_heartbeat_fresh( $job );
+		}
+
+		$cooldown_remaining = self::get_job_api_cooldown_remaining( $job );
+		if ( $cooldown_remaining > 0 ) {
+			$job['api_cooldown_remaining'] = $cooldown_remaining;
+			$job                           = self::apply_api_cooldown_job_presentation( $job, $cooldown_remaining );
 		}
 
 		return $job;

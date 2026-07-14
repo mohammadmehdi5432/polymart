@@ -23,6 +23,9 @@ const LOCK_IDLE_STALE_SEC = 30;
 /** Do not hammer ensure more than once per this interval. */
 const ENSURE_MIN_INTERVAL_MS = 3000;
 const AUTO_RUN_STORAGE_KEY = 'polymart_ai_autotranslate_autorun';
+const JOB_CACHE_STORAGE_KEY = 'polymart_ai_autotranslate_job_cache';
+const JOB_LOGS_CACHE_KEY = 'polymart_ai_autotranslate_logs_cache';
+const UI_UNLOCK_MS = 1800;
 const POLL_ERROR_NOTICE_THRESHOLD = 3;
 
 function latestWorkerStamp(job, includeScheduled = false) {
@@ -356,6 +359,73 @@ function writeAutoRunFlag(active) {
   }
 }
 
+function readJobCache() {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(JOB_CACHE_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeJobCache(job) {
+  if (typeof window === 'undefined' || !job || typeof job !== 'object') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      JOB_CACHE_STORAGE_KEY,
+      JSON.stringify({
+        ...job,
+        poll_unreachable: false,
+        cached_at: Math.floor(Date.now() / 1000),
+      })
+    );
+  } catch {
+    // Ignore quota / private mode errors.
+  }
+}
+
+function readLogsCache() {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  try {
+    const raw = window.localStorage.getItem(JOB_LOGS_CACHE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(-200) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLogsCache(logs) {
+  if (typeof window === 'undefined' || !Array.isArray(logs)) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(JOB_LOGS_CACHE_KEY, JSON.stringify(logs.slice(-200)));
+  } catch {
+    // Ignore quota / private mode errors.
+  }
+}
+
 function jobPhaseLabel(phase) {
   switch (phase) {
     case 'elementor':
@@ -431,9 +501,10 @@ export default function AutoTranslateApp() {
     targetLabel,
   } = useTargetLanguages('en');
 
-  const [job, setJob] = useState(null);
-  const [logs, setLogs] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [job, setJob] = useState(() => readJobCache());
+  const [logs, setLogs] = useState(() => readLogsCache());
+  const [loading, setLoading] = useState(() => !readJobCache());
+  const [pollUnreachable, setPollUnreachable] = useState(false);
   const [actionPending, setActionPending] = useState(null);
   const [refreshingStats, setRefreshingStats] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -463,6 +534,10 @@ export default function AutoTranslateApp() {
       isActiveRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    writeLogsCache(logs);
+  }, [logs]);
 
   const appendLog = useCallback((message, type = 'info') => {
     if (!message) {
@@ -573,10 +648,12 @@ export default function AutoTranslateApp() {
     [appendLog]
   );
 
-  const loadJob = useCallback(async () => {
+  const loadJob = useCallback(async ({ background = false } = {}) => {
     try {
-      const data = await fetchJob({ initial: true });
+      const data = await fetchJob({ initial: !background });
       pollErrorCountRef.current = 0;
+      setPollUnreachable(false);
+      writeJobCache(data);
       const merged = mergeJobSnapshot(null, data);
       setJob(merged);
 
@@ -599,6 +676,18 @@ export default function AutoTranslateApp() {
     } catch (error) {
       pollErrorCountRef.current += 1;
       const status = error?.response?.status;
+      const cached = readJobCache();
+
+      if (cached) {
+        setJob(
+          mergeJobSnapshot(null, {
+            ...cached,
+            poll_unreachable: true,
+          })
+        );
+      }
+
+      setPollUnreachable(true);
 
       if (status === 403) {
         setNotice({
@@ -608,18 +697,71 @@ export default function AutoTranslateApp() {
       } else {
         setNotice({
           type: 'warning',
-          message:
-            'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید؛ کارگر روی سرور ادامه می‌دهد.',
+          message: cached
+            ? 'اتصال به سرور کند است — وضعیت ذخیره‌شده نمایش داده می‌شود؛ کارگر روی سرور ادامه می‌دهد.'
+            : 'بارگذاری وضعیت موقتاً ناموفق بود — اگر ترجمه در حال اجراست چند ثانیه صبر کنید؛ کارگر روی سرور ادامه می‌دهد.',
         });
       }
 
-      return null;
+      return cached ? mergeJobSnapshot(null, cached) : null;
     }
   }, [setTargetLang, syncServerLogs]);
 
   useEffect(() => {
-    loadJob().finally(() => setLoading(false));
+    let cancelled = false;
+    const hadCache = Boolean(readJobCache());
+    const unlockTimer = hadCache
+      ? null
+      : window.setTimeout(() => {
+          if (!cancelled) {
+            setLoading(false);
+          }
+        }, UI_UNLOCK_MS);
+
+    loadJob().finally(() => {
+      if (!cancelled) {
+        if (unlockTimer) {
+          window.clearTimeout(unlockTimer);
+        }
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      if (unlockTimer) {
+        window.clearTimeout(unlockTimer);
+      }
+    };
   }, [loadJob]);
+
+  useEffect(() => {
+    if (loading) {
+      return undefined;
+    }
+
+    const shouldReconnect =
+      pollUnreachable || job?.poll_unreachable || job?.status === 'running';
+
+    if (!shouldReconnect) {
+      return undefined;
+    }
+
+    const reconnect = async () => {
+      const data = await loadJob({ background: true }).catch(() => null);
+      if (data?.status) {
+        setPollUnreachable(false);
+        setNotice((prev) =>
+          prev?.message?.includes('اتصال به سرور کند') ? null : prev
+        );
+      }
+    };
+
+    reconnect();
+    const timer = window.setInterval(reconnect, 6000);
+
+    return () => window.clearInterval(timer);
+  }, [loading, loadJob, pollUnreachable, job?.poll_unreachable, job?.status]);
 
   const loadRemainingWork = useCallback(
     async (page = 1) => {
@@ -1601,13 +1743,31 @@ export default function AutoTranslateApp() {
                 {job?.lang ? ` (${job.lang})` : ''}
               </p>
             </div>
-            {(isRunning || actionPending) && (
-              <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-xs font-medium text-blue-800">
-                <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
-                {actionPendingLabel || 'مانیتور کرون'}
-              </span>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {(pollUnreachable || job?.poll_unreachable) && (
+                <button
+                  type="button"
+                  onClick={() => loadJob({ background: true })}
+                  className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-900 hover:bg-amber-100"
+                >
+                  بروزرسانی وضعیت
+                </button>
+              )}
+              {(isRunning || actionPending) && (
+                <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-xs font-medium text-blue-800">
+                  <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+                  {actionPendingLabel || 'مانیتور کرون'}
+                </span>
+              )}
+            </div>
           </div>
+
+          {(pollUnreachable || job?.poll_unreachable) && !loading && (
+            <p className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              اتصال به سرور کند است — وضعیت ذخیره‌شده نمایش داده می‌شود؛ کارگر روی سرور ادامه می‌دهد.
+              {job?.cached_at ? ` · آخرین بروزرسانی موفق: ${formatTime(job.cached_at)}` : ''}
+            </p>
+          )}
 
           {loading ? (
             <p className="text-pmai-muted">در حال بارگذاری…</p>

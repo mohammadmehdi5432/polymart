@@ -5,7 +5,9 @@ export const JOB_STEP_TIMEOUT_MS = 240000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
 /** Initial SPA load — fail fast so the monitor UI is not blocked by a busy worker. */
-const JOB_INITIAL_FETCH_TIMEOUT_MS = 15000;
+const JOB_INITIAL_FETCH_TIMEOUT_MS = 12000;
+/** Background reconnect polls — must not pile up when PHP workers are busy. */
+const JOB_POLL_FETCH_TIMEOUT_MS = 20000;
 /** Start/stop should return quickly; worker runs on AS/cron. */
 const JOB_START_STOP_TIMEOUT_MS = 120000;
 const JOB_FETCH_RETRIES = 4;
@@ -21,7 +23,10 @@ async function sleep(ms) {
   });
 }
 
-async function withRetries(fn, { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETCH_RETRY_DELAY_MS } = {}) {
+async function withRetries(
+  fn,
+  { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETCH_RETRY_DELAY_MS, retryOnTimeout = false } = {}
+) {
   let lastError;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -36,6 +41,11 @@ async function withRetries(fn, { retries = JOB_FETCH_RETRIES, delayMs = JOB_FETC
 
       const isTimeout =
         error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
+
+      if (isTimeout && retryOnTimeout && attempt < retries) {
+        await sleep(delayMs * (attempt + 1));
+        continue;
+      }
 
       if (isTimeout) {
         throw error;
@@ -61,12 +71,19 @@ export function abortJobStep() {
 }
 
 export async function fetchJob(options = {}) {
-  const timeout =
-    options.initial === true ? JOB_INITIAL_FETCH_TIMEOUT_MS : JOB_FETCH_TIMEOUT_MS;
-  const retries = options.initial === true ? 1 : JOB_FETCH_RETRIES;
+  const timeout = options.initial
+    ? JOB_INITIAL_FETCH_TIMEOUT_MS
+    : options.background
+      ? JOB_POLL_FETCH_TIMEOUT_MS
+      : JOB_FETCH_TIMEOUT_MS;
+  const retries = options.initial ? 2 : options.background ? 1 : JOB_FETCH_RETRIES;
   const { data } = await withRetries(
     () => api.get('/translation-job', { timeout }),
-    { retries, delayMs: JOB_FETCH_RETRY_DELAY_MS }
+    {
+      retries,
+      delayMs: JOB_FETCH_RETRY_DELAY_MS,
+      retryOnTimeout: options.initial === true,
+    }
   );
   return data;
 }

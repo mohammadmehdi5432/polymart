@@ -51,6 +51,11 @@ trait Trait_Storage {
 			return true;
 		}
 
+		// Poll requests must stay fast — never decode Elementor JSON on GET /translation-job.
+		if ( \PolymartAI\Activity_Logger::is_job_poll_request() ) {
+			return false;
+		}
+
 		return self::maybe_backfill_elementor_finalized_meta( $post_id, $lang );
 	}
 
