@@ -734,44 +734,76 @@ trait Trait_Job_Runner {
 			\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
 
 			if ( is_wp_error( $chunk_result ) ) {
-				// Capture the exact transport error and which fields were in-flight.
-				$failed_paths = array_keys( $chunk );
-				update_post_meta(
-					$post_id,
-					'_polymart_ai_elementor_error_' . $lang,
-					sprintf(
-						/* translators: 1: chunk index, 2: total chunks, 3: error */
-						__( 'Elementor toxic probe — chunk %1$d/%2$d failed: %3$s', 'polymart-ai' ),
-						$attempt_index,
-						$progress_total,
-						\PolymartAI\Activity_Logger::humanize_api_error_message( $chunk_result->get_error_message() )
-					)
-				);
+				if ( ! empty( $aliased_payload ) && AI_Client::is_transient_parse_response_error( $chunk_result ) ) {
+					\PolymartAI\Activity_Logger::wait_for_arvan_api_gap();
 
-				$state['elementor_failures'] = $failures;
+					$recovered = self::translate_job_chunk_with_single_field_fallback(
+						$aliased_payload,
+						$api_key,
+						$api_endpoint,
+						$ai_model,
+						$lang,
+						count( $aliased_payload ),
+						$ai_options
+					);
 
-				\PolymartAI\Activity_Logger::log(
-					'warning',
-					sprintf(
-						/* translators: 1: post ID, 2: chunk index, 3: error message */
-						__( 'Elementor — #%1$d: خطای API در بخش %2$d — %3$s', 'polymart-ai' ),
+					\PolymartAI\Activity_Logger::touch_arvan_api_attempt();
+
+					if ( ! is_wp_error( $recovered ) ) {
+						\PolymartAI\Activity_Logger::log(
+							'info',
+							sprintf(
+								/* translators: 1: post ID, 2: chunk index */
+								__( 'Elementor — #%1$d: بازیابی بخش %2$d با ترجمه تک‌فیلدی', 'polymart-ai' ),
+								$post_id,
+								$attempt_index
+							),
+							array( 'post_id' => $post_id, 'lang' => $lang )
+						);
+						$chunk_result = $recovered;
+					}
+				}
+
+				if ( is_wp_error( $chunk_result ) ) {
+					// Capture the exact transport error and which fields were in-flight.
+					$failed_paths = array_keys( $chunk );
+					update_post_meta(
 						$post_id,
-						$attempt_index,
-						\PolymartAI\Activity_Logger::humanize_api_error_message( $chunk_result->get_error_message() )
-					),
-					array( 'post_id' => $post_id, 'lang' => $lang )
-				);
+						'_polymart_ai_elementor_error_' . $lang,
+						sprintf(
+							/* translators: 1: chunk index, 2: total chunks, 3: error */
+							__( 'Elementor — بخش %1$d/%2$d ناموفق: %3$s', 'polymart-ai' ),
+							$attempt_index,
+							$progress_total,
+							\PolymartAI\Activity_Logger::humanize_api_error_message( $chunk_result->get_error_message() )
+						)
+					);
 
-				return self::handle_elementor_job_slice_failure(
-					$post_id,
-					$lang,
-					$data,
-					$state,
-					$map,
-					$progress_total,
-					$chunk_result,
-					$failed_paths
-				);
+					$state['elementor_failures'] = $failures;
+
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: chunk index, 3: error message */
+							__( 'Elementor — #%1$d: خطای API در بخش %2$d — %3$s', 'polymart-ai' ),
+							$post_id,
+							$attempt_index,
+							\PolymartAI\Activity_Logger::humanize_api_error_message( $chunk_result->get_error_message() )
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+
+					return self::handle_elementor_job_slice_failure(
+						$post_id,
+						$lang,
+						$data,
+						$state,
+						$map,
+						$progress_total,
+						$chunk_result,
+						$failed_paths
+					);
+				}
 			}
 
 			$raw_mapped = self::unmap_elementor_aliases(

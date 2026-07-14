@@ -367,8 +367,72 @@ final class AI_Client {
 
 		$parsed = self::parse_response( $response, $data_array );
 
+		if ( is_wp_error( $parsed ) && self::is_transient_parse_response_error( $parsed ) ) {
+			$parsed = self::retry_after_transient_parse_error( $endpoint, $api_key, $payload, $data_array, $options, $parsed, 1 );
+		}
+
 		if ( is_wp_error( $parsed ) && self::should_retry_rate_limited_error( $parsed ) ) {
 			return self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $parsed, 1 );
+		}
+
+		return $parsed;
+	}
+
+	/**
+	 * Empty/malformed model payloads that are safe to retry (not rate limits).
+	 *
+	 * @param \WP_Error $error Error object.
+	 * @return bool
+	 */
+	public static function is_transient_parse_response_error( \WP_Error $error ) {
+		return in_array(
+			$error->get_error_code(),
+			array(
+				'polymart_ai_missing_choices',
+				'polymart_ai_empty_response',
+				'polymart_ai_invalid_json',
+				'polymart_ai_no_translations',
+				'polymart_ai_chunk_empty',
+			),
+			true
+		);
+	}
+
+	/**
+	 * Retry once when the gateway returns HTTP 200 without usable translation content.
+	 *
+	 * @param string               $endpoint   API base.
+	 * @param string               $api_key    API key.
+	 * @param array<string, mixed> $payload    Request body.
+	 * @param array<string, string> $data_array Original fields.
+	 * @param array<string, mixed> $options    Request options.
+	 * @param \WP_Error            $last_error Last error.
+	 * @param int                  $attempt    Retry attempt (1-based).
+	 * @return array<string, string>|\WP_Error
+	 */
+	private static function retry_after_transient_parse_error( $endpoint, $api_key, array $payload, array $data_array, array $options, \WP_Error $last_error, $attempt ) {
+		if ( $attempt > 2 ) {
+			return $last_error;
+		}
+
+		sleep( min( 4, $attempt + 1 ) );
+
+		$retry_payload = $payload;
+
+		if ( isset( $retry_payload['response_format'] ) ) {
+			unset( $retry_payload['response_format'] );
+		}
+
+		$response = self::post_chat_completion( $endpoint, $api_key, $retry_payload, 1, $options );
+
+		if ( is_wp_error( $response ) ) {
+			return $last_error;
+		}
+
+		$parsed = self::parse_response( $response, $data_array );
+
+		if ( is_wp_error( $parsed ) && self::is_transient_parse_response_error( $parsed ) ) {
+			return self::retry_after_transient_parse_error( $endpoint, $api_key, $retry_payload, $data_array, $options, $parsed, $attempt + 1 );
 		}
 
 		return $parsed;
@@ -879,23 +943,28 @@ final class AI_Client {
 			);
 		}
 
-		if (
-			empty( $decoded['choices'] )
-			|| ! is_array( $decoded['choices'] )
-			|| ! isset( $decoded['choices'][0]['message']['content'] )
-		) {
+		$content = self::extract_chat_completion_content( $decoded );
+
+		if ( null === $content ) {
+			$finish = '';
+
+			if ( ! empty( $decoded['choices'][0]['finish_reason'] ) ) {
+				$finish = (string) $decoded['choices'][0]['finish_reason'];
+			}
+
+			$message = __( 'پاسخ هوش مصنوعی آروان‌کلاد شامل محتوای ترجمه نبود.', 'polymart-ai' );
+
+			if ( '' !== $finish ) {
+				$message .= ' (finish_reason: ' . $finish . ')';
+			}
+
 			return new \WP_Error(
 				'polymart_ai_missing_choices',
-				__( 'پاسخ هوش مصنوعی آروان‌کلاد شامل محتوای ترجمه نبود.', 'polymart-ai' )
-			);
-		}
-
-		$content = $decoded['choices'][0]['message']['content'];
-
-		if ( ! is_string( $content ) || '' === trim( $content ) ) {
-			return new \WP_Error(
-				'polymart_ai_empty_response',
-				__( 'هوش مصنوعی آروان‌کلاد پاسخ ترجمه خالی برگرداند.', 'polymart-ai' )
+				$message,
+				array(
+					'status'       => $status_code,
+					'body_excerpt' => self::truncate_error_message( $body ),
+				)
 			);
 		}
 
@@ -906,6 +975,110 @@ final class AI_Client {
 		}
 
 		return self::validate_keys( $data_array, $translations );
+	}
+
+	/**
+	 * Extract assistant text from OpenAI-compatible or legacy completion payloads.
+	 *
+	 * @param array<string, mixed> $decoded Response JSON.
+	 * @return string|null
+	 */
+	private static function extract_chat_completion_content( array $decoded ) {
+		if ( ! empty( $decoded['choices'] ) && is_array( $decoded['choices'] ) ) {
+			foreach ( $decoded['choices'] as $choice ) {
+				if ( ! is_array( $choice ) ) {
+					continue;
+				}
+
+				if ( isset( $choice['message'] ) && is_array( $choice['message'] ) ) {
+					$text = self::normalize_message_content_value( $choice['message']['content'] ?? null );
+
+					if ( null !== $text ) {
+						return $text;
+					}
+
+					$text = self::normalize_message_content_value( $choice['message']['text'] ?? null );
+
+					if ( null !== $text ) {
+						return $text;
+					}
+				}
+
+				if ( isset( $choice['text'] ) ) {
+					$text = self::normalize_message_content_value( $choice['text'] );
+
+					if ( null !== $text ) {
+						return $text;
+					}
+				}
+
+				if ( isset( $choice['delta'] ) && is_array( $choice['delta'] ) ) {
+					$text = self::normalize_message_content_value( $choice['delta']['content'] ?? null );
+
+					if ( null !== $text ) {
+						return $text;
+					}
+				}
+			}
+		}
+
+		foreach ( array( 'output', 'response', 'content', 'result' ) as $key ) {
+			if ( ! isset( $decoded[ $key ] ) ) {
+				continue;
+			}
+
+			$text = self::normalize_message_content_value( $decoded[ $key ] );
+
+			if ( null !== $text ) {
+				return $text;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * @param mixed $value Raw content value from API JSON.
+	 * @return string|null
+	 */
+	private static function normalize_message_content_value( $value ) {
+		if ( is_string( $value ) ) {
+			$value = trim( $value );
+
+			return '' !== $value ? $value : null;
+		}
+
+		if ( ! is_array( $value ) ) {
+			return null;
+		}
+
+		$parts = array();
+
+		foreach ( $value as $part ) {
+			if ( is_string( $part ) && '' !== trim( $part ) ) {
+				$parts[] = trim( $part );
+				continue;
+			}
+
+			if ( ! is_array( $part ) ) {
+				continue;
+			}
+
+			if ( isset( $part['text'] ) && is_string( $part['text'] ) && '' !== trim( $part['text'] ) ) {
+				$parts[] = trim( $part['text'] );
+				continue;
+			}
+
+			if ( isset( $part['content'] ) && is_string( $part['content'] ) && '' !== trim( $part['content'] ) ) {
+				$parts[] = trim( $part['content'] );
+			}
+		}
+
+		if ( empty( $parts ) ) {
+			return null;
+		}
+
+		return implode( "\n", $parts );
 	}
 
 	/**
