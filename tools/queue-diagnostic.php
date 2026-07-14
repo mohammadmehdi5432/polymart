@@ -15,6 +15,21 @@
 
 defined( 'ABSPATH' ) || exit;
 
+/**
+ * Extend runtime for admin diagnostics (avoid blank timeout pages).
+ *
+ * @return void
+ */
+function polymart_ai_queue_diag_bootstrap() {
+	if ( function_exists( 'set_time_limit' ) ) {
+		@set_time_limit( 120 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+	}
+
+	if ( function_exists( 'wp_raise_memory_limit' ) ) {
+		wp_raise_memory_limit( 'admin' );
+	}
+}
+
 add_action(
 	'admin_menu',
 	static function () {
@@ -145,54 +160,35 @@ function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
  * @return array<string, mixed>
  */
 function polymart_ai_queue_diag_simulate_start( $lang ) {
-	$lang = sanitize_key( (string) $lang );
+	$lang  = sanitize_key( (string) $lang );
+	$front = absint( get_option( 'page_on_front' ) );
 
-	\PolymartAI\Translation\Post_Translator::flush_translation_status_cache();
-	\PolymartAI\REST_API::invalidate_stats_cache();
+	$stats_index    = \PolymartAI\Translation\Pipeline\Translation_Query::compute_translation_stats( $lang, false );
+	$menu_needs     = \PolymartAI\Translation\Content\Menu_Translator::count_untranslated( $lang );
+	$priority_probe = \PolymartAI\Translation\Pipeline\Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, true );
+	$issue_ids      = array();
 
-	$reconciled = \PolymartAI\Translation\Post_Translator::reconcile_stale_translation_indexes( $lang, 500 );
-	\PolymartAI\Translation\Post_Translator::flush_translation_status_cache();
+	if ( $front > 0 && \PolymartAI\Translation\Post_Translator::post_needs_translation_work( $front, $lang ) ) {
+		$issue_ids[] = $front;
+	}
 
-	$issues_light  = \PolymartAI\Translation\Pipeline\Translation_Query::collect_storefront_translation_issues( $lang, 12, true );
-	$issues_full   = \PolymartAI\Translation\Pipeline\Translation_Query::collect_storefront_translation_issues( $lang, 12, false );
-	$issue_ids     = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues_full, 'post_id' ) ) ) );
-	$priority_full = \PolymartAI\Translation\Pipeline\Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, false );
-	$priority_light = \PolymartAI\Translation\Pipeline\Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, true );
-	$front         = absint( get_option( 'page_on_front' ) );
+	foreach ( $priority_probe as $post_id ) {
+		$post_id = absint( $post_id );
 
-	$stats_index = \PolymartAI\Translation\Pipeline\Translation_Query::compute_translation_stats( $lang, false );
-	$stats_full  = \PolymartAI\Translation\Pipeline\Translation_Query::compute_translation_stats( $lang, true );
-	$menu_needs  = \PolymartAI\Translation\Content\Menu_Translator::count_untranslated( $lang );
+		if ( $post_id > 0 ) {
+			$issue_ids[] = $post_id;
+		}
+	}
+
+	$issue_ids = array_values( array_unique( $issue_ids ) );
 
 	$needs_work = (int) $stats_index['untranslated'] + (int) $stats_index['partial'] + $menu_needs;
 	$total      = $needs_work;
 	$probe_ids  = $issue_ids;
-	$steps      = array();
-
-	$steps[] = array(
-		'step'       => 'after_stats_index',
-		'needs_work' => $needs_work,
-		'total'      => $total,
-		'stats'      => $stats_index,
-		'menu_needs' => $menu_needs,
-	);
-
-	if ( ! empty( $priority_full ) ) {
-		$needs_work = max( $needs_work, count( $priority_full ) );
-		$total      = max( $total, $needs_work );
-	}
 
 	if ( ! empty( $issue_ids ) ) {
 		$needs_work = max( $needs_work, count( $issue_ids ) );
 		$total      = max( $total, $needs_work );
-	}
-
-	if ( ! empty( $priority_full ) ) {
-		$probe_ids = array_values( array_unique( array_merge( $probe_ids, $priority_full ) ) );
-	}
-
-	if ( $front > 0 && \PolymartAI\Translation\Post_Translator::post_needs_translation_work( $front, $lang ) ) {
-		$probe_ids = array_values( array_unique( array_merge( array( $front ), $probe_ids ) ) );
 	}
 
 	if ( $total <= 0 && ! empty( $probe_ids ) ) {
@@ -203,20 +199,10 @@ function polymart_ai_queue_diag_simulate_start( $lang ) {
 	$probe_post = 0;
 
 	if ( $total <= 0 ) {
-		$retry_probe = \PolymartAI\Translation\Pipeline\Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, false );
-
-		if ( ! empty( $retry_probe ) ) {
-			$probe_ids  = $retry_probe;
-			$needs_work = max( count( $retry_probe ), (int) $stats_index['untranslated'] + (int) $stats_index['partial'], $menu_needs );
-			$total      = $needs_work;
-		}
-	}
-
-	if ( $total <= 0 ) {
 		$probe_post = \PolymartAI\Translation\Pipeline\Translation_Query::find_next_actionable_post_id( $lang, 0 );
 
 		if ( $probe_post > 0 || $menu_needs > 0 ) {
-			$needs_work = max( 1, $menu_needs );
+			$needs_work = max( 1, $menu_needs, $probe_post > 0 ? 1 : 0 );
 			$total      = $needs_work;
 		}
 	}
@@ -231,14 +217,6 @@ function polymart_ai_queue_diag_simulate_start( $lang ) {
 			)
 		);
 		$seed_ids = array_slice( $seed_ids, 0, max( $seed_limit, count( $probe_ids ) ) );
-	}
-
-	if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
-		$seed_ids = array_values( array_unique( array_map( 'absint', $issue_ids ) ) );
-	}
-
-	if ( empty( $seed_ids ) ) {
-		$seed_ids = \PolymartAI\Translation\Pipeline\Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, false );
 	}
 
 	if ( empty( $seed_ids ) ) {
@@ -267,35 +245,27 @@ function polymart_ai_queue_diag_simulate_start( $lang ) {
 
 	$would_error = empty( $seed_ids ) && $menu_needs <= 0;
 
-	$steps[] = array(
-		'step'        => 'final',
-		'needs_work'  => $needs_work,
-		'total'       => $total,
-		'seed_ids'    => $seed_ids,
-		'probe_ids'   => $probe_ids,
-		'probe_post'  => $probe_post,
-		'would_error' => $would_error,
-		'would_log'   => sprintf( 'ترجمه خودکار شروع شد — %d مورد در صف', $total ),
-	);
-
 	return array(
-		'lang'              => $lang,
-		'reconciled_rows'   => $reconciled,
-		'page_on_front'     => $front,
-		'stats_index'       => $stats_index,
-		'stats_full'        => $stats_full,
-		'menu_needs'        => $menu_needs,
-		'issues_light_count' => count( $issues_light ),
-		'issues_full_count'  => count( $issues_full ),
-		'issues_full'        => $issues_full,
-		'priority_light'     => $priority_light,
-		'priority_full'      => $priority_full,
-		'find_next_actionable' => \PolymartAI\Translation\Pipeline\Translation_Query::find_next_actionable_post_id( $lang, 0 ),
+		'lang'                   => $lang,
+		'mode'                   => 'light',
+		'page_on_front'          => $front,
+		'stats_index'            => $stats_index,
+		'menu_needs'             => $menu_needs,
+		'priority_probe'         => $priority_probe,
+		'issue_ids'              => $issue_ids,
+		'find_next_actionable'   => \PolymartAI\Translation\Pipeline\Translation_Query::find_next_actionable_post_id( $lang, 0 ),
 		'find_next_untranslated' => \PolymartAI\Translation\Pipeline\Translation_Query::find_next_untranslated_post_id( $lang, 0 ),
-		'seed_actionable'    => \PolymartAI\Translation\Pipeline\Translation_Query::seed_actionable_post_ids( $lang, 8 ),
-		'simulation'          => end( $steps ),
-		'steps'               => $steps,
-		'ai_configured'       => \PolymartAI\REST_API::is_ai_configured(),
+		'seed_actionable'        => $seed_ids,
+		'simulation'             => array(
+			'needs_work'  => $needs_work,
+			'total'       => $total,
+			'seed_ids'    => $seed_ids,
+			'probe_ids'   => $probe_ids,
+			'probe_post'  => $probe_post,
+			'would_error' => $would_error,
+			'would_log'   => sprintf( 'ترجمه خودکار شروع شد — %d مورد در صف', $total ),
+		),
+		'ai_configured'          => \PolymartAI\REST_API::is_ai_configured(),
 	);
 }
 
@@ -336,17 +306,58 @@ function polymart_ai_queue_diag_summary( $lang ) {
 			'lang'            => (string) ( $job['lang'] ?? '' ),
 		),
 		'stats_index'     => \PolymartAI\Translation\Pipeline\Translation_Query::compute_translation_stats( $lang, false ),
-		'stats_full'      => \PolymartAI\Translation\Pipeline\Translation_Query::compute_translation_stats( $lang, true ),
-		'remaining_work_total' => (int) ( \PolymartAI\Translation\Pipeline\Translation_Query::get_remaining_work_page(
-			array(
-				'lang'      => $lang,
-				'post_type' => 'page',
-				'page'      => 1,
-				'per_page'  => 1,
-			)
-		)['total'] ?? 0 ),
+		'remaining_light' => polymart_ai_queue_diag_remaining_light( $lang ),
 		'homepage_snapshot' => $front > 0 ? polymart_ai_queue_diag_post_snapshot( $front, $lang ) : null,
 		'start_simulation'  => polymart_ai_queue_diag_simulate_start( $lang ),
+	);
+}
+
+/**
+ * Fast remaining-work probe (homepage + priority posts only).
+ *
+ * @param string $lang Language code.
+ * @return array<string, mixed>
+ */
+function polymart_ai_queue_diag_remaining_light( $lang ) {
+	$lang    = sanitize_key( (string) $lang );
+	$items   = array();
+	$seen    = array();
+	$front   = absint( get_option( 'page_on_front' ) );
+	$check   = array( $front );
+
+	$check = array_merge(
+		$check,
+		\PolymartAI\Translation\Pipeline\Translation_Query::probe_priority_unfinished_post_ids( $lang, 20, true ),
+		\PolymartAI\Translation\Pipeline\Translation_Query::seed_actionable_post_ids( $lang, 12 )
+	);
+
+	foreach ( array_values( array_unique( array_filter( array_map( 'absint', $check ) ) ) ) as $post_id ) {
+		if ( $post_id <= 0 || isset( $seen[ $post_id ] ) ) {
+			continue;
+		}
+
+		$seen[ $post_id ] = true;
+
+		if ( ! \PolymartAI\Translation\Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+			continue;
+		}
+
+		$items[] = array(
+			'post_id'            => $post_id,
+			'title'              => get_the_title( $post_id ),
+			'index_status'       => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_status_index_meta_key( $lang ), true ),
+			'live_status'        => \PolymartAI\Translation\Post_Translator::get_translation_status( $post_id, $lang ),
+			'needs_work'         => true,
+			'storefront_persian' => \PolymartAI\Translation\Post_Translator::storefront_would_show_persian_source( $post_id, $lang ),
+			'gap_reason'         => \PolymartAI\Translation\Post_Translator::describe_translation_gap( $post_id, $lang ),
+		);
+	}
+
+	return array(
+		'mode'    => 'light',
+		'total'   => count( $items ),
+		'items'   => $items,
+		'note'    => 'Fast probe only — full site scan skipped to avoid timeout.',
 	);
 }
 
@@ -389,7 +400,7 @@ function polymart_ai_queue_diag_mismatches( $lang, $limit = 40 ) {
 			array_merge(
 				array( \PolymartAI\Translation\Post_Translator::PERSIAN_CONTENT_FLAG_META, $status_key ),
 				$post_types,
-				array( min( 300, $limit * 8 ) )
+				array( min( 40, $limit * 3 ) )
 			)
 		)
 	);
@@ -423,8 +434,14 @@ function polymart_ai_queue_diag_mismatches( $lang, $limit = 40 ) {
  * @return array<string, mixed>
  */
 function polymart_ai_queue_diag_collect( $view, $lang ) {
+	polymart_ai_queue_diag_bootstrap();
+
 	$view = sanitize_key( (string) $view );
 	$lang = sanitize_key( (string) $lang );
+
+	if ( '' === $view ) {
+		$view = 'summary';
+	}
 
 	if ( '' === $lang ) {
 		$lang = 'en';
@@ -459,18 +476,10 @@ function polymart_ai_queue_diag_collect( $view, $lang ) {
 			break;
 
 		case 'remaining':
-			$page = \PolymartAI\Translation\Pipeline\Translation_Query::get_remaining_work_page(
-				array(
-					'lang'      => $lang,
-					'post_type' => 'page',
-					'page'      => 1,
-					'per_page'  => 50,
-				)
-			);
-			$data['remaining'] = $page;
-			$data['message']   = 0 === (int) ( $page['total'] ?? 0 )
-				? 'UI shows: all pages fully translated for ' . $lang
-				: 'UI should list ' . (int) $page['total'] . ' page(s) needing work';
+			$data['remaining'] = polymart_ai_queue_diag_remaining_light( $lang );
+			$data['message']   = 0 === (int) ( $data['remaining']['total'] ?? 0 )
+				? 'Light probe: no priority/homepage items need work (full scan skipped).'
+				: 'Light probe found ' . (int) $data['remaining']['total'] . ' item(s) needing work.';
 			break;
 
 		case 'mismatch':
@@ -523,7 +532,11 @@ function polymart_ai_queue_diag_render_html( array $data ) {
 			?>
 		</p>
 
-		<?php if ( 'summary' === $view && ! empty( $data['summary'] ) ) : ?>
+		<?php if ( ! empty( $data['error'] ) ) : ?>
+			<div class="notice notice-error"><p><?php echo esc_html( (string) $data['error'] ); ?></p></div>
+		<?php endif; ?>
+
+		<?php if ( ( 'summary' === $view || '' === $view ) && ! empty( $data['summary'] ) ) : ?>
 			<?php $s = $data['summary']; ?>
 			<h2>Quick answer</h2>
 			<table class="widefat striped" style="max-width:960px;">
@@ -531,7 +544,7 @@ function polymart_ai_queue_diag_render_html( array $data ) {
 					<tr><th>Homepage ID</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['page_on_front'] ?? '' ) ); ?> — <?php echo esc_html( (string) ( $s['page_on_front_title'] ?? '' ) ); ?></td></tr>
 					<tr><th>Homepage needs work?</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['homepage_snapshot']['needs_work'] ?? 'n/a' ) ); ?></td></tr>
 					<tr><th>Homepage shows Persian on EN?</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['homepage_snapshot']['storefront_persian'] ?? 'n/a' ) ); ?></td></tr>
-					<tr><th>Remaining pages (UI count)</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['remaining_work_total'] ?? '' ) ); ?></td></tr>
+					<tr><th>Remaining (light probe)</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['remaining_light']['total'] ?? '' ) ); ?></td></tr>
 					<tr><th>Start would log total</th><td><strong><?php echo esc_html( polymart_ai_queue_diag_str( $s['start_simulation']['simulation']['total'] ?? '' ) ); ?></strong> — <?php echo esc_html( polymart_ai_queue_diag_str( $s['start_simulation']['simulation']['would_log'] ?? '' ) ); ?></td></tr>
 					<tr><th>Start seed IDs</th><td><code><?php echo esc_html( polymart_ai_queue_diag_str( $s['start_simulation']['simulation']['seed_ids'] ?? array() ) ); ?></code></td></tr>
 					<tr><th>Would start fail?</th><td><?php echo esc_html( polymart_ai_queue_diag_str( $s['start_simulation']['simulation']['would_error'] ?? false ) ); ?></td></tr>
@@ -572,11 +585,51 @@ function polymart_ai_render_queue_diagnostic_page() {
 		wp_die( esc_html__( 'Sorry, you are not allowed to access this page.', 'polymart-ai' ) );
 	}
 
+	polymart_ai_queue_diag_bootstrap();
+
+	register_shutdown_function(
+		static function () {
+			$error = error_get_last();
+
+			if ( ! is_array( $error ) ) {
+				return;
+			}
+
+			$fatal_types = array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR );
+
+			if ( ! in_array( (int) ( $error['type'] ?? 0 ), $fatal_types, true ) ) {
+				return;
+			}
+
+			if ( headers_sent() ) {
+				echo "\n<pre style=\"padding:12px;background:#fee;\">PolyMart diagnostic fatal: "
+					. esc_html( (string) ( $error['message'] ?? 'unknown' ) )
+					. ' in '
+					. esc_html( (string) ( $error['file'] ?? '' ) )
+					. ':'
+					. esc_html( (string) ( $error['line'] ?? '' ) )
+					. '</pre>';
+			}
+		}
+	);
+
 	$lang   = sanitize_key( (string) ( $_GET['lang'] ?? 'en' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$view   = sanitize_key( (string) ( $_GET['view'] ?? 'summary' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$format = sanitize_key( (string) ( $_GET['format'] ?? 'html' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 
-	$data = polymart_ai_queue_diag_collect( $view, $lang );
+	if ( '' === $view ) {
+		$view = 'summary';
+	}
+
+	try {
+		$data = polymart_ai_queue_diag_collect( $view, $lang );
+	} catch ( \Throwable $exception ) {
+		$data = array(
+			'error'   => $exception->getMessage(),
+			'view'    => $view,
+			'lang'    => $lang,
+		);
+	}
 
 	if ( 'json' === $format ) {
 		nocache_headers();

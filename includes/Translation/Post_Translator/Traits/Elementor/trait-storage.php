@@ -369,9 +369,19 @@ trait Trait_Storage {
 		$progress = trim( (string) get_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), true ) );
 
 		if ( '' !== $progress ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
+			// Finalized jobs sometimes keep a human-readable progress marker (e.g. 24/24).
+			if (
+				! self::is_elementor_progress_message( $progress )
+				|| ! self::is_elementor_translation_finalized( $post_id, $lang )
+				|| ! self::is_elementor_translation_current( $post_id, $lang )
+				|| self::stored_elementor_translation_has_persian( $post_id, $lang )
+			) {
+				self::$elementor_storefront_serve_cache[ $key ] = false;
 
-			return false;
+				return false;
+			}
+
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 		}
 
 		$decoded = json_decode( $stored, true );
@@ -655,15 +665,35 @@ trait Trait_Storage {
 
 		$stored_hash = trim( (string) get_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), true ) );
 		$finalized   = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
+		$progress    = trim( (string) get_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), true ) );
+		$cleared     = false;
 
-		if ( '' === $stored_hash && ! is_numeric( $finalized ) ) {
+		if ( '' !== $progress ) {
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+			$cleared = true;
+		}
+
+		if ( '' === $stored_hash && ! is_numeric( $finalized ) && ! $cleared ) {
 			return false;
 		}
 
-		delete_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ) );
-		delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
+		if ( '' !== $stored_hash ) {
+			delete_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ) );
+			$cleared = true;
+		}
+
+		if ( is_numeric( $finalized ) ) {
+			delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
+			$cleared = true;
+		}
+
+		if ( ! $cleared ) {
+			return false;
+		}
+
 		unset( self::$elementor_current_cache, self::$elementor_storefront_serve_cache );
 		self::flush_translation_status_cache( $post_id );
+		self::repair_completed_elementor_job_meta( $post_id, $lang );
 
 		return true;
 	}

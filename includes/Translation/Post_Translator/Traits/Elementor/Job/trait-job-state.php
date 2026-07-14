@@ -255,6 +255,13 @@ trait Trait_Job_State {
 			}
 		}
 
+		if (
+			! self::elementor_translation_is_storefront_ready( $post_id, $lang )
+			|| self::storefront_would_show_persian_source( $post_id, $lang )
+		) {
+			return false;
+		}
+
 		return true;
 	}
 
@@ -845,7 +852,12 @@ trait Trait_Job_State {
 		self::repair_stale_elementor_completion_meta( $post_id, $lang );
 
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
-			return false;
+			if (
+				self::elementor_translation_is_storefront_ready( $post_id, $lang )
+				&& ! self::storefront_would_show_persian_source( $post_id, $lang )
+			) {
+				return false;
+			}
 		}
 
 		if (
