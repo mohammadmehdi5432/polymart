@@ -547,8 +547,8 @@ trait Trait_Job_Runner {
 			);
 			$slice_cursor = min( $slice_cursor, $progress_total );
 			$ai_options   = array(
-				'min_timeout' => 45,
-				'max_timeout' => 45,
+				'min_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT,
+				'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX,
 			);
 			$budget       = min( $budget, 3 );
 
@@ -626,6 +626,15 @@ trait Trait_Job_Runner {
 			}
 
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
+			$ai_options = self::build_elementor_chunk_ai_options( $chunk );
+
+			if ( $gap_fill_mode ) {
+				$ai_options['max_timeout'] = max(
+					$ai_options['max_timeout'],
+					self::ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX
+				);
+				$ai_options['min_timeout'] = $ai_options['max_timeout'];
+			}
 
 			if ( $gap_fill_mode ) {
 				$attempt_index = $gap_fill_done + 1;

@@ -22,14 +22,77 @@ defined( 'ABSPATH' ) || exit;
 trait Trait_Chunking {
 
 	private static function get_elementor_segment_max_chars() {
+		$default = \PolymartAI\Activity_Logger::is_bulk_job_running()
+			? self::ELEMENTOR_BULK_LONG_FIELD_SEGMENT_CHARS
+			: self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS;
+
 		return max(
-			400,
+			250,
 			absint(
 				apply_filters(
 					'polymart_ai_elementor_segment_chars',
-					self::ELEMENTOR_LONG_FIELD_SEGMENT_CHARS
+					$default
 				)
 			)
+		);
+	}
+
+	/**
+	 * Heavy Elementor fields (HTML editor segments) must not share an API batch with siblings.
+	 *
+	 * @param string $path Field path.
+	 * @param string $text Source text.
+	 * @return bool
+	 */
+	private static function elementor_field_needs_isolated_job_batch( $path, $text ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( self::elementor_path_is_segment( $path ) ) {
+			return true;
+		}
+
+		if ( self::utf8_strlen( $text ) > 220 ) {
+			return true;
+		}
+
+		return false !== stripos( $text, '<' ) && self::utf8_strlen( $text ) > 80;
+	}
+
+	/**
+	 * Scale Arvan HTTP timeout from outbound chunk size (matches test-API behaviour).
+	 *
+	 * @param array<string, string> $chunk Field map for one API call.
+	 * @return array{min_timeout: int, max_timeout: int}
+	 */
+	private static function build_elementor_chunk_ai_options( array $chunk ) {
+		$chars = 0;
+
+		foreach ( $chunk as $key => $value ) {
+			$chars += self::utf8_strlen( (string) $key ) + self::utf8_strlen( (string) $value );
+		}
+
+		$base = max( 30, absint( self::ELEMENTOR_JOB_REQUEST_TIMEOUT ) );
+		$cap  = max( $base, absint( self::ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX ) );
+
+		// Short labels/buttons: keep the fast window. HTML segments scale up like the admin test API.
+		if ( $chars <= 160 ) {
+			$timeout = $base;
+		} else {
+			$timeout = (int) min( $cap, max( $base, 18 + (int) ceil( $chars / 16 ) ) );
+		}
+
+		/**
+		 * Filter HTTP timeout (seconds) for one Elementor API batch.
+		 *
+		 * @param int                   $timeout Seconds.
+		 * @param array<string, string> $chunk   Outbound field map.
+		 */
+		$timeout = max( $base, min( $cap, (int) apply_filters( 'polymart_ai_elementor_chunk_timeout', $timeout, $chunk ) ) );
+
+		return array(
+			'min_timeout' => $timeout,
+			'max_timeout' => $timeout,
 		);
 	}
 
@@ -850,14 +913,50 @@ trait Trait_Chunking {
 		 */
 		$chunk_size = max( 1, (int) apply_filters( 'polymart_ai_elementor_job_field_chunk_size', $chunk_size, $payload ) );
 
-		// Sub-chunk long Elementor fields (paragraph-aware) before batching.
-		$payload = self::expand_elementor_payload_for_ai( $payload );
+		$expanded = self::expand_elementor_payload_for_ai( $payload );
+		$chunks   = array();
+		$current  = array();
+		$current_chars = 0;
+		$max_chars     = self::ELEMENTOR_JOB_MAX_CHUNK_CHARS;
 
-		return self::chunk_payload_with_limits(
-			$payload,
-			$chunk_size,
-			self::ELEMENTOR_JOB_MAX_CHUNK_CHARS
-		);
+		foreach ( $expanded as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( self::elementor_field_needs_isolated_job_batch( $path, $text ) ) {
+				if ( ! empty( $current ) ) {
+					$chunks[] = $current;
+					$current       = array();
+					$current_chars = 0;
+				}
+
+				$chunks[] = array( $path => $text );
+				continue;
+			}
+
+			$size = self::utf8_strlen( $path ) + self::utf8_strlen( $text );
+
+			if (
+				! empty( $current )
+				&& (
+					$current_chars + $size > $max_chars
+					|| count( $current ) >= $chunk_size
+				)
+			) {
+				$chunks[]      = $current;
+				$current       = array();
+				$current_chars = 0;
+			}
+
+			$current[ $path ] = $text;
+			$current_chars += $size;
+		}
+
+		if ( ! empty( $current ) ) {
+			$chunks[] = $current;
+		}
+
+		return $chunks;
 	}
 
 	private static function collapse_duplicate_elementor_payload( array $payload ) {

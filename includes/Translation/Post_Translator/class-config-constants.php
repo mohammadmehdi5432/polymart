@@ -63,16 +63,20 @@ final class Config_Constants {
 	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1500;
 	/** Split very long Elementor text fields before calling the AI. */
 	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = 1000;
+	/** Smaller segments during bulk jobs — faster Arvan responses, fewer 30s timeouts. */
+	const ELEMENTOR_BULK_LONG_FIELD_SEGMENT_CHARS = 400;
 	/** Max API attempts per Elementor __segN key before source-text fallback. */
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = 3;
 	/** Empty stubborn hand-off ticks before force-saving with source-text fallback. */
 	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 5;
-	/** HTTP timeout (seconds) for a single Elementor job-step AI call. */
+	/** Base HTTP timeout (seconds) for a short Elementor job-step AI call. */
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 45;
+	/** Upper HTTP timeout (seconds) for heavy HTML / __segN Elementor slices. */
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX = 90;
 	/** Minimum HTTP timeout (seconds) for auto-translate job AI calls. */
-	const JOB_REQUEST_MIN_TIMEOUT = 30;
+	const JOB_REQUEST_MIN_TIMEOUT = 45;
 	/** Maximum HTTP timeout (seconds) for a single auto-translate job AI call. */
-	const JOB_REQUEST_MAX_TIMEOUT = 45;
+	const JOB_REQUEST_MAX_TIMEOUT = 90;
 	/** Variation title batches — variable products may have 100+ rows. */
 	const VARIATION_AI_FIELD_CHUNK_SIZE = 2;
 	/** Maximum combined characters per variation AI batch. */

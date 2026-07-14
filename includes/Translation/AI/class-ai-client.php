@@ -46,7 +46,7 @@ final class AI_Client {
 	/**
 	 * Default HTTP timeout ceiling when caller does not pass max_timeout (seconds).
 	 */
-	const REQUEST_TIMEOUT_MAX = 45;
+	const REQUEST_TIMEOUT_MAX = 90;
 
 	/**
 	 * Maximum automatic retries after transport failures.
@@ -562,8 +562,8 @@ final class AI_Client {
 
 		$max_transport_retries = self::MAX_TRANSPORT_RETRIES;
 
-		// Elementor/AS/metabox slices cap at ~45s — never chain transport retries.
-		if ( ! empty( $options['max_timeout'] ) && absint( $options['max_timeout'] ) <= 50 ) {
+		// Elementor/AS/metabox slices cap transport retries — never chain multi-minute hangs.
+		if ( ! empty( $options['max_timeout'] ) && absint( $options['max_timeout'] ) <= 95 ) {
 			$max_transport_retries = 0;
 		}
 

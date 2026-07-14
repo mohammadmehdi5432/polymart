@@ -26,14 +26,14 @@ final class Config_Constants {
 	const STEP_LOCK_CLAIM_KEY  = 'polymart_ai_job_step_lock_claim';
 	/**
 	 * Absolute orphan ceiling. Living ticks refresh the lock before/during AI HTTP.
-	 * Must stay above Post_Translator::JOB_REQUEST_MAX_TIMEOUT (~50s) plus overhead.
+	 * Must stay above Post_Translator::ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX (~90s) plus overhead.
 	 */
-	const STEP_LOCK_TTL        = 90;
+	const STEP_LOCK_TTL        = 120;
 	/**
 	 * ensure/kick must not force-unlock during a normal AI call.
-	 * Keep slightly above JOB_REQUEST_MAX_TIMEOUT.
+	 * Keep above ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX (~90s) plus overhead.
 	 */
-	const LOCK_FORCE_IDLE_SEC  = 70;
+	const LOCK_FORCE_IDLE_SEC  = 100;
 	const CRON_HOOK            = 'polymart_ai_translation_job_step';
 	/**
 	 * Recurring pulse — keep-alive: ensure AS action exists + run queue inline.
