@@ -915,17 +915,15 @@ export default function AutoTranslateApp() {
     setActionPending('start');
     appendLog(`در حال آماده‌سازی صف ترجمه برای ${targetLabel}…`);
 
-    try {
+    const runStart = async () => {
       const data = await jobAction('start', targetLang);
       setJob(data);
       autoResumedRef.current = true;
       writeAutoRunFlag(true);
-      setActionPending(null);
       appendLog(
         `ترجمه خودکار شروع شد — ${data.total ?? 0} مورد در صف (${targetLabel}). کارگر کرون روی سرور اجرا می‌شود.`,
         'success'
       );
-      // Server already enqueued Action Scheduler — nudge worker without blocking the UI on a heavy kick.
       void jobAction('ensure', targetLang)
         .then((kicked) => {
           if (kicked) {
@@ -933,6 +931,11 @@ export default function AutoTranslateApp() {
           }
         })
         .catch(() => {});
+      return data;
+    };
+
+    try {
+      await runStart();
     } catch (error) {
       const code = error?.response?.data?.code;
       const isTimeout =
@@ -946,7 +949,7 @@ export default function AutoTranslateApp() {
       if (isTimeout) {
         let recovered = null;
 
-        for (let attempt = 0; attempt < 4; attempt += 1) {
+        for (let attempt = 0; attempt < 6; attempt += 1) {
           recovered = await loadJob();
 
           if (recovered?.status === 'running') {
@@ -975,20 +978,39 @@ export default function AutoTranslateApp() {
 
       if (code === 'polymart_ai_job_running') {
         const existing = await loadJob();
+        const workerStamp = latestWorkerStamp(existing);
+        const workerAge = workerStamp
+          ? Math.max(0, Math.floor(Date.now() / 1000) - workerStamp)
+          : Number.POSITIVE_INFINITY;
+        const staleRunning =
+          existing?.status === 'running' &&
+          !existing?.worker_lock &&
+          !existing?.as_running &&
+          workerAge > LOCK_HEALTHY_SEC;
 
-        if (existing?.status === 'running') {
+        if (staleRunning) {
+          appendLog('اجرای قبلی روی سرور گیر کرده بود — پاک‌سازی و شروع مجدد…', 'warning');
+          try {
+            await jobAction('stop', targetLang);
+            await runStart();
+            return;
+          } catch (retryError) {
+            message =
+              retryError?.response?.data?.message ||
+              retryError?.message ||
+              message;
+          }
+        } else if (existing?.status === 'running') {
           setNotice({
             type: 'info',
             message: 'یک ترجمه از قبل در حال اجراست — مانیتور همین اجرا را نشان می‌دهد.',
           });
           await ensureServerWorker();
-        } else {
-          setNotice({ type: 'error', message });
+          return;
         }
-      } else {
-        setNotice({ type: 'error', message });
       }
 
+      setNotice({ type: 'error', message });
       appendLog(message, 'error');
       autoResumedRef.current = false;
       writeAutoRunFlag(false);

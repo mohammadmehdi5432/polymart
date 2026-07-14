@@ -5,7 +5,7 @@ export const JOB_STEP_TIMEOUT_MS = 240000;
 
 const JOB_FETCH_TIMEOUT_MS = 90000;
 /** Start/stop should return quickly; worker runs on AS/cron. */
-const JOB_START_STOP_TIMEOUT_MS = 90000;
+const JOB_START_STOP_TIMEOUT_MS = 120000;
 const JOB_FETCH_RETRIES = 4;
 const JOB_FETCH_RETRY_DELAY_MS = 1500;
 const JOB_STEP_RETRIES = 1;

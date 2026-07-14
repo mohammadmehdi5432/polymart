@@ -190,14 +190,11 @@ trait Trait_Job_Lifecycle {
 			);
 		}
 
-		$existing = self::get_job( false );
+		$existing        = wp_parse_args( self::get_job_raw(), self::empty_job() );
 		$existing_status = (string) ( $existing['status'] ?? 'idle' );
 
 		if ( in_array( $existing_status, array( 'running', 'paused' ), true ) ) {
-			$elementor_active = absint( $existing['partial_post_id'] ?? 0 ) > 0
-				&& 'elementor' === sanitize_key( (string) ( $existing['partial_phase'] ?? '' ) );
-
-			if ( 'running' === $existing_status && ( self::is_bulk_worker_lively( 180 ) || $elementor_active ) ) {
+			if ( 'running' === $existing_status && self::is_bulk_worker_lively( 180 ) ) {
 				return new \WP_Error(
 					'polymart_ai_job_running',
 					__( 'یک فرآیند ترجمه خودکار در حال اجراست. ابتدا آن را متوقف یا از سرگیری کنید.', 'polymart-ai' )
@@ -235,13 +232,10 @@ trait Trait_Job_Lifecycle {
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
-		// Reconcile falsely "translated" index rows before stats/queue seeding.
-		Post_Translator::reconcile_stale_translation_indexes( $lang, 500 );
-		Post_Translator::flush_translation_status_cache();
-
-		$issues         = Translation_Query::collect_storefront_translation_issues( $lang, 12, false );
+		// Fast start: light probes only — heavy index reconcile runs during worker ticks.
+		$issues         = Translation_Query::collect_storefront_translation_issues( $lang, 8, true );
 		$issue_ids      = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
-		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, false );
+		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
 		$front          = absint( get_option( 'page_on_front' ) );
 		$repair_ids     = array_values(
 			array_unique(
@@ -249,8 +243,8 @@ trait Trait_Job_Lifecycle {
 					array_map(
 						'absint',
 						array_merge(
-							$issue_ids,
-							$priority_probe,
+							array_slice( $issue_ids, 0, 4 ),
+							array_slice( $priority_probe, 0, 4 ),
 							$front > 0 ? array( $front ) : array()
 						)
 					)
@@ -258,7 +252,7 @@ trait Trait_Job_Lifecycle {
 			)
 		);
 
-		self::reconcile_start_probe_posts( $lang, $repair_ids );
+		self::reconcile_start_probe_posts( $lang, array_slice( $repair_ids, 0, 4 ) );
 
 		$stats      = Translation_Query::compute_translation_stats( $lang, false );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
@@ -290,7 +284,7 @@ trait Trait_Job_Lifecycle {
 		}
 
 		if ( $total <= 0 ) {
-			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 12, false );
+			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
 
 			if ( ! empty( $probe_ids ) ) {
 				$stats      = Translation_Query::compute_translation_stats( $lang, false );
@@ -338,7 +332,7 @@ trait Trait_Job_Lifecycle {
 		}
 
 		if ( empty( $seed_ids ) ) {
-			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, false );
+			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, true );
 		}
 
 		if ( empty( $seed_ids ) ) {
@@ -394,6 +388,21 @@ trait Trait_Job_Lifecycle {
 			);
 			$needs_work = max( $needs_work, 1 );
 			$total      = max( $total, $needs_work );
+		}
+
+		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
+			$seed_ids = self::scan_start_seed_post_ids( $lang, min( 8, max( 3, $needs_work ) ) );
+		}
+
+		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
+			$indexed_work = (int) $stats['untranslated'] + (int) $stats['partial'];
+
+			if ( $indexed_work > 0 ) {
+				$seed_ids = Translation_Query::seed_actionable_post_ids(
+					$lang,
+					min( 8, max( 1, $indexed_work ) )
+				);
+			}
 		}
 
 		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {
@@ -776,6 +785,33 @@ trait Trait_Job_Lifecycle {
 			Post_Translator::repair_stale_elementor_completion_meta( $post_id, $lang );
 			Post_Translator::repair_completed_elementor_job_meta( $post_id, $lang );
 		}
+	}
+
+	/**
+	 * Last-resort scan when indexed seeding returns nothing but the site still has work.
+	 *
+	 * @param string $lang  Target language.
+	 * @param int    $limit Maximum IDs.
+	 * @return int[]
+	 */
+	private static function scan_start_seed_post_ids( $lang, $limit = 8 ) {
+		$lang   = sanitize_key( (string) $lang );
+		$limit  = max( 1, min( 12, absint( $limit ) ) );
+		$found  = array();
+		$cursor = 0;
+
+		for ( $attempt = 0; $attempt < 16 && count( $found ) < $limit; $attempt++ ) {
+			$next_id = Translation_Query::find_next_actionable_post_id( $lang, $cursor );
+
+			if ( $next_id <= 0 ) {
+				break;
+			}
+
+			$found[] = $next_id;
+			$cursor  = $next_id;
+		}
+
+		return array_values( array_unique( array_map( 'absint', $found ) ) );
 	}
 
 }
