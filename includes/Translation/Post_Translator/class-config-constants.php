@@ -55,8 +55,10 @@ final class Config_Constants {
 	const ELEMENTOR_AI_FIELD_CHUNK_SIZE = 3;
 	/** Maximum combined characters per Elementor AI batch. */
 	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 2500;
-	/** Elementor job batches: 1 field for bulk (timeout-safe), more for manual metabox. */
+	/** Elementor job batches for manual metabox / inline translate. */
 	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 6;
+	/** Elementor bulk job batches — group short fields; still capped by ELEMENTOR_JOB_MAX_CHUNK_CHARS. */
+	const ELEMENTOR_BULK_JOB_FIELD_CHUNK_SIZE = 3;
 	/** Maximum characters per Elementor job-step API call. */
 	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1500;
 	/** Split very long Elementor text fields before calling the AI. */
@@ -65,12 +67,12 @@ final class Config_Constants {
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = 3;
 	/** Empty stubborn hand-off ticks before force-saving with source-text fallback. */
 	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 5;
-	/** HTTP timeout cap (seconds) for a single Elementor job-step AI call. */
-	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 30;
+	/** HTTP timeout (seconds) for a single Elementor job-step AI call. */
+	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 45;
 	/** Minimum HTTP timeout (seconds) for auto-translate job AI calls. */
-	const JOB_REQUEST_MIN_TIMEOUT = 20;
+	const JOB_REQUEST_MIN_TIMEOUT = 30;
 	/** Maximum HTTP timeout (seconds) for a single auto-translate job AI call. */
-	const JOB_REQUEST_MAX_TIMEOUT = 30;
+	const JOB_REQUEST_MAX_TIMEOUT = 45;
 	/** Variation title batches — variable products may have 100+ rows. */
 	const VARIATION_AI_FIELD_CHUNK_SIZE = 2;
 	/** Maximum combined characters per variation AI batch. */

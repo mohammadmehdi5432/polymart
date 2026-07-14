@@ -527,7 +527,10 @@ trait Trait_Job_Runner {
 
 		$source_total    = max( 1, absint( $state['elementor_chunks_total'] ?? 0 ) );
 		$budget          = self::get_job_step_max_elementor_chunks();
-		$ai_options      = array( 'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT );
+		$ai_options      = array(
+			'min_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT,
+			'max_timeout' => self::ELEMENTOR_JOB_REQUEST_TIMEOUT,
+		);
 		$processed       = 0;
 		$failures        = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 		$skipped_list    = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
@@ -543,7 +546,10 @@ trait Trait_Job_Runner {
 				self::read_elementor_slice_cursor_total( $post_id, $lang )
 			);
 			$slice_cursor = min( $slice_cursor, $progress_total );
-			$ai_options   = array( 'max_timeout' => 45 );
+			$ai_options   = array(
+				'min_timeout' => 45,
+				'max_timeout' => 45,
+			);
 			$budget       = min( $budget, 3 );
 
 			if ( function_exists( 'set_time_limit' ) ) {
@@ -1469,7 +1475,7 @@ trait Trait_Job_Runner {
 			$progress,
 			sprintf(
 				/* translators: 1: progress marker, 2: timed-out path count */
-				__( 'Elementor — %1$s: timeout API — %2$d مسیر معلق — ادامه با سگمنت بعدی…', 'polymart-ai' ),
+				__( 'Elementor — %1$s: timeout API — %2$d مسیر معلق — تلاش مجدد همان بخش…', 'polymart-ai' ),
 				$progress,
 				count( $timed_out )
 			)

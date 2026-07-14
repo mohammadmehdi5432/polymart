@@ -839,7 +839,7 @@ trait Trait_Chunking {
 
 	private static function chunk_elementor_payload_for_job( array $payload ) {
 		$chunk_size = \PolymartAI\Activity_Logger::is_bulk_job_running()
-			? 1
+			? self::ELEMENTOR_BULK_JOB_FIELD_CHUNK_SIZE
 			: self::ELEMENTOR_JOB_FIELD_CHUNK_SIZE;
 
 		/**

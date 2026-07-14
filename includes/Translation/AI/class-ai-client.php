@@ -44,9 +44,9 @@ final class AI_Client {
 	const REQUEST_TIMEOUT_MIN = 20;
 
 	/**
-	 * Maximum HTTP timeout for a translation request (seconds).
+	 * Default HTTP timeout ceiling when caller does not pass max_timeout (seconds).
 	 */
-	const REQUEST_TIMEOUT_MAX = 30;
+	const REQUEST_TIMEOUT_MAX = 45;
 
 	/**
 	 * Maximum automatic retries after transport failures.
@@ -541,7 +541,7 @@ final class AI_Client {
 			);
 		}
 
-		$timeout = self::request_timeout_for_payload( $payload );
+		$timeout = self::request_timeout_for_payload( $payload, $options );
 
 		/**
 		 * Filter the HTTP timeout used for ArvanCloud translation requests.
@@ -549,7 +549,7 @@ final class AI_Client {
 		 * @param int                   $timeout Request timeout in seconds.
 		 * @param array<string, mixed>  $payload Outbound request body.
 		 */
-		$timeout = (int) apply_filters( 'polymart_ai_request_timeout', $timeout, $payload );
+		$timeout = (int) apply_filters( 'polymart_ai_request_timeout', $timeout, $payload, $options );
 
 		$floor = ! empty( $options['min_timeout'] )
 			? max( 20, absint( $options['min_timeout'] ) )
@@ -644,16 +644,22 @@ final class AI_Client {
 	/**
 	 * Estimate an HTTP timeout from the outbound payload size.
 	 *
+	 * The final bound is still clamped in post_chat_completion() via min_timeout/max_timeout.
+	 *
 	 * @param array<string, mixed> $payload Request body.
+	 * @param array<string, mixed> $options Request options (max_timeout).
 	 * @return int
 	 */
-	private static function request_timeout_for_payload( array $payload ) {
-		$chars = strlen( (string) wp_json_encode( $payload ) );
+	private static function request_timeout_for_payload( array $payload, array $options = array() ) {
+		$chars      = strlen( (string) wp_json_encode( $payload ) );
+		$calculated = max( self::REQUEST_TIMEOUT_MIN, (int) ceil( $chars / 20 ) + 60 );
+		$ceiling    = self::REQUEST_TIMEOUT_MAX;
 
-		return (int) min(
-			self::REQUEST_TIMEOUT_MAX,
-			max( self::REQUEST_TIMEOUT_MIN, (int) ceil( $chars / 20 ) + 60 )
-		);
+		if ( ! empty( $options['max_timeout'] ) ) {
+			$ceiling = max( $ceiling, absint( $options['max_timeout'] ) );
+		}
+
+		return (int) min( $ceiling, $calculated );
 	}
 
 	/**
