@@ -499,17 +499,16 @@ final class REST_API {
 	 */
 	public function get_dashboard() {
 		$translation = self::get_stored_translation_settings();
+		$active      = self::get_active_translation_credentials( $translation );
 
 		return rest_ensure_response(
 			array(
 				'stats'           => $this->get_translation_stats(),
 				'ai_configured'   => self::is_ai_configured(),
-				'api_key_set'     => '' !== trim( $translation['api_key'] ),
-				'endpoint_set'    => '' !== trim( $translation['api_endpoint'] ),
-				'ai_model'        => AI_Client::resolve_model(
-					$translation['ai_model'],
-					$translation['api_endpoint']
-				),
+				'ai_provider'     => $active['ai_provider'],
+				'api_key_set'     => '' !== trim( $active['api_key'] ),
+				'endpoint_set'    => '' !== trim( $active['api_endpoint'] ),
+				'ai_model'        => $active['ai_model'],
 				'english_url'     => Language_Registry::get_language_home_url( 'en' ),
 				'site_url'        => home_url( '/' ),
 				'languages'       => Language_Registry::format_for_api(),
@@ -603,28 +602,47 @@ final class REST_API {
 			$incoming = array();
 		}
 
-		$api_key  = sanitize_text_field( (string) ( $incoming['api_key'] ?? '' ) );
-		$endpoint = self::sanitize_gateway_endpoint( (string) ( $incoming['api_endpoint'] ?? '' ) );
-		$model    = sanitize_text_field( (string) ( $incoming['ai_model'] ?? '' ) );
-
-		if ( '' === $api_key ) {
-			$api_key = $current['api_key'];
+		$provider = sanitize_key( (string) ( $incoming['ai_provider'] ?? $current['ai_provider'] ) );
+		if ( ! in_array( $provider, array( AI_Client::PROVIDER_ARVAN, AI_Client::PROVIDER_GAPGPT ), true ) ) {
+			$provider = AI_Client::PROVIDER_ARVAN;
 		}
 
-		if ( '' === $endpoint && '' !== trim( (string) ( $incoming['api_endpoint'] ?? '' ) ) ) {
-			return new \WP_Error(
-				'polymart_ai_invalid_gateway_endpoint',
-				__( 'آدرس AI Gateway نامعتبر است. آدرس کامل را از پنل آروان کپی کنید — باید با https:// شروع شود.', 'polymart-ai' ),
-				array( 'status' => 400 )
-			);
-		}
+		if ( AI_Client::PROVIDER_GAPGPT === $provider ) {
+			$api_key  = sanitize_text_field( (string) ( $incoming['gapgpt_api_key'] ?? '' ) );
+			$endpoint = AI_Client::GAPGPT_DEFAULT_ENDPOINT;
+			$model    = sanitize_text_field( (string) ( $incoming['gapgpt_ai_model'] ?? '' ) );
 
-		if ( '' === $endpoint ) {
-			$endpoint = $current['api_endpoint'];
-		}
+			if ( '' === $api_key ) {
+				$api_key = $current['gapgpt_api_key'];
+			}
 
-		if ( '' === $model ) {
-			$model = $current['ai_model'];
+			if ( '' === $model ) {
+				$model = $current['gapgpt_ai_model'];
+			}
+		} else {
+			$api_key  = sanitize_text_field( (string) ( $incoming['api_key'] ?? '' ) );
+			$endpoint = self::sanitize_gateway_endpoint( (string) ( $incoming['api_endpoint'] ?? '' ) );
+			$model    = sanitize_text_field( (string) ( $incoming['ai_model'] ?? '' ) );
+
+			if ( '' === $api_key ) {
+				$api_key = $current['api_key'];
+			}
+
+			if ( '' === $endpoint && '' !== trim( (string) ( $incoming['api_endpoint'] ?? '' ) ) ) {
+				return new \WP_Error(
+					'polymart_ai_invalid_gateway_endpoint',
+					__( 'آدرس AI Gateway نامعتبر است. آدرس کامل را از پنل آروان کپی کنید — باید با https:// شروع شود.', 'polymart-ai' ),
+					array( 'status' => 400 )
+				);
+			}
+
+			if ( '' === $endpoint ) {
+				$endpoint = $current['api_endpoint'];
+			}
+
+			if ( '' === $model ) {
+				$model = $current['ai_model'];
+			}
 		}
 
 		$result = AI_Client::test_connection( $api_key, $endpoint, $model );
@@ -637,10 +655,16 @@ final class REST_API {
 			);
 		}
 
+		$provider_label = AI_Client::provider_label( $provider );
+
 		return rest_ensure_response(
 			array(
 				'success' => true,
-				'message' => __( 'اتصال به API با موفقیت برقرار شد.', 'polymart-ai' ),
+				'message' => sprintf(
+					/* translators: %s: AI provider name */
+					__( 'اتصال به API %s با موفقیت برقرار شد.', 'polymart-ai' ),
+					$provider_label
+				),
 			)
 		);
 	}
@@ -1056,9 +1080,12 @@ final class REST_API {
 	public static function get_default_settings() {
 		return array(
 			'translation' => array(
-				'api_key'      => '',
-				'api_endpoint' => '',
-				'ai_model'     => AI_Client::DEFAULT_MODEL,
+				'ai_provider'    => AI_Client::PROVIDER_ARVAN,
+				'api_key'          => '',
+				'api_endpoint'     => '',
+				'ai_model'         => AI_Client::DEFAULT_MODEL,
+				'gapgpt_api_key'   => '',
+				'gapgpt_ai_model'  => AI_Client::GAPGPT_DEFAULT_MODEL,
 			),
 			'currency'    => array(
 				'api_key' => '',
@@ -1067,9 +1094,9 @@ final class REST_API {
 	}
 
 	/**
-	 * Read normalized translation settings from the database.
+	 * Read normalized translation settings from the database (all providers, raw keys).
 	 *
-	 * @return array{api_key: string, api_endpoint: string, ai_model: string}
+	 * @return array<string, mixed>
 	 */
 	public static function get_stored_translation_settings() {
 		$settings = wp_parse_args(
@@ -1081,14 +1108,61 @@ final class REST_API {
 	}
 
 	/**
+	 * Resolve credentials for the active AI provider (used by translation jobs).
+	 *
+	 * @param array<string, mixed>|null $translation Optional stored translation settings.
+	 * @return array{ai_provider: string, api_key: string, api_endpoint: string, ai_model: string}
+	 */
+	public static function get_active_translation_credentials( $translation = null ) {
+		if ( ! is_array( $translation ) ) {
+			$translation = self::get_stored_translation_settings();
+		} else {
+			$translation = self::normalize_translation_settings( $translation );
+		}
+
+		$provider = (string) ( $translation['ai_provider'] ?? AI_Client::PROVIDER_ARVAN );
+
+		if ( AI_Client::PROVIDER_GAPGPT === $provider ) {
+			$endpoint = AI_Client::GAPGPT_DEFAULT_ENDPOINT;
+			$model    = AI_Client::resolve_model(
+				(string) ( $translation['gapgpt_ai_model'] ?? '' ),
+				$endpoint
+			);
+
+			return array(
+				'ai_provider'  => AI_Client::PROVIDER_GAPGPT,
+				'api_key'      => trim( (string) ( $translation['gapgpt_api_key'] ?? '' ) ),
+				'api_endpoint' => $endpoint,
+				'ai_model'     => $model,
+			);
+		}
+
+		$endpoint = trim( (string) ( $translation['api_endpoint'] ?? '' ) );
+
+		return array(
+			'ai_provider'  => AI_Client::PROVIDER_ARVAN,
+			'api_key'      => trim( (string) ( $translation['api_key'] ?? '' ) ),
+			'api_endpoint' => $endpoint,
+			'ai_model'     => AI_Client::resolve_model(
+				(string) ( $translation['ai_model'] ?? '' ),
+				$endpoint
+			),
+		);
+	}
+
+	/**
 	 * Whether AI translation credentials are stored and usable.
 	 *
 	 * @return bool
 	 */
 	public static function is_ai_configured() {
-		$translation = self::get_stored_translation_settings();
+		$credentials = self::get_active_translation_credentials();
 
-		return '' !== trim( $translation['api_key'] ) && '' !== trim( $translation['api_endpoint'] );
+		if ( AI_Client::PROVIDER_GAPGPT === $credentials['ai_provider'] ) {
+			return '' !== trim( $credentials['api_key'] );
+		}
+
+		return '' !== trim( $credentials['api_key'] ) && '' !== trim( $credentials['api_endpoint'] );
 	}
 
 	/**
@@ -1101,9 +1175,14 @@ final class REST_API {
 			'translation' => array(
 				'type'       => 'object',
 				'properties' => array(
-					'api_key'      => array( 'type' => 'string' ),
-					'api_endpoint' => array( 'type' => 'string' ),
-					'ai_model'     => array( 'type' => 'string' ),
+					'ai_provider'         => array( 'type' => 'string' ),
+					'api_key'             => array( 'type' => 'string' ),
+					'api_endpoint'        => array( 'type' => 'string' ),
+					'ai_model'            => array( 'type' => 'string' ),
+					'gapgpt_api_key'      => array( 'type' => 'string' ),
+					'gapgpt_ai_model'     => array( 'type' => 'string' ),
+					'clear_api_key'       => array( 'type' => 'boolean' ),
+					'clear_gapgpt_api_key'=> array( 'type' => 'boolean' ),
 				),
 			),
 			'currency'    => array(
@@ -1125,12 +1204,33 @@ final class REST_API {
 	private function sanitize_translation_settings( array $incoming, array $current ) {
 		$current = self::normalize_translation_settings( $current );
 
-		$incoming_key = isset( $incoming['api_key'] ) ? (string) $incoming['api_key'] : '';
+		$provider = sanitize_key( (string) ( $incoming['ai_provider'] ?? $current['ai_provider'] ) );
+		if ( ! in_array( $provider, array( AI_Client::PROVIDER_ARVAN, AI_Client::PROVIDER_GAPGPT ), true ) ) {
+			$provider = AI_Client::PROVIDER_ARVAN;
+		}
 
-		if ( '' !== trim( $incoming_key ) ) {
-			$api_key = sanitize_text_field( $incoming_key );
+		if ( ! empty( $incoming['clear_api_key'] ) ) {
+			$api_key = '';
 		} else {
-			$api_key = $current['api_key'];
+			$incoming_key = isset( $incoming['api_key'] ) ? (string) $incoming['api_key'] : '';
+
+			if ( '' !== trim( $incoming_key ) ) {
+				$api_key = sanitize_text_field( $incoming_key );
+			} else {
+				$api_key = $current['api_key'];
+			}
+		}
+
+		if ( ! empty( $incoming['clear_gapgpt_api_key'] ) ) {
+			$gapgpt_api_key = '';
+		} else {
+			$incoming_gapgpt_key = isset( $incoming['gapgpt_api_key'] ) ? (string) $incoming['gapgpt_api_key'] : '';
+
+			if ( '' !== trim( $incoming_gapgpt_key ) ) {
+				$gapgpt_api_key = sanitize_text_field( $incoming_gapgpt_key );
+			} else {
+				$gapgpt_api_key = $current['gapgpt_api_key'];
+			}
 		}
 
 		$endpoint_raw = isset( $incoming['api_endpoint'] ) ? (string) $incoming['api_endpoint'] : '';
@@ -1148,10 +1248,21 @@ final class REST_API {
 			$endpoint = $current['api_endpoint'];
 		}
 
+		$gapgpt_model = sanitize_text_field(
+			(string) ( $incoming['gapgpt_ai_model'] ?? $current['gapgpt_ai_model'] ?? AI_Client::GAPGPT_DEFAULT_MODEL )
+		);
+
+		if ( '' === trim( $gapgpt_model ) ) {
+			$gapgpt_model = AI_Client::GAPGPT_DEFAULT_MODEL;
+		}
+
 		return array(
-			'api_key'      => $api_key,
-			'api_endpoint' => $endpoint,
-			'ai_model'     => sanitize_text_field( $incoming['ai_model'] ?? $current['ai_model'] ),
+			'ai_provider'    => $provider,
+			'api_key'        => $api_key,
+			'api_endpoint'   => $endpoint,
+			'ai_model'       => sanitize_text_field( $incoming['ai_model'] ?? $current['ai_model'] ),
+			'gapgpt_api_key' => $gapgpt_api_key,
+			'gapgpt_ai_model'=> $gapgpt_model,
 		);
 	}
 
@@ -1162,8 +1273,9 @@ final class REST_API {
 	 * @return array<string, mixed>
 	 */
 	private static function mask_translation_settings_for_response( array $translation ) {
-		$translation['api_key_set'] = '' !== trim( (string) ( $translation['api_key'] ?? '' ) );
-		unset( $translation['api_key'] );
+		$translation['api_key_set']        = '' !== trim( (string) ( $translation['api_key'] ?? '' ) );
+		$translation['gapgpt_api_key_set'] = '' !== trim( (string) ( $translation['gapgpt_api_key'] ?? '' ) );
+		unset( $translation['api_key'], $translation['gapgpt_api_key'] );
 
 		return $translation;
 	}
@@ -1187,10 +1299,28 @@ final class REST_API {
 			$translation['ai_model'] = $translation['arvan_model'];
 		}
 
+		$provider = sanitize_key( (string) ( $translation['ai_provider'] ?? AI_Client::PROVIDER_ARVAN ) );
+		if ( ! in_array( $provider, array( AI_Client::PROVIDER_ARVAN, AI_Client::PROVIDER_GAPGPT ), true ) ) {
+			$provider = AI_Client::PROVIDER_ARVAN;
+		}
+
+		$ai_model = trim( (string) ( $translation['ai_model'] ?? '' ) );
+		if ( '' === $ai_model ) {
+			$ai_model = AI_Client::DEFAULT_MODEL;
+		}
+
+		$gapgpt_model = trim( (string) ( $translation['gapgpt_ai_model'] ?? '' ) );
+		if ( '' === $gapgpt_model ) {
+			$gapgpt_model = AI_Client::GAPGPT_DEFAULT_MODEL;
+		}
+
 		return array(
-			'api_key'      => (string) ( $translation['api_key'] ?? '' ),
-			'api_endpoint' => (string) ( $translation['api_endpoint'] ?? '' ),
-			'ai_model'     => (string) ( $translation['ai_model'] ?? '' ),
+			'ai_provider'     => $provider,
+			'api_key'         => (string) ( $translation['api_key'] ?? '' ),
+			'api_endpoint'    => (string) ( $translation['api_endpoint'] ?? '' ),
+			'ai_model'        => $ai_model,
+			'gapgpt_api_key'  => (string) ( $translation['gapgpt_api_key'] ?? '' ),
+			'gapgpt_ai_model' => $gapgpt_model,
 		);
 	}
 
@@ -1499,9 +1629,26 @@ final class REST_API {
 	 * @return \WP_REST_Response
 	 */
 	public function get_translation_job() {
-		$job = Activity_Logger::get_job( false );
+		return rest_ensure_response( self::enrich_translation_job_response( Activity_Logger::get_job( false ) ) );
+	}
 
-		return rest_ensure_response( $job );
+	/**
+	 * Attach active AI provider metadata to auto-translate job payloads.
+	 *
+	 * @param array<string, mixed>|\WP_Error $job Job state.
+	 * @return array<string, mixed>|\WP_Error
+	 */
+	public static function enrich_translation_job_response( $job ) {
+		if ( ! is_array( $job ) ) {
+			return $job;
+		}
+
+		$credentials = self::get_active_translation_credentials();
+
+		$job['ai_provider']       = (string) ( $credentials['ai_provider'] ?? AI_Client::PROVIDER_ARVAN );
+		$job['ai_provider_label'] = AI_Client::provider_label( $job['ai_provider'] );
+
+		return $job;
 	}
 
 	/**
@@ -1558,11 +1705,11 @@ final class REST_API {
 			);
 		}
 
-		return rest_ensure_response( $result );
+		return rest_ensure_response( self::enrich_translation_job_response( $result ) );
 	}
 
 	/**
-	 * Run a short sample translation through ArvanCloud (same path as bulk jobs).
+	 * Run a short sample translation through the active AI provider (same path as bulk jobs).
 	 *
 	 * @param \WP_REST_Request $request REST request.
 	 * @return \WP_REST_Response|\WP_Error
@@ -1581,12 +1728,11 @@ final class REST_API {
 			$lang = 'en';
 		}
 
-		$current     = wp_parse_args( get_option( self::OPTION_KEY, array() ), self::get_default_settings() );
-		$translation = self::normalize_translation_settings( $current['translation'] );
-
-		$api_key  = trim( (string) ( $translation['api_key'] ?? '' ) );
-		$endpoint = trim( (string) ( $translation['api_endpoint'] ?? '' ) );
-		$model    = trim( (string) ( $translation['ai_model'] ?? '' ) );
+		$credentials = self::get_active_translation_credentials();
+		$api_key     = trim( (string) ( $credentials['api_key'] ?? '' ) );
+		$endpoint    = trim( (string) ( $credentials['api_endpoint'] ?? '' ) );
+		$model       = trim( (string) ( $credentials['ai_model'] ?? '' ) );
+		$provider    = (string) ( $credentials['ai_provider'] ?? AI_Client::PROVIDER_ARVAN );
 
 		if ( '' === $api_key ) {
 			return new \WP_Error(
@@ -1596,7 +1742,7 @@ final class REST_API {
 			);
 		}
 
-		if ( '' === $endpoint ) {
+		if ( AI_Client::PROVIDER_GAPGPT !== $provider && '' === $endpoint ) {
 			return new \WP_Error(
 				'polymart_ai_missing_endpoint',
 				__( 'آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده است.', 'polymart-ai' ),
@@ -1605,6 +1751,8 @@ final class REST_API {
 		}
 
 		$result = AI_Client::test_sample_translation( $text, $lang, $api_key, $endpoint, $model );
+		$result['ai_provider']       = $provider;
+		$result['ai_provider_label'] = AI_Client::provider_label( $provider );
 
 		if ( ! empty( $result['success'] ) ) {
 			$result['cooldown_cleared'] = Activity_Logger::clear_job_api_cooldown( true );
@@ -1612,7 +1760,11 @@ final class REST_API {
 			if ( ! empty( $result['cooldown_cleared'] ) ) {
 				Activity_Logger::log(
 					'info',
-					__( 'تست API موفق — توقف خودکار آروان برداشته شد و کار ادامه می‌یابد.', 'polymart-ai' )
+					sprintf(
+						/* translators: %s: AI provider name */
+						__( 'تست API %s موفق — توقف خودکار API برداشته شد و کار ادامه می‌یابد.', 'polymart-ai' ),
+						AI_Client::provider_label( $provider )
+					)
 				);
 			}
 		}
@@ -1645,7 +1797,7 @@ final class REST_API {
 			return $job;
 		}
 
-		return rest_ensure_response( $job );
+		return rest_ensure_response( self::enrich_translation_job_response( $job ) );
 	}
 
 	/**

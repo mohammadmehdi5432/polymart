@@ -78,30 +78,7 @@ trait Trait_Translation_Status {
 	}
 
 	public static function get_translation_settings() {
-		$settings = wp_parse_args(
-			get_option( REST_API::OPTION_KEY, array() ),
-			REST_API::get_default_settings()
-		);
-
-		$translation = $settings['translation'] ?? array();
-
-		if ( empty( $translation['api_key'] ) && ! empty( $translation['arvan_api_key'] ) ) {
-			$translation['api_key'] = $translation['arvan_api_key'];
-		}
-
-		if ( empty( $translation['api_endpoint'] ) && ! empty( $translation['arvan_api_endpoint'] ) ) {
-			$translation['api_endpoint'] = $translation['arvan_api_endpoint'];
-		}
-
-		if ( empty( $translation['ai_model'] ) && ! empty( $translation['arvan_model'] ) ) {
-			$translation['ai_model'] = $translation['arvan_model'];
-		}
-
-		if ( empty( $translation['ai_model'] ) ) {
-			$translation['ai_model'] = AI_Client::DEFAULT_MODEL;
-		}
-
-		return $translation;
+		return REST_API::get_active_translation_credentials();
 	}
 
 	public static function get_custom_meta_label( $meta_key, $lang = 'en' ) {

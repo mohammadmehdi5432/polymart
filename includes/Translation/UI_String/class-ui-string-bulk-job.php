@@ -498,11 +498,19 @@ final class UI_String_Bulk_Job {
 		$settings = Post_Translator::get_translation_settings();
 		$api_key  = trim( (string) ( $settings['api_key'] ?? '' ) );
 		$endpoint = trim( (string) ( $settings['api_endpoint'] ?? '' ) );
+		$provider = sanitize_key( (string) ( $settings['ai_provider'] ?? AI_Client::PROVIDER_ARVAN ) );
 
-		if ( '' === $api_key || '' === $endpoint ) {
+		if ( '' === $api_key ) {
 			return new \WP_Error(
 				'polymart_ai_missing_credentials',
-				__( 'کلید API یا Endpoint آروان‌کلاد پیکربندی نشده است.', 'polymart-ai' )
+				__( 'کلید API سرویس ترجمه پیکربندی نشده است.', 'polymart-ai' )
+			);
+		}
+
+		if ( AI_Client::PROVIDER_GAPGPT !== $provider && '' === $endpoint ) {
+			return new \WP_Error(
+				'polymart_ai_missing_credentials',
+				__( 'آدرس AI Gateway آروان‌کلاد پیکربندی نشده است.', 'polymart-ai' )
 			);
 		}
 

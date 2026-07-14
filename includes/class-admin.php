@@ -7,6 +7,8 @@
 
 namespace PolymartAI;
 
+use PolymartAI\Translation\AI\AI_Client;
+
 defined( 'ABSPATH' ) || exit;
 
 /**
@@ -226,6 +228,7 @@ final class Admin {
 		}
 
 		$version = POLYMART_AI_VERSION . '.' . (string) filemtime( $asset_file );
+		$active_ai = REST_API::get_active_translation_credentials();
 
 		wp_enqueue_style(
 			'polymart-ai-admin',
@@ -278,7 +281,9 @@ final class Admin {
 					'report'        => admin_url( 'admin.php?page=polymart-ai-report' ),
 					'logs'          => admin_url( 'admin.php?page=polymart-ai-logs' ),
 				),
-				'aiConfigured'   => REST_API::is_ai_configured(),
+				'aiConfigured'    => REST_API::is_ai_configured(),
+				'aiProvider'      => $active_ai['ai_provider'] ?? AI_Client::PROVIDER_ARVAN,
+				'aiProviderLabel' => AI_Client::provider_label( $active_ai['ai_provider'] ?? AI_Client::PROVIDER_ARVAN ),
 				'cronDisabled'   => defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON,
 				'devMode'        => defined( 'WP_DEBUG' ) && WP_DEBUG,
 			)

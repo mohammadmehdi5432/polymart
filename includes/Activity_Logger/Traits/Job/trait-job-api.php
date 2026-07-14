@@ -251,6 +251,9 @@ trait Trait_Job_Api {
 
 	public static function format_api_cooldown_message( $remaining_seconds ) {
 		$remaining_seconds = max( 0, absint( $remaining_seconds ) );
+		$provider_label    = AI_Client::provider_label(
+			(string) ( REST_API::get_active_translation_credentials()['ai_provider'] ?? AI_Client::PROVIDER_ARVAN )
+		);
 
 		if ( $remaining_seconds <= 0 ) {
 			return __( 'API آماده تلاش مجدد است', 'polymart-ai' );
@@ -258,15 +261,17 @@ trait Trait_Job_Api {
 
 		if ( $remaining_seconds >= 60 ) {
 			return sprintf(
-				/* translators: %d: minutes remaining */
-				__( 'API آروان محدود — %d دقیقه تا ادامه (بدون مصرف توکن)', 'polymart-ai' ),
+				/* translators: 1: AI provider name, 2: minutes remaining */
+				__( 'API %1$s محدود — %2$d دقیقه تا ادامه (بدون مصرف توکن)', 'polymart-ai' ),
+				$provider_label,
 				(int) ceil( $remaining_seconds / 60 )
 			);
 		}
 
 		return sprintf(
-			/* translators: %d: seconds remaining */
-			__( 'API آروان محدود — %d ثانیه تا ادامه', 'polymart-ai' ),
+			/* translators: 1: AI provider name, 2: seconds remaining */
+			__( 'API %1$s محدود — %2$d ثانیه تا ادامه', 'polymart-ai' ),
+			$provider_label,
 			$remaining_seconds
 		);
 	}

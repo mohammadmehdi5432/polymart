@@ -6,6 +6,10 @@ import { useTargetLanguages } from './hooks/useTargetLanguages';
 import { fetchJob, jobAction, jobStep, refreshJobStats, abortJobStep, testTranslationApi, fetchRemainingWork } from './api/job';
 import { HiBolt, HiArrowPath } from './components/ui/icons';
 
+const config = window.polymartAiSettings ?? {};
+const adminUrls = config.adminUrls ?? {};
+const aiConfigured = Boolean(config.aiConfigured);
+
 const POLL_INTERVAL_MS = 2000;
 /** Between-batch idle before the monitor kicks ensure (seconds). */
 const CRON_STALE_SEC = 45;
@@ -47,16 +51,24 @@ function isApiCooldownActive(job) {
   return job?.status === 'running' && apiCooldownRemaining(job) > 0;
 }
 
-function formatApiCooldownLabel(seconds) {
+function formatApiCooldownLabel(seconds, providerLabel = 'API') {
   if (seconds >= 60) {
-    return `API آروان محدود — ${Math.ceil(seconds / 60)} دقیقه تا ادامه`;
+    return `API ${providerLabel} محدود — ${Math.ceil(seconds / 60)} دقیقه تا ادامه`;
   }
-  return `API آروان محدود — ${seconds} ثانیه تا ادامه`;
+  return `API ${providerLabel} محدود — ${seconds} ثانیه تا ادامه`;
 }
 
 function isSyntheticCooldownMessage(message) {
   const text = String(message || '');
-  return /API آروان محدود|تا ادامه|بدون مصرف توکن|API آماده تلاش مجدد/i.test(text);
+  return /API .+ محدود|API آروان محدود|تا ادامه|بدون مصرف توکن|API آماده تلاش مجدد/i.test(text);
+}
+
+function resolveAiProviderLabel(job) {
+  return job?.ai_provider_label || config.aiProviderLabel || 'آروان‌کلاد';
+}
+
+function resolveAiProviderId(job) {
+  return job?.ai_provider || config.aiProvider || 'arvan';
 }
 
 /** Top status line while Elementor chunks are in flight (lock is only held a few seconds per tick). */
@@ -205,16 +217,16 @@ function jobStepHeadline(lastStepStatus, displayPost, job) {
     if (lastStepStatus === 'partial' && phase === 'elementor' && progress) {
       const parsed = /^(\d+)\/(\d+)$/.exec(progress);
       if (parsed && Number(parsed[1]) >= Number(parsed[2])) {
-        return `Elementor ${progress} — تکمیل فیلدهای باقی‌مانده (${formatApiCooldownLabel(cooldownRemaining)})`;
+        return `Elementor ${progress} — تکمیل فیلدهای باقی‌مانده (${formatApiCooldownLabel(cooldownRemaining, resolveAiProviderLabel(job))})`;
       }
-      return `Elementor ${progress} — ${formatApiCooldownLabel(cooldownRemaining)}`;
+      return `Elementor ${progress} — ${formatApiCooldownLabel(cooldownRemaining, resolveAiProviderLabel(job))}`;
     }
 
     if (stepMsg && !isSyntheticCooldownMessage(stepMsg)) {
-      return formatApiCooldownLabel(cooldownRemaining);
+      return formatApiCooldownLabel(cooldownRemaining, resolveAiProviderLabel(job));
     }
 
-    return formatApiCooldownLabel(cooldownRemaining);
+    return formatApiCooldownLabel(cooldownRemaining, resolveAiProviderLabel(job));
   }
 
   const lockAge = Number(job?.worker_lock_age || 0);
@@ -360,10 +372,6 @@ function jobPhaseLabel(phase) {
       return phase || '';
   }
 }
-
-const config = window.polymartAiSettings ?? {};
-const adminUrls = config.adminUrls ?? {};
-const aiConfigured = Boolean(config.aiConfigured);
 
 function formatTime(ts) {
   if (!ts) return '—';
@@ -1175,13 +1183,17 @@ export default function AutoTranslateApp() {
     setApiTestResult(null);
     setNotice(null);
 
+    const providerLabel = resolveAiProviderLabel(job);
+
     try {
       const data = await testTranslationApi({ text: apiTestText.trim() || 'سلام دنیا', lang: targetLang });
       setApiTestResult(data);
 
+      const resultProvider = data?.ai_provider_label || data?.provider_label || providerLabel;
+
       if (data?.success) {
         appendLog(
-          `تست آروان موفق (${data.elapsed_ms}ms): «${data.source}» → «${data.translated}»`,
+          `تست ${resultProvider} موفق (${data.elapsed_ms}ms): «${data.source}» → «${data.translated}»`,
           'success'
         );
 
@@ -1191,12 +1203,12 @@ export default function AutoTranslateApp() {
           setJob(refreshed);
         }
       } else {
-        appendLog(`تست آروان ناموفق (${data?.elapsed_ms ?? '?'}ms): ${data?.error || 'خطای نامشخص'}`, 'error');
+        appendLog(`تست ${resultProvider} ناموفق (${data?.elapsed_ms ?? '?'}ms): ${data?.error || 'خطای نامشخص'}`, 'error');
       }
     } catch (error) {
       const message = error?.response?.data?.message || error?.message || 'تست API ناموفق بود.';
       setApiTestResult({ success: false, error: message });
-      appendLog(`تست آروان ناموفق: ${message}`, 'error');
+      appendLog(`تست ${providerLabel} ناموفق: ${message}`, 'error');
     } finally {
       setApiTestLoading(false);
     }
@@ -1229,6 +1241,7 @@ export default function AutoTranslateApp() {
   const canStart =
     aiConfigured && !loading && !isBusy && !isRunning && !langsLoading && langOptions.length > 0;
   const activeLangLabel = job?.lang_label || targetLabel;
+  const aiProviderLabel = resolveAiProviderLabel(job);
   const displayPost = resolveDisplayPost(job, activePost);
   const lastStepStatus = displayPost?.step_status || job?.last_step?.status;
   const skipTargetId =
@@ -1362,7 +1375,11 @@ export default function AutoTranslateApp() {
         <div className="mb-4">
           <Notice
             type="error"
-            message="کلید API یا آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده — ابتدا از بخش تنظیمات پیکربندی کنید."
+            message={
+              resolveAiProviderId(job) === 'gapgpt'
+                ? 'کلید API گپ GPT در تنظیمات ترجمه تنظیم نشده — ابتدا از بخش تنظیمات پیکربندی کنید.'
+                : 'کلید API یا آدرس AI Gateway در تنظیمات ترجمه تنظیم نشده — ابتدا از بخش تنظیمات پیکربندی کنید.'
+            }
           />
         </div>
       )}
@@ -1507,9 +1524,9 @@ export default function AutoTranslateApp() {
           </div>
 
           <div className="mt-5 rounded-lg border border-dashed border-gray-300 bg-gray-50 p-4">
-            <p className="text-xs font-medium text-gray-800">تست سریع آروان‌کلاد</p>
+            <p className="text-xs font-medium text-gray-800">تست سریع {aiProviderLabel}</p>
             <p className="mt-1 text-xs text-gray-600">
-              همان مسیر ترجمه واقعی — اگر اینجا timeout بخورد، مشکل از API است نه از محصول.
+              همان مسیر ترجمه واقعی ({aiProviderLabel}) — اگر اینجا timeout بخورد، مشکل از API است نه از محصول.
             </p>
             <input
               type="text"
@@ -1525,7 +1542,9 @@ export default function AutoTranslateApp() {
               disabled={apiTestLoading}
               className="mt-2 w-full cursor-pointer rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium text-blue-900 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {apiTestLoading ? 'در حال ارسال به آروان… (تا ۲ دقیقه)' : `تست ترجمه به ${targetLabel}`}
+              {apiTestLoading
+                ? `در حال ارسال به ${aiProviderLabel}… (تا ۲ دقیقه)`
+                : `تست ترجمه ${aiProviderLabel} → ${targetLabel}`}
             </button>
             {apiTestResult && (
               <div
@@ -1540,6 +1559,9 @@ export default function AutoTranslateApp() {
                     <p className="font-medium">موفق — {apiTestResult.elapsed_ms}ms</p>
                     <p className="mt-1">«{apiTestResult.source}» → «{apiTestResult.translated}»</p>
                     {apiTestResult.model ? <p className="mt-1 opacity-80">مدل: {apiTestResult.model}</p> : null}
+                    {apiTestResult.ai_provider_label ? (
+                      <p className="mt-1 opacity-80">سرویس: {apiTestResult.ai_provider_label}</p>
+                    ) : null}
                   </>
                 ) : (
                   <>

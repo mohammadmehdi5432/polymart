@@ -694,11 +694,12 @@ trait Trait_Job_Runner {
 				\PolymartAI\Activity_Logger::log(
 					'info',
 					sprintf(
-						/* translators: 1: post label, 2: chunk index, 3: total chunks */
-						__( 'Elementor — %1$s: ارسال بخش %2$d از %3$d به API آروان…', 'polymart-ai' ),
+						/* translators: 1: post label, 2: chunk index, 3: total chunks, 4: AI provider label */
+						__( 'Elementor — %1$s: ارسال بخش %2$d از %3$d به API %4$s…', 'polymart-ai' ),
 						$post_label,
 						$attempt_index,
-						$attempt_total
+						$attempt_total,
+						\PolymartAI\Translation\AI\AI_Client::provider_label( $api_endpoint )
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);

@@ -32,10 +32,16 @@ const SAVEABLE_TABS = new Set(['translation']);
 
 const defaultSettings = {
   translation: {
+    ai_provider: 'arvan',
     api_key: '',
     api_key_set: false,
     api_endpoint: '',
     ai_model: 'DeepSeek-V3-2-g6zde',
+    gapgpt_api_key: '',
+    gapgpt_api_key_set: false,
+    gapgpt_ai_model: 'gapgpt-qwen-3.6',
+    clear_api_key: false,
+    clear_gapgpt_api_key: false,
   },
 };
 
@@ -46,6 +52,13 @@ function mergeSettings(base, patch) {
   if (patch?.translation && !Object.prototype.hasOwnProperty.call(translationPatch, 'api_key')) {
     mergedTranslation.api_key = '';
   }
+
+  if (patch?.translation && !Object.prototype.hasOwnProperty.call(translationPatch, 'gapgpt_api_key')) {
+    mergedTranslation.gapgpt_api_key = '';
+  }
+
+  mergedTranslation.clear_api_key = false;
+  mergedTranslation.clear_gapgpt_api_key = false;
 
   return {
     translation: mergedTranslation,
@@ -115,16 +128,30 @@ export default function App() {
     try {
       const payload = {
         translation: {
+          ai_provider: settings.translation.ai_provider ?? 'arvan',
           api_endpoint: (settings.translation.api_endpoint ?? '')
             .trim()
             .replace(/…/g, '')
             .replace(/\.\.\./g, ''),
           ai_model: settings.translation.ai_model,
+          gapgpt_ai_model: settings.translation.gapgpt_ai_model,
         },
       };
 
       if (settings.translation.api_key?.trim()) {
         payload.translation.api_key = settings.translation.api_key.trim();
+      }
+
+      if (settings.translation.gapgpt_api_key?.trim()) {
+        payload.translation.gapgpt_api_key = settings.translation.gapgpt_api_key.trim();
+      }
+
+      if (settings.translation.clear_api_key) {
+        payload.translation.clear_api_key = true;
+      }
+
+      if (settings.translation.clear_gapgpt_api_key) {
+        payload.translation.clear_gapgpt_api_key = true;
       }
 
       const saved = await saveSettings(payload);

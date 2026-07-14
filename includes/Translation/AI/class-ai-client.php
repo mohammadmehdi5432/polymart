@@ -37,6 +37,22 @@ final class AI_Client {
 	const DEFAULT_MODEL = 'DeepSeek-V3-2-g6zde';
 
 	/**
+	 * GapGPT OpenAI-compatible API base URL.
+	 */
+	const GAPGPT_DEFAULT_ENDPOINT = 'https://api.gapgpt.app/v1';
+
+	/**
+	 * Default GapGPT model when none is configured.
+	 */
+	const GAPGPT_DEFAULT_MODEL = 'gapgpt-qwen-3.6';
+
+	/**
+	 * Supported AI provider identifiers.
+	 */
+	const PROVIDER_ARVAN  = 'arvan';
+	const PROVIDER_GAPGPT = 'gapgpt';
+
+	/**
 	 * Minimum HTTP timeout for a translation request (seconds).
 	 *
 	 * Job/AS path typically caps at 45–50s via request options.
@@ -291,6 +307,8 @@ final class AI_Client {
 			'source'      => $text,
 			'target_lang' => $target_lang,
 			'model'       => self::resolve_model( (string) $model, (string) $endpoint ),
+			'provider'    => self::is_gapgpt_endpoint( $endpoint ) ? self::PROVIDER_GAPGPT : self::PROVIDER_ARVAN,
+			'provider_label' => self::provider_label( $endpoint ),
 			'translated'  => (string) ( $translations['test_line'] ?? '' ),
 		);
 	}
@@ -312,14 +330,22 @@ final class AI_Client {
 		if ( '' === $endpoint ) {
 			return new \WP_Error(
 				'polymart_ai_missing_endpoint',
-				__( 'آدرس API آروان‌کلاد پیکربندی نشده است.', 'polymart-ai' )
+				self::provider_message(
+					AI_Client::PROVIDER_ARVAN,
+					/* translators: %s: AI provider name */
+					__( 'آدرس API %s پیکربندی نشده است.', 'polymart-ai' )
+				)
 			);
 		}
 
 		if ( '' === $api_key ) {
 			return new \WP_Error(
 				'polymart_ai_missing_api_key',
-				__( 'کلید API آروان‌کلاد پیکربندی نشده است.', 'polymart-ai' )
+				self::provider_message(
+					$endpoint,
+					/* translators: %s: AI provider name */
+					__( 'کلید API %s پیکربندی نشده است.', 'polymart-ai' )
+				)
 			);
 		}
 
@@ -365,7 +391,7 @@ final class AI_Client {
 			return $response;
 		}
 
-		$parsed = self::parse_response( $response, $data_array );
+		$parsed = self::parse_response( $response, $data_array, $endpoint );
 
 		if ( is_wp_error( $parsed ) && self::is_transient_parse_response_error( $parsed ) ) {
 			$parsed = self::retry_after_transient_parse_error( $endpoint, $api_key, $payload, $data_array, $options, $parsed, 1 );
@@ -429,7 +455,7 @@ final class AI_Client {
 			return $last_error;
 		}
 
-		$parsed = self::parse_response( $response, $data_array );
+		$parsed = self::parse_response( $response, $data_array, $endpoint );
 
 		if ( is_wp_error( $parsed ) && self::is_transient_parse_response_error( $parsed ) ) {
 			return self::retry_after_transient_parse_error( $endpoint, $api_key, $retry_payload, $data_array, $options, $parsed, $attempt + 1 );
@@ -513,7 +539,7 @@ final class AI_Client {
 			return $response;
 		}
 
-		$parsed = self::parse_response( $response, $data_array );
+		$parsed = self::parse_response( $response, $data_array, $endpoint );
 
 		if ( is_wp_error( $parsed ) && self::should_retry_rate_limited_error( $parsed ) ) {
 			return self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $parsed, $attempt + 1 );
@@ -620,9 +646,10 @@ final class AI_Client {
 			if ( 'http_request_failed' === $error_code ) {
 				return new \WP_Error(
 					'polymart_ai_timeout',
-					sprintf(
-						/* translators: %s: underlying transport error */
-						__( 'درخواست API آروان‌کلاد منقضی شد یا اتصال برقرار نشد: %s', 'polymart-ai' ),
+					self::provider_message(
+						$endpoint,
+						/* translators: 1: AI provider name, 2: underlying transport error */
+						__( 'درخواست API %1$s منقضی شد یا اتصال برقرار نشد: %2$s', 'polymart-ai' ),
 						self::truncate_error_message( $error_message )
 					)
 				);
@@ -630,9 +657,10 @@ final class AI_Client {
 
 			return new \WP_Error(
 				'polymart_ai_http_error',
-				sprintf(
-					/* translators: %s: error message */
-					__( 'درخواست API آروان‌کلاد ناموفق بود: %s', 'polymart-ai' ),
+				self::provider_message(
+					$endpoint,
+					/* translators: 1: AI provider name, 2: error message */
+					__( 'درخواست API %1$s ناموفق بود: %2$s', 'polymart-ai' ),
 					self::truncate_error_message( $error_message )
 				)
 			);
@@ -790,7 +818,11 @@ final class AI_Client {
 			return empty( $validated )
 				? new \WP_Error(
 					'polymart_ai_no_translations',
-					__( 'هوش مصنوعی آروان‌کلاد هیچ ترجمه قابل استفاده‌ای برنگرداند.', 'polymart-ai' )
+					self::provider_message(
+						$endpoint,
+						/* translators: %s: AI provider name */
+						__( 'هوش مصنوعی %s هیچ ترجمه قابل استفاده‌ای برنگرداند.', 'polymart-ai' )
+					)
 				)
 				: $validated;
 		}
@@ -818,7 +850,7 @@ final class AI_Client {
 			}
 		}
 
-		return self::validate_keys( $source, $validated, false );
+		return self::validate_keys( $source, $validated, false, $endpoint );
 	}
 
 	/**
@@ -904,16 +936,17 @@ final class AI_Client {
 	 * @param array<string, string> $data_array Original input keys.
 	 * @return array<string, string>|\WP_Error
 	 */
-	private static function parse_response( $response, array $data_array ) {
+	private static function parse_response( $response, array $data_array, $endpoint = '' ) {
 		$status_code = (int) wp_remote_retrieve_response_code( $response );
 		$body        = wp_remote_retrieve_body( $response );
 
 		if ( '' === $body ) {
 			return new \WP_Error(
 				'polymart_ai_empty_response',
-				sprintf(
-					/* translators: %d: HTTP status code */
-					__( 'API آروان‌کلاد پاسخ خالی برگرداند (HTTP %d).', 'polymart-ai' ),
+				self::provider_message(
+					$endpoint,
+					/* translators: 1: AI provider name, 2: HTTP status code */
+					__( 'API %1$s پاسخ خالی برگرداند (HTTP %2$d).', 'polymart-ai' ),
 					$status_code
 				)
 			);
@@ -932,9 +965,10 @@ final class AI_Client {
 
 			return new \WP_Error(
 				$error_code,
-				sprintf(
-					/* translators: 1: HTTP status code, 2: error message */
-					__( 'API آروان‌کلاد کد HTTP %1$d برگرداند: %2$s', 'polymart-ai' ),
+				self::provider_message(
+					$endpoint,
+					/* translators: 1: AI provider name, 2: HTTP status code, 3: error message */
+					__( 'API %1$s کد HTTP %2$d برگرداند: %3$s', 'polymart-ai' ),
 					$status_code,
 					self::truncate_error_message( $message )
 				),
@@ -945,7 +979,11 @@ final class AI_Client {
 		if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $decoded ) ) {
 			return new \WP_Error(
 				'polymart_ai_invalid_response',
-				__( 'API آروان‌کلاد پاسخ JSON نامعتبر برگرداند.', 'polymart-ai' )
+				self::provider_message(
+					$endpoint,
+					/* translators: %s: AI provider name */
+					__( 'API %s پاسخ JSON نامعتبر برگرداند.', 'polymart-ai' )
+				)
 			);
 		}
 
@@ -958,7 +996,11 @@ final class AI_Client {
 				$finish = (string) $decoded['choices'][0]['finish_reason'];
 			}
 
-			$message = __( 'پاسخ هوش مصنوعی آروان‌کلاد شامل محتوای ترجمه نبود.', 'polymart-ai' );
+			$message = self::provider_message(
+				$endpoint,
+				/* translators: %s: AI provider name */
+				__( 'پاسخ هوش مصنوعی %s شامل محتوای ترجمه نبود.', 'polymart-ai' )
+			);
 
 			if ( '' !== $finish ) {
 				$message .= ' (finish_reason: ' . $finish . ')';
@@ -974,13 +1016,13 @@ final class AI_Client {
 			);
 		}
 
-		$translations = self::decode_json_content( $content );
+		$translations = self::decode_json_content( $content, $endpoint );
 
 		if ( is_wp_error( $translations ) ) {
 			return $translations;
 		}
 
-		return self::validate_keys( $data_array, $translations );
+		return self::validate_keys( $data_array, $translations, false, $endpoint );
 	}
 
 	/**
@@ -1159,7 +1201,7 @@ final class AI_Client {
 	 * @param string $content Raw model output.
 	 * @return array<string, string>|\WP_Error
 	 */
-	private static function decode_json_content( $content ) {
+	private static function decode_json_content( $content, $endpoint = '' ) {
 		$candidates = self::json_content_candidates( $content );
 
 		foreach ( $candidates as $candidate ) {
@@ -1172,7 +1214,11 @@ final class AI_Client {
 
 		return new \WP_Error(
 			'polymart_ai_invalid_json',
-			__( 'هوش مصنوعی آروان‌کلاد JSON نامعتبر برگرداند.', 'polymart-ai' )
+			self::provider_message(
+				$endpoint,
+				/* translators: %s: AI provider name */
+				__( 'هوش مصنوعی %s JSON نامعتبر برگرداند.', 'polymart-ai' )
+			)
 		);
 	}
 
@@ -1258,7 +1304,7 @@ final class AI_Client {
 	 * @param array<string, string> $translations Parsed AI output.
 	 * @return array<string, string>|\WP_Error
 	 */
-	private static function validate_keys( array $source, array $translations, $allow_partial = false ) {
+	private static function validate_keys( array $source, array $translations, $allow_partial = false, $endpoint = '' ) {
 		$validated = array();
 
 		foreach ( array_keys( $source ) as $key ) {
@@ -1271,10 +1317,16 @@ final class AI_Client {
 			return $validated;
 		}
 
+		$no_translation_message = self::provider_message(
+			$endpoint,
+			/* translators: %s: AI provider name */
+			__( 'هوش مصنوعی %s هیچ ترجمه قابل استفاده‌ای برنگرداند.', 'polymart-ai' )
+		);
+
 		if ( empty( $validated ) ) {
 			return new \WP_Error(
 				'polymart_ai_no_translations',
-				__( 'هوش مصنوعی آروان‌کلاد هیچ ترجمه قابل استفاده‌ای برنگرداند.', 'polymart-ai' )
+				$no_translation_message
 			);
 		}
 
@@ -1282,7 +1334,7 @@ final class AI_Client {
 			if ( ! isset( $validated[ $key ] ) ) {
 				return new \WP_Error(
 					'polymart_ai_no_translations',
-					__( 'هوش مصنوعی آروان‌کلاد هیچ ترجمه قابل استفاده‌ای برنگرداند.', 'polymart-ai' )
+					$no_translation_message
 				);
 			}
 		}
@@ -1320,17 +1372,62 @@ final class AI_Client {
 	 * @return string
 	 */
 	public static function resolve_model( $model, $endpoint ) {
-		$model = trim( (string) $model );
+		$model    = trim( (string) $model );
+		$endpoint = (string) $endpoint;
 
 		if ( '' !== $model ) {
 			return $model;
 		}
 
-		if ( preg_match( '#/models/([^/]+)/#i', (string) $endpoint, $matches ) ) {
+		if ( self::is_gapgpt_endpoint( $endpoint ) ) {
+			return self::GAPGPT_DEFAULT_MODEL;
+		}
+
+		if ( preg_match( '#/models/([^/]+)/#i', $endpoint, $matches ) ) {
 			return $matches[1];
 		}
 
 		return self::DEFAULT_MODEL;
+	}
+
+	/**
+	 * Whether the endpoint belongs to GapGPT.
+	 *
+	 * @param string $endpoint API base URL.
+	 * @return bool
+	 */
+	public static function is_gapgpt_endpoint( $endpoint ) {
+		return (bool) preg_match( '#gapgpt\.app#i', (string) $endpoint );
+	}
+
+	/**
+	 * Human-readable provider label for admin logs.
+	 *
+	 * @param string $provider Provider id or endpoint URL.
+	 * @return string
+	 */
+	public static function provider_label( $provider = '' ) {
+		$provider = strtolower( trim( (string) $provider ) );
+
+		if ( self::PROVIDER_GAPGPT === $provider || self::is_gapgpt_endpoint( $provider ) ) {
+			return 'GapGPT';
+		}
+
+		return __( 'آروان‌کلاد', 'polymart-ai' );
+	}
+
+	/**
+	 * Build a user-facing message with the active AI provider name inserted.
+	 *
+	 * @param string $endpoint Provider id or API base URL.
+	 * @param string $format   vsprintf format — first placeholder is always the provider label.
+	 * @param mixed  ...$args  Additional vsprintf arguments.
+	 * @return string
+	 */
+	private static function provider_message( $endpoint, $format, ...$args ) {
+		array_unshift( $args, self::provider_label( $endpoint ) );
+
+		return vsprintf( $format, $args );
 	}
 
 	/**
