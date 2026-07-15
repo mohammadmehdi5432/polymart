@@ -296,6 +296,167 @@ final class Metabox_Action_Scheduler {
 	}
 
 	/**
+	 * Cancel every metabox AS action site-wide (Stop / bulk takeover).
+	 *
+	 * @return int Number of rows cleared.
+	 */
+	public static function cancel_all_plugin_actions() {
+		if ( ! self::is_available() ) {
+			return 0;
+		}
+
+		$removed = 0;
+
+		self::fail_all_running_plugin_actions();
+
+		if ( function_exists( 'as_unschedule_all_actions' ) ) {
+			as_unschedule_all_actions( self::HOOK, array(), self::GROUP );
+			as_unschedule_all_actions( self::HOOK, null, self::GROUP );
+		}
+
+		if ( ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return $removed;
+		}
+
+		$store    = \ActionScheduler_Store::instance();
+		$statuses = array(
+			\ActionScheduler_Store::STATUS_PENDING,
+			\ActionScheduler_Store::STATUS_FAILED,
+			\ActionScheduler_Store::STATUS_CANCELED,
+		);
+
+		foreach ( $statuses as $store_status ) {
+			$page = 1;
+
+			do {
+				$actions = as_get_scheduled_actions(
+					array(
+						'hook'     => self::HOOK,
+						'group'    => self::GROUP,
+						'status'   => $store_status,
+						'per_page' => 50,
+						'page'     => $page,
+					)
+				);
+
+				if ( empty( $actions ) ) {
+					break;
+				}
+
+				foreach ( $actions as $action ) {
+					if ( ! is_object( $action ) || ! method_exists( $action, 'get_id' ) ) {
+						continue;
+					}
+
+					$action_id = absint( $action->get_id() );
+
+					if ( $action_id <= 0 ) {
+						continue;
+					}
+
+					try {
+						$store->cancel_action( $action_id );
+						++$removed;
+					} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+					}
+				}
+
+				++$page;
+			} while ( count( $actions ) >= 50 );
+		}
+
+		return $removed;
+	}
+
+	/**
+	 * Whether any metabox AS row is pending or actively running (any post/lang).
+	 *
+	 * @return bool
+	 */
+	public static function has_any_live_as_actions() {
+		if ( ! self::is_available() || ! function_exists( 'as_get_scheduled_actions' ) ) {
+			return false;
+		}
+
+		foreach ( array( \ActionScheduler_Store::STATUS_PENDING, \ActionScheduler_Store::STATUS_RUNNING ) as $store_status ) {
+			$actions = as_get_scheduled_actions(
+				array(
+					'hook'     => self::HOOK,
+					'group'    => self::GROUP,
+					'status'   => $store_status,
+					'per_page' => 1,
+				)
+			);
+
+			if ( ! empty( $actions ) ) {
+				if ( \ActionScheduler_Store::STATUS_RUNNING === $store_status ) {
+					$action = reset( $actions );
+
+					if ( is_object( $action ) && method_exists( $action, 'get_args' ) && method_exists( $action, 'get_id' ) ) {
+						$args = $action->get_args();
+
+						if (
+							self::is_metabox_as_running_action_live(
+								absint( $action->get_id() ),
+								absint( $args['post_id'] ?? 0 ),
+								sanitize_key( (string) ( $args['lang'] ?? '' ) )
+							)
+						) {
+							return true;
+						}
+
+						continue;
+					}
+				}
+
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * @return int
+	 */
+	private static function fail_all_running_plugin_actions() {
+		if ( ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+			return 0;
+		}
+
+		$store   = \ActionScheduler_Store::instance();
+		$failed  = 0;
+		$running = as_get_scheduled_actions(
+			array(
+				'hook'     => self::HOOK,
+				'group'    => self::GROUP,
+				'status'   => \ActionScheduler_Store::STATUS_RUNNING,
+				'per_page' => 50,
+			)
+		);
+
+		foreach ( (array) $running as $action ) {
+			if ( ! is_object( $action ) || ! method_exists( $action, 'get_id' ) ) {
+				continue;
+			}
+
+			$action_id = absint( $action->get_id() );
+
+			if ( $action_id <= 0 ) {
+				continue;
+			}
+
+			try {
+				$store->mark_failure( $action_id );
+				++$failed;
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			}
+		}
+
+		return $failed;
+	}
+
+	/**
 	 * Remove every metabox AS row for one post/language (pending, running, failed).
 	 *
 	 * Prevents ghost jobs where stale rows block as_schedule_single_action silently.
@@ -575,6 +736,10 @@ final class Metabox_Action_Scheduler {
 		$lang    = sanitize_key( (string) $lang );
 
 		if ( $post_id <= 0 || '' === $lang || ! self::is_available() ) {
+			return;
+		}
+
+		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
 			return;
 		}
 
@@ -904,6 +1069,18 @@ final class Metabox_Action_Scheduler {
 			);
 		}
 
+		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			Translation_Scheduler_Coordinator::clear_halt();
+		}
+
+		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+			return new \WP_Error(
+				'polymart_ai_bulk_job_active',
+				__( 'ترجمه خودکار در حال اجراست — ترجمه متاباکس تا پایان Bulk Job به تعویق افتاد. ابتدا Bulk را متوقف کنید یا صبر کنید.', 'polymart-ai' ),
+				array( 'deferred' => true )
+			);
+		}
+
 		if ( $unlock ) {
 			self::force_unlock_post( $post_id, $lang );
 		}
@@ -1061,6 +1238,14 @@ final class Metabox_Action_Scheduler {
 
 		if ( $post_id <= 0 || '' === $lang ) {
 			return new \WP_Error( 'polymart_ai_invalid_request', __( 'شناسه مطلب یا زبان نامعتبر است.', 'polymart-ai' ) );
+		}
+
+		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+			return new \WP_Error(
+				'polymart_ai_bulk_job_active',
+				__( 'ترجمه خودکار در حال اجراست — Polling متاباکس تا پایان Bulk Job متوقف است.', 'polymart-ai' ),
+				array( 'deferred' => true )
+			);
 		}
 
 		if ( function_exists( 'set_time_limit' ) ) {
@@ -1301,6 +1486,10 @@ final class Metabox_Action_Scheduler {
 			return 0;
 		}
 
+		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+			return 0;
+		}
+
 		$post_id            = absint( $post_id );
 		$lang               = sanitize_key( (string) $lang );
 		$delay_sec          = max( 0, min( 30, absint( $delay_sec ) ) );
@@ -1338,6 +1527,35 @@ final class Metabox_Action_Scheduler {
 		$lang    = sanitize_key( (string) $lang );
 
 		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		if ( Translation_Scheduler_Coordinator::is_halted() || Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+			$halt_message = Translation_Scheduler_Coordinator::is_halted()
+				? __( 'ترجمه متاباکس توسط کاربر متوقف شد.', 'polymart-ai' )
+				: __( 'ترجمه متاباکس به‌دلیل اجرای Bulk Job لغو شد.', 'polymart-ai' );
+
+			self::purge_all_queue_actions( $post_id, $lang, self::resolve_current_action_id() );
+			self::update_status(
+				$post_id,
+				$lang,
+				array(
+					'status'  => 'failed',
+					'message' => $halt_message,
+					'error'   => '',
+				)
+			);
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+			Translation_Scheduler_Coordinator::release_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX );
+
+			return;
+		}
+
+		if ( ! Translation_Scheduler_Coordinator::try_claim_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX ) ) {
+			if ( ! Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+				self::chain_next( $post_id, $lang );
+			}
+
 			return;
 		}
 
@@ -1483,10 +1701,11 @@ final class Metabox_Action_Scheduler {
 					Post_Translator::release_translation_lock( $post_id, $lang, $completed );
 				}
 
-				if ( $should_chain && ! $completed ) {
+				if ( $should_chain && ! $completed && ! Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
 					self::chain_next( $post_id, $lang );
 				}
 
+				Translation_Scheduler_Coordinator::release_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX );
 				\PolymartAI\Activity_Logger::end_metabox_as_worker();
 			}
 
@@ -1494,9 +1713,12 @@ final class Metabox_Action_Scheduler {
 		}
 
 		if ( $should_chain && ! $completed ) {
-			self::chain_next( $post_id, $lang );
+			if ( ! Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+				self::chain_next( $post_id, $lang );
+			}
 		}
 
+		Translation_Scheduler_Coordinator::release_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX );
 		\PolymartAI\Activity_Logger::end_metabox_as_worker();
 	}
 
@@ -1691,6 +1913,10 @@ final class Metabox_Action_Scheduler {
 	 * @return void
 	 */
 	private static function chain_next( $post_id, $lang ) {
+		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+			return;
+		}
+
 		$action_id = self::schedule_slice( $post_id, $lang, self::CHAIN_DELAY_SEC, self::$current_action_id );
 
 		if ( $action_id > 0 ) {
@@ -1993,6 +2219,15 @@ final class Metabox_Action_Scheduler {
 			return;
 		}
 
+		if ( Translation_Scheduler_Coordinator::is_halted() || Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+			Post_Translator::release_translation_lock( $post_id, $lang, true );
+			self::finalize_interrupted_action();
+			Translation_Scheduler_Coordinator::release_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX );
+			\PolymartAI\Activity_Logger::end_metabox_as_worker();
+
+			return;
+		}
+
 		$failure_message = self::$last_auth_failure_message;
 
 		if ( '' === $failure_message && function_exists( 'error_get_last' ) ) {
@@ -2026,6 +2261,7 @@ final class Metabox_Action_Scheduler {
 
 		self::chain_next( $post_id, $lang );
 
+		Translation_Scheduler_Coordinator::release_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX );
 		\PolymartAI\Activity_Logger::end_metabox_as_worker();
 	}
 

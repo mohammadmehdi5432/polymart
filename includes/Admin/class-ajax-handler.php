@@ -348,12 +348,15 @@ final class Ajax_Handler {
 				if ( function_exists( 'ob_get_length' ) && ob_get_length() ) {
 					@ob_clean();
 				}
+				$error_code = $queued->get_error_code();
+				$http_status = in_array( $error_code, array( 'polymart_ai_bulk_job_active', 'polymart_ai_job_running' ), true ) ? 409 : 500;
 				wp_send_json_error(
 					array(
-						'message' => $queued->get_error_message(),
-						'scan'    => self::build_scan_response( $post_id, $lang ),
+						'message'  => $queued->get_error_message(),
+						'scan'     => self::build_scan_response( $post_id, $lang ),
+						'deferred' => 'polymart_ai_bulk_job_active' === $error_code,
 					),
-					500
+					$http_status
 				);
 			}
 

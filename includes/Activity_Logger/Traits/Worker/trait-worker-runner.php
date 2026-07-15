@@ -9,6 +9,7 @@ namespace PolymartAI\Activity_Logger\Traits\Worker;
 
 use PolymartAI\Activity_Logger\Job_Action_Scheduler;
 use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
+use PolymartAI\Activity_Logger\Translation_Scheduler_Coordinator;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
 use PolymartAI\Translation\Content\Menu_Translator;
@@ -308,6 +309,10 @@ trait Trait_Worker_Runner {
 	}
 
 	public static function maybe_heal_background_worker() {
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return null;
+		}
+
 		if (
 			! wp_doing_cron()
 			&& ! self::$trusted_loopback_tick

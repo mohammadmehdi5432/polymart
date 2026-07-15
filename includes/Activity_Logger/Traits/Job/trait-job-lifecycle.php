@@ -9,6 +9,7 @@ namespace PolymartAI\Activity_Logger\Traits\Job;
 
 use PolymartAI\Activity_Logger\Job_Action_Scheduler;
 use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
+use PolymartAI\Activity_Logger\Translation_Scheduler_Coordinator;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
 use PolymartAI\Translation\Content\Menu_Translator;
@@ -211,6 +212,10 @@ trait Trait_Job_Lifecycle {
 				__( 'زبان مقصد انتخاب‌شده فعال نیست.', 'polymart-ai' )
 			);
 		}
+
+		Translation_Scheduler_Coordinator::clear_halt();
+		Metabox_Action_Scheduler::cancel_all_plugin_actions();
+		Translation_Scheduler_Coordinator::try_claim_global_worker( Translation_Scheduler_Coordinator::OWNER_BULK );
 
 		$existing        = wp_parse_args( self::get_job_raw(), self::empty_job() );
 		$existing_status = (string) ( $existing['status'] ?? 'idle' );
@@ -599,14 +604,12 @@ trait Trait_Job_Lifecycle {
 	public static function stop_job() {
 		$job = self::get_job_raw();
 
+		// Nuclear stop: purge bulk + metabox AS rows and block zombie enqueue/recovery.
+		Translation_Scheduler_Coordinator::halt_all_schedulers();
+
 		// Always tear down workers/locks first so Start cannot hit a stale "running" worker.
 		self::unschedule_background_worker();
 		self::release_step_lock();
-
-		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::cancel_all();
-			Job_Action_Scheduler::clear_slice_mutex();
-		}
 
 		$lang = sanitize_key( (string) ( $job['lang'] ?? '' ) );
 
@@ -624,7 +627,10 @@ trait Trait_Job_Lifecycle {
 		$cleared['updated_at'] = time();
 		$cleared['api_cooldown_until'] = null;
 
-		return self::save_job( $cleared );
+		$result = self::save_job( $cleared );
+		Translation_Scheduler_Coordinator::clear_halt();
+
+		return $result;
 	}
 
 	public static function skip_current_job_post( $post_id = 0 ) {

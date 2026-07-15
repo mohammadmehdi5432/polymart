@@ -9,6 +9,7 @@ namespace PolymartAI\Activity_Logger\Traits\Job\Queue;
 
 use PolymartAI\Activity_Logger\Job_Action_Scheduler;
 use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
+use PolymartAI\Activity_Logger\Translation_Scheduler_Coordinator;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
 use PolymartAI\Translation\Content\Menu_Translator;
@@ -244,6 +245,10 @@ trait Trait_Queue_Run {
 	}
 
 	public static function kick_worker() {
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return self::normalize_job_for_response( self::get_job_raw(), false );
+		}
+
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {

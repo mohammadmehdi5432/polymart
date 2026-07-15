@@ -9,6 +9,7 @@ namespace PolymartAI\Activity_Logger\Traits\Worker;
 
 use PolymartAI\Activity_Logger\Job_Action_Scheduler;
 use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
+use PolymartAI\Activity_Logger\Translation_Scheduler_Coordinator;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
 use PolymartAI\Translation\Content\Menu_Translator;
@@ -115,6 +116,10 @@ trait Trait_Worker_Recovery {
 	}
 
 	public static function recover_worker_infrastructure_failure( $message, array $context = array() ) {
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return self::normalize_job_for_response( self::get_job_raw(), false );
+		}
+
 		$message = is_string( $message ) ? $message : wp_json_encode( $message );
 
 		self::log(
@@ -165,7 +170,12 @@ trait Trait_Worker_Recovery {
 			self::save_job( $job );
 		}
 
-		if ( $force_release && self::is_bulk_job_running() && Job_Action_Scheduler::is_available() ) {
+		if (
+			$force_release
+			&& ! Translation_Scheduler_Coordinator::is_halted()
+			&& self::is_bulk_job_running()
+			&& Job_Action_Scheduler::is_available()
+		) {
 			Job_Action_Scheduler::chain_next_after_recovery();
 		}
 
@@ -179,7 +189,7 @@ trait Trait_Worker_Recovery {
 	 * @return bool True when recovery actions ran.
 	 */
 	public static function force_recover_stalled_bulk_worker( $reason = '' ) {
-		if ( ! self::is_bulk_job_running() ) {
+		if ( Translation_Scheduler_Coordinator::is_halted() || ! self::is_bulk_job_running() ) {
 			return false;
 		}
 

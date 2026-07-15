@@ -150,7 +150,15 @@ final class Job_Action_Scheduler {
 	 * @return int Action ID or 0.
 	 */
 	public static function enqueue_next( $force = false, $delay_sec = null ) {
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return 0;
+		}
+
 		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			return 0;
+		}
+
+		if ( Translation_Scheduler_Coordinator::should_defer_bulk_work() ) {
 			return 0;
 		}
 
@@ -233,7 +241,15 @@ final class Job_Action_Scheduler {
 	 * @return int Action ID or 0.
 	 */
 	public static function ensure_scheduled() {
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return 0;
+		}
+
 		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			return 0;
+		}
+
+		if ( Translation_Scheduler_Coordinator::should_defer_bulk_work() ) {
 			return 0;
 		}
 
@@ -465,7 +481,19 @@ final class Job_Action_Scheduler {
 	public static function handle_slice_action( ...$unused ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter
 		unset( $unused );
 
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return;
+		}
+
 		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			return;
+		}
+
+		if ( Translation_Scheduler_Coordinator::should_defer_bulk_work() ) {
+			return;
+		}
+
+		if ( ! Translation_Scheduler_Coordinator::try_claim_global_worker( Translation_Scheduler_Coordinator::OWNER_BULK ) ) {
 			return;
 		}
 
@@ -496,6 +524,8 @@ final class Job_Action_Scheduler {
 			self::run_slice_action_batch();
 		} catch ( \Throwable $e ) {
 			self::handle_slice_action_exception( $e );
+		} finally {
+			Translation_Scheduler_Coordinator::release_global_worker( Translation_Scheduler_Coordinator::OWNER_BULK );
 		}
 	}
 
@@ -840,7 +870,10 @@ final class Job_Action_Scheduler {
 			)
 		);
 
-		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+		if (
+			! Translation_Scheduler_Coordinator::is_halted()
+			&& \PolymartAI\Activity_Logger::is_bulk_job_running()
+		) {
 			self::enqueue_next( true, 0 );
 		}
 	}
@@ -855,7 +888,8 @@ final class Job_Action_Scheduler {
 
 		if ( self::$handler_clean_exit ) {
 			if (
-				\PolymartAI\Activity_Logger::is_bulk_job_running()
+				! Translation_Scheduler_Coordinator::is_halted()
+				&& \PolymartAI\Activity_Logger::is_bulk_job_running()
 				&& ! self::has_pending_or_running()
 			) {
 				self::chain_next_slice_immediately();
@@ -910,7 +944,10 @@ final class Job_Action_Scheduler {
 				)
 			);
 
-			if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			if (
+				! Translation_Scheduler_Coordinator::is_halted()
+				&& \PolymartAI\Activity_Logger::is_bulk_job_running()
+			) {
 				self::chain_next_after_recovery();
 			}
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
@@ -934,7 +971,11 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function chain_next_slice_immediately() {
-		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() || self::$chaining_next ) {
+		if (
+			Translation_Scheduler_Coordinator::is_halted()
+			|| ! \PolymartAI\Activity_Logger::is_bulk_job_running()
+			|| self::$chaining_next
+		) {
 			return;
 		}
 

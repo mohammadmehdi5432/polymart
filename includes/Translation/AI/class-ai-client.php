@@ -8,6 +8,7 @@
 namespace PolymartAI\Translation\AI;
 
 use PolymartAI\Translation\Post_Translator;
+use PolymartAI\Translation\Post_Translator\Shortcode_Masker;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -360,7 +361,9 @@ final class AI_Client {
 			$model = self::resolve_model( '', $endpoint );
 		}
 
-		$payload = self::build_payload( $data_array, $model, $target_lang );
+		$masked_payload = Shortcode_Masker::mask_payload( $data_array );
+
+		$payload = self::build_payload( $masked_payload, $model, $target_lang );
 
 		if ( is_wp_error( $payload ) ) {
 			return $payload;
@@ -398,10 +401,28 @@ final class AI_Client {
 		}
 
 		if ( is_wp_error( $parsed ) && self::should_retry_rate_limited_error( $parsed ) ) {
-			return self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $parsed, 1 );
+			$parsed = self::retry_after_rate_limit( $endpoint, $api_key, $payload, $data_array, $options, $parsed, 1 );
 		}
 
-		return $parsed;
+		if ( is_wp_error( $parsed ) ) {
+			return $parsed;
+		}
+
+		return Shortcode_Masker::restore_payload_shortcodes( $data_array, $parsed );
+	}
+
+	/**
+	 * @param array<string, string> $payload Field map.
+	 * @return bool
+	 */
+	private static function payload_contains_shortcode_tokens( array $payload ) {
+		foreach ( $payload as $value ) {
+			if ( false !== strpos( (string) $value, Shortcode_Masker::TOKEN_PREFIX ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -887,6 +908,10 @@ final class AI_Client {
 		if ( $has_segment_keys ) {
 			$system_rules[] = 'Some keys end with __segN — these are HTML segment identifiers. Return every key unchanged, including the __seg suffix, and translate only the string values.';
 			$system_rules[] = 'Do not merge, rename, or drop __segN keys. Do not strip or rewrite HTML tag structure inside segment values.';
+		}
+
+		if ( self::payload_contains_shortcode_tokens( $data_array ) ) {
+			$system_rules[] = 'Some values contain tokens like __SHORTCODE_0__ — copy them exactly; never translate, rename, or remove these tokens.';
 		}
 
 		$system_prompt = implode( ' ', $system_rules );

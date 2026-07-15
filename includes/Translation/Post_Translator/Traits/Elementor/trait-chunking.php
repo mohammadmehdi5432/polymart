@@ -13,6 +13,7 @@ use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator\Meta_Keys;
 use PolymartAI\Translation\Post_Translator\Persistence_Guard;
+use PolymartAI\Translation\Post_Translator\Shortcode_Masker;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
@@ -316,6 +317,93 @@ trait Trait_Chunking {
 		);
 	}
 
+	/**
+	 * Unblock a chunk when API/safety rejected every field — keep partial saves and move on.
+	 *
+	 * @param array<string, string> $chunk          Chunk payload.
+	 * @param array<string, string> $map            Translation map.
+	 * @param array<string, string> $source_payload Source payload.
+	 * @param array<string, mixed>  $state          Job partial state.
+	 * @param array<string, int>    $failures       Failure counters.
+	 * @return void
+	 */
+	private static function release_stalled_elementor_chunk_fields( array $chunk, array &$map, array $source_payload, array &$state, array &$failures ) {
+		foreach ( $chunk as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( preg_match( '/::__(?:part|seg)\d+$/', $path ) ) {
+				continue;
+			}
+
+			$source_text = (string) ( $source_payload[ $path ] ?? $text );
+
+			if ( self::elementor_field_translation_complete( $path, $source_text, $map ) ) {
+				continue;
+			}
+
+			if ( isset( $map[ $path ] ) ) {
+				$restored = Shortcode_Masker::restore_shortcodes( $source_text, (string) $map[ $path ] );
+
+				if ( self::elementor_map_value_is_valid_translation( $path, $source_text, $restored ) ) {
+					$map[ $path ] = $restored;
+					continue;
+				}
+			}
+
+			if ( Shortcode_Masker::contains_shortcode( $source_text ) ) {
+				self::apply_elementor_shortcode_hybrid_fallback( $path, $source_text, $map, $state );
+				continue;
+			}
+
+			$failures[ $path ] = absint( $failures[ $path ] ?? 0 ) + 1;
+
+			if ( $failures[ $path ] >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+				$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+				$skipped[] = $path;
+				$state['elementor_skipped'] = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+				unset( $failures[ $path ] );
+			}
+		}
+	}
+
+	/**
+	 * Keep translated prose but force original shortcodes back into the field.
+	 *
+	 * @param string               $path  Field path.
+	 * @param string               $text  Source text.
+	 * @param array<string,string> $map   Translation map.
+	 * @param array<string,mixed>  $state Job state.
+	 * @return void
+	 */
+	private static function apply_elementor_shortcode_hybrid_fallback( $path, $text, array &$map, array &$state ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( '' === $path || '' === $text || ! Shortcode_Masker::contains_shortcode( $text ) ) {
+			return;
+		}
+
+		$candidate = isset( $map[ $path ] ) ? (string) $map[ $path ] : '';
+		$hybrid    = Shortcode_Masker::restore_shortcodes( $text, $candidate );
+
+		if ( ! self::elementor_map_value_is_valid_translation( $path, $text, $hybrid ) ) {
+			return;
+		}
+
+		$map[ $path ] = $hybrid;
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: field path */
+				__( 'Elementor — فیلد %1$s با fallback شورت‌کد ذخیره شد.', 'polymart-ai' ),
+				$path
+			),
+			array( 'path' => $path )
+		);
+	}
+
 	private static function apply_elementor_field_source_fallback( $path, $text, array &$map, array &$state ) {
 		$path = (string) $path;
 		$text = (string) $text;
@@ -520,11 +608,19 @@ trait Trait_Chunking {
 		$source_text   = trim( (string) $source_text );
 		$translated    = trim( (string) $translated );
 
+		if ( '' !== $source_text && Shortcode_Masker::contains_shortcode( $source_text ) ) {
+			$translated = Shortcode_Masker::restore_shortcodes( $source_text, $translated );
+		}
+
 		if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
 			return false;
 		}
 
 		if ( '' !== $source_text && $translated === $source_text ) {
+			return false;
+		}
+
+		if ( '' !== $source_text && ! Shortcode_Masker::shortcodes_preserved( $source_text, $translated ) ) {
 			return false;
 		}
 

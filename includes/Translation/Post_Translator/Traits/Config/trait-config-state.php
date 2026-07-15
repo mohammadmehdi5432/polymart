@@ -195,6 +195,18 @@ trait Trait_Config_State {
 		'list_text'           => true,
 		'menu_title'          => true,
 		'menu_text'           => true,
+		'body_cell_text'      => true,
+		'header_cell_text'    => true,
+		'footer_cell_text'    => true,
+		'cell_text'           => true,
+		'row_text'            => true,
+		'column_text'         => true,
+		'column_title'        => true,
+		'row_title'           => true,
+		'table_title'         => true,
+		'table_text'          => true,
+		'order_label'         => true,
+		'order_text'          => true,
 	);
 	/**
 	 * Segment passthrough keys for the active Elementor slice (from partial state).

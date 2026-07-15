@@ -13,6 +13,7 @@ use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator\Meta_Keys;
 use PolymartAI\Translation\Post_Translator\Persistence_Guard;
+use PolymartAI\Translation\Post_Translator\Shortcode_Masker;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
@@ -218,6 +219,9 @@ trait Trait_Walk {
 			'_link_text',
 			'_more_text',
 			'_read_more',
+			'_cell_text',
+			'_row_text',
+			'_column_text',
 		);
 
 		foreach ( $suffixes as $suffix ) {
@@ -257,10 +261,16 @@ trait Trait_Walk {
 	private static function should_skip_elementor_setting_key( $key, $value ) {
 		$key          = (string) $key;
 		$value        = trim( (string) $value );
-		$is_user_text = self::is_elementor_user_text_setting_key( $key );
+		$is_user_text = self::is_elementor_user_text_setting_key( $key )
+			|| self::is_elementor_probable_user_text_setting_key( $key );
 
 		if ( '' === $value || ! Persian_Detector::contains_persian( $value ) ) {
 			return true;
+		}
+
+		// Shortcode-bearing labels must be translated (mask/unmask protects bracket tokens).
+		if ( $is_user_text && Shortcode_Masker::contains_shortcode( $value ) ) {
+			return false;
 		}
 
 		static $blocked_keys = array(

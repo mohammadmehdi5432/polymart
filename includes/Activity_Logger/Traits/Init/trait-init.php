@@ -9,6 +9,7 @@ namespace PolymartAI\Activity_Logger\Traits\Init;
 
 use PolymartAI\Activity_Logger\Job_Action_Scheduler;
 use PolymartAI\Activity_Logger\Metabox_Action_Scheduler;
+use PolymartAI\Activity_Logger\Translation_Scheduler_Coordinator;
 use PolymartAI\Language_Registry;
 use PolymartAI\REST_API;
 use PolymartAI\Translation\Content\Menu_Translator;
@@ -49,7 +50,7 @@ trait Trait_Init {
 	 * @return void
 	 */
 	public static function maybe_heal_on_as_queue() {
-		if ( ! self::is_bulk_job_running() ) {
+		if ( Translation_Scheduler_Coordinator::is_halted() || ! self::is_bulk_job_running() ) {
 			return;
 		}
 

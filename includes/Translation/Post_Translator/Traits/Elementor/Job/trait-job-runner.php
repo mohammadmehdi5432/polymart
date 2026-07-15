@@ -13,6 +13,7 @@ use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\AI\Persian_Detector;
 use PolymartAI\Translation\Post_Translator\Meta_Keys;
 use PolymartAI\Translation\Post_Translator\Persistence_Guard;
+use PolymartAI\Translation\Post_Translator\Shortcode_Masker;
 use PolymartAI\Translation\Post_Translator\Text_Normalizer;
 use PolymartAI\Translation\Post_Translator\Translation_Lock;
 
@@ -847,6 +848,7 @@ trait Trait_Job_Runner {
 				is_array( $chunk_result ) ? $chunk_result : array(),
 				$alias_to_path
 			);
+			$raw_mapped = Shortcode_Masker::restore_payload_shortcodes( $chunk, $raw_mapped );
 			$mapped_chunk = self::merge_elementor_api_translations_into_map( $raw_mapped, $source_payload );
 
 			if ( empty( $mapped_chunk ) && ! empty( $aliased_payload ) ) {
@@ -869,13 +871,24 @@ trait Trait_Job_Runner {
 						is_array( $recovered ) ? $recovered : array(),
 						$alias_to_path
 					);
+					$raw_recovered = Shortcode_Masker::restore_payload_shortcodes( $chunk, $raw_recovered );
 					$mapped_chunk = self::merge_elementor_api_translations_into_map( $raw_recovered, $source_payload );
 				}
 			}
 
 			foreach ( $mapped_chunk as $path => $translated ) {
-				$translated = trim( (string) $translated );
-				$path       = (string) $path;
+				$translated  = trim( (string) $translated );
+				$path        = (string) $path;
+				$source_text = (string) ( $source_payload[ $path ] ?? $chunk[ $path ] ?? '' );
+
+				if ( '' !== $source_text ) {
+					$translated = Shortcode_Masker::restore_shortcodes( $source_text, $translated );
+				}
+
+				if ( self::elementor_map_value_is_valid_translation( $path, $source_text, $translated ) ) {
+					$mapped_chunk[ $path ] = $translated;
+					continue;
+				}
 
 				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
 					if ( $gap_fill_mode ) {
@@ -999,7 +1012,12 @@ trait Trait_Job_Runner {
 				++$slice_cursor;
 				$commit_done = $slice_cursor;
 			} else {
-				$commit_done = $slice_cursor;
+				self::release_stalled_elementor_chunk_fields( $chunk, $map, $source_payload, $state, $failures );
+				$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
+				$state['elementor_map'] = $map;
+				++$slice_cursor;
+				$commit_done     = $slice_cursor;
+				$chunk_satisfied = true;
 			}
 
 			$committed = self::commit_elementor_chunk_progress_to_site(
