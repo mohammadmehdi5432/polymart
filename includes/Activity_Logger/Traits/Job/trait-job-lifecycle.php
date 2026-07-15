@@ -554,7 +554,9 @@ trait Trait_Job_Lifecycle {
 			$job['step_started_at'] = null;
 			self::save_job( $job );
 			self::release_step_lock();
+			// Kill pending/running AS rows immediately — otherwise zombies keep chaining.
 			self::unschedule_background_worker();
+			Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
 			self::log( 'warning', __( 'ترجمه خودکار متوقف موقت شد.', 'polymart-ai' ) );
 		}
 
@@ -628,7 +630,10 @@ trait Trait_Job_Lifecycle {
 		$cleared['api_cooldown_until'] = null;
 
 		$result = self::save_job( $cleared );
-		Translation_Scheduler_Coordinator::clear_halt();
+
+		// Keep halt armed until the next intentional start_job()/metabox start.
+		// Clearing halt here let zombie AS ticks re-enqueue after Stop.
+		Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
 
 		return $result;
 	}
@@ -739,6 +744,11 @@ trait Trait_Job_Lifecycle {
 		self::sync_job_remaining( $job, $lang );
 		self::save_job( $job );
 
+		// Drop every in-flight AS row for this (and any) post so the skipped item
+		// cannot keep consuming ticks for another 10–15 minutes.
+		Job_Action_Scheduler::cancel_all();
+		Job_Action_Scheduler::clear_slice_mutex();
+
 		if ( 'running' === ( $job['status'] ?? '' ) ) {
 			self::schedule_background_worker();
 		}
@@ -755,6 +765,45 @@ trait Trait_Job_Lifecycle {
 		);
 
 		return self::normalize_job_for_response( $job, false );
+	}
+
+	/**
+	 * Whether a post was Skip'd (in exhausted_ids) for the active bulk job.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function is_job_post_skipped( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			return false;
+		}
+
+		$job       = self::get_job_raw();
+		$exhausted = is_array( $job['exhausted_ids'] ?? null ) ? array_map( 'absint', $job['exhausted_ids'] ) : array();
+
+		return in_array( $post_id, $exhausted, true );
+	}
+
+	/**
+	 * Whether Stop pressed (halt armed). Safe for metabox + bulk.
+	 *
+	 * @return bool
+	 */
+	public static function should_abort_background_work() {
+		return Translation_Scheduler_Coordinator::is_halted();
+	}
+
+	/**
+	 * Whether the bulk job is explicitly paused (not idle / stopped).
+	 *
+	 * @return bool
+	 */
+	public static function is_bulk_job_paused() {
+		$job = get_option( self::JOB_OPTION, array() );
+
+		return is_array( $job ) && 'paused' === (string) ( $job['status'] ?? '' );
 	}
 
 	public static function refresh_job_stats( $lang = '' ) {

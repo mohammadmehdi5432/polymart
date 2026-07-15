@@ -150,11 +150,8 @@ final class Job_Action_Scheduler {
 	 * @return int Action ID or 0.
 	 */
 	public static function enqueue_next( $force = false, $delay_sec = null ) {
-		if ( Translation_Scheduler_Coordinator::is_halted() ) {
-			return 0;
-		}
-
-		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+		// Strict pre-spawn brake: Stop/Pause/idle must never enqueue another AS row.
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
 			return 0;
 		}
 
@@ -170,9 +167,25 @@ final class Job_Action_Scheduler {
 			self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
 		}
 
-		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+		// Idempotency: never stack a second pending/running slice for this group.
+		if ( self::has_pending_or_running() ) {
+			$running_ids = self::query_running_action_ids( 5 );
+			$only_self   = 1 === count( $running_ids )
+				&& absint( $running_ids[0] ) === absint( self::$current_action_id )
+				&& 0 === self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING );
+
+			if ( ! $only_self ) {
+				return 0;
+			}
+		}
+
+		// Short-lived enqueue mutex to prevent parallel PHP workers from racing
+		// three AS #702780/#702781/#702782 rows for the same job.
+		$enqueue_lock = 'polymart_ai_as_bulk_enqueue_lock';
+		if ( false !== get_transient( $enqueue_lock ) ) {
 			return 0;
 		}
+		set_transient( $enqueue_lock, time(), 15 );
 
 		if ( null === $delay_sec ) {
 			$delay_sec = self::CHAIN_DELAY_SEC;
@@ -187,14 +200,10 @@ final class Job_Action_Scheduler {
 		$max_delay = $cooldown_remaining > 0 ? 600 : 30;
 		$delay_sec = max( 0, min( $max_delay, absint( $delay_sec ) ) );
 
-		if ( $delay_sec <= 1 && self::count_actions_by_status( \ActionScheduler_Store::STATUS_RUNNING ) > 0 ) {
-			$running_ids = self::query_running_action_ids( 5 );
-			$only_self   = 1 === count( $running_ids )
-				&& absint( $running_ids[0] ) === absint( self::$current_action_id );
-
-			if ( ! $only_self ) {
-				return 0;
-			}
+		// Re-check abort after cooldown math — Pause may have landed mid-request.
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+			delete_transient( $enqueue_lock );
+			return 0;
 		}
 
 		do_action( 'polymart_ai_before_enqueue_as_slice' );
@@ -213,6 +222,8 @@ final class Job_Action_Scheduler {
 		} else {
 			$action_id = 0;
 		}
+
+		delete_transient( $enqueue_lock );
 
 		if ( $action_id <= 0 ) {
 			return 0;
@@ -241,11 +252,7 @@ final class Job_Action_Scheduler {
 	 * @return int Action ID or 0.
 	 */
 	public static function ensure_scheduled() {
-		if ( Translation_Scheduler_Coordinator::is_halted() ) {
-			return 0;
-		}
-
-		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
 			return 0;
 		}
 
@@ -481,11 +488,8 @@ final class Job_Action_Scheduler {
 	public static function handle_slice_action( ...$unused ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter
 		unset( $unused );
 
-		if ( Translation_Scheduler_Coordinator::is_halted() ) {
-			return;
-		}
-
-		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+		// Pre-execution brake: Stop/Pause must kill the tick before any AI work.
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
 			return;
 		}
 
@@ -614,11 +618,15 @@ final class Job_Action_Scheduler {
 			$elementor_slices_cap = 1;
 
 			while (
-				\PolymartAI\Activity_Logger::is_bulk_job_running()
+				! Translation_Scheduler_Coordinator::should_abort_bulk_work()
 				&& \PolymartAI\Activity_Logger::should_prioritize_elementor_partial( $job_step )
 				&& $slices_done < $elementor_slices_cap
 				&& ( time() - $request_start ) < ( $request_budget - 5 )
 			) {
+				if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+					break;
+				}
+
 				$steps_before     = absint( $job_step['steps'] ?? 0 );
 				$step_cap         = \PolymartAI\Activity_Logger::get_elementor_partial_step_cap( $job_step );
 				$elapsed          = time() - $request_start;
@@ -683,10 +691,14 @@ final class Job_Action_Scheduler {
 			}
 		} else {
 			while (
-				\PolymartAI\Activity_Logger::is_bulk_job_running()
+				! Translation_Scheduler_Coordinator::should_abort_bulk_work()
 				&& $slices_done < self::AS_MAX_STEPS_PER_REQUEST
 				&& ( time() - $request_start ) < ( $request_budget - 5 )
 			) {
+				if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+					break;
+				}
+
 				$job_step         = \PolymartAI\Activity_Logger::get_job_for_as_debug();
 				$elapsed          = time() - $request_start;
 				$remaining_budget = max( 25, $request_budget - $elapsed );
@@ -780,12 +792,22 @@ final class Job_Action_Scheduler {
 		self::$handler_clean_exit = true;
 		self::release_slice_mutex();
 
+		// Pre-enqueue brake: never chain after Stop/Pause.
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+			return;
+		}
+
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			$job_after_chain = \PolymartAI\Activity_Logger::get_job_for_as_debug();
 			$needs_gap_chain = self::job_needs_elementor_gap_fill_chain( $job_after_chain )
 				|| \PolymartAI\Activity_Logger::should_prioritize_elementor_partial( $job_after_chain );
 			$post_id = absint( $job_after['partial_post_id'] ?? 0 ) ?: absint( $job_after['current_post_id'] ?? 0 );
 			$lang    = sanitize_key( (string) ( $job_after['lang'] ?? 'en' ) );
+
+			if ( $post_id > 0 && \PolymartAI\Activity_Logger::is_job_post_skipped( $post_id ) ) {
+				// Skip flipped the pin mid-flight — do not keep churning the same post.
+				$needs_gap_chain = false;
+			}
 
 			if ( $any_productive || $needs_gap_chain ) {
 				if ( $any_productive ) {
@@ -804,6 +826,10 @@ final class Job_Action_Scheduler {
 					&& '' !== $lang
 				) {
 					Post_Translator::release_stale_translation_lock( $post_id, $lang, 25 );
+				}
+
+				if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+					return;
 				}
 
 				if ( $needs_gap_chain && ! $any_productive && self::has_pending_or_running() ) {
@@ -971,17 +997,17 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function chain_next_slice_immediately() {
-		if (
-			Translation_Scheduler_Coordinator::is_halted()
-			|| ! \PolymartAI\Activity_Logger::is_bulk_job_running()
-			|| self::$chaining_next
-		) {
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() || self::$chaining_next ) {
 			return;
 		}
 
 		self::$chaining_next = true;
 
 		try {
+			if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+				return;
+			}
+
 			$cooldown_remaining = \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining();
 
 			if ( $cooldown_remaining > 0 ) {
@@ -993,9 +1019,19 @@ final class Job_Action_Scheduler {
 				@set_time_limit( 330 );
 			}
 
+			// Idempotent: never spawn a sibling while something is already live.
+			if ( self::has_pending_or_running() ) {
+				return;
+			}
+
 			$action_id = self::enqueue_next( true, 0 );
 
 			if ( $action_id <= 0 ) {
+				return;
+			}
+
+			if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+				self::cancel_all();
 				return;
 			}
 
@@ -1012,7 +1048,7 @@ final class Job_Action_Scheduler {
 	 * @return int Action ID or 0.
 	 */
 	public static function schedule_cooldown_wakeup( $cooldown_remaining ) {
-		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() || ! self::is_available() ) {
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() || ! self::is_available() ) {
 			return 0;
 		}
 
@@ -1327,7 +1363,11 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function defer_slice_action( $action_id ) {
-		if ( self::count_actions_by_status( \ActionScheduler_Store::STATUS_PENDING ) > 0 ) {
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+			return;
+		}
+
+		if ( self::has_pending_or_running() ) {
 			return;
 		}
 

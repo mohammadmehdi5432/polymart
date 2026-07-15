@@ -140,6 +140,12 @@ trait Trait_Queue_Run {
 				break;
 			}
 
+			// Emergency brake: user pressed Pause/Stop between steps.
+			if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+				self::unschedule_background_worker();
+				break;
+			}
+
 			self::touch_worker_heartbeat();
 			$job_before   = self::get_job_raw();
 			$steps_before = absint( $job_before['steps'] ?? 0 );
@@ -587,6 +593,21 @@ trait Trait_Queue_Run {
 
 		self::save_job( $job );
 
+		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
+			$job['current_post_id'] = null;
+			$job['step_started_at'] = null;
+			self::save_job( $job );
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		if ( self::is_job_post_skipped( $post_id ) ) {
+			return self::normalize_job_for_response(
+				self::advance_past_already_translated_post( $job, $post_id, $lang ),
+				false
+			);
+		}
+
 		if ( Post_Translator::should_run_elementor_job_slice( $post_id, $lang ) ) {
 			self::pin_job_for_elementor_post( $job, $post_id, $lang );
 			self::save_job( $job );
@@ -628,6 +649,30 @@ trait Trait_Queue_Run {
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
+		if (
+			is_wp_error( $slice )
+			&& in_array( $slice->get_error_code(), array( 'polymart_ai_job_aborted', 'polymart_ai_job_post_skipped' ), true )
+		) {
+			$job = self::get_job_raw();
+			$job['current_post_id'] = null;
+			$job['step_started_at'] = null;
+
+			if ( 'polymart_ai_job_post_skipped' === $slice->get_error_code() ) {
+				$job['partial_post_id']  = null;
+				$job['partial_phase']    = null;
+				$job['partial_progress'] = null;
+			}
+
+			self::save_job( $job );
+			self::unschedule_background_worker();
+
+			if ( 'running' === ( $job['status'] ?? '' ) && 'polymart_ai_job_post_skipped' === $slice->get_error_code() ) {
+				self::schedule_background_worker();
+			}
 
 			return self::normalize_job_for_response( $job, false );
 		}

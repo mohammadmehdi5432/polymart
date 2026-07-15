@@ -944,6 +944,23 @@ trait Trait_Job_Slice {
 		$lang        = sanitize_key( (string) $lang );
 		$manage_lock = (bool) $manage_lock;
 
+		// Halt (Stop) kills every worker including metabox. Bulk Pause is enforced
+		// in AS enqueue / handle_slice / process_background_step — not here —
+		// so metabox can still run while the bulk job option is idle or paused.
+		if ( \PolymartAI\Activity_Logger\Translation_Scheduler_Coordinator::is_halted() ) {
+			return new \WP_Error(
+				'polymart_ai_job_aborted',
+				__( 'ترجمه توسط کاربر متوقف شد.', 'polymart-ai' )
+			);
+		}
+
+		if ( \PolymartAI\Activity_Logger::is_job_post_skipped( $post_id ) ) {
+			return new \WP_Error(
+				'polymart_ai_job_post_skipped',
+				__( 'این مورد از صف رد شد.', 'polymart-ai' )
+			);
+		}
+
 		if ( ! $post_id || ! self::can_translate_post( $post_id ) ) {
 			$message = __( 'شما اجازه ترجمه این مورد را ندارید.', 'polymart-ai' );
 

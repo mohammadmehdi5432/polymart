@@ -67,6 +67,11 @@ final class Config_Constants {
 	const ELEMENTOR_BULK_LONG_FIELD_SEGMENT_CHARS = 400;
 	/** Max API attempts per Elementor __segN key before source-text fallback. */
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = 5;
+	/**
+	 * Fast-fail for a stuck primary/gap chunk: after this many hard failures
+	 * (timeout / rate-limit / filter reject) fallback + advance the cursor.
+	 */
+	const ELEMENTOR_CHUNK_FAST_FAIL_RETRIES = 2;
 	/** Empty stubborn hand-off ticks before force-saving with source-text fallback. */
 	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 3;
 	/**

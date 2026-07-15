@@ -34,7 +34,7 @@ final class Translation_Scheduler_Coordinator {
 	}
 
 	/**
-	 * Clear halt flag when a new bulk job is intentionally started.
+	 * Clear halt flag when a new bulk/metabox job is intentionally started.
 	 *
 	 * @return void
 	 */
@@ -47,6 +47,20 @@ final class Translation_Scheduler_Coordinator {
 	 */
 	public static function is_halted() {
 		return absint( get_option( self::HALT_OPTION, 0 ) ) > 0;
+	}
+
+	/**
+	 * Hard abort signal for every enqueue / AS callback / mid-batch loop.
+	 * True when Stop was pressed (halt) OR bulk job is no longer running (paused/idle/stopped).
+	 *
+	 * @return bool
+	 */
+	public static function should_abort_bulk_work() {
+		if ( self::is_halted() ) {
+			return true;
+		}
+
+		return ! \PolymartAI\Activity_Logger::is_bulk_job_running();
 	}
 
 	/**

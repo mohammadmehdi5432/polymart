@@ -1435,6 +1435,10 @@ trait Trait_Job_Runner {
 		$progress_total         = max( 1, absint( $state['elementor_chunks_total'] ?? $source_total ) );
 		$failures               = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 
+		$fast_limit    = max( 1, absint( self::ELEMENTOR_CHUNK_FAST_FAIL_RETRIES ) );
+		$fast_fail_hit = false;
+		$skipped       = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+
 		foreach ( $failed_keys as $failed_key ) {
 			$failed_key = (string) $failed_key;
 
@@ -1443,9 +1447,56 @@ trait Trait_Job_Runner {
 			}
 
 			$failures[ $failed_key ] = absint( $failures[ $failed_key ] ?? 0 ) + 1;
+
+			if ( $failures[ $failed_key ] >= $fast_limit ) {
+				$fast_fail_hit = true;
+
+				if ( self::elementor_path_is_segment( $failed_key ) ) {
+					$base       = preg_replace( '/::__(?:part|seg)\d+$/', '', $failed_key );
+					$base_text  = (string) ( $source_payload[ $base ] ?? '' );
+					$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
+					$seg_source = (string) ( $seg_lookup[ $failed_key ] ?? '' );
+
+					if ( '' !== $seg_source ) {
+						self::apply_elementor_segment_source_fallback( $failed_key, $seg_source, $map, $state );
+					}
+				} else {
+					$skipped[] = $failed_key;
+				}
+
+				unset( $failures[ $failed_key ] );
+			}
 		}
 
 		$state['elementor_failures'] = $failures;
+		$state['elementor_skipped']  = array_values( array_unique( array_map( 'strval', $skipped ) ) );
+
+		if ( $fast_fail_hit && empty( $state['elementor_gap_fill'] ) ) {
+			$slice_cursor = min(
+				$progress_total,
+				max(
+					self::read_elementor_slice_cursor( $post_id, $lang ),
+					absint( $state['elementor_chunk_index'] ?? 0 )
+				) + 1
+			);
+			$state['elementor_gap_fill']         = true;
+			$state['elementor_chunk_index']      = $slice_cursor;
+			$state['elementor_slices_completed'] = $slice_cursor;
+			self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $progress_total );
+			$progress = self::format_elementor_job_progress_marker( $post_id, $lang, $state );
+
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: progress */
+					__( 'Elementor — #%1$d: fast-fail پس از %2$d تلاش — کرسر به %3$s رفت.', 'polymart-ai' ),
+					$post_id,
+					$fast_limit,
+					$progress
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+		}
 
 		update_post_meta(
 			$post_id,
@@ -1458,10 +1509,15 @@ trait Trait_Job_Runner {
 			)
 		);
 
-		if ( ! empty( $map ) ) {
+		if ( ! empty( $map ) || $fast_fail_hit ) {
 			$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
 			$done_count     = self::resolve_elementor_done_count( $state, $chunk_progress['done'], $post_id, $lang );
-			$persisted      = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
+
+			if ( $fast_fail_hit ) {
+				$done_count = max( $done_count, absint( $state['elementor_chunk_index'] ?? 0 ) );
+			}
+
+			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
 
 			if ( ! is_wp_error( $persisted ) ) {
 				self::save_job_partial_state( $post_id, $lang, $state );
@@ -1470,13 +1526,19 @@ trait Trait_Job_Runner {
 				return self::make_recoverable_partial_slice_response(
 					'elementor',
 					$progress,
-					sprintf(
-						/* translators: 1: saved batch count, 2: total batches, 3: error hint */
-						__( 'Elementor — %1$d از %2$d بخش ذخیره شد. %3$s', 'polymart-ai' ),
-						$done_count,
-						$progress_total,
-						$short_error
-					)
+					$fast_fail_hit
+						? sprintf(
+							/* translators: 1: progress marker */
+							__( 'Elementor — %1$s: fast-fail — ادامه…', 'polymart-ai' ),
+							$progress
+						)
+						: sprintf(
+							/* translators: 1: saved batch count, 2: total batches, 3: error hint */
+							__( 'Elementor — %1$d از %2$d بخش ذخیره شد. %3$s', 'polymart-ai' ),
+							$done_count,
+							$progress_total,
+							$short_error
+						)
 				);
 			}
 		}
@@ -1503,6 +1565,8 @@ trait Trait_Job_Runner {
 		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$failures       = is_array( $state['elementor_failures'] ?? null ) ? $state['elementor_failures'] : array();
 		$timed_out      = array();
+		$fast_fail_hit  = false;
+		$fast_limit     = max( 1, absint( self::ELEMENTOR_CHUNK_FAST_FAIL_RETRIES ) );
 
 		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
 		$state['elementor_map'] = $map;
@@ -1520,9 +1584,10 @@ trait Trait_Job_Runner {
 				$attempts = absint( $seg_failures[ $failed_key ] ?? 0 ) + 1;
 				$seg_failures[ $failed_key ] = $attempts;
 
-				if ( $attempts >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
-					$base      = preg_replace( '/::__(?:part|seg)\d+$/', '', $failed_key );
-					$base_text = (string) ( $source_payload[ $base ] ?? '' );
+				if ( $attempts >= $fast_limit ) {
+					$fast_fail_hit = true;
+					$base       = preg_replace( '/::__(?:part|seg)\d+$/', '', $failed_key );
+					$base_text  = (string) ( $source_payload[ $base ] ?? '' );
 					$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
 					$seg_source = (string) ( $seg_lookup[ $failed_key ] ?? '' );
 
@@ -1536,8 +1601,9 @@ trait Trait_Job_Runner {
 
 			$failures[ $failed_key ] = absint( $failures[ $failed_key ] ?? 0 ) + 1;
 
-			if ( $failures[ $failed_key ] >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
-				$skipped[] = $failed_key;
+			if ( $failures[ $failed_key ] >= $fast_limit ) {
+				$fast_fail_hit = true;
+				$skipped[]     = $failed_key;
 				unset( $failures[ $failed_key ] );
 			}
 		}
@@ -1553,6 +1619,31 @@ trait Trait_Job_Runner {
 		$done_count     = self::resolve_elementor_done_count( $state, $chunk_progress['done'], $post_id, $lang );
 		$progress_total = max( $source_total, (int) $chunk_progress['total'], absint( $state['elementor_chunks_total'] ?? 0 ), 1 );
 		$state['elementor_chunks_total'] = $progress_total;
+
+		// Fast-fail: after N hard failures, force-advance the cursor so 14/19 cannot stick forever.
+		if ( $fast_fail_hit && empty( $state['elementor_gap_fill'] ) ) {
+			$slice_cursor = max(
+				$done_count,
+				self::read_elementor_slice_cursor( $post_id, $lang ),
+				absint( $state['elementor_chunk_index'] ?? 0 )
+			) + 1;
+			$slice_cursor = min( $progress_total, $slice_cursor );
+			self::release_stalled_elementor_chunk_fields(
+				array_fill_keys( $timed_out, '' ),
+				$map,
+				$source_payload,
+				$state,
+				$failures
+			);
+			$map                         = self::sanitize_elementor_translation_map( $map, $source_payload );
+			$state['elementor_map']      = $map;
+			$state['elementor_failures'] = $failures;
+			$state['elementor_gap_fill'] = true;
+			$done_count                  = $slice_cursor;
+			self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $progress_total );
+			$state['elementor_chunk_index']      = $slice_cursor;
+			$state['elementor_slices_completed'] = $slice_cursor;
+		}
 
 		self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $done_count, $progress_total );
 		self::save_job_partial_state( $post_id, $lang, $state );
@@ -1575,16 +1666,19 @@ trait Trait_Job_Runner {
 			'warning',
 			sprintf(
 				/* translators: 1: post ID, 2: progress marker, 3: timed-out count, 4: error */
-				__( 'Elementor — #%1$d: timeout API در %2$s — %3$d مسیر معلق (%4$s) — پیشرفت سگمنت‌ها حفظ شد.', 'polymart-ai' ),
+				$fast_fail_hit
+					? __( 'Elementor — #%1$d: fast-fail در %2$s — %3$d مسیر fallback شد (%4$s) — کرسر جلو رفت.', 'polymart-ai' )
+					: __( 'Elementor — #%1$d: timeout API در %2$s — %3$d مسیر معلق (%4$s) — پیشرفت سگمنت‌ها حفظ شد.', 'polymart-ai' ),
 				$post_id,
 				$progress,
 				count( $timed_out ),
 				$short_error
 			),
 			array(
-				'post_id' => $post_id,
-				'lang'    => $lang,
+				'post_id'   => $post_id,
+				'lang'      => $lang,
 				'timed_out' => $timed_out,
+				'fast_fail' => $fast_fail_hit,
 			)
 		);
 
@@ -1593,12 +1687,18 @@ trait Trait_Job_Runner {
 		return self::make_recoverable_partial_slice_response(
 			'elementor',
 			$progress,
-			sprintf(
-				/* translators: 1: progress marker, 2: timed-out path count */
-				__( 'Elementor — %1$s: timeout API — %2$d مسیر معلق — تلاش مجدد همان بخش…', 'polymart-ai' ),
-				$progress,
-				count( $timed_out )
-			)
+			$fast_fail_hit
+				? sprintf(
+					/* translators: 1: progress marker */
+					__( 'Elementor — %1$s: fast-fail — ادامه بخش بعدی…', 'polymart-ai' ),
+					$progress
+				)
+				: sprintf(
+					/* translators: 1: progress marker, 2: timed-out path count */
+					__( 'Elementor — %1$s: timeout API — %2$d مسیر معلق — تلاش مجدد همان بخش…', 'polymart-ai' ),
+					$progress,
+					count( $timed_out )
+				)
 		);
 	}
 

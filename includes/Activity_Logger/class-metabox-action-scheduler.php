@@ -1486,7 +1486,10 @@ final class Metabox_Action_Scheduler {
 			return 0;
 		}
 
-		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+		if (
+			Translation_Scheduler_Coordinator::is_halted()
+			|| Translation_Scheduler_Coordinator::should_defer_metabox_work()
+		) {
 			return 0;
 		}
 
@@ -1499,7 +1502,17 @@ final class Metabox_Action_Scheduler {
 			return 0;
 		}
 
+		// Idempotency: if a live action already exists (and we are not preserving
+		// the current in-flight row), return it instead of spawning siblings.
+		if ( $preserve_action_id <= 0 && self::has_pending_or_running( $post_id, $lang ) ) {
+			return 0;
+		}
+
 		self::purge_all_queue_actions( $post_id, $lang, $preserve_action_id );
+
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return 0;
+		}
 
 		$args = array(
 			'post_id' => $post_id,
@@ -1913,7 +1926,22 @@ final class Metabox_Action_Scheduler {
 	 * @return void
 	 */
 	private static function chain_next( $post_id, $lang ) {
-		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+		if (
+			Translation_Scheduler_Coordinator::is_halted()
+			|| Translation_Scheduler_Coordinator::should_defer_metabox_work()
+		) {
+			return;
+		}
+
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		// Don't chain a skipped/already-finished post.
+		if ( $post_id > 0 && \PolymartAI\Activity_Logger::is_job_post_skipped( $post_id ) ) {
+			return;
+		}
+
+		if ( self::has_pending_or_running( $post_id, $lang ) ) {
 			return;
 		}
 
