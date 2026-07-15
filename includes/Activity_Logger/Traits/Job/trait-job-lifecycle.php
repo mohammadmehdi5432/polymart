@@ -612,6 +612,7 @@ trait Trait_Job_Lifecycle {
 		// Always tear down workers/locks first so Start cannot hit a stale "running" worker.
 		self::unschedule_background_worker();
 		self::release_step_lock();
+		Translation_Scheduler_Coordinator::release_global_worker( null );
 
 		$lang = sanitize_key( (string) ( $job['lang'] ?? '' ) );
 
@@ -634,6 +635,14 @@ trait Trait_Job_Lifecycle {
 		// Keep halt armed until the next intentional start_job()/metabox start.
 		// Clearing halt here let zombie AS ticks re-enqueue after Stop.
 		Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
+
+		// Race-guard: an in-flight AS tick may have re-saved "running" after our empty_job.
+		$again = self::get_job_raw();
+		if ( is_array( $again ) && 'running' === ( $again['status'] ?? '' ) ) {
+			$cleared['updated_at'] = time();
+			$result = self::save_job( $cleared );
+			Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
+		}
 
 		return $result;
 	}

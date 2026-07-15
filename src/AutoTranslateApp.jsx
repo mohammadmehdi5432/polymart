@@ -383,6 +383,18 @@ function writeAutoRunFlag(active) {
   }
 }
 
+function readAutoRunFlag() {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(AUTO_RUN_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 function readJobCache() {
   if (typeof window === 'undefined') {
     return null;
@@ -540,6 +552,7 @@ export default function AutoTranslateApp() {
   const [remainingLoading, setRemainingLoading] = useState(false);
   const [remainingPage, setRemainingPage] = useState(1);
   const autoResumedRef = useRef(false);
+  const stoppedAtRef = useRef(0);
   const lastStepLogRef = useRef('');
   const lastPartialProgressRef = useRef('');
   const seenServerLogIdsRef = useRef(new Set());
@@ -862,6 +875,15 @@ export default function AutoTranslateApp() {
       return null;
     }
 
+    // After Stop, ignore zombie "running" payloads from in-flight poll/ensure races.
+    if (
+      data.status === 'running' &&
+      !readAutoRunFlag() &&
+      Date.now() - stoppedAtRef.current < 20000
+    ) {
+      return null;
+    }
+
     let merged = null;
     setJob((prev) => {
       merged = mergeJobSnapshot(prev, data);
@@ -1086,6 +1108,11 @@ export default function AutoTranslateApp() {
     }
 
     if (job?.status !== 'running') {
+      return;
+    }
+
+    // User pressed Stop — never reconnect/revive via ensure.
+    if (!readAutoRunFlag()) {
       return;
     }
 
@@ -1363,6 +1390,7 @@ export default function AutoTranslateApp() {
 
   const handleStop = async () => {
     writeAutoRunFlag(false);
+    stoppedAtRef.current = Date.now();
     abortJobStep();
     setActivePost(null);
     setActionPending('stop');

@@ -506,6 +506,25 @@ trait Trait_Worker_Runner {
 	}
 
 	public static function ensure_background_worker() {
+		// After Stop, never revive a zombie "running" job via monitor ensure/kick.
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			$job = self::get_job_raw();
+
+			if ( is_array( $job ) && 'running' === ( $job['status'] ?? '' ) ) {
+				$cleared = self::empty_job();
+				$cleared['updated_at'] = time();
+				self::save_job( $cleared );
+				Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
+				$job = $cleared;
+			}
+
+			$job = is_array( $job ) ? $job : self::empty_job();
+			$job['halted']         = true;
+			$job['worker_ensured'] = false;
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {

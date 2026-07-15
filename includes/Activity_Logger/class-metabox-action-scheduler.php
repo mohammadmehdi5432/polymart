@@ -1069,12 +1069,10 @@ final class Metabox_Action_Scheduler {
 			);
 		}
 
-		if ( ! \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
-			Translation_Scheduler_Coordinator::clear_halt();
-		}
+		// Always clear Stop-halt on intentional metabox start (even if a stale
+		// bulk "running" option somehow remains — interactive work must proceed).
+		Translation_Scheduler_Coordinator::clear_halt();
 
-		// Only hard-block metabox when Stop was pressed — never park interactive
-		// Elementor jobs behind a long Bulk queue (that caused endless 0/N UI).
 		if ( Translation_Scheduler_Coordinator::is_halted() ) {
 			return new \WP_Error(
 				'polymart_ai_scheduler_halted',

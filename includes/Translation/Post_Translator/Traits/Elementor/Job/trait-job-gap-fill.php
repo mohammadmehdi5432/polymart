@@ -453,6 +453,12 @@ trait Trait_Job_Gap_Fill {
 		$accept_long_fallback = (
 			$ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 			|| $long_attempts >= $long_limit
+			|| (
+				// Single stubborn leftover with missing __segN after primary N/N — don't pin forever.
+				1 === count( $remaining )
+				&& $ghost >= 1
+				&& $long_attempts >= 1
+			)
 		);
 
 		$long_remaining = 0;
