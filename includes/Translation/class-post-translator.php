@@ -152,6 +152,10 @@ final class Post_Translator {
 		return Meta_Keys::is_translatable_meta_key( $meta_key, $lang );
 	}
 
+	public static function is_translation_storage_meta_key( $meta_key ) {
+		return Meta_Keys::is_translation_storage_meta_key( $meta_key );
+	}
+
 	public static function is_custom_meta_key( $meta_key ) {
 		return Meta_Keys::is_custom_meta_key( $meta_key );
 	}

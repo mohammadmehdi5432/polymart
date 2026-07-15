@@ -542,14 +542,13 @@ trait Trait_Queue_Run {
 		$job['step_started_at'] = time();
 
 		// Already done for this language — do not burn an AI call or spam "ترجمه شد".
-		if (
+		if ( Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+			if ( self::job_already_counted_success( $job, $post_id ) ) {
+				self::untrack_succeeded_post( $job, $post_id );
+			}
+		} elseif (
 			self::job_already_counted_success( $job, $post_id )
 			|| 'translated' === self::resolve_post_job_status( $post_id, $lang )
-			|| (
-				Post_Translator::uses_elementor_builder( $post_id )
-				&& Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
-				&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
-			)
 		) {
 			return self::normalize_job_for_response(
 				self::advance_past_already_translated_post( $job, $post_id, $lang ),
@@ -1083,7 +1082,7 @@ trait Trait_Queue_Run {
 		}
 
 		self::log(
-			'error',
+			'polymart_ai_elementor_partial' === $error_code ? 'warning' : 'error',
 			sprintf(
 				/* translators: 1: post ID, 2: error message */
 				__( 'خطا در ترجمه مورد #%1$d: %2$s', 'polymart-ai' ),
@@ -1092,6 +1091,20 @@ trait Trait_Queue_Run {
 			),
 			array( 'post_id' => $post_id, 'lang' => $lang )
 		);
+
+		if (
+			'polymart_ai_elementor_partial' === $error_code
+			&& ! self::is_critical_api_error( $result )
+		) {
+			self::track_partial_post( $job, $post_id );
+			self::untrack_succeeded_post( $job, $post_id );
+			self::pin_job_for_elementor_post( $job, $post_id, $lang );
+			self::enqueue_job_retry( $job, $post_id );
+			self::sync_job_remaining( $job, $lang );
+			self::save_job( $job );
+
+			return $job;
+		}
 
 		if ( self::is_critical_api_error( $result ) ) {
 			$job['failed']++;
@@ -1159,30 +1172,30 @@ trait Trait_Queue_Run {
 			self::untrack_succeeded_post( $job, $post_id );
 			self::track_partial_post( $job, $post_id );
 
-			$elementor_api_done = ! Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
-				&& ! Post_Translator::should_run_elementor_job_slice( $post_id, $lang );
+			$partial_state    = Post_Translator::get_job_partial_state( $post_id, $lang );
+			$gap_fill_pending = ! empty( $partial_state['elementor_gap_fill'] )
+				|| ! empty( $partial_state['elementor_gap_fill_stubborn_only'] );
 
-			if (
-				! $elementor_api_done
-				&& ! $elementor_done
-				&& (
-					Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
-					|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
-				)
-			) {
+			$elementor_needs_continuation = $gap_fill_pending
+				|| Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+				|| Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
+				|| Post_Translator::should_run_elementor_job_slice( $post_id, $lang );
+
+			if ( $elementor_needs_continuation ) {
 				self::pin_job_for_elementor_post( $job, $post_id, $lang );
 
 				self::log(
 					'info',
 					sprintf(
 						/* translators: 1: post title, 2: progress marker */
-						__( '«%1$s» — Elementor بخش‌بندی شده؛ ادامه همان مورد (%2$s) تا تکمیل.', 'polymart-ai' ),
+						__( '«%1$s» — Elementor هنوز ناقص است؛ ادامه همان مورد (%2$s) تا تکمیل persist و gap-fill.', 'polymart-ai' ),
 						$title_source,
 						'' !== (string) ( $job['partial_progress'] ?? '' ) ? (string) $job['partial_progress'] : '…'
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);
-			} elseif ( $elementor_api_done || $elementor_done ) {
+			} elseif ( $elementor_done ) {
 				$job['partial_post_id']  = null;
 				$job['partial_phase']    = null;
 				$job['partial_progress'] = null;
@@ -1192,7 +1205,7 @@ trait Trait_Queue_Run {
 					'info',
 					sprintf(
 						/* translators: 1: post title */
-						__( '«%1$s» — همه بخش‌های Elementor API انجام شد؛ ادامه با مورد بعدی صف.', 'polymart-ai' ),
+						__( '«%1$s» — Elementor به‌طور کامل ذخیره شد؛ ادامه با مورد بعدی صف.', 'polymart-ai' ),
 						$title_source
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )

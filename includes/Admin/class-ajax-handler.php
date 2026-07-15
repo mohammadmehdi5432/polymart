@@ -74,43 +74,17 @@ final class Ajax_Handler {
 		$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
 
 		if ( is_wp_error( $save_result ) ) {
+			if ( 'polymart_ai_elementor_partial' === $save_result->get_error_code() ) {
+				wp_send_json_success( $this->build_generate_translation_payload( $post_id, $lang, true, $save_result->get_error_message() ) );
+			}
+
 			wp_send_json_error(
 				array( 'message' => $save_result->get_error_message() ),
-				500
+				$this->error_status_code( $save_result )
 			);
 		}
 
-		$meta_fields = array();
-
-		foreach ( array( 'title', 'excerpt', 'content' ) as $field ) {
-			$meta_key = Post_Translator::get_meta_key( $field, $lang );
-			$meta_fields[ Post_Translator::get_form_field_name( $meta_key ) ] = (string) get_post_meta( $post_id, $meta_key, true );
-		}
-
-		foreach ( Post_Translator::CUSTOM_META_KEYS as $meta_key ) {
-			$translated_key = Post_Translator::get_custom_meta_key( $meta_key, $lang );
-			$meta_fields[ Post_Translator::get_form_field_name( $translated_key ) ] = (string) get_post_meta( $post_id, $translated_key, true );
-		}
-
-		foreach ( array_keys( Post_Translator::collect_discovered_meta_fields( $post_id ) ) as $meta_key ) {
-			$translated_key = Post_Translator::get_custom_meta_key( $meta_key, $lang );
-			$meta_fields[ Post_Translator::get_form_field_name( $translated_key ) ] = (string) get_post_meta( $post_id, $translated_key, true );
-		}
-
-		$language = Language_Registry::get_language( $lang );
-		$lang_label = $language ? $language['native_name'] : $lang;
-
-		wp_send_json_success(
-			array(
-				'message' => sprintf(
-					/* translators: %s: language name */
-					__( 'ترجمه %s تولید و در دیتابیس ذخیره شد.', 'polymart-ai' ),
-					$lang_label
-				),
-				'fields'  => $meta_fields,
-				'lang'    => $lang,
-			)
-		);
+		wp_send_json_success( $this->build_generate_translation_payload( $post_id, $lang ) );
 	}
 
 	/**
@@ -1006,6 +980,8 @@ final class Ajax_Handler {
 			'polymart_ai_missing_credentials',
 			'polymart_ai_empty_source',
 			'polymart_ai_translation_in_progress',
+			'polymart_ai_elementor_partial',
+			'polymart_ai_elementor_no_translations',
 		);
 
 		if ( in_array( $error->get_error_code(), $client_errors, true ) ) {
@@ -1017,9 +993,76 @@ final class Ajax_Handler {
 				return 409;
 			}
 
+			if (
+				in_array(
+					$error->get_error_code(),
+					array( 'polymart_ai_elementor_partial', 'polymart_ai_elementor_no_translations' ),
+					true
+				)
+			) {
+				return 422;
+			}
+
 			return 400;
 		}
 
 		return 500;
+	}
+
+	/**
+	 * Build metabox generate-translation JSON payload.
+	 *
+	 * @param int    $post_id           Post ID.
+	 * @param string $lang              Target language code.
+	 * @param bool   $elementor_partial Whether Elementor persistence was partial.
+	 * @param string $detail_message    Optional detail message.
+	 * @return array<string, mixed>
+	 */
+	private function build_generate_translation_payload( $post_id, $lang, $elementor_partial = false, $detail_message = '' ) {
+		$lang     = sanitize_key( (string) $lang );
+		$language = Language_Registry::get_language( $lang );
+		$lang_label = $language ? $language['native_name'] : $lang;
+		$status     = Post_Translator::get_translation_status( $post_id, $lang );
+		$meta_fields = array();
+
+		foreach ( array( 'title', 'excerpt', 'content' ) as $field ) {
+			$meta_key = Post_Translator::get_meta_key( $field, $lang );
+			$meta_fields[ Post_Translator::get_form_field_name( $meta_key ) ] = (string) get_post_meta( $post_id, $meta_key, true );
+		}
+
+		foreach ( Post_Translator::CUSTOM_META_KEYS as $meta_key ) {
+			$translated_key = Post_Translator::get_custom_meta_key( $meta_key, $lang );
+			$meta_fields[ Post_Translator::get_form_field_name( $translated_key ) ] = (string) get_post_meta( $post_id, $translated_key, true );
+		}
+
+		foreach ( array_keys( Post_Translator::collect_discovered_meta_fields( $post_id ) ) as $meta_key ) {
+			$translated_key = Post_Translator::get_custom_meta_key( $meta_key, $lang );
+			$meta_fields[ Post_Translator::get_form_field_name( $translated_key ) ] = (string) get_post_meta( $post_id, $translated_key, true );
+		}
+
+		if ( 'translated' === $status ) {
+			$message = sprintf(
+				/* translators: %s: language name */
+				__( 'ترجمه %s تولید و در دیتابیس ذخیره شد.', 'polymart-ai' ),
+				$lang_label
+			);
+		} elseif ( $elementor_partial && '' !== $detail_message ) {
+			$message = $detail_message;
+		} else {
+			$message = sprintf(
+				/* translators: 1: language name, 2: status */
+				__( 'ترجمه %1$s ذخیره شد اما وضعیت «%2$s» است — ممکن است Elementor یا فیلدهای دیگر ناقص باشند.', 'polymart-ai' ),
+				$lang_label,
+				$status
+			);
+		}
+
+		return array(
+			'message'           => $message,
+			'fields'            => $meta_fields,
+			'lang'              => $lang,
+			'status'            => $status,
+			'elementor_partial' => (bool) $elementor_partial,
+		);
 	}
 }

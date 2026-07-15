@@ -180,6 +180,8 @@ trait Trait_Ai_Persistence {
 			);
 		}
 
+		$release_lock_on_exit = true;
+
 		try {
 			if ( function_exists( 'set_time_limit' ) ) {
 				$chunk_count = empty( $payload ) ? 0 : count( self::chunk_payload_for_ai( $payload ) );
@@ -228,12 +230,18 @@ trait Trait_Ai_Persistence {
 				$translated = self::collapse_payload_parts( $translated );
 			}
 
+			// Hand off lock ownership to save_ai_translations() so concurrent workers
+			// cannot overwrite meta before persistence finishes.
+			$release_lock_on_exit = false;
+
 			return array(
 				'post'         => $post,
 				'translations' => $translated,
 			);
 		} finally {
-			self::release_translation_lock( $post_id, $lang );
+			if ( $release_lock_on_exit ) {
+				self::release_translation_lock( $post_id, $lang );
+			}
 		}
 	}
 
@@ -271,10 +279,16 @@ trait Trait_Ai_Persistence {
 
 		self::begin_persisting_translations();
 
+		$release_lock = empty( $options['keep_lock'] );
+
 		try {
 			return self::save_ai_translations_internal( $post_id, $translations, $lang, $options );
 		} finally {
 			self::end_persisting_translations();
+
+			if ( $release_lock && self::owns_translation_lock( $post_id, $lang ) ) {
+				self::release_translation_lock( $post_id, $lang );
+			}
 		}
 	}
 
@@ -385,9 +399,33 @@ trait Trait_Ai_Persistence {
 
 			if ( is_wp_error( $elementor_result ) ) {
 				update_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, $elementor_result->get_error_message() );
-			} else {
-				delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+				self::clear_elementor_translation_finalized( $post_id, $lang );
+				delete_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang );
+				self::flush_translation_status_cache( $post_id );
+				self::sync_translation_index_meta( $post_id, $lang );
+				REST_API::invalidate_stats_cache();
+
+				$log_level = 'polymart_ai_elementor_partial' === $elementor_result->get_error_code() ? 'warning' : 'error';
+				\PolymartAI\Activity_Logger::log(
+					$log_level,
+					sprintf(
+						/* translators: 1: post ID, 2: language code, 3: error message */
+						__( 'ذخیره Elementor مورد #%1$d (%2$s) ناموفق بود: %3$s', 'polymart-ai' ),
+						$post_id,
+						$lang,
+						$elementor_result->get_error_message()
+					),
+					array(
+						'post_id' => $post_id,
+						'lang'    => $lang,
+						'source'  => 'elementor_persist',
+					)
+				);
+
+				return $elementor_result;
 			}
+
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		} else {
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		}

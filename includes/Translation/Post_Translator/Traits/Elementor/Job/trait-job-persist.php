@@ -181,6 +181,12 @@ trait Trait_Job_Persist {
 			);
 		}
 
+		if ( function_exists( 'set_time_limit' ) ) {
+			$chunk_count = count( self::chunk_elementor_payload_for_ai( $payload ) );
+
+			@set_time_limit( min( 1200, 120 + $chunk_count * 60 ) );
+		}
+
 		$settings = self::get_translation_settings();
 
 		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) ) {
@@ -228,23 +234,30 @@ trait Trait_Job_Persist {
 		}
 
 		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), $json );
-		self::save_elementor_source_hash( $post_id, $lang );
 
 		if ( ! empty( $missing ) ) {
-			update_post_meta(
-				$post_id,
-				'_polymart_ai_elementor_error_' . $lang,
-				sprintf(
-					/* translators: 1: translated count, 2: total count */
-					__( 'ترجمه Elementor بخشی ذخیره شد (%1$d از %2$d فیلد).', 'polymart-ai' ),
-					count( $payload ) - count( $missing ),
-					count( $payload )
-				)
+			$error_message = sprintf(
+				/* translators: 1: translated count, 2: total count */
+				__( 'ترجمه Elementor بخشی ذخیره شد (%1$d از %2$d فیلد).', 'polymart-ai' ),
+				count( $payload ) - count( $missing ),
+				count( $payload )
 			);
 
-			return true;
+			update_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, $error_message );
+			self::clear_elementor_translation_finalized( $post_id, $lang );
+
+			return new \WP_Error(
+				'polymart_ai_elementor_partial',
+				$error_message,
+				array(
+					'missing' => $missing,
+					'total'   => count( $payload ),
+					'saved'   => count( $payload ) - count( $missing ),
+				)
+			);
 		}
 
+		self::save_elementor_source_hash( $post_id, $lang );
 		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 
 		return true;
@@ -335,6 +348,25 @@ trait Trait_Job_Persist {
 		}
 
 		if ( empty( $translated_map ) ) {
+			if ( $last_error instanceof \WP_Error ) {
+				return $last_error;
+			}
+
+			return new \WP_Error(
+				'polymart_ai_elementor_no_translations',
+				__( 'ترجمه Elementor ناموفق بود — هیچ فیلدی از AI برنگشت.', 'polymart-ai' )
+			);
+		}
+
+		$missing_after = array();
+
+		foreach ( array_keys( $payload ) as $path ) {
+			if ( empty( $translated_map[ $path ] ) || '' === trim( (string) $translated_map[ $path ] ) ) {
+				$missing_after[] = $path;
+			}
+		}
+
+		if ( count( $missing_after ) === count( $payload ) ) {
 			if ( $last_error instanceof \WP_Error ) {
 				return $last_error;
 			}

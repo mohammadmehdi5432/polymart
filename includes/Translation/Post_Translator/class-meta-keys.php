@@ -410,4 +410,64 @@ final class Meta_Keys {
 
 		return self::resolve_translated_meta_key_for_source( $source_key, $lang );
 	}
+
+	/**
+	 * Whether a meta key stores an AI/manual translation (not Persian source content).
+	 *
+	 * Used by async hooks to avoid re-scheduling translation when persistence writes
+	 * companion meta such as custom_card_subtitle_en or _polymart_ai_title_en.
+	 *
+	 * @param string $meta_key Post meta key.
+	 * @return bool
+	 */
+	public static function is_translation_storage_meta_key( $meta_key ) {
+		if ( ! is_string( $meta_key ) || '' === $meta_key ) {
+			return false;
+		}
+
+		foreach ( self::get_skipped_meta_prefixes() as $prefix ) {
+			if ( 0 === strpos( $meta_key, $prefix ) ) {
+				return true;
+			}
+		}
+
+		if ( ! class_exists( '\PolymartAI\Language_Registry' ) ) {
+			return false;
+		}
+
+		foreach ( \PolymartAI\Language_Registry::get_translation_target_languages() as $language ) {
+			$lang = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+			if ( '' === $lang || ! preg_match( '/_' . preg_quote( $lang, '/' ) . '$/', $meta_key ) ) {
+				continue;
+			}
+
+			$source_key = substr( $meta_key, 0, - ( strlen( $lang ) + 1 ) );
+
+			if ( in_array( $source_key, self::CUSTOM_META_KEYS, true ) ) {
+				return true;
+			}
+
+			foreach ( array( 'title', 'content', 'excerpt' ) as $field ) {
+				if ( self::get_meta_key( $field, $lang ) === $meta_key ) {
+					return true;
+				}
+			}
+
+			if (
+				self::get_thumbnail_meta_key( $lang ) === $meta_key
+				|| self::get_elementor_meta_key( $lang ) === $meta_key
+			) {
+				return true;
+			}
+		}
+
+		/**
+		 * Filter whether a post meta key is translation storage (companion output).
+		 *
+		 * @param bool   $is_storage Whether the key stores translated output.
+		 * @param string $meta_key   Meta key being inspected.
+		 */
+		return (bool) apply_filters( 'polymart_ai_is_translation_storage_meta_key', false, $meta_key );
+	}
 }

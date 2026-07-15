@@ -120,7 +120,7 @@ final class Async_Translator {
 
 		Post_Translator::reconcile_post_translations_after_save( $post_id, $post_after, $post_before );
 
-		if ( Post_Translator::is_admin_translation_save_request() ) {
+		if ( Post_Translator::should_skip_translation_invalidation() ) {
 			return;
 		}
 
@@ -498,6 +498,10 @@ final class Async_Translator {
 			return $check;
 		}
 
+		if ( Post_Translator::is_translation_storage_meta_key( $meta_key ) ) {
+			return $check;
+		}
+
 		if ( $this->meta_values_equal( $meta_value, $prev_value ) ) {
 			return $check;
 		}
@@ -508,7 +512,16 @@ final class Async_Translator {
 			return $check;
 		}
 
-		// Never auto-delete companion translations when third-party meta changes.
+		if ( Post_Translator::should_skip_translation_invalidation() ) {
+			return $check;
+		}
+
+		if ( ! Post_Translator::has_persian_content( $post_id ) ) {
+			return $check;
+		}
+
+		$this->schedule_translation( $post_id );
+
 		return $check;
 	}
 
@@ -581,13 +594,17 @@ final class Async_Translator {
 			return;
 		}
 
+		if ( Post_Translator::is_translation_storage_meta_key( $meta_key ) ) {
+			return;
+		}
+
 		$post = get_post( absint( $post_id ) );
 
 		if ( ! $post instanceof \WP_Post || $this->should_skip_request( $post_id, $post ) ) {
 			return;
 		}
 
-		if ( Post_Translator::is_admin_translation_save_request() ) {
+		if ( Post_Translator::should_skip_translation_invalidation() ) {
 			return;
 		}
 
@@ -672,10 +689,10 @@ final class Async_Translator {
 			return;
 		}
 
-		// Increase timeout for background cron jobs
-		set_time_limit( 300 );
+		$this->apply_async_time_limit( $post_id );
 
 		self::$is_translating = true;
+		$needs_retry          = false;
 
 		try {
 			foreach ( $languages as $language ) {
@@ -685,44 +702,13 @@ final class Async_Translator {
 					continue;
 				}
 
-				$result = Post_Translator::request_ai_translation( $post_id, $lang );
-
-				if ( is_wp_error( $result ) ) {
-					Activity_Logger::log(
-						'error',
-						sprintf(
-							/* translators: 1: post ID, 2: language code, 3: error message */
-							__( 'ترجمه پس‌زمینه مورد #%1$d (%2$s) ناموفق بود: %3$s', 'polymart-ai' ),
-							$post_id,
-							$lang,
-							$result->get_error_message()
-						),
-						array(
-							'post_id' => $post_id,
-							'lang'    => $lang,
-							'source'  => 'async',
-						)
-					);
-					continue;
+				if ( ! $this->process_async_language_translation( $post_id, $lang, $language, $post ) ) {
+					$needs_retry = true;
 				}
+			}
 
-				Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
-				REST_API::invalidate_stats_cache();
-
-				Activity_Logger::log(
-					'success',
-					sprintf(
-						/* translators: 1: post title, 2: language label */
-						__( 'ترجمه پس‌زمینه «%1$s» به %2$s ذخیره شد.', 'polymart-ai' ),
-						get_the_title( $post_id ),
-						$language['native_name'] ?? $lang
-					),
-					array(
-						'post_id' => $post_id,
-						'lang'    => $lang,
-						'source'  => 'async',
-					)
-				);
+			if ( $needs_retry ) {
+				$this->schedule_async_translation_retry( $post_id );
 			}
 		} catch ( \Throwable $exception ) {
 			Activity_Logger::log(
@@ -892,8 +878,12 @@ final class Async_Translator {
 			return;
 		}
 
-		// Bulk auto-translate owns the queue — avoid racing the same product.
+		// Bulk auto-translate owns the queue — defer async work until it finishes.
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			if ( ! wp_next_scheduled( self::CRON_HOOK, array( $post_id ) ) ) {
+				wp_schedule_single_event( time() + MINUTE_IN_SECONDS, self::CRON_HOOK, array( $post_id ) );
+			}
+
 			return;
 		}
 
@@ -969,6 +959,10 @@ final class Async_Translator {
 
 		// Bulk auto-translate owns the AI budget — defer term work until it finishes.
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			if ( ! wp_next_scheduled( self::TERM_CRON_HOOK, array( $term_id ) ) ) {
+				wp_schedule_single_event( time() + MINUTE_IN_SECONDS, self::TERM_CRON_HOOK, array( $term_id ) );
+			}
+
 			return;
 		}
 
@@ -1131,6 +1125,267 @@ final class Async_Translator {
 		}
 
 		return $processed;
+	}
+
+	/**
+	 * Raise PHP execution time for async cron based on core + Elementor payload size.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return void
+	 */
+	private function apply_async_time_limit( $post_id ) {
+		if ( ! function_exists( 'set_time_limit' ) ) {
+			return;
+		}
+
+		$post   = get_post( absint( $post_id ) );
+		$budget = 120;
+
+		if ( $post instanceof \WP_Post ) {
+			$core_fields = Post_Translator::collect_persian_fields( $post );
+			$budget     += min( 600, count( $core_fields ) * 45 );
+		}
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
+			$plain = Post_Translator::collect_elementor_persian_plain_text( $post_id );
+
+			if ( '' !== trim( $plain ) ) {
+				$budget += min( 900, (int) ceil( strlen( $plain ) / 800 ) * 60 );
+			}
+		}
+
+		@set_time_limit( min( 1200, max( 300, $budget ) ) );
+	}
+
+	/**
+	 * Schedule a follow-up async cron tick when translation is partial or recoverable.
+	 *
+	 * @param int $post_id       Post ID.
+	 * @param int $delay_seconds Delay before retry.
+	 * @return void
+	 */
+	private function schedule_async_translation_retry( $post_id, $delay_seconds = 120 ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 || \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			return;
+		}
+
+		if ( ! wp_next_scheduled( self::CRON_HOOK, array( $post_id ) ) ) {
+			wp_schedule_single_event(
+				time() + max( 60, absint( $delay_seconds ) ),
+				self::CRON_HOOK,
+				array( $post_id )
+			);
+			self::maybe_spawn_cron();
+		}
+	}
+
+	/**
+	 * Translate one language in async cron; returns true when no retry is needed.
+	 *
+	 * @param int      $post_id  Post ID.
+	 * @param string   $lang     Target language code.
+	 * @param array    $language Language registry row.
+	 * @param \WP_Post $post     Post object.
+	 * @return bool
+	 */
+	private function process_async_language_translation( $post_id, $lang, array $language, \WP_Post $post ) {
+		$lang = sanitize_key( (string) $lang );
+
+		if ( $this->should_use_elementor_slice_for_async( $post_id, $lang, $post ) ) {
+			return $this->process_async_language_via_slices( $post_id, $lang, $language );
+		}
+
+		$result = Post_Translator::request_ai_translation( $post_id, $lang );
+
+		if ( is_wp_error( $result ) ) {
+			Activity_Logger::log(
+				'error',
+				sprintf(
+					/* translators: 1: post ID, 2: language code, 3: error message */
+					__( 'ترجمه پس‌زمینه مورد #%1$d (%2$s) ناموفق بود: %3$s', 'polymart-ai' ),
+					$post_id,
+					$lang,
+					$result->get_error_message()
+				),
+				array(
+					'post_id' => $post_id,
+					'lang'    => $lang,
+					'source'  => 'async',
+				)
+			);
+
+			return ! $this->should_retry_async_error( $result );
+		}
+
+		$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
+
+		if ( is_wp_error( $save_result ) ) {
+			$log_level = in_array( $save_result->get_error_code(), array( 'polymart_ai_elementor_partial', 'polymart_ai_elementor_no_translations' ), true )
+				? 'warning'
+				: 'error';
+
+			Activity_Logger::log(
+				$log_level,
+				sprintf(
+					/* translators: 1: post ID, 2: language code, 3: error message */
+					__( 'ذخیره ترجمه پس‌زمینه مورد #%1$d (%2$s) ناموفق بود: %3$s', 'polymart-ai' ),
+					$post_id,
+					$lang,
+					$save_result->get_error_message()
+				),
+				array(
+					'post_id' => $post_id,
+					'lang'    => $lang,
+					'source'  => 'async',
+				)
+			);
+
+			return ! $this->should_retry_async_error( $save_result );
+		}
+
+		return $this->log_async_language_outcome( $post_id, $lang, $language );
+	}
+
+	/**
+	 * Continue async Elementor work via the same slice pipeline used by bulk jobs.
+	 *
+	 * @param int    $post_id  Post ID.
+	 * @param string $lang     Target language code.
+	 * @param array  $language Language registry row.
+	 * @return bool
+	 */
+	private function process_async_language_via_slices( $post_id, $lang, array $language ) {
+		$lang        = sanitize_key( (string) $lang );
+		$max_slices  = 8;
+		$needs_retry = false;
+
+		for ( $i = 0; $i < $max_slices; $i++ ) {
+			if ( ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+				break;
+			}
+
+			$slice = Post_Translator::process_job_translation_slice( $post_id, $lang );
+
+			if ( is_wp_error( $slice ) ) {
+				$log_level = 'polymart_ai_translation_in_progress' === $slice->get_error_code() ? 'info' : 'warning';
+
+				Activity_Logger::log(
+					$log_level,
+					sprintf(
+						/* translators: 1: post ID, 2: language code, 3: error message */
+						__( 'ترجمه slice پس‌زمینه مورد #%1$d (%2$s): %3$s', 'polymart-ai' ),
+						$post_id,
+						$lang,
+						$slice->get_error_message()
+					),
+					array(
+						'post_id' => $post_id,
+						'lang'    => $lang,
+						'source'  => 'async_slice',
+					)
+				);
+
+				$needs_retry = $this->should_retry_async_error( $slice );
+				break;
+			}
+
+			if ( ! empty( $slice['done'] ) ) {
+				break;
+			}
+		}
+
+		$complete = $this->log_async_language_outcome( $post_id, $lang, $language );
+
+		if ( $needs_retry || ( ! $complete && Post_Translator::post_needs_translation_work( $post_id, $lang ) ) ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Use slice pipeline when core fields are already saved and only Elementor remains.
+	 *
+	 * @param int      $post_id Post ID.
+	 * @param string   $lang    Target language code.
+	 * @param \WP_Post $post    Post object.
+	 * @return bool
+	 */
+	private function should_use_elementor_slice_for_async( $post_id, $lang, \WP_Post $post ) {
+		if ( ! Post_Translator::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$needs_elementor = Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
+			|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
+
+		if ( ! $needs_elementor ) {
+			return false;
+		}
+
+		return empty( Post_Translator::collect_persian_fields( $post, $lang ) );
+	}
+
+	/**
+	 * Whether async cron should reschedule after a recoverable error or partial save.
+	 *
+	 * @param \WP_Error $error Error object.
+	 * @return bool
+	 */
+	private function should_retry_async_error( \WP_Error $error ) {
+		$retry_codes = array(
+			'polymart_ai_elementor_partial',
+			'polymart_ai_elementor_no_translations',
+			'polymart_ai_core_meta_not_saved',
+			'polymart_ai_translation_in_progress',
+			'polymart_ai_timeout',
+			'polymart_ai_http_error',
+			'polymart_ai_api_error',
+			'polymart_ai_rate_limited',
+		);
+
+		if ( in_array( $error->get_error_code(), $retry_codes, true ) ) {
+			return true;
+		}
+
+		return Post_Translator::is_recoverable_job_slice_error( $error );
+	}
+
+	/**
+	 * Log async outcome and return true when the language no longer needs work.
+	 *
+	 * @param int    $post_id  Post ID.
+	 * @param string $lang     Target language code.
+	 * @param array  $language Language registry row.
+	 * @return bool
+	 */
+	private function log_async_language_outcome( $post_id, $lang, array $language ) {
+		REST_API::invalidate_stats_cache();
+
+		$status = Post_Translator::get_translation_status( $post_id, $lang );
+
+		Activity_Logger::log(
+			'translated' === $status ? 'success' : 'warning',
+			sprintf(
+				/* translators: 1: post title, 2: language label, 3: status label */
+				'translated' === $status
+					? __( 'ترجمه پس‌زمینه «%1$s» به %2$s ذخیره شد.', 'polymart-ai' )
+					: __( 'ترجمه پس‌زمینه «%1$s» (%2$s) ناقص ذخیره شد — وضعیت: %3$s', 'polymart-ai' ),
+				get_the_title( $post_id ),
+				$language['native_name'] ?? $lang,
+				$status
+			),
+			array(
+				'post_id' => $post_id,
+				'lang'    => $lang,
+				'source'  => 'async',
+				'status'  => $status,
+			)
+		);
+
+		return 'translated' === $status || ! Post_Translator::post_needs_translation_work( $post_id, $lang );
 	}
 
 	/**

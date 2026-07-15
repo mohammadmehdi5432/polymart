@@ -861,16 +861,35 @@ final class REST_API {
 			return $this->translation_error_to_rest_response( $result );
 		}
 
-		Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
+		$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
+
+		if ( is_wp_error( $save_result ) ) {
+			$partial_response = $this->translation_partial_save_rest_response( $post_id, $lang, $save_result );
+
+			if ( null !== $partial_response ) {
+				self::invalidate_stats_cache();
+				$this->record_translation_report( $post_id, $lang, 'bulk' );
+
+				return $partial_response;
+			}
+
+			return $this->translation_error_to_rest_response( $save_result );
+		}
+
 		self::invalidate_stats_cache();
 		$this->record_translation_report( $post_id, $lang, 'bulk' );
+
+		$status = Post_Translator::get_translation_status( $post_id, $lang );
 
 		return rest_ensure_response(
 			array(
 				'post_id'   => $post_id,
 				'title'     => get_the_title( $post_id ),
 				'post_type' => $result['post']->post_type,
-				'message'   => __( 'ترجمه با موفقیت ذخیره شد.', 'polymart-ai' ),
+				'status'    => $status,
+				'message'   => 'translated' === $status
+					? __( 'ترجمه با موفقیت ذخیره شد.', 'polymart-ai' )
+					: __( 'ترجمه ذخیره شد اما هنوز ناقص است.', 'polymart-ai' ),
 			)
 		);
 	}
@@ -1030,15 +1049,33 @@ final class REST_API {
 			return $this->translation_error_to_rest_response( $result );
 		}
 
-		Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
+		$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );
+
+		if ( is_wp_error( $save_result ) ) {
+			$partial_response = $this->translation_partial_save_rest_response( $post_id, $lang, $save_result );
+
+			if ( null !== $partial_response ) {
+				self::invalidate_stats_cache();
+				$this->record_translation_report( $post_id, $lang, 'ai' );
+
+				return $partial_response;
+			}
+
+			return $this->translation_error_to_rest_response( $save_result );
+		}
+
 		self::invalidate_stats_cache();
 		$this->record_translation_report( $post_id, $lang, 'ai' );
 
-		$post = get_post( $post_id );
+		$post   = get_post( $post_id );
+		$status = Post_Translator::get_translation_status( $post_id, $lang );
 
 		return rest_ensure_response(
 			array(
-				'message' => __( 'ترجمه هوش مصنوعی با موفقیت تولید و ذخیره شد.', 'polymart-ai' ),
+				'message' => 'translated' === $status
+					? __( 'ترجمه هوش مصنوعی با موفقیت تولید و ذخیره شد.', 'polymart-ai' )
+					: __( 'ترجمه ذخیره شد اما هنوز ناقص است (مثلاً Elementor).', 'polymart-ai' ),
+				'status'  => $status,
 				'item'    => $post instanceof \WP_Post ? Post_Translator::format_translation_record( $post, $lang ) : null,
 			)
 		);
@@ -1059,6 +1096,7 @@ final class REST_API {
 			'polymart_ai_invalid_post_id',
 			'polymart_ai_missing_credentials',
 			'polymart_ai_empty_source',
+			'polymart_ai_elementor_no_translations',
 		);
 
 		if ( in_array( $code, $client_errors, true ) ) {
@@ -1069,6 +1107,36 @@ final class REST_API {
 			'polymart_ai_translation_failed',
 			$error->get_error_message(),
 			array( 'status' => $status )
+		);
+	}
+
+	/**
+	 * When core fields saved but Elementor persistence was partial, return an honest 200 payload.
+	 *
+	 * @param int       $post_id Post ID.
+	 * @param string    $lang    Target language code.
+	 * @param \WP_Error $error   Save error.
+	 * @return \WP_REST_Response|null
+	 */
+	private function translation_partial_save_rest_response( $post_id, $lang, \WP_Error $error ) {
+		if ( 'polymart_ai_elementor_partial' !== $error->get_error_code() ) {
+			return null;
+		}
+
+		$post   = get_post( $post_id );
+		$status = Post_Translator::get_translation_status( $post_id, $lang );
+
+		return rest_ensure_response(
+			array(
+				'post_id'           => $post_id,
+				'title'             => get_the_title( $post_id ),
+				'post_type'         => $post instanceof \WP_Post ? $post->post_type : '',
+				'status'            => $status,
+				'partial'           => true,
+				'elementor_partial' => true,
+				'message'           => $error->get_error_message(),
+				'item'              => $post instanceof \WP_Post ? Post_Translator::format_translation_record( $post, $lang ) : null,
+			)
 		);
 	}
 

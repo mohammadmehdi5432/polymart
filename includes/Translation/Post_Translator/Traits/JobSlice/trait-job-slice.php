@@ -648,7 +648,10 @@ trait Trait_Job_Slice {
 					$post_id,
 					$batch,
 					$lang,
-					array( 'skip_elementor' => true )
+					array(
+						'skip_elementor' => true,
+						'keep_lock'      => true,
+					)
 				);
 
 				if ( is_wp_error( $save_result ) ) {
@@ -1058,7 +1061,10 @@ trait Trait_Job_Slice {
 							$post_id,
 							$batch,
 							$lang,
-							array( 'skip_elementor' => true )
+							array(
+								'skip_elementor' => true,
+								'keep_lock'      => true,
+							)
 						);
 
 						if ( is_wp_error( $save_result ) ) {
