@@ -949,7 +949,15 @@ trait Trait_Job_Runner {
 			foreach ( $mapped_chunk as $path => $translated ) {
 				$translated  = trim( (string) $translated );
 				$path        = (string) $path;
-				$source_text = (string) ( $source_payload[ $path ] ?? $chunk[ $path ] ?? '' );
+				$source_text = (string) ( $chunk[ $path ] ?? $source_payload[ $path ] ?? '' );
+
+				// __segN sources live in the chunk / segment lookup, not the base payload.
+				if ( preg_match( '/^(.+)::__seg\d+$/', $path, $seg_matches ) ) {
+					$base       = (string) $seg_matches[1];
+					$base_text  = (string) ( $source_payload[ $base ] ?? '' );
+					$seg_lookup = self::get_elementor_segment_source_lookup( $base, $base_text );
+					$source_text = (string) ( $chunk[ $path ] ?? $seg_lookup[ $path ] ?? $source_text );
+				}
 
 				if ( '' !== $source_text ) {
 					$translated = Shortcode_Masker::restore_shortcodes( $source_text, $translated );

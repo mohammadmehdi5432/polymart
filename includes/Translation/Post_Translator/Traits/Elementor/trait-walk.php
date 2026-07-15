@@ -343,7 +343,14 @@ trait Trait_Walk {
 		}
 
 		// Long serialized JSON-like strings.
-		if ( mb_strlen( $value ) > 500 && preg_match( '/["\']\s*:\s*["\[\{]/', $value ) ) {
+		// Never apply this to whitelist/user-text keys (editor, text_content, …) —
+		// production HTML often embeds style/data/JSON fragments and was incorrectly
+		// counted as «فیلترشده (HTML/ایمنی)» while remaining translation stayed 0.
+		if (
+			! $is_user_text
+			&& mb_strlen( $value ) > 500
+			&& preg_match( '/["\']\s*:\s*["\[\{]/', $value )
+		) {
 			return true;
 		}
 

@@ -74,6 +74,13 @@ final class Config_Constants {
 	 * before it is accepted with partial segments / source fallback and the job closes.
 	 */
 	const ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT = 3;
+	/**
+	 * When a single long HTML widget expands to more segments than this,
+	 * API packs are capped at ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE.
+	 */
+	const ELEMENTOR_HUGE_FIELD_SEGMENT_THRESHOLD = 10;
+	/** Max __segN pieces from one widget sent in a single AI request. */
+	const ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE = 8;
 	/** Base HTTP timeout (seconds) for a short Elementor job-step AI call. */
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 45;
 	/** Upper HTTP timeout (seconds) for heavy HTML / __segN Elementor slices. */

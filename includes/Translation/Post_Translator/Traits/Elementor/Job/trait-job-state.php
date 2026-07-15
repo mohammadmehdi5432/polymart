@@ -706,14 +706,15 @@ trait Trait_Job_State {
 		$repairs = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
 
 		// Gap-fill/stubborn must actually spend AS ticks on __segN / short leftovers
-		// before we force-accept Persian source. After the attempt/ghost ceiling the
-		// force-finalize path may close long HTML with partial/source fallback.
+		// before we force-accept Persian source. Huge HTML widgets need more ticks
+		// (ceil(segs/batch) + buffer) so a 31-seg field is not closed after 3 ghosts.
 		if ( $stubborn ) {
 			$long_attempts = absint( $state['elementor_long_gap_force_attempts'] ?? 0 );
+			$long_limit    = self::resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, $state );
 
-			return $ghost >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
-				|| $long_attempts >= self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT
-				|| $repairs >= 2;
+			return $ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
+				|| $long_attempts >= $long_limit
+				|| $repairs >= 3;
 		}
 
 		if ( $remaining < 3 && $ghost >= 2 ) {

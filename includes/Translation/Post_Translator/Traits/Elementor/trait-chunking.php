@@ -274,7 +274,15 @@ trait Trait_Chunking {
 			: array();
 	}
 
-	private static function bind_elementor_accepted_paths_context( $post_id, $lang ) {
+	/**
+	 * Bind accepted Elementor field paths for the current request.
+	 * Public so Activity_Logger scan/queue helpers can share the same context.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return void
+	 */
+	public static function bind_elementor_accepted_paths_context( $post_id, $lang ) {
 		self::$current_elementor_accepted_paths = self::get_elementor_accepted_paths( $post_id, $lang );
 	}
 
@@ -417,12 +425,7 @@ trait Trait_Chunking {
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
 
 		if ( ! empty( $seg_lookup ) ) {
-			foreach ( $seg_lookup as $seg_key => $seg_source ) {
-				if ( ! self::elementor_segment_is_resolved( $seg_key, (string) $seg_source, $map ) ) {
-					self::apply_elementor_segment_source_fallback( $seg_key, (string) $seg_source, $map, $state );
-				}
-			}
-
+			self::accept_elementor_long_field_with_partial_fallback( $path, $text, $map, $state );
 			return;
 		}
 
@@ -444,6 +447,149 @@ trait Trait_Chunking {
 			),
 			array( 'path' => $path )
 		);
+	}
+
+	/**
+	 * Force-close a long HTML field while retaining every successfully translated __segN.
+	 * Only unresolved segments are filled from the Persian source.
+	 *
+	 * @param string                $path  Base field path.
+	 * @param string                $text  Source HTML.
+	 * @param array<string, string> $map   Translation map.
+	 * @param array<string, mixed>  $state Job state.
+	 * @return array{kept:int, fallback:int}
+	 */
+	private static function accept_elementor_long_field_with_partial_fallback( $path, $text, array &$map, array &$state ) {
+		$path = (string) $path;
+		$text = (string) $text;
+		$kept = 0;
+		$fallback = 0;
+		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+
+		foreach ( $seg_lookup as $seg_key => $seg_source ) {
+			$seg_key    = (string) $seg_key;
+			$seg_source = (string) $seg_source;
+
+			if ( self::elementor_segment_is_resolved( $seg_key, $seg_source, $map ) ) {
+				++$kept;
+				continue;
+			}
+
+			// Soft keep: already-English map value that validity helpers might still reject
+			// (e.g. shortcode edge cases) must never be overwritten with Persian source.
+			if (
+				isset( $map[ $seg_key ] )
+				&& '' !== trim( (string) $map[ $seg_key ] )
+				&& ! Persian_Detector::contains_persian( (string) $map[ $seg_key ] )
+				&& (string) $map[ $seg_key ] !== $seg_source
+			) {
+				++$kept;
+				continue;
+			}
+
+			self::apply_elementor_segment_source_fallback( $seg_key, $seg_source, $map, $state );
+			++$fallback;
+		}
+
+		$assembled = self::assemble_elementor_segment_field( $path, $text, $map, true );
+
+		if ( '' !== $assembled ) {
+			$map[ $path ] = $assembled;
+		}
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: field path, 2: kept English segments, 3: Persian fallback segments */
+				__( 'Elementor — فیلد %1$s: %2$d سگمنت انگلیسی نگه داشته شد؛ %3$d سگمنت با متن اصلی پر شد (partial fallback).', 'polymart-ai' ),
+				$path,
+				$kept,
+				$fallback
+			),
+			array(
+				'path'     => $path,
+				'kept'     => $kept,
+				'fallback' => $fallback,
+			)
+		);
+
+		return array(
+			'kept'     => $kept,
+			'fallback' => $fallback,
+		);
+	}
+
+	/**
+	 * Max __segN items from one widget allowed in a single AI request.
+	 *
+	 * @param int $segment_count Missing or total segment count for the widget.
+	 * @return int
+	 */
+	private static function resolve_elementor_segment_api_batch_size( $segment_count ) {
+		$segment_count = absint( $segment_count );
+
+		if ( $segment_count > self::ELEMENTOR_HUGE_FIELD_SEGMENT_THRESHOLD ) {
+			return max( 1, absint( self::ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE ) );
+		}
+
+		if ( \PolymartAI\Activity_Logger::is_trusted_as_tick() ) {
+			return min( 2, max( 1, absint( self::ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE ) ) );
+		}
+
+		return min( 3, max( 1, absint( self::ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE ) ) );
+	}
+
+	/**
+	 * How many force-finalize deferrals a post's long HTML fields may endure.
+	 * Scales with the largest remaining segmented widget so 31-seg fields get enough AI packs.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Language code.
+	 * @param array<string, mixed> $state   Optional partial state.
+	 * @return int
+	 */
+	private static function resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, array $state = array() ) {
+		$base_limit = max( 1, absint( self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT ) );
+		$post_id    = absint( $post_id );
+		$lang       = sanitize_key( (string) $lang );
+		$max_segs   = 0;
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return $base_limit;
+		}
+
+		$source_data = json_decode( $raw, true );
+
+		if ( ! is_array( $source_data ) ) {
+			return $base_limit;
+		}
+
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$map            = is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array();
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining      = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		foreach ( $remaining as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( ! self::stubborn_elementor_field_is_long( $path, $text ) ) {
+				continue;
+			}
+
+			$max_segs = max( $max_segs, count( self::get_elementor_segment_keys( $path, $text ) ) );
+		}
+
+		if ( $max_segs <= self::ELEMENTOR_HUGE_FIELD_SEGMENT_THRESHOLD ) {
+			return $base_limit;
+		}
+
+		$batch = max( 1, absint( self::ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE ) );
+
+		// ceil(segs/batch) packs + a small buffer for API errors/timeouts.
+		return max( $base_limit, (int) ceil( $max_segs / $batch ) + 2 );
 	}
 
 	private static function split_elementor_text_into_segments( $path, $text, $max_chars ) {
@@ -609,6 +755,7 @@ trait Trait_Chunking {
 		$path          = (string) $path;
 		$source_text   = trim( (string) $source_text );
 		$translated    = trim( (string) $translated );
+		$is_segment    = (bool) preg_match( '/::__seg\d+$/', $path );
 
 		if ( '' !== $source_text && Shortcode_Masker::contains_shortcode( $source_text ) ) {
 			$translated = Shortcode_Masker::restore_shortcodes( $source_text, $translated );
@@ -622,11 +769,73 @@ trait Trait_Chunking {
 			return false;
 		}
 
-		if ( '' !== $source_text && ! Shortcode_Masker::shortcodes_preserved( $source_text, $translated ) ) {
+		// Hard shortcode gate for whole fields; segments get a relaxed gate below.
+		if (
+			! $is_segment
+			&& '' !== $source_text
+			&& ! Shortcode_Masker::shortcodes_preserved( $source_text, $translated )
+		) {
 			return false;
 		}
 
-		unset( $path );
+		if ( $is_segment ) {
+			return self::elementor_segment_translation_is_acceptable( $source_text, $translated );
+		}
+
+		return true;
+	}
+
+	/**
+	 * Relaxed acceptance for __segN HTML pieces — keep English even when AI
+	 * lightly reorders safe inline tags (span/strong/em/b/i/br/a).
+	 *
+	 * @param string $source_text Source segment.
+	 * @param string $translated  AI translation.
+	 * @return bool
+	 */
+	private static function elementor_segment_translation_is_acceptable( $source_text, $translated ) {
+		$source_text = (string) $source_text;
+		$translated  = (string) $translated;
+
+		if ( '' === trim( $translated ) || Persian_Detector::contains_persian( $translated ) ) {
+			return false;
+		}
+
+		// Dangerous markup must never enter Elementor JSON.
+		if ( preg_match( '/<\s*(?:script|iframe|object|embed|form|link|meta|style)\b/i', $translated ) ) {
+			return false;
+		}
+
+		if ( false !== stripos( $translated, 'javascript:' ) ) {
+			return false;
+		}
+
+		// Prefer shortcode preservation, but do not hard-fail the whole segment if
+		// AI kept most tokens: require at least half of shortcodes to survive.
+		if ( Shortcode_Masker::contains_shortcode( $source_text ) ) {
+			if ( Shortcode_Masker::shortcodes_preserved( $source_text, $translated ) ) {
+				return true;
+			}
+
+			$source_codes = preg_match_all( '/\[[^\]]+\]/', $source_text, $sm ) ? count( $sm[0] ) : 0;
+			$kept         = 0;
+
+			if ( $source_codes > 0 && preg_match_all( '/\[[^\]]+\]/', $translated, $tm ) ) {
+				$kept = count( $tm[0] );
+			}
+
+			if ( $source_codes > 0 && $kept < (int) ceil( $source_codes * 0.5 ) ) {
+				return false;
+			}
+		}
+
+		// Length sanity — reject tiny stubs / empty shells for large HTML chunks.
+		$src_len = self::utf8_strlen( wp_strip_all_tags( $source_text ) );
+		$tr_len  = self::utf8_strlen( wp_strip_all_tags( $translated ) );
+
+		if ( $src_len >= 40 && $tr_len < (int) floor( $src_len * 0.25 ) ) {
+			return false;
+		}
 
 		return true;
 	}
@@ -817,8 +1026,9 @@ trait Trait_Chunking {
 			}
 		);
 
-		// One missing __segN per AS tick — long Text Editor HTML must not share a batch or retry loop.
-		$batch_size = \PolymartAI\Activity_Logger::is_trusted_as_tick() ? 1 : 2;
+		// Huge HTML widgets (e.g. 14–31 segs): never dump everything into one AI call.
+		// Cap at ELEMENTOR_HUGE_FIELD_SEGMENT_BATCH_SIZE so Arvan replies stay complete.
+		$batch_size = self::resolve_elementor_segment_api_batch_size( count( $missing ) );
 
 		return self::chunk_payload_with_limits(
 			$missing,
@@ -909,16 +1119,15 @@ trait Trait_Chunking {
 				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $prepared[ $path ] )
 				&& Persian_Detector::contains_persian( $assembled )
 			) {
-				foreach ( $seg_keys as $seg_key ) {
-					unset( $prepared[ $seg_key ] );
-				}
+				// Keep English base AND retain any English __segN that still help repairs.
 				continue;
 			}
 
 			$prepared[ $path ] = $assembled;
 
 			// Only drop __segN keys once the collapsed field is fully English.
-			// Otherwise keep translated segments so gap-fill can finish missing pieces.
+			// Partial/hybrid assemblies must keep successful English segments so later
+			// gap-fill / force-finalize never rewrites them back to Persian source.
 			if ( self::elementor_map_value_is_valid_translation( $path, $text, $assembled ) ) {
 				foreach ( $seg_keys as $seg_key ) {
 					unset( $prepared[ $seg_key ] );
@@ -1349,7 +1558,58 @@ trait Trait_Chunking {
 		$current_chars = 0;
 		$max_chars     = self::ELEMENTOR_JOB_MAX_CHUNK_CHARS;
 
+		// Group __segN by base widget so huge HTML fields pack ≤ N segs/request.
+		$segment_groups = array();
+		$plain          = array();
+
 		foreach ( $expanded as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( preg_match( '/^(.+)::__seg\d+$/', $path, $matches ) ) {
+				$base = (string) $matches[1];
+				if ( ! isset( $segment_groups[ $base ] ) ) {
+					$segment_groups[ $base ] = array();
+				}
+				$segment_groups[ $base ][ $path ] = $text;
+				continue;
+			}
+
+			$plain[ $path ] = $text;
+		}
+
+		foreach ( $segment_groups as $base => $group ) {
+			uksort(
+				$group,
+				static function ( $left, $right ) {
+					$left_num  = preg_match( '/::__seg(\d+)$/', (string) $left, $m ) ? (int) $m[1] : 0;
+					$right_num = preg_match( '/::__seg(\d+)$/', (string) $right, $m ) ? (int) $m[1] : 0;
+
+					return $left_num <=> $right_num;
+				}
+			);
+
+			$seg_batch_size = self::resolve_elementor_segment_api_batch_size( count( $group ) );
+			$seg_chunks     = self::chunk_payload_with_limits(
+				$group,
+				$seg_batch_size,
+				$max_chars,
+				false
+			);
+
+			foreach ( $seg_chunks as $seg_chunk ) {
+				if ( ! empty( $current ) ) {
+					$chunks[]      = $current;
+					$current       = array();
+					$current_chars = 0;
+				}
+				$chunks[] = $seg_chunk;
+			}
+
+			unset( $base );
+		}
+
+		foreach ( $plain as $path => $text ) {
 			$path = (string) $path;
 			$text = (string) $text;
 

@@ -107,7 +107,12 @@ trait Trait_Job_Gap_Fill {
 			$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
 		}
 
-		if ( $ghost_ticks >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT ) {
+		$ghost_limit = max(
+			self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT,
+			min( 8, self::resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, $state ) )
+		);
+
+		if ( $ghost_ticks >= $ghost_limit ) {
 			self::log_elementor_remaining_field_diagnostics(
 				$post_id,
 				$lang,
@@ -162,7 +167,7 @@ trait Trait_Job_Gap_Fill {
 					$post_id,
 					$stubborn_left,
 					$ghost_ticks + 1,
-					self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
+					$ghost_limit
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
@@ -244,7 +249,7 @@ trait Trait_Job_Gap_Fill {
 		}
 
 		if (
-			absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
+			absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= $ghost_limit
 			&& ! empty( $remaining_after )
 		) {
 			self::log_elementor_remaining_field_diagnostics(
@@ -442,11 +447,12 @@ trait Trait_Job_Gap_Fill {
 
 		$ghost         = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
 		$long_attempts = absint( $state['elementor_long_gap_force_attempts'] ?? 0 );
+		$long_limit    = self::resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, $state );
 		// Prefer real AI retries first; after the attempt/ghost ceiling, accept long HTML
-		// with whatever segments we have (+ source for gaps) and close the job.
+		// with whatever English segments we already have (+ source only for gaps).
 		$accept_long_fallback = (
-			$ghost >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
-			|| $long_attempts >= self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT
+			$ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
+			|| $long_attempts >= $long_limit
 		);
 
 		$long_remaining = 0;
@@ -466,23 +472,31 @@ trait Trait_Job_Gap_Fill {
 				continue;
 			}
 
-			// Prefer collapsing any already-translated __segN pieces before full source fallback.
+			// Prefer collapsing already-translated __segN pieces; only fill missing with source.
 			if ( $is_long ) {
-				$map = self::prepare_elementor_map_for_persist( $map, array( $path => $text ), true );
-				if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
-					$accepted_paths[] = $path;
-					++$forced_long;
-					continue;
-				}
+				$partial = self::accept_elementor_long_field_with_partial_fallback( $path, $text, $map, $state );
+				$map     = self::prepare_elementor_map_for_persist( $map, array( $path => $text ), true );
+				$accepted_paths[] = $path;
+				++$forced_long;
+
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: post ID, 2: path, 3: kept, 4: fallback */
+						__( 'Elementor — #%1$d: long fallback %2$s — kept=%3$d fallback=%4$d', 'polymart-ai' ),
+						$post_id,
+						$path,
+						(int) ( $partial['kept'] ?? 0 ),
+						(int) ( $partial['fallback'] ?? 0 )
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
+				);
+				continue;
 			}
 
 			self::apply_elementor_field_source_fallback( $path, $text, $map, $state );
 			$accepted_paths[] = $path;
-			if ( $is_long ) {
-				++$forced_long;
-			} else {
-				++$forced;
-			}
+			++$forced;
 		}
 
 		if ( ! empty( $accepted_paths ) ) {
@@ -531,7 +545,7 @@ trait Trait_Job_Gap_Fill {
 					$forced,
 					$long_remaining,
 					(int) $state['elementor_long_gap_force_attempts'],
-					self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT
+					$long_limit
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
@@ -1772,12 +1786,14 @@ trait Trait_Job_Gap_Fill {
 			return compact( 'completed', 'touched' );
 		}
 
-		$max_attempts = \PolymartAI\Activity_Logger::is_trusted_as_tick()
+		// On Action Scheduler ticks we only try once per HTTP call, but must NOT
+		// source-fallback missing segs after that single miss — next tick retries.
+		$http_attempts = \PolymartAI\Activity_Logger::is_trusted_as_tick()
 			? 1
 			: self::ELEMENTOR_SEGMENT_MAX_RETRIES;
 		$request_timeout = self::resolve_elementor_stubborn_request_timeout( $pending );
 
-		for ( $attempt = 1; $attempt <= $max_attempts && ! empty( $pending ); $attempt++ ) {
+		for ( $attempt = 1; $attempt <= $http_attempts && ! empty( $pending ); $attempt++ ) {
 			list( $aliased_attempt, $alias_map_attempt ) = self::alias_elementor_payload_keys( $pending );
 
 			if ( empty( $aliased_attempt ) ) {
@@ -1793,7 +1809,7 @@ trait Trait_Job_Gap_Fill {
 						absint( $post_id ),
 						$path,
 						$attempt,
-						$max_attempts
+						$http_attempts
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
 				);
@@ -1879,8 +1895,12 @@ trait Trait_Job_Gap_Fill {
 				}
 
 				$source_snippet = (string) ( $pending[ $map_path ] ?? $batch[ $map_path ] ?? $source_payload[ $map_path ] ?? $text );
-				if ( preg_match( '/^(.+)::__(?:part|seg)\d+$/', $map_path, $matches ) ) {
-					$source_snippet = (string) ( $pending[ $map_path ] ?? $batch[ $map_path ] ?? $source_payload[ $matches[1] ] ?? $text );
+				if ( preg_match( '/^(.+)::__seg\d+$/', $map_path, $matches ) ) {
+					$base_text      = (string) ( $source_payload[ (string) $matches[1] ] ?? $text );
+					$seg_lookup     = self::get_elementor_segment_source_lookup( (string) $matches[1], $base_text );
+					$source_snippet = (string) ( $pending[ $map_path ] ?? $batch[ $map_path ] ?? $seg_lookup[ $map_path ] ?? $source_snippet );
+				} elseif ( preg_match( '/^(.+)::__part\d+$/', $map_path, $matches ) ) {
+					$source_snippet = (string) ( $pending[ $map_path ] ?? $batch[ $map_path ] ?? $source_payload[ (string) $matches[1] ] ?? $text );
 				}
 
 				if ( ! self::elementor_map_value_is_valid_translation( $map_path, $source_snippet, $translated ) ) {
@@ -1907,6 +1927,8 @@ trait Trait_Job_Gap_Fill {
 			}
 		}
 
+		// Only exhaustively source-fallback after the hard segment retry ceiling.
+		// Never equate "1 failed HTTP on this AS tick" with "give up on English".
 		foreach ( $pending as $pending_key => $pending_text ) {
 			$pending_key  = (string) $pending_key;
 			$pending_text = (string) $pending_text;
@@ -1915,7 +1937,7 @@ trait Trait_Job_Gap_Fill {
 				continue;
 			}
 
-			if ( absint( $seg_failures[ $pending_key ] ?? 0 ) >= $max_attempts ) {
+			if ( absint( $seg_failures[ $pending_key ] ?? 0 ) >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
 				self::apply_elementor_segment_source_fallback( $pending_key, $pending_text, $map, $state );
 				$touched = true;
 				unset( $pending[ $pending_key ], $seg_failures[ $pending_key ] );
@@ -1927,7 +1949,8 @@ trait Trait_Job_Gap_Fill {
 		$map                    = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$map                    = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
 		$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
-		$map                    = self::prepare_elementor_map_for_persist( $map, $source_payload );
+		// Keep partial English __segN; allow assemble to fill only unresolved gaps later.
+		$map                    = self::prepare_elementor_map_for_persist( $map, $source_payload, true );
 		$state['elementor_map'] = $map;
 
 		if ( $touched ) {
