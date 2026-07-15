@@ -178,6 +178,8 @@ final class Universal_Translator {
 		}
 
 		$this->register_elementor_swap_filters();
+		// Footer/header Theme Builder templates read meta during render — same early window as homepage.
+		$this->maybe_register_embedded_elementor_filter();
 	}
 
 	/**
@@ -561,6 +563,10 @@ final class Universal_Translator {
 	 * Element Caching (`_elementor_element_cache`) would otherwise keep Persian HTML
 	 * even after `_elementor_data` is correctly swapped.
 	 *
+	 * Homepage fix: bust cache for the main post. Footer Theme Builder templates
+	 * (`elementor_library`) also store FA HTML in `_elementor_element_cache` — they
+	 * must be busted too, even though Layout_Guard marks them structural.
+	 *
 	 * @param mixed  $value     Short-circuit value.
 	 * @param int    $object_id Post ID.
 	 * @param string $meta_key  Meta key.
@@ -578,25 +584,47 @@ final class Universal_Translator {
 
 		$post_id = (int) $object_id;
 
-		if ( $post_id <= 0 || Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
+		if ( $post_id <= 0 || ! $this->should_bust_elementor_render_cache( $post_id ) ) {
 			return $value;
 		}
 
-		if ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
-			$post_type = get_post_type( $post_id );
+		return $single ? '' : array();
+	}
 
-			if ( ! in_array( $post_type, self::get_embedded_elementor_post_types(), true ) ) {
-				return $value;
+	/**
+	 * Whether Elementor element-cache HTML may be discarded so companion JSON is used.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	private function should_bust_elementor_render_cache( $post_id ) {
+		$post_id   = (int) $post_id;
+		$post_type = get_post_type( $post_id );
+		$embedded  = in_array( $post_type, self::get_embedded_elementor_post_types(), true );
+
+		// Structural shells (footer/header library): allow only via embedded swap path;
+		// never rewrite product single layout documents.
+		if ( Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
+			if ( ! $embedded ) {
+				return false;
+			}
+
+			if (
+				Layout_Guard::is_single_product_context()
+				&& in_array( $post_type, array( 'woodmart_layout', 'elementor_library' ), true )
+			) {
+				return false;
+			}
+		} elseif ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
+			// Non-structural nested docs: only bust when they are known embed types.
+			if ( ! $embedded ) {
+				return false;
 			}
 		}
 
 		$lang = Url_Router::get_current_language();
 
-		if ( ! Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
-			return $value;
-		}
-
-		return $single ? '' : array();
+		return Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
 	}
 
 	/**
@@ -626,16 +654,39 @@ final class Universal_Translator {
 		$lang     = Url_Router::get_current_language();
 		$serving  = $post_id > 0 && Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
 		$filter   = self::$elementor_swap_registered ? 'on' : 'off';
+		$embedded = self::$embedded_elementor_registered ? 'on' : 'off';
 		$cached   = ( $post_id > 0 && array_key_exists( $post_id, $this->elementor_cache ) && self::ELEMENTOR_CACHE_UNCHANGED !== ( $this->elementor_cache[ $post_id ] ?? null ) ) ? 'hit' : 'miss';
 
+		$embedded_hits = array();
+
+		foreach ( $this->elementor_cache as $cached_id => $payload ) {
+			if ( self::ELEMENTOR_CACHE_UNCHANGED === $payload ) {
+				continue;
+			}
+
+			$cached_id = (int) $cached_id;
+
+			if ( $cached_id === (int) $post_id ) {
+				continue;
+			}
+
+			$type = get_post_type( $cached_id );
+
+			if ( in_array( $type, self::get_embedded_elementor_post_types(), true ) ) {
+				$embedded_hits[] = $cached_id;
+			}
+		}
+
 		printf(
-			"\n<!-- Polymart AI: Serving %s for Post ID %d | filter=%s cache=%s singular=%s front=%s -->\n",
+			"\n<!-- Polymart AI: Serving %s for Post ID %d | filter=%s embedded=%s cache=%s singular=%s front=%s embeds=%s -->\n",
 			esc_html( strtoupper( $lang ) ),
 			(int) $post_id,
 			esc_html( $filter ),
+			esc_html( $embedded ),
 			esc_html( $cached ),
 			is_singular() ? '1' : '0',
-			is_front_page() ? '1' : '0'
+			is_front_page() ? '1' : '0',
+			esc_html( $embedded_hits ? implode( ',', $embedded_hits ) : '-' )
 		);
 
 		if ( ! $serving ) {
