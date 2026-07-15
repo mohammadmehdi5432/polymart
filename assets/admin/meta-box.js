@@ -528,7 +528,8 @@
 	}
 
 	function shouldUseChunkedTranslation() {
-		return config.postType === 'page' && !!config.usesElementor;
+		// Any Elementor-backed supported type (page, cms_block, woodmart_layout, …).
+		return !!config.usesElementor;
 	}
 
 	function requestTranslateComplete(postId, lang, options) {

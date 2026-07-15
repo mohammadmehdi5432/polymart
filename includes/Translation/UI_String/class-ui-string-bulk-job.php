@@ -7,6 +7,7 @@
 
 namespace PolymartAI\Translation\UI_String;
 
+use PolymartAI\Integration\Woodmart_Header_Integration;
 use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\Post_Translator;
 
@@ -78,6 +79,18 @@ final class UI_String_Bulk_Job {
 		if ( 'paused' === ( $existing['status'] ?? '' ) && sanitize_key( (string) ( $existing['lang'] ?? '' ) ) === $lang ) {
 			return self::resume_job();
 		}
+
+		// Ensure WoodMart Header Builder text/html widgets are in the registry
+		// and pre-translate any known WHB Persian leaves before batching.
+		if ( class_exists( '\\PolymartAI\\Integration\\Woodmart_Header_Integration' ) ) {
+			\PolymartAI\Integration\Woodmart_Header_Integration::ensure_registry_entries_after_scan();
+			\PolymartAI\Integration\Woodmart_Header_Integration::translate_strings_for_language( $lang );
+		}
+
+		// Ensure WoodMart Header Builder text/html widgets are in the registry
+		// and get a synchronous AI pass (they are few, but customer-facing).
+		Woodmart_Header_Integration::ensure_registry_entries_after_scan();
+		Woodmart_Header_Integration::translate_strings_for_language( $lang );
 
 		$remaining = UI_String_Registry::count_untranslated( $lang );
 

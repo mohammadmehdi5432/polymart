@@ -40,6 +40,14 @@ final class UI_String_Scanner {
 			)
 		);
 
+		/**
+		 * Fires after the UI string registry has been rebuilt from catalogs/extras.
+		 *
+		 * Used by WoodMart Header Builder integration to ensure WHB text/html strings
+		 * remain registered for the bulk UI translation job.
+		 */
+		do_action( 'polymart_ai_ui_strings_after_scan' );
+
 		return array_merge(
 			UI_String_Registry::get_stats(),
 			array(

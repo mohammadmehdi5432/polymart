@@ -416,6 +416,12 @@ trait Trait_Storage {
 			return false;
 		}
 
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			self::$elementor_storefront_serve_cache[ $key ] = false;
+
+			return false;
+		}
+
 		self::$elementor_storefront_serve_cache[ $key ] = self::is_elementor_translation_current( $post_id, $lang, $stored );
 
 		return self::$elementor_storefront_serve_cache[ $key ];
@@ -592,14 +598,9 @@ trait Trait_Storage {
 		}
 
 		$payload = self::collect_elementor_translation_payload( $data );
-		$accepted = self::get_elementor_accepted_paths( $post_id, $lang );
 
-		if ( ! empty( $accepted ) ) {
-			foreach ( $accepted as $path ) {
-				unset( $payload[ $path ] );
-			}
-		}
-
+		// Do not ignore "accepted" fallback paths — if Persian is still in the stored
+		// JSON, storefront must not treat the companion as customer-ready English.
 		self::$stored_elementor_persian_cache[ $key ] = implode(
 			"\n\n",
 			array_unique( array_filter( array_values( $payload ) ) )

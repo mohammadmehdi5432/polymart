@@ -74,7 +74,7 @@ trait Trait_Job_Persist {
 
 		$tree = self::apply_elementor_translation_payload( $source_data, $map );
 		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
-		$json = wp_json_encode( $tree );
+		$json = wp_json_encode( $tree, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 
 		if ( false === $json || '' === $json ) {
 			\PolymartAI\Activity_Logger::log(
@@ -93,7 +93,30 @@ trait Trait_Job_Persist {
 			);
 		}
 
-		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), $json );
+		// WP expects slashed meta; without wp_slash(), escaped quotes inside HTML
+		// chunks are stripped and `_elementor_data_{lang}` becomes invalid JSON.
+		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), wp_slash( $json ) );
+
+		$verify  = get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
+		$decoded = json_decode( is_string( $verify ) ? $verify : '', true );
+
+		if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $decoded ) ) {
+			\PolymartAI\Activity_Logger::log(
+				'error',
+				sprintf(
+					/* translators: 1: post ID, 2: json error */
+					__( 'Elementor — #%1$d: JSON ذخیره‌شده نامعتبر است (%2$s).', 'polymart-ai' ),
+					absint( $post_id ),
+					json_last_error_msg()
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
+			return new \WP_Error(
+				'polymart_ai_elementor_save_corrupt',
+				__( 'ذخیره ترجمه Elementor JSON خراب تولید کرد.', 'polymart-ai' )
+			);
+		}
 		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 
 		if ( $complete ) {
@@ -226,7 +249,7 @@ trait Trait_Job_Persist {
 		}
 
 		$tree = self::apply_elementor_translation_payload( $data, $translated_map );
-		$json = wp_json_encode( $tree );
+		$json = wp_json_encode( $tree, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 
 		if ( false === $json || '' === $json ) {
 			return new \WP_Error(
@@ -235,7 +258,7 @@ trait Trait_Job_Persist {
 			);
 		}
 
-		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), $json );
+		update_post_meta( $post_id, self::get_elementor_meta_key( $lang ), wp_slash( $json ) );
 
 		if ( ! empty( $missing ) ) {
 			$error_message = sprintf(

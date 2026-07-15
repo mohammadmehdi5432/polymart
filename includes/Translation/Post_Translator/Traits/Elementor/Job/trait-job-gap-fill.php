@@ -424,11 +424,20 @@ trait Trait_Job_Gap_Fill {
 			);
 		}
 
+		$long_remaining = 0;
+
 		foreach ( $remaining as $path => $text ) {
 			$path = (string) $path;
 			$text = (string) $text;
 
 			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+				continue;
+			}
+
+			// Keep long HTML/__segN fields in stubborn gap-fill — never accept Persian source
+			// as "done" for those widgets (homepage text_content was getting stuck that way).
+			if ( self::stubborn_elementor_field_is_long( $path, $text ) ) {
+				++$long_remaining;
 				continue;
 			}
 
@@ -449,6 +458,52 @@ trait Trait_Job_Gap_Fill {
 		$state['elementor_map'] = $map;
 
 		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+
+		if ( $long_remaining > 0 ) {
+			$state['elementor_gap_fill']              = true;
+			$state['elementor_gap_fill_stubborn_only'] = true;
+			unset( $state['elementor_stubborn_ghost_ticks'] );
+
+			$persisted = self::persist_elementor_job_progress(
+				$post_id,
+				$lang,
+				$source_data,
+				$map,
+				$progress_total,
+				$progress_total,
+				false
+			);
+
+			if ( is_wp_error( $persisted ) ) {
+				return $persisted;
+			}
+
+			self::save_job_partial_state( $post_id, $lang, $state );
+			self::flush_translation_status_cache( $post_id );
+
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: short forced count, 3: long remaining */
+					__( 'Elementor — #%1$d: %2$d فیلد کوتاه force شد؛ %3$d فیلد بلند HTML همچنان در gap-fill می‌ماند.', 'polymart-ai' ),
+					$post_id,
+					$forced,
+					$long_remaining
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+				'message'        => sprintf(
+					/* translators: 1: long remaining count */
+					__( 'در حال تکمیل نهایی فیلدهای HTML سرسخت (%1$d مورد)', 'polymart-ai' ),
+					$long_remaining
+				),
+			);
+		}
 
 		\PolymartAI\Activity_Logger::log(
 			'warning',
@@ -1365,7 +1420,63 @@ trait Trait_Job_Gap_Fill {
 			}
 		}
 
-		// Priority 1: long fields — send missing __segN batches first.
+		// On AS ticks the budget is often 1. Prefer short not_in_map labels first so
+		// long __segN widgets cannot starve button/title/search strings forever.
+		$short_target = 0;
+
+		if ( ! empty( $short ) ) {
+			$short_target = empty( $long ) ? $api_budget : min( 2, max( 1, (int) ceil( $api_budget / 2 ) ) );
+		}
+
+		foreach ( array_slice( $short, 0, 4, true ) as $path => $text ) {
+			if ( $spent >= $short_target ) {
+				break;
+			}
+
+			if ( isset( $persist_map[ $path ] ) && self::elementor_field_translation_complete( $path, $text, $persist_map ) ) {
+				$map[ $path ] = (string) $persist_map[ $path ];
+				unset( $short[ $path ] );
+				++$done;
+				continue;
+			}
+
+			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+				unset( $short[ $path ] );
+				++$done;
+				continue;
+			}
+
+			$progress = self::translate_elementor_stubborn_field_batch(
+				$post_id,
+				$lang,
+				$path,
+				$text,
+				array( $path => $text ),
+				$source_data,
+				$source_payload,
+				$text_mirrors,
+				$state,
+				$map,
+				$failures,
+				$api_key,
+				$api_endpoint,
+				$ai_model,
+				1,
+				1
+			);
+
+			++$spent;
+			unset( $short[ $path ] );
+
+			if ( ! empty( $progress['touched'] ) ) {
+				$touched = true;
+			}
+
+			if ( ! empty( $progress['completed'] ) ) {
+				++$done;
+			}
+		}
+
 		foreach ( $long as $path => $text ) {
 			if ( $spent >= $api_budget ) {
 				break;
@@ -1443,19 +1554,21 @@ trait Trait_Job_Gap_Fill {
 			}
 		}
 
-		// Priority 2: short fields — only if budget remains and not already persisted.
-		foreach ( array_slice( $short, 0, 2, true ) as $path => $text ) {
+		// Leftover AS budget → more short fields.
+		foreach ( array_slice( $short, 0, 4, true ) as $path => $text ) {
 			if ( $spent >= $api_budget ) {
 				break;
 			}
 
 			if ( isset( $persist_map[ $path ] ) && self::elementor_field_translation_complete( $path, $text, $persist_map ) ) {
 				$map[ $path ] = (string) $persist_map[ $path ];
+				unset( $short[ $path ] );
 				++$done;
 				continue;
 			}
 
 			if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+				unset( $short[ $path ] );
 				++$done;
 				continue;
 			}
@@ -1480,6 +1593,7 @@ trait Trait_Job_Gap_Fill {
 			);
 
 			++$spent;
+			unset( $short[ $path ] );
 
 			if ( ! empty( $progress['touched'] ) ) {
 				$touched = true;

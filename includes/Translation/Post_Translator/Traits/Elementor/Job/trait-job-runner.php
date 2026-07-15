@@ -1082,9 +1082,12 @@ trait Trait_Job_Runner {
 				++$slice_cursor;
 				$commit_done = $slice_cursor;
 			} else {
+				// Advance so AS cannot stick forever on one pack, but keep incomplete
+				// short fields recoverable via gap-fill (they must not be starved by __segN).
 				self::release_stalled_elementor_chunk_fields( $chunk, $map, $source_payload, $state, $failures );
 				$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
 				$state['elementor_map'] = $map;
+				$state['elementor_gap_fill'] = true;
 				++$slice_cursor;
 				$commit_done     = $slice_cursor;
 				$chunk_satisfied = true;

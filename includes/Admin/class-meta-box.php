@@ -86,12 +86,12 @@ final class Meta_Box {
 	public function render_meta_box( $post ) {
 		wp_nonce_field( self::NONCE_ACTION, self::NONCE_NAME );
 
-		$languages        = Language_Registry::get_translation_target_languages();
-		$is_slide         = ( 'woodmart_slide' === $post->post_type );
-		$is_page          = ( 'page' === $post->post_type );
-		$uses_elementor   = $is_page && Post_Translator::uses_elementor_builder( $post->ID );
-		$show_image_field = Post_Translator::supports_featured_image_translation( $post->post_type );
-		$first_lang       = ! empty( $languages[0]['code'] ) ? sanitize_key( (string) $languages[0]['code'] ) : '';
+		$languages              = Language_Registry::get_translation_target_languages();
+		$is_slide               = ( 'woodmart_slide' === $post->post_type );
+		$uses_elementor         = Post_Translator::uses_elementor_builder( $post->ID );
+		$show_elementor_workflow = $uses_elementor;
+		$show_image_field       = Post_Translator::supports_featured_image_translation( $post->post_type );
+		$first_lang             = ! empty( $languages[0]['code'] ) ? sanitize_key( (string) $languages[0]['code'] ) : '';
 		?>
 		<div
 			class="polymart-ai-metabox"
@@ -110,7 +110,7 @@ final class Meta_Box {
 
 				<?php if ( ! $is_slide && ! empty( $languages ) ) : ?>
 					<div class="polymart-ai-metabox__toolbar-actions">
-						<?php if ( $is_page ) : ?>
+						<?php if ( $show_elementor_workflow ) : ?>
 							<button type="button" class="button polymart-ai-scan-gaps-btn">
 								<span class="polymart-ai-scan-gaps-btn__label"><?php esc_html_e( 'اسکن فیلدهای قابل ترجمه', 'polymart-ai' ); ?></span>
 								<span class="polymart-ai-scan-gaps-btn__spinner spinner" style="float:none;margin:0 8px 0 0;display:none;"></span>
@@ -129,14 +129,12 @@ final class Meta_Box {
 						</button>
 						<span class="polymart-ai-metabox__global-status" role="status" aria-live="polite"></span>
 					</div>
-					<?php if ( $is_page ) : ?>
-						<?php if ( $uses_elementor ) : ?>
-							<div class="notice notice-info inline polymart-ai-metabox__elementor-notice">
-								<p>
-									<?php esc_html_e( 'این برگه با Elementor ساخته شده — متن‌های اصلی در JSON المنتور هستند، نه در ویرایشگر «محتوای کامل» پایین. از «اسکن» و «ترجمه و تکمیل» استفاده کنید.', 'polymart-ai' ); ?>
-								</p>
-							</div>
-						<?php endif; ?>
+					<?php if ( $show_elementor_workflow ) : ?>
+						<div class="notice notice-info inline polymart-ai-metabox__elementor-notice">
+							<p>
+								<?php esc_html_e( 'این مطلب با Elementor ساخته شده — متن‌های اصلی در JSON المنتور هستند، نه در ویرایشگر «محتوای کامل» پایین. از «اسکن» و «ترجمه و تکمیل» استفاده کنید.', 'polymart-ai' ); ?>
+							</p>
+						</div>
 						<div class="polymart-ai-metabox__scan-results" hidden aria-live="polite"></div>
 					<?php endif; ?>
 				<?php endif; ?>
@@ -364,11 +362,11 @@ final class Meta_Box {
 					</table>
 				</div>
 
-				<div class="polymart-ai-metabox__field-group<?php echo ( 'page' === $post->post_type && Post_Translator::uses_elementor_builder( $post->ID ) ) ? ' polymart-ai-metabox__field-group--deemphasized' : ''; ?>">
+				<div class="polymart-ai-metabox__field-group<?php echo $uses_elementor ? ' polymart-ai-metabox__field-group--deemphasized' : ''; ?>">
 					<h4 class="polymart-ai-metabox__group-title">
 						<?php esc_html_e( 'محتوای کامل', 'polymart-ai' ); ?>
-						<?php if ( 'page' === $post->post_type && Post_Translator::uses_elementor_builder( $post->ID ) ) : ?>
-							<span class="description"><?php esc_html_e( '(برای برگه‌های Elementor معمولاً خالی است)', 'polymart-ai' ); ?></span>
+						<?php if ( $uses_elementor ) : ?>
+							<span class="description"><?php esc_html_e( '(برای مطالب Elementor معمولاً خالی است)', 'polymart-ai' ); ?></span>
 						<?php endif; ?>
 					</h4>
 					<div class="polymart-ai-metabox__editor-wrap">
@@ -554,7 +552,7 @@ final class Meta_Box {
 		$post         = isset( $GLOBALS['post'] ) ? $GLOBALS['post'] : null;
 		$post_type    = $post instanceof \WP_Post ? $post->post_type : (string) $screen->post_type;
 		$type_label   = Post_Translator::get_post_type_label( $post_type );
-		$uses_elementor = $post instanceof \WP_Post && 'page' === $post->post_type && Post_Translator::uses_elementor_builder( $post->ID );
+		$uses_elementor = $post instanceof \WP_Post && Post_Translator::uses_elementor_builder( $post->ID );
 
 		wp_enqueue_media();
 

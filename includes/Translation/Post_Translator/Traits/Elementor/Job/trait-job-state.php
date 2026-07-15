@@ -701,22 +701,25 @@ trait Trait_Job_State {
 			|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
 			|| self::elementor_job_has_stubborn_remaining( $post_id, $lang );
 
+		$ghost   = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
+		$repairs = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
+
+		// Gap-fill/stubborn must actually spend AS ticks on __segN / short leftovers
+		// before we force-accept Persian source. Finalizing on the first handoff tick
+		// left homepage long HTML fields untranslated while still marking can_serve.
 		if ( $stubborn ) {
+			return $ghost >= 4 || $repairs >= 2;
+		}
+
+		if ( $remaining < 3 && $ghost >= 2 ) {
 			return true;
 		}
 
-		if ( $remaining < 3 ) {
+		if ( $ghost >= 3 ) {
 			return true;
 		}
 
-		if ( absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= 1 ) {
-			return true;
-		}
-
-		if (
-			absint( $state['elementor_queue_repair_attempts'] ?? 0 ) >= 1
-			&& $remaining <= 5
-		) {
+		if ( $repairs >= 2 && $remaining <= 5 ) {
 			return true;
 		}
 
@@ -1310,15 +1313,6 @@ trait Trait_Job_State {
 			return false;
 		}
 
-		$partial = self::get_job_partial_state( $post_id, $lang );
-
-		if (
-			! empty( $partial['elementor_gap_fill'] )
-			|| ! empty( $partial['elementor_gap_fill_stubborn_only'] )
-		) {
-			return true;
-		}
-
 		$raw = get_post_meta( $post_id, '_elementor_data', true );
 
 		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
@@ -1341,6 +1335,8 @@ trait Trait_Job_State {
 			$skipped
 		);
 
+		// gap_fill flags alone must not report remaining work — otherwise AS spins
+		// forever after short fields finish while a clean English base is already mapped.
 		return ! empty( $remaining );
 	}
 

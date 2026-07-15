@@ -26,6 +26,9 @@ const TYPE_OPTIONS = [
   { value: '', label: 'همه انواع' },
   { value: 'product', label: 'محصولات' },
   { value: 'post', label: 'نوشته‌ها' },
+  { value: 'page', label: 'برگه‌ها' },
+  { value: 'cms_block', label: 'بلوک‌های HTML' },
+  { value: 'woodmart_layout', label: 'لایه‌های وودمارت' },
   { value: 'woodmart_slide', label: 'اسلایدهای وودمارت' },
 ];
 

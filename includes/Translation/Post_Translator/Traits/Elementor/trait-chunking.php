@@ -257,7 +257,9 @@ trait Trait_Chunking {
 			in_array( $seg_key, self::$current_elementor_segment_passthrough, true )
 			&& $value === $seg_source
 		) {
-			return true;
+			// Persian source-fallback is a temporary placeholder — never treat it as resolved
+			// or gap-fill will mark the long HTML field complete while customers still see FA.
+			return ! Persian_Detector::contains_persian( $value );
 		}
 
 		return self::elementor_map_value_is_valid_translation( $seg_key, $seg_source, $value );
@@ -882,16 +884,45 @@ trait Trait_Chunking {
 				continue;
 			}
 
+			// Prefer an already-complete collapsed English base over rebuilding from
+			// incomplete __segN pieces (source-filled gaps would reintroduce Persian).
+			if (
+				isset( $prepared[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $prepared[ $path ] )
+				&& self::utf8_strlen( (string) $prepared[ $path ] ) >= (int) floor( self::utf8_strlen( $text ) * 0.85 )
+			) {
+				foreach ( $seg_keys as $seg_key ) {
+					unset( $prepared[ $seg_key ] );
+				}
+				continue;
+			}
+
 			$assembled = self::assemble_elementor_segment_field( $path, $text, $prepared, $allow_partial_segments );
 
 			if ( '' === $assembled ) {
 				continue;
 			}
 
+			// Never overwrite a clean English base with a Persian hybrid.
+			if (
+				isset( $prepared[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $prepared[ $path ] )
+				&& Persian_Detector::contains_persian( $assembled )
+			) {
+				foreach ( $seg_keys as $seg_key ) {
+					unset( $prepared[ $seg_key ] );
+				}
+				continue;
+			}
+
 			$prepared[ $path ] = $assembled;
 
-			foreach ( $seg_keys as $seg_key ) {
-				unset( $prepared[ $seg_key ] );
+			// Only drop __segN keys once the collapsed field is fully English.
+			// Otherwise keep translated segments so gap-fill can finish missing pieces.
+			if ( self::elementor_map_value_is_valid_translation( $path, $text, $assembled ) ) {
+				foreach ( $seg_keys as $seg_key ) {
+					unset( $prepared[ $seg_key ] );
+				}
 			}
 		}
 
@@ -917,8 +948,30 @@ trait Trait_Chunking {
 		}
 
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
-		$parts      = array();
-		$resolved   = 0;
+
+		// Scan ahead: if any __segN is translated, never abort the whole field on an earlier missing piece.
+		if ( ! $fill_missing_with_source ) {
+			$any_resolved = false;
+
+			foreach ( $seg_keys as $probe_key ) {
+				$probe_source = (string) ( $seg_lookup[ $probe_key ] ?? '' );
+
+				if (
+					isset( $map[ $probe_key ] )
+					&& self::elementor_segment_is_resolved( $probe_key, $probe_source, $map )
+				) {
+					$any_resolved = true;
+					break;
+				}
+			}
+
+			if ( $any_resolved ) {
+				$fill_missing_with_source = true;
+			}
+		}
+
+		$parts    = array();
+		$resolved = 0;
 
 		foreach ( $seg_keys as $seg_key ) {
 			$seg_source = (string) ( $seg_lookup[ $seg_key ] ?? '' );
@@ -935,11 +988,6 @@ trait Trait_Chunking {
 			if ( $fill_missing_with_source && '' !== $seg_source ) {
 				$parts[] = $seg_source;
 				continue;
-			}
-
-			// Resilient partial: keep translated segments already collected, source-fill the rest.
-			if ( $resolved > 0 ) {
-				return self::assemble_elementor_segment_field( $path, $text, $map, true );
 			}
 
 			return '';
@@ -989,17 +1037,21 @@ trait Trait_Chunking {
 			return false;
 		}
 
+		// Coverage is about progress, not storefront-ready English. Hybrid assemblies
+		// may still contain Persian source-filled gaps; those must stay "incomplete"
+		// for gap-fill until every __segN is resolved.
 		$assembled = self::assemble_elementor_segment_field( $path, $text, $map, true );
 
 		if ( '' === $assembled ) {
 			return false;
 		}
 
-		if ( ! self::elementor_map_value_is_valid_translation( $path, $text, $assembled ) ) {
+		if ( $translated_chars < (int) floor( $source_chars * 0.75 ) ) {
 			return false;
 		}
 
-		return $translated_chars >= (int) floor( $source_chars * 0.75 );
+		// Only treat as sufficiently covered when the collapsed value is clean English.
+		return self::elementor_map_value_is_valid_translation( $path, $text, $assembled );
 	}
 
 	/**
@@ -1206,7 +1258,8 @@ trait Trait_Chunking {
 			&& isset( $map[ $path ] )
 			&& (string) $map[ $path ] === $text
 		) {
-			return true;
+			// Same rule as segments: Persian source placeholders are not complete translations.
+			return ! Persian_Detector::contains_persian( $text );
 		}
 
 		// For very long Elementor fields, require all __segN pieces (or one collapsed base value).
@@ -1230,14 +1283,14 @@ trait Trait_Chunking {
 				}
 
 				$all_segs_ok = false;
-				break;
 			}
 
 			if ( $all_segs_ok ) {
 				return true;
 			}
 
-			// Accept resilient partial assembly when most segment characters are translated.
+			// Accept resilient partial assembly when most segment characters are translated
+			// (including cases where an early __segN is missing but later ones are present).
 			if ( $resolved > 0 && self::elementor_segment_field_has_sufficient_coverage( $path, $text, $map ) ) {
 				return true;
 			}
