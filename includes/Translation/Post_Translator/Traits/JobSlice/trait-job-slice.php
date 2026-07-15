@@ -1325,15 +1325,25 @@ trait Trait_Job_Slice {
 
 		if ( self::uses_elementor_builder( $post_id ) && self::has_elementor_persian_content( $post_id ) ) {
 			if ( ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+				$explain = self::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
+
+				foreach ( (array) ( $explain['messages'] ?? array() ) as $serve_message ) {
+					$serve_message = trim( (string) $serve_message );
+
+					if ( '' !== $serve_message ) {
+						$notes[] = $serve_message;
+					}
+				}
+
 				$error = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ) );
 
-				if ( '' !== $error ) {
+				if ( '' !== $error && ! self::is_elementor_progress_message( $error ) ) {
 					$notes[] = sprintf(
 						/* translators: %s: Elementor error message */
 						__( 'Elementor: %s', 'polymart-ai' ),
 						$error
 					);
-				} else {
+				} elseif ( empty( $explain['messages'] ) ) {
 					$notes[] = __( 'ترجمه Elementor روی URL انگلیسی اعمال نمی‌شود', 'polymart-ai' );
 				}
 			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {

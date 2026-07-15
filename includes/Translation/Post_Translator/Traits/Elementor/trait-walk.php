@@ -59,6 +59,7 @@ trait Trait_Walk {
 					$filtered[] = array(
 						'path'    => $child_path,
 						'preview' => $value,
+						'kind'    => self::classify_elementor_filtered_out_kind( (string) $key, $value ),
 					);
 				}
 				continue;
@@ -85,6 +86,7 @@ trait Trait_Walk {
 					$filtered[] = array(
 						'path'    => $child_path,
 						'preview' => $value,
+						'kind'    => self::classify_elementor_filtered_out_kind( (string) $key, $value ),
 					);
 				}
 				continue;
@@ -287,7 +289,58 @@ trait Trait_Walk {
 			return true;
 		}
 
-		return in_array( $key, array( 'image_url', 'image_link', 'image_src', 'image_path', 'image_file' ), true );
+		if ( in_array( $key, array( 'image_url', 'image_link', 'image_src', 'image_path', 'image_file' ), true ) ) {
+			return true;
+		}
+
+		// Nested Elementor media objects use bare key "url" (e.g. settings.image.url).
+		// Opt-in only: translating filenames can 404 unless the media file is renamed too.
+		if (
+			in_array( $key, array( 'url', 'src', 'href' ), true )
+			&& self::is_elementor_media_path_value( $value )
+			&& (bool) apply_filters( 'polymart_ai_elementor_translate_media_urls', false, $key, (string) $value )
+		) {
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether a setting value looks like a media/file URL or path.
+	 *
+	 * @param string $value Raw setting value.
+	 * @return bool
+	 */
+	private static function is_elementor_media_path_value( $value ) {
+		$value = trim( (string) $value );
+
+		if ( '' === $value ) {
+			return false;
+		}
+
+		return (bool) preg_match( '/\.(jpe?g|png|gif|webp|svg|mp4|webm|pdf|ico)(\?|#|$)/i', $value );
+	}
+
+	/**
+	 * Classify why a Persian Elementor string was excluded from the AI queue.
+	 *
+	 * @param string $key   Setting / node key.
+	 * @param string $value Field value.
+	 * @return string media_url|blocked_key|other
+	 */
+	private static function classify_elementor_filtered_out_kind( $key, $value ) {
+		$key = strtolower( (string) $key );
+
+		if ( self::is_elementor_media_path_value( $value ) ) {
+			return 'media_url';
+		}
+
+		if ( in_array( $key, array( 'url', 'src', 'href', 'link', '_id', 'id', 'eltype', 'widgettype', 'isinner' ), true ) ) {
+			return 'blocked_key';
+		}
+
+		return 'other';
 	}
 
 	private static function should_skip_elementor_setting_key( $key, $value ) {

@@ -842,8 +842,10 @@ final class Ajax_Handler {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$gaps    = Post_Translator::get_translation_gaps( $post_id, $lang );
-		$status  = (string) ( $gaps['status'] ?? Post_Translator::get_translation_status( $post_id, $lang ) );
+		// Prefer demoted live status — raw audit alone can say «کامل» while /en/ still serves FA.
+		$status  = Post_Translator::get_translation_status( $post_id, $lang );
 		$fields  = array();
+		$notes   = array_values( array_map( 'strval', (array) ( $gaps['notes'] ?? array() ) ) );
 
 		foreach ( (array) ( $gaps['fields'] ?? array() ) as $field ) {
 			if ( ! is_array( $field ) ) {
@@ -873,6 +875,33 @@ final class Ajax_Handler {
 		$elementor = Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang );
 		$lock      = Post_Translator::get_translation_lock_status( $post_id, $lang );
 		$stubborn  = Post_Translator::get_elementor_stubborn_field_diagnostics( $post_id, $lang );
+		$gap_reason = Post_Translator::describe_translation_gap( $post_id, $lang );
+
+		if (
+			'' !== trim( (string) $gap_reason )
+			&& ( 'translated' !== $status || ! empty( $elementor['storefront_persian'] ) || empty( $elementor['can_serve_storefront'] ) )
+		) {
+			$notes[] = $gap_reason;
+		}
+
+		foreach ( (array) ( $elementor['serve_block_messages'] ?? array() ) as $serve_message ) {
+			$serve_message = trim( (string) $serve_message );
+
+			if ( '' !== $serve_message ) {
+				$notes[] = $serve_message;
+			}
+		}
+
+		$notes = array_values( array_unique( array_filter( $notes ) ) );
+
+		$needs_work = 'translated' !== $status
+			|| ! empty( $gaps['missing'] )
+			|| ! empty( $elementor['storefront_persian'] )
+			|| (
+				! empty( $elementor['active'] )
+				&& empty( $elementor['can_serve_storefront'] )
+				&& ! empty( $elementor['has_saved_json'] )
+			);
 
 		return array(
 			'lang'               => $lang,
@@ -881,14 +910,15 @@ final class Ajax_Handler {
 			'status_label'       => self::get_status_label_for_scan( $status ),
 			'fields'             => $fields,
 			'missing'            => array_values( array_map( 'strval', (array) ( $gaps['missing'] ?? array() ) ) ),
-			'notes'              => array_values( array_map( 'strval', (array) ( $gaps['notes'] ?? array() ) ) ),
+			'notes'              => $notes,
 			'uses_elementor'     => Post_Translator::uses_elementor_builder( $post_id ),
 			'elementor_error'    => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
 			'elementor_progress' => $progress,
 			'elementor'          => $elementor,
 			'stubborn_details'   => $stubborn,
 			'lock'               => $lock,
-			'needs_work'         => 'translated' !== $status || ! empty( $gaps['missing'] ),
+			'needs_work'         => $needs_work,
+			'force_retranslate_hint' => $needs_work,
 		);
 	}
 

@@ -348,83 +348,169 @@ trait Trait_Storage {
 			return self::$elementor_storefront_serve_cache[ $key ];
 		}
 
-		if ( $post_id <= 0 || '' === $lang || self::is_commerce_product_post( $post_id ) ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
+		// allow_progress_clean=true so harmless finalized progress markers are cleared.
+		$blockers = self::explain_elementor_storefront_serve_blockers( $post_id, $lang, true );
+		$can      = empty( $blockers['codes'] );
 
-			return false;
+		self::$elementor_storefront_serve_cache[ $key ] = $can;
+
+		return $can;
+	}
+
+	/**
+	 * Explain why `_elementor_data_{lang}` cannot be swapped on /en/ (or why it can).
+	 *
+	 * @param int  $post_id              Post ID.
+	 * @param string $lang               Language code.
+	 * @param bool $allow_progress_clean When true (default), stale progress markers may be deleted.
+	 * @return array{ok:bool,codes:string[],messages:string[],meta:array<string,mixed>}
+	 */
+	public static function explain_elementor_storefront_serve_blockers( $post_id, $lang, $allow_progress_clean = true ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$codes   = array();
+		$messages = array();
+		$meta    = array(
+			'stored_bytes'   => 0,
+			'finalized'      => false,
+			'hash_current'   => false,
+			'has_persian'    => false,
+			'error'          => '',
+			'progress'       => '',
+			'json_valid'     => false,
+			'oversize'       => false,
+			'is_commerce'    => false,
+		);
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			$codes[]    = 'invalid_args';
+			$messages[] = __( 'شناسه مطلب یا زبان نامعتبر است.', 'polymart-ai' );
+
+			return array(
+				'ok'       => false,
+				'codes'    => $codes,
+				'messages' => $messages,
+				'meta'     => $meta,
+			);
+		}
+
+		if ( self::is_commerce_product_post( $post_id ) ) {
+			$meta['is_commerce'] = true;
+			$codes[]             = 'commerce_product';
+			$messages[]          = __( 'محصول ووکامرس از مسیر Elementor JSON swap استفاده نمی‌کند.', 'polymart-ai' );
+
+			return array(
+				'ok'       => false,
+				'codes'    => $codes,
+				'messages' => $messages,
+				'meta'     => $meta,
+			);
 		}
 
 		$stored = self::get_stored_elementor_json( $post_id, $lang );
 
 		if ( ! is_string( $stored ) ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
+			$codes[]    = 'missing_companion_json';
+			$messages[] = __( 'JSON ترجمه Elementor (_elementor_data_en) ذخیره نشده است.', 'polymart-ai' );
 
-			return false;
+			return array(
+				'ok'       => false,
+				'codes'    => $codes,
+				'messages' => $messages,
+				'meta'     => $meta,
+			);
 		}
 
-		$stored = ltrim( $stored );
+		$stored              = ltrim( $stored );
+		$meta['stored_bytes'] = strlen( $stored );
 
 		if ( '' === $stored || ( '[' !== $stored[0] && '{' !== $stored[0] ) || strlen( $stored ) <= 2 ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
+			$codes[]    = 'invalid_companion_json';
+			$messages[] = __( 'JSON ترجمه Elementor خالی یا نامعتبر است.', 'polymart-ai' );
 
-			return false;
+			return array(
+				'ok'       => false,
+				'codes'    => $codes,
+				'messages' => $messages,
+				'meta'     => $meta,
+			);
 		}
 
 		if ( strlen( $stored ) > self::get_max_storefront_elementor_json_bytes() ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
-
-			return false;
+			$meta['oversize'] = true;
+			$codes[]          = 'oversize_json';
+			$messages[]       = __( 'حجم JSON ترجمه از سقف سرو فروشگاه بزرگ‌تر است.', 'polymart-ai' );
 		}
 
 		$elementor_error = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
+		$meta['error']   = $elementor_error;
 
 		if ( '' !== trim( $elementor_error ) && ! self::is_elementor_progress_message( $elementor_error ) ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
-
-			return false;
+			$codes[]    = 'hard_error_meta';
+			$messages[] = sprintf(
+				/* translators: %s: Elementor error message */
+				__( 'متای خطا Elementor فعال است: %s', 'polymart-ai' ),
+				$elementor_error
+			);
 		}
 
-		$progress = trim( (string) get_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), true ) );
+		$progress         = trim( (string) get_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ), true ) );
+		$meta['progress'] = $progress;
+		$finalized        = self::is_elementor_translation_finalized( $post_id, $lang );
+		$hash_current     = self::is_elementor_translation_current( $post_id, $lang, $stored );
+		$has_persian      = self::stored_elementor_translation_has_persian( $post_id, $lang );
+		$meta['finalized']    = $finalized;
+		$meta['hash_current'] = $hash_current;
+		$meta['has_persian']  = $has_persian;
 
 		if ( '' !== $progress ) {
 			// Finalized jobs sometimes keep a human-readable progress marker (e.g. 24/24).
 			if (
 				! self::is_elementor_progress_message( $progress )
-				|| ! self::is_elementor_translation_finalized( $post_id, $lang )
-				|| ! self::is_elementor_translation_current( $post_id, $lang )
-				|| self::stored_elementor_translation_has_persian( $post_id, $lang )
+				|| ! $finalized
+				|| ! $hash_current
+				|| $has_persian
 			) {
-				self::$elementor_storefront_serve_cache[ $key ] = false;
-
-				return false;
+				$codes[]    = 'progress_meta_blocks_serve';
+				$messages[] = __( 'متای پیشرفت Elementor هنوز سرو فروشگاه را قفل کرده است.', 'polymart-ai' );
+			} elseif ( $allow_progress_clean ) {
+				delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+				$meta['progress'] = '';
 			}
-
-			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 		}
 
 		$decoded = json_decode( $stored, true );
 
 		if ( ! is_array( $decoded ) ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
-
-			return false;
+			$codes[]    = 'json_decode_failed';
+			$messages[] = __( 'JSON ترجمه Elementor قابل decode نیست.', 'polymart-ai' );
+		} else {
+			$meta['json_valid'] = true;
 		}
 
-		if ( ! self::is_elementor_translation_finalized( $post_id, $lang ) ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
-
-			return false;
+		if ( ! $finalized ) {
+			$codes[]    = 'not_finalized';
+			$messages[] = __( 'ترجمه Elementor نهایی‌سازی (finalized) نشده است.', 'polymart-ai' );
 		}
 
-		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
-			self::$elementor_storefront_serve_cache[ $key ] = false;
-
-			return false;
+		if ( $has_persian ) {
+			$codes[]    = 'stored_has_persian';
+			$messages[] = __( 'JSON ترجمه‌شده هنوز فیلدهای فارسی whitelist دارد.', 'polymart-ai' );
 		}
 
-		self::$elementor_storefront_serve_cache[ $key ] = self::is_elementor_translation_current( $post_id, $lang, $stored );
+		if ( ! $hash_current ) {
+			$codes[]    = 'source_hash_stale';
+			$messages[] = __( 'هش منبع Elementor با JSON فارسی فعلی جور نیست (منبع عوض شده).', 'polymart-ai' );
+		}
 
-		return self::$elementor_storefront_serve_cache[ $key ];
+		$codes = array_values( array_unique( $codes ) );
+
+		return array(
+			'ok'       => empty( $codes ),
+			'codes'    => $codes,
+			'messages' => array_values( array_unique( $messages ) ),
+			'meta'     => $meta,
+		);
 	}
 
 	public static function get_max_storefront_elementor_json_bytes() {

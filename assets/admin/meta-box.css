@@ -236,6 +236,11 @@
 	align-items: center;
 }
 
+.polymart-ai-metabox__warning-inline {
+	color: #b32d2e;
+	font-weight: 600;
+}
+
 .polymart-ai-metabox__elementor-notice {
 	margin: 0;
 }

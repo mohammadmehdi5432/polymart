@@ -396,8 +396,21 @@
 			if (elementor.long_remaining_count > 0) {
 				html += '<li>' + (config.strings.elementorLongRemaining || 'متن‌های بلند مانده') + ': ' + elementor.long_remaining_count + '</li>';
 			}
-			if (elementor.filtered_out_count > 0) {
-				html += '<li>' + (config.strings.elementorFilteredOut || 'فیلترشده (HTML/ایمنی)') + ': ' + elementor.filtered_out_count + '</li>';
+			if (elementor.media_url_skipped_count > 0) {
+				html += '<li>' + (config.strings.elementorMediaUrls || 'URL رسانه با نام فارسی (متن صفحه نیست)') + ': ' + elementor.media_url_skipped_count + '</li>';
+			}
+			if (elementor.filtered_other_count > 0) {
+				html += '<li>' + (config.strings.elementorFilteredOut || 'فیلترشده (کلید غیروایت‌لیست / HTML)') + ': ' + elementor.filtered_other_count + '</li>';
+			} else if (elementor.filtered_out_count > 0 && !(elementor.media_url_skipped_count > 0)) {
+				html += '<li>' + (config.strings.elementorFilteredOut || 'فیلترشده (کلید غیروایت‌لیست / HTML)') + ': ' + elementor.filtered_out_count + '</li>';
+			}
+			if (elementor.can_serve_storefront === false && elementor.has_saved_json) {
+				html += '<li class="polymart-ai-metabox__warning-inline">' + (config.strings.elementorNotServed || 'روی /en/ سرو نمی‌شود') + '</li>';
+			} else if (elementor.can_serve_storefront) {
+				html += '<li>' + (config.strings.elementorServedOk || 'آماده سرو روی /en/') + '</li>';
+			}
+			if (elementor.storefront_persian) {
+				html += '<li class="polymart-ai-metabox__warning-inline">' + (config.strings.elementorStorefrontPersian || 'فروشگاه هنوز منبع فارسی نشان می‌دهد') + '</li>';
 			}
 			if (elementor.chunk_progress) {
 				html += '<li>' + (config.strings.elementorChunks || '') + ': ' + elementor.chunk_progress;
@@ -438,11 +451,26 @@
 				html += '</ul>';
 			}
 
+			if ((elementor.serve_block_messages || []).length) {
+				html += '<p class="polymart-ai-metabox__warning"><strong>' + (config.strings.elementorServeBlocked || 'چرا /en/ فارسی می‌ماند:') + '</strong></p>';
+				html += '<ul class="polymart-ai-metabox__scan-list polymart-ai-metabox__scan-list--missing">';
+				elementor.serve_block_messages.forEach(function (msg) {
+					html += '<li>' + msg + '</li>';
+				});
+				html += '</ul>';
+				html += '<p class="description">' + (config.strings.forceRetranslateHint || 'برای ترجمه از صفر همین زبان: Shift + کلیک روی «ترجمه و تکمیل این زبان».') + '</p>';
+			}
+
 			if ((elementor.filtered_out_samples || []).length) {
 				html += '<p class="description">' + (config.strings.elementorFilteredOutHint || 'این فیلدها در JSON فارسی دارند ولی فعلاً در صف ترجمه نیستند:') + '</p>';
 				html += '<ul class="polymart-ai-metabox__scan-list polymart-ai-metabox__scan-list--missing">';
 				elementor.filtered_out_samples.forEach(function (sample) {
-					html += '<li><code class="polymart-ai-metabox__path">' + sample.path + '</code> — ' + sample.preview + '</li>';
+					const kindLabel = sample.kind === 'media_url'
+						? (config.strings.elementorKindMedia || 'رسانه')
+						: (sample.kind === 'blocked_key'
+							? (config.strings.elementorKindBlocked || 'کلید مسدود')
+							: (config.strings.elementorKindOther || 'سایر'));
+					html += '<li><code class="polymart-ai-metabox__path">' + sample.path + '</code> [' + kindLabel + '] — ' + sample.preview + '</li>';
 				});
 				html += '</ul>';
 			}
@@ -486,8 +514,16 @@
 			html += '</ul>';
 		} else if (!fields.length && !elementor.active) {
 			html += '<p>' + (config.strings.scanEmpty || '') + '</p>';
-		} else if (!missing.length && !(elementor.remaining_field_count > 0)) {
+		} else if (
+			!missing.length
+			&& !(elementor.remaining_field_count > 0)
+			&& scan.status === 'translated'
+			&& !elementor.storefront_persian
+			&& elementor.can_serve_storefront !== false
+		) {
 			html += '<p>' + (config.strings.scanComplete || '') + '</p>';
+		} else if (!missing.length && !(elementor.remaining_field_count > 0) && (elementor.storefront_persian || elementor.can_serve_storefront === false)) {
+			html += '<p class="polymart-ai-metabox__warning">' + (config.strings.scanLooksDoneButFrontFa || 'صف فیلدها خالی است ولی فروشگاه هنوز فارسی سرو می‌کند — ترجمه از صفر (Shift+«ترجمه و تکمیل») یا دیاگ صف را ببینید.') + '</p>';
 		}
 
 		if (done.length) {

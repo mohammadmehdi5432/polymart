@@ -1143,20 +1143,30 @@ trait Trait_Job_State {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$empty   = array(
-			'active'                 => false,
-			'source_field_count'     => 0,
-			'remaining_field_count'  => 0,
-			'translated_field_count' => 0,
-			'chunk_done'             => 0,
-			'chunk_total'            => 0,
-			'chunk_progress'         => '',
-			'partial_phase'          => '',
-			'has_saved_json'         => false,
-			'saved_json_has_persian' => false,
-			'remaining_samples'      => array(),
-			'lock'                   => self::get_translation_lock_status( $post_id, $lang ),
-			'bulk_job_running'       => \PolymartAI\Activity_Logger::is_bulk_job_running(),
-			'bulk_job_on_post'       => false,
+			'active'                    => false,
+			'source_field_count'        => 0,
+			'remaining_field_count'     => 0,
+			'translated_field_count'    => 0,
+			'chunk_done'                => 0,
+			'chunk_total'               => 0,
+			'chunk_progress'            => '',
+			'partial_phase'             => '',
+			'has_saved_json'            => false,
+			'saved_json_has_persian'    => false,
+			'can_serve_storefront'      => false,
+			'storefront_persian'        => false,
+			'serve_block_codes'         => array(),
+			'serve_block_messages'      => array(),
+			'serve_meta'                => array(),
+			'gap_reason'                => '',
+			'remaining_samples'         => array(),
+			'filtered_out_count'        => 0,
+			'media_url_skipped_count'   => 0,
+			'filtered_other_count'      => 0,
+			'filtered_out_samples'      => array(),
+			'lock'                      => self::get_translation_lock_status( $post_id, $lang ),
+			'bulk_job_running'          => \PolymartAI\Activity_Logger::is_bulk_job_running(),
+			'bulk_job_on_post'          => false,
 		);
 
 		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
@@ -1250,6 +1260,16 @@ trait Trait_Job_State {
 		$filtered_probe         = self::collect_elementor_filtered_out_payload( $data );
 		$api_payload_samples    = array();
 		$sample_index           = 0;
+		$media_url_count        = 0;
+		$filtered_other_count   = 0;
+
+		foreach ( $filtered_probe as $filtered_item ) {
+			if ( 'media_url' === (string) ( $filtered_item['kind'] ?? '' ) ) {
+				++$media_url_count;
+			} else {
+				++$filtered_other_count;
+			}
+		}
 
 		foreach ( array_slice( $job_payload['payload'], 0, 4, true ) as $path => $text ) {
 			$api_payload_samples[] = array(
@@ -1258,6 +1278,9 @@ trait Trait_Job_State {
 			);
 			++$sample_index;
 		}
+
+		$serve_explain = self::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
+		$gap_reason    = self::describe_translation_gap( $post_id, $lang );
 
 		return array(
 			'active'                 => true,
@@ -1276,16 +1299,25 @@ trait Trait_Job_State {
 			'pending_api_chunks'     => count( $chunk_queue['pending'] ),
 			'has_saved_json'         => is_string( $saved_raw ) && '' !== trim( $saved_raw ),
 			'saved_json_has_persian' => self::stored_elementor_translation_has_persian( $post_id, $lang ),
+			'can_serve_storefront'   => ! empty( $serve_explain['ok'] ),
+			'storefront_persian'     => self::storefront_would_show_persian_source( $post_id, $lang ),
+			'serve_block_codes'      => array_values( array_map( 'strval', (array) ( $serve_explain['codes'] ?? array() ) ) ),
+			'serve_block_messages'   => array_values( array_map( 'strval', (array) ( $serve_explain['messages'] ?? array() ) ) ),
+			'serve_meta'             => is_array( $serve_explain['meta'] ?? null ) ? $serve_explain['meta'] : array(),
+			'gap_reason'             => $gap_reason,
 			'remaining_samples'      => $samples,
 			'long_field_count'       => $long_field_count,
 			'long_remaining_count'   => $long_remaining_count,
 			'filtered_out_count'     => count( $filtered_probe ),
+			'media_url_skipped_count'=> $media_url_count,
+			'filtered_other_count'   => $filtered_other_count,
 			'filtered_out_samples'   => array_slice(
 				array_map(
 					static function ( $item ) {
 						return array(
 							'path'    => (string) ( $item['path'] ?? '' ),
 							'preview' => wp_trim_words( wp_strip_all_tags( html_entity_decode( (string) ( $item['preview'] ?? '' ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ), 12, '…' ),
+							'kind'    => (string) ( $item['kind'] ?? 'other' ),
 						);
 					},
 					array_values( $filtered_probe )
