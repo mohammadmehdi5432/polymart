@@ -635,6 +635,7 @@ trait Trait_Job_State {
 	public static function elementor_recovery_should_force_finalize( $post_id, $lang, array $job = array() ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
+		unset( $job );
 
 		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
 			return false;
@@ -646,20 +647,27 @@ trait Trait_Job_State {
 			return false;
 		}
 
-		$state    = self::get_job_partial_state( $post_id, $lang );
-		$attempts = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
-		$ghost    = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
-		$retried  = $attempts >= 1 || $ghost >= 1;
+		$state = self::hydrate_elementor_job_partial_state(
+			$post_id,
+			$lang,
+			self::get_job_partial_state( $post_id, $lang )
+		);
 
-		if ( ! $retried ) {
-			return false;
-		}
-
+		// Never kick/ensure-force while stubborn is still chewing __segN batches.
+		// Old rule (ghost>=1 OR repair>=1) closed #1021 mid-progress with Persian EN JSON.
 		$stubborn = self::elementor_job_has_stubborn_remaining( $post_id, $lang )
 			|| ! empty( $state['elementor_gap_fill'] )
 			|| ! empty( $state['elementor_gap_fill_stubborn_only'] );
 
-		return $stubborn || $remaining < 3;
+		if ( $stubborn ) {
+			return self::elementor_should_force_finalize_in_pipeline( $post_id, $lang, $state );
+		}
+
+		// Non-stubborn leftovers: require real stall evidence, not a single recovery tick.
+		$attempts = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
+		$ghost    = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
+
+		return ( $attempts >= 3 && $remaining <= 2 ) || ( $ghost >= 3 && $remaining <= 2 );
 	}
 
 	/**

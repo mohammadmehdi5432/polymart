@@ -83,6 +83,8 @@ trait Trait_Job_Elementor {
 		if (
 			Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
 			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			&& Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
+			&& ! Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
 		) {
 			self::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
 
@@ -607,7 +609,11 @@ trait Trait_Job_Elementor {
 			return;
 		}
 
-		if ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+		if (
+			Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			|| Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
+			|| ! Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
+		) {
 			return;
 		}
 

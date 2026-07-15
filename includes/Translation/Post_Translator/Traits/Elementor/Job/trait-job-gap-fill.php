@@ -288,7 +288,7 @@ trait Trait_Job_Gap_Fill {
 		}
 
 		if ( self::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-stubborn-handoff' ) ) {
-			return self::pipeline_force_finalize_success_response( 'pipeline-stubborn-handoff' );
+			return self::pipeline_force_finalize_if_storefront_ready( $post_id, $lang, 'pipeline-stubborn-handoff' );
 		}
 
 		\PolymartAI\Activity_Logger::schedule_elementor_partial_follow_up( 0 );
@@ -675,6 +675,8 @@ trait Trait_Job_Gap_Fill {
 	}
 
 	private static function pipeline_force_finalize_success_response( $context ) {
+		// Caller must only invoke this after storefront-ready English is verified.
+		// Returning done=true blindly was marking #1021 successful while EN still had FA.
 		return array(
 			'done'           => true,
 			'phase'          => 'elementor',
@@ -684,6 +686,40 @@ trait Trait_Job_Gap_Fill {
 				__( 'ترجمه Elementor با تکمیل اجباری ذخیره شد (%1$s).', 'polymart-ai' ),
 				sanitize_text_field( (string) $context )
 			),
+		);
+	}
+
+	/**
+	 * Only emit a done=true pipeline response when EN Elementor JSON is clean English.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Lang.
+	 * @param string $context Tag.
+	 * @return array Slice response.
+	 */
+	private static function pipeline_force_finalize_if_storefront_ready( $post_id, $lang, $context ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if (
+			$post_id > 0
+			&& '' !== $lang
+			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
+		) {
+			return self::pipeline_force_finalize_success_response( $context );
+		}
+
+		return array(
+			'done'           => false,
+			'phase'          => 'elementor',
+			'phase_progress' => self::format_elementor_job_progress_marker(
+				$post_id,
+				$lang,
+				self::get_job_partial_state( $post_id, $lang )
+			),
+			'message'        => __( 'Elementor هنوز فارسی دارد — تکمیل اجباری رد شد؛ ادامه gap-fill.', 'polymart-ai' ),
+			'recoverable'    => true,
 		);
 	}
 
@@ -845,7 +881,7 @@ trait Trait_Job_Gap_Fill {
 		if ( ! empty( $remaining ) ) {
 			if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
 				if ( self::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-slice-primary-done' ) ) {
-					return self::pipeline_force_finalize_success_response( 'pipeline-slice-primary-done' );
+					return self::pipeline_force_finalize_if_storefront_ready( $post_id, $lang, 'pipeline-slice-primary-done' );
 				}
 
 				$stored_total  = self::read_elementor_slice_cursor_total( $post_id, $lang );

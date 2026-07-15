@@ -134,25 +134,26 @@ trait Trait_Translation_Status {
 				$status = 'partial';
 			} elseif (
 				self::uses_elementor_builder( $post_id )
+				&& (
+					self::stored_elementor_translation_has_persian( $post_id, $lang )
+					|| self::storefront_would_show_persian_source( $post_id, $lang )
+					|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+					|| (
+						self::has_elementor_persian_content( $post_id )
+						&& ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang )
+					)
+				)
+			) {
+				// Must run BEFORE finalized+!remaining — that old order called #1021
+				// "translated" while /en/ still served Persian source.
+				$status = 'partial';
+			} elseif (
+				self::uses_elementor_builder( $post_id )
 				&& self::is_elementor_translation_finalized( $post_id, $lang )
+				&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 				&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
 			) {
 				$status = 'translated';
-			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
-				$status = 'partial';
-			} elseif (
-				self::uses_elementor_builder( $post_id )
-				&& self::elementor_job_has_remaining_payload( $post_id, $lang )
-			) {
-				$status = 'partial';
-			} elseif (
-				self::uses_elementor_builder( $post_id )
-				&& self::has_elementor_persian_content( $post_id )
-				&& ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang )
-			) {
-				$status = 'partial';
-			} elseif ( self::storefront_would_show_persian_source( $post_id, $lang ) ) {
-				$status = 'partial';
 			}
 		}
 

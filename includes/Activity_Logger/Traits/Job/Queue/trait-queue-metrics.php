@@ -1056,22 +1056,24 @@ trait Trait_Queue_Metrics {
 		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
 			Post_Translator::bind_elementor_accepted_paths_context( $post_id, $lang );
 
+			// EN JSON with Persian is never "translated" — even if meta says finalized
+			// and remaining_payload is empty after accepted fallbacks (#1021 storefront bug).
+			if (
+				Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
+				|| Post_Translator::storefront_would_show_persian_source( $post_id, $lang )
+				|| Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			) {
+				return 'partial';
+			}
+
 			if (
 				Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+				&& Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
 				&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
 			) {
 				return 'translated';
-			}
-		}
-
-		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
-			if (
-				Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
-				|| Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang )
-				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
-				|| Post_Translator::storefront_would_show_persian_source( $post_id, $lang )
-			) {
-				return 'partial';
 			}
 		}
 
