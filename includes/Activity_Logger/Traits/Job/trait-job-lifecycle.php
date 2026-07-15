@@ -768,6 +768,139 @@ trait Trait_Job_Lifecycle {
 	}
 
 	/**
+	 * Pin a remaining post as the next / current Elementor target for the bulk job.
+	 *
+	 * Used by Auto-Translate UI «الان این را ترجمه کن» so the user can jump
+	 * between backlog pages without waiting for the natural queue order.
+	 *
+	 * @param int $post_id Post ID to focus.
+	 * @return array|\WP_Error Normalized job or error.
+	 */
+	public static function focus_job_on_post( $post_id ) {
+		$job     = self::get_job_raw();
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$status  = (string) ( $job['status'] ?? 'idle' );
+
+		if ( $post_id <= 0 ) {
+			return new \WP_Error(
+				'polymart_ai_no_focus_target',
+				__( 'موردی برای اولویت‌بندی مشخص نیست.', 'polymart-ai' )
+			);
+		}
+
+		if ( ! in_array( $status, array( 'running', 'paused' ), true ) ) {
+			return new \WP_Error(
+				'polymart_ai_focus_needs_job',
+				__( 'ابتدا ترجمه خودکار را Start یا Resume کنید، سپس صفحه را اولویت دهید.', 'polymart-ai' )
+			);
+		}
+
+		if ( '' === $lang ) {
+			$lang = 'en';
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post ) {
+			return new \WP_Error(
+				'polymart_ai_invalid_focus_post',
+				__( 'پست انتخاب‌شده معتبر نیست.', 'polymart-ai' )
+			);
+		}
+
+		// Pull out of Skip / park lists so the picker can see it again.
+		$exhausted = self::get_exhausted_job_post_ids( $job );
+		$job['exhausted_ids'] = array_values(
+			array_filter(
+				$exhausted,
+				static function ( $id ) use ( $post_id ) {
+					return (int) $id !== $post_id;
+				}
+			)
+		);
+
+		$job['parked_ids'] = array_values(
+			array_filter(
+				self::get_parked_ids( $job ),
+				static function ( $id ) use ( $post_id ) {
+					return (int) $id !== $post_id;
+				}
+			)
+		);
+
+		$prev_partial = absint( $job['partial_post_id'] ?? 0 );
+		$prev_current = absint( $job['current_post_id'] ?? 0 );
+
+		foreach ( array_unique( array_filter( array( $prev_partial, $prev_current ) ) ) as $locked_id ) {
+			if ( $locked_id !== $post_id && '' !== $lang ) {
+				Post_Translator::release_translation_lock( $locked_id, $lang, true );
+			}
+		}
+
+		self::release_step_lock();
+		self::remove_post_from_deferred_queue( $job, $post_id );
+
+		$deferred   = self::get_deferred_queue( $job );
+		array_unshift( $deferred, $post_id );
+		$job['deferred_queue'] = array_values( array_unique( array_map( 'absint', $deferred ) ) );
+
+		$job['current_post_id']        = null;
+		$job['step_started_at']        = null;
+		$job['consecutive_post_id']    = 0;
+		$job['consecutive_post_steps'] = 0;
+		$job['stuck_progress_steps']   = 0;
+		$job['last_error']             = null;
+		$job['pause_reason']           = null;
+		$job['step_deferred']          = false;
+		$job['step_deferred_reason']   = null;
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
+			self::pin_job_for_elementor_post( $job, $post_id, $lang );
+		} else {
+			$job['partial_post_id']  = $post_id;
+			$job['partial_phase']    = 'core';
+			$job['partial_progress'] = null;
+		}
+
+		self::set_job_last_step(
+			$job,
+			$post_id,
+			'focused',
+			sprintf(
+				/* translators: 1: post ID, 2: title */
+				__( 'اولویت‌بندی شد — #%1$d «%2$s» بعدی ترجمه می‌شود.', 'polymart-ai' ),
+				$post_id,
+				get_the_title( $post_id ) ?: '#' . $post_id
+			)
+		);
+
+		self::sync_job_remaining( $job, $lang );
+		self::save_job( $job );
+
+		// Drop zombie AS for previous pin and spawn a fresh tick for the focused post.
+		Job_Action_Scheduler::cancel_all();
+		Job_Action_Scheduler::clear_slice_mutex();
+
+		if ( 'running' === ( $job['status'] ?? '' ) ) {
+			self::schedule_background_worker();
+		}
+
+		self::log(
+			'info',
+			sprintf(
+				/* translators: 1: post ID, 2: title */
+				__( 'اولویت کاربر: #%1$d «%2$s» به سر صف ترجمه منتقل شد.', 'polymart-ai' ),
+				$post_id,
+				get_the_title( $post_id ) ?: '#' . $post_id
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang )
+		);
+
+		return self::normalize_job_for_response( $job, false );
+	}
+
+	/**
 	 * Whether a post was Skip'd (in exhausted_ids) for the active bulk job.
 	 *
 	 * @param int $post_id Post ID.

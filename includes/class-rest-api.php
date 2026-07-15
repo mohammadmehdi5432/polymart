@@ -1749,6 +1749,10 @@ final class REST_API {
 				$post_id = absint( $request->get_param( 'post_id' ) );
 				$result  = Activity_Logger::skip_current_job_post( $post_id );
 				break;
+			case 'focus':
+				$post_id = absint( $request->get_param( 'post_id' ) );
+				$result  = Activity_Logger::focus_job_on_post( $post_id );
+				break;
 			case 'kick':
 				// Heavy tick — prefer ensure from the SPA; kick is recovery/debug.
 				$result = Activity_Logger::kick_worker();

@@ -389,18 +389,88 @@ trait Trait_Job_Runner {
 							$state['elementor_chunks_total'] = $progress_total;
 							// Fall through to the API batch loop below.
 						} else {
-							self::save_job_partial_state( $post_id, $lang, $state );
+							// Dead-end escape: empty queue + incomplete at e.g. 14/19 must NOT
+							// spin forever. Lock primary schedule complete and hand off to gap-fill.
+							$progress_total = max(
+								$progress_total,
+								absint( $state['elementor_chunks_total'] ?? 0 ),
+								self::read_elementor_slice_cursor_total( $post_id, $lang ),
+								1
+							);
+							$state['elementor_chunks_total']         = $progress_total;
+							$state['elementor_primary_batches_done'] = $progress_total;
+							$state['elementor_gap_fill']             = true;
+							$state['elementor_empty_queue_escapes']  = absint( $state['elementor_empty_queue_escapes'] ?? 0 ) + 1;
+							self::write_elementor_slice_cursor( $post_id, $lang, $progress_total, $progress_total );
+							self::persist_elementor_primary_batches_done( $post_id, $lang, $progress_total );
 
-							return array(
-								'done'           => false,
-								'phase'          => 'elementor',
-								'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-								'message'        => self::format_elementor_job_slice_status_message(
+							$map     = self::merge_elementor_path_map( $post_id, $lang, $data, $map );
+							$map     = self::sanitize_elementor_translation_map( $map, $source_payload );
+							$skipped = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+							$state['elementor_map'] = $map;
+
+							\PolymartAI\Activity_Logger::log(
+								'warning',
+								sprintf(
+									/* translators: 1: post ID, 2: progress marker */
+									__( 'Elementor — #%1$d: صف خالی در %2$s — قفل primary و ورود به gap-fill/سخت‌جان.', 'polymart-ai' ),
+									$post_id,
+									self::format_elementor_job_progress_marker( $post_id, $lang, $state )
+								),
+								array( 'post_id' => $post_id, 'lang' => $lang )
+							);
+
+							if ( self::elementor_job_map_has_no_remaining( $source_payload, $map, $skipped ) ) {
+								return self::finalize_elementor_stubborn_handoff_success(
 									$post_id,
 									$lang,
-									array_merge( $state, array( 'elementor_map' => $map ) )
-								),
-								'recoverable'    => true,
+									$data,
+									$state,
+									$map,
+									$source_payload,
+									$text_mirrors,
+									$progress_total
+								);
+							}
+
+							// After repeated empty escapes, force-finalize instead of ghosting.
+							if ( absint( $state['elementor_empty_queue_escapes'] ?? 0 ) >= 3 ) {
+								\PolymartAI\Activity_Logger::log(
+									'warning',
+									sprintf(
+										/* translators: 1: post ID */
+										__( 'Elementor — #%1$d: ۳ بار صف خالی ناقص — تکمیل اجباری با fallback.', 'polymart-ai' ),
+										$post_id
+									),
+									array( 'post_id' => $post_id, 'lang' => $lang )
+								);
+
+								return self::force_finalize_elementor_job_with_fallback(
+									$post_id,
+									$lang,
+									$data,
+									$state,
+									$map,
+									$source_payload,
+									$text_mirrors,
+									$progress_total
+								);
+							}
+
+							self::save_job_partial_state( $post_id, $lang, $state );
+
+							return self::run_elementor_stubborn_handoff_tick(
+								$post_id,
+								$lang,
+								$data,
+								$state,
+								$map,
+								$source_payload,
+								$text_mirrors,
+								$api_key,
+								$api_endpoint,
+								$ai_model,
+								$progress_total
 							);
 						}
 					} else {

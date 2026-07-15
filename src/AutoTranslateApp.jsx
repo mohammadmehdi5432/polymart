@@ -1293,6 +1293,49 @@ export default function AutoTranslateApp() {
     }
   };
 
+  const handleFocusPost = async (postId) => {
+    const id = Number(postId) || 0;
+
+    if (!id || Boolean(actionPending)) {
+      return;
+    }
+
+    if (!job || !['running', 'paused'].includes(job.status)) {
+      setNotice({
+        type: 'error',
+        message: 'ابتدا ترجمه خودکار را Start کنید، بعد صفحه را اولویت دهید.',
+      });
+      return;
+    }
+
+    setNotice(null);
+    setActionPending(`focus-${id}`);
+    abortJobStep();
+
+    try {
+      const jobLang = job?.lang || targetLang;
+      const data = await jobAction('focus', jobLang, { post_id: id });
+      setJob(data);
+      appendLog(`اولویت: #${id} به سر صف ترجمه منتقل شد.`, 'success');
+      setNotice({
+        type: 'success',
+        message: `صفحه #${id} الان اولویت دارد و بعدی ترجمه می‌شود.`,
+      });
+
+      if (data?.status === 'running') {
+        await ensureServerWorker();
+      }
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: error?.response?.data?.message || 'اولویت‌بندی ناموفق بود.',
+      });
+      await loadJob();
+    } finally {
+      setActionPending(null);
+    }
+  };
+
   const handlePause = async () => {
     writeAutoRunFlag(false);
     abortJobStep();
@@ -2073,8 +2116,9 @@ export default function AutoTranslateApp() {
           <div>
             <h3 className="text-base font-semibold text-gray-900">برگه‌های باقی‌مانده</h3>
             <p className="mt-1 text-xs text-pmai-muted">
-              برگه‌هایی که برای <strong>{targetLabel}</strong> هنوز ترجمه کامل ندارند — روی «ویرایش برگه» برو
-              و از متاباکس پلی‌مارت اسکن و ترجمه را انجام بده.
+              برگه‌هایی که برای <strong>{targetLabel}</strong> هنوز ترجمه کامل ندارند. با دکمه
+              «الان این را ترجمه کن» همان برگه را به سر صف کارگر ببرید (ترجمه خودکار باید
+              Start یا Pause باشد).
             </p>
           </div>
           <button
@@ -2130,7 +2174,25 @@ export default function AutoTranslateApp() {
                         </p>
                       ) : null}
                     </div>
-                    <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                    <div className="flex shrink-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+                      <button
+                        type="button"
+                        onClick={() => handleFocusPost(item.post_id)}
+                        disabled={
+                          Boolean(actionPending) ||
+                          !job ||
+                          !['running', 'paused'].includes(job.status) ||
+                          Number(job?.partial_post_id) === Number(item.post_id)
+                        }
+                        className="inline-flex cursor-pointer items-center justify-center rounded-lg bg-pmai-primary px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                        title="این صفحه را الان به سر صف ترجمه ببر"
+                      >
+                        {actionPending === `focus-${item.post_id}`
+                          ? 'در حال اولویت…'
+                          : Number(job?.partial_post_id) === Number(item.post_id)
+                            ? 'در حال ترجمه'
+                            : 'الان این را ترجمه کن'}
+                      </button>
                       {item.edit_url ? (
                         <a
                           href={item.edit_url}
