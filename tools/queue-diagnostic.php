@@ -8,7 +8,7 @@
  *   Queue sim: /wp-admin/admin.php?page=polymart-ai-queue-debug&view=queue
  *   Remaining: /wp-admin/admin.php?page=polymart-ai-queue-debug&view=remaining
  *   Mismatch:  /wp-admin/admin.php?page=polymart-ai-queue-debug&view=mismatch
- *   Post:      /wp-admin/admin.php?page=polymart-ai-queue-debug&view=post&post_id=1041&lang=en&format=json
+ *   Post:      /wp-admin/admin.php?page=polymart-ai-queue-debug&view=post&post_id=1021&lang=en&format=json
  *   JSON:      append &format=json  OR  admin-ajax.php?action=polymart_ai_queue_debug&view=summary&lang=en
  *   Compact:   add &compact=1 (summary JSON only — short)
  *
