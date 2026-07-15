@@ -550,6 +550,151 @@ trait Trait_Job_State {
 	}
 
 	/**
+	 * Count Elementor fields still needing translation.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return int
+	 */
+	public static function count_elementor_remaining_fields( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return 0;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return 0;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return 0;
+		}
+
+		$state          = self::get_job_partial_state( $post_id, $lang );
+		$source_payload = self::collect_elementor_translation_payload( $data );
+		$map            = self::merge_elementor_job_path_map(
+			$post_id,
+			$lang,
+			$data,
+			is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array()
+		);
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+
+		return count( self::filter_remaining_elementor_payload( $source_payload, $map, $skipped ) );
+	}
+
+	/**
+	 * Record a kick/recovery attempt without rebuilding the Elementor chunk queue.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return int Updated attempt count.
+	 */
+	public static function note_elementor_queue_repair_attempt( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return 0;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		if ( ! is_array( $state ) ) {
+			$state = array();
+		}
+
+		$state['elementor_queue_repair_attempts'] = absint( $state['elementor_queue_repair_attempts'] ?? 0 ) + 1;
+		self::save_job_partial_state( $post_id, $lang, $state );
+
+		return (int) $state['elementor_queue_repair_attempts'];
+	}
+
+	/**
+	 * Whether a stalled recovery should force-save partial Elementor work instead of re-chaining.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Target language code.
+	 * @param array<string, mixed> $job     Optional bulk job snapshot.
+	 * @return bool
+	 */
+	public static function elementor_recovery_should_force_finalize( $post_id, $lang, array $job = array() ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$remaining = self::count_elementor_remaining_fields( $post_id, $lang );
+
+		if ( $remaining <= 0 ) {
+			return false;
+		}
+
+		$state    = self::get_job_partial_state( $post_id, $lang );
+		$attempts = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
+		$ghost    = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
+		$retried  = $attempts >= 1 || $ghost >= 1;
+
+		if ( ! $retried ) {
+			return false;
+		}
+
+		$stubborn = self::elementor_job_has_stubborn_remaining( $post_id, $lang )
+			|| ! empty( $state['elementor_gap_fill'] )
+			|| ! empty( $state['elementor_gap_fill_stubborn_only'] );
+
+		return $stubborn || $remaining < 3;
+	}
+
+	/**
+	 * Whether kick/recovery must skip destructive Elementor queue rebuilds.
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Target language code.
+	 * @param array<string, mixed> $job     Optional bulk job snapshot.
+	 * @return bool
+	 */
+	public static function elementor_recovery_should_skip_queue_repair( $post_id, $lang, array $job = array() ) {
+		if ( self::elementor_recovery_should_force_finalize( $post_id, $lang, $job ) ) {
+			return true;
+		}
+
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$remaining = self::count_elementor_remaining_fields( $post_id, $lang );
+
+		if ( $remaining <= 0 ) {
+			return false;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		return self::elementor_job_has_stubborn_remaining( $post_id, $lang )
+			|| ! empty( $state['elementor_gap_fill'] )
+			|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
+			|| (
+				$remaining < 3
+				&& (
+					self::elementor_job_primary_batches_exhausted( $post_id, $lang )
+					|| self::elementor_primary_schedule_locked( $post_id, $lang, $state )
+				)
+			);
+	}
+
+	/**
 	 * Unstick Elementor when the primary schedule/cursor blocks API chunks but fields remain.
 	 *
 	 * @return bool True when queue/cursor/primary lock was repaired.
@@ -594,6 +739,14 @@ trait Trait_Job_State {
 			return self::repair_completed_elementor_job_meta( $post_id, $lang );
 		}
 
+		if ( self::elementor_recovery_should_force_finalize( $post_id, $lang ) ) {
+			return self::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'queue-repair-force' );
+		}
+
+		if ( self::elementor_recovery_should_skip_queue_repair( $post_id, $lang ) ) {
+			return false;
+		}
+
 		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
 		$done           = (int) $chunk_progress['done'];
 		$total          = max( 1, (int) $chunk_progress['total'] );
@@ -613,6 +766,12 @@ trait Trait_Job_State {
 
 		if ( ! $primary_blocked && $done >= $total ) {
 			return false;
+		}
+
+		self::note_elementor_queue_repair_attempt( $post_id, $lang );
+
+		if ( self::elementor_recovery_should_force_finalize( $post_id, $lang ) ) {
+			return self::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'queue-repair-reset' );
 		}
 
 		self::clear_elementor_primary_batches_lock( $post_id, $lang );
@@ -827,6 +986,14 @@ trait Trait_Job_State {
 		$remaining = self::filter_remaining_elementor_payload( $source, $map, $skipped );
 
 		if ( empty( $remaining ) ) {
+			return false;
+		}
+
+		if ( self::elementor_recovery_should_force_finalize( $post_id, $lang ) ) {
+			return self::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'unblock-force' );
+		}
+
+		if ( self::elementor_recovery_should_skip_queue_repair( $post_id, $lang ) ) {
 			return false;
 		}
 

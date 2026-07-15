@@ -1063,6 +1063,35 @@ trait Trait_Job_Gap_Fill {
 
 		self::persist_elementor_stubborn_field_diagnostics( $report );
 
+		$compact = array();
+
+		foreach ( $report['fields'] as $field ) {
+			$compact[] = array(
+				'path'   => (string) ( $field['path'] ?? '' ),
+				'reason' => (string) ( $field['reason'] ?? '' ),
+				'detail' => (string) ( $field['detail'] ?? '' ),
+			);
+		}
+
+		$json_line = wp_json_encode( $compact );
+
+		if ( false !== $json_line && '' !== $json_line ) {
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: JSON field diagnostics */
+					__( 'Stubborn JSON — #%1$d: %2$s', 'polymart-ai' ),
+					$post_id,
+					$json_line
+				),
+				array(
+					'post_id' => $post_id,
+					'lang'    => $lang,
+					'context' => $context,
+				)
+			);
+		}
+
 		foreach ( $report['fields'] as $field ) {
 			$content = is_array( $field['content'] ?? null ) ? $field['content'] : array();
 			$flags   = self::format_stubborn_content_flags_label( $content );
@@ -1698,6 +1727,88 @@ trait Trait_Job_Gap_Fill {
 		}
 
 		return compact( 'completed', 'touched' );
+	}
+
+	/**
+	 * Force-save partial Elementor progress during kick/recovery (no chunk-queue rebuild).
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @param string $context Recovery context tag.
+	 * @return bool True when finalize ran.
+	 */
+	public static function force_finalize_elementor_job_from_recovery( $post_id, $lang, $context = 'kick-recovery' ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$context = sanitize_text_field( (string) $context );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( self::count_elementor_remaining_fields( $post_id, $lang ) <= 0 ) {
+			return false;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$source_data = json_decode( $raw, true );
+
+		if ( ! is_array( $source_data ) ) {
+			return false;
+		}
+
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+		$state          = self::hydrate_elementor_job_partial_state(
+			$post_id,
+			$lang,
+			self::get_job_partial_state( $post_id, $lang )
+		);
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$map            = self::merge_elementor_job_path_map(
+			$post_id,
+			$lang,
+			$source_data,
+			is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array()
+		);
+		$text_mirrors   = self::get_elementor_text_mirror_paths( $source_payload );
+		$map            = self::expand_elementor_map_mirrors( $map, $text_mirrors );
+		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$progress_total = max( 1, (int) ( $chunk_progress['total'] ?? 1 ) );
+
+		self::bind_elementor_segment_passthrough_context( $state );
+
+		$remaining = self::count_elementor_remaining_fields( $post_id, $lang );
+
+		\PolymartAI\Activity_Logger::log(
+			'warning',
+			sprintf(
+				/* translators: 1: post ID, 2: remaining fields, 3: context */
+				__( 'Elementor — #%1$d: تکمیل اجباری از بازیابی — %2$d فیلد stubborn باقی (%3$s)', 'polymart-ai' ),
+				$post_id,
+				$remaining,
+				$context
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang, 'context' => $context )
+		);
+
+		$result = self::force_finalize_elementor_job_with_fallback(
+			$post_id,
+			$lang,
+			$source_data,
+			$state,
+			$map,
+			$source_payload,
+			$text_mirrors,
+			$progress_total
+		);
+
+		return ! is_wp_error( $result ) && is_array( $result ) && ! empty( $result['done'] );
 	}
 
 	private static function resolve_elementor_stubborn_api_budget( $max_fields ) {

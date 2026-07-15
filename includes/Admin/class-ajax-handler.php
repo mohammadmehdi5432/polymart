@@ -869,6 +869,7 @@ final class Ajax_Handler {
 
 		$elementor = Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang );
 		$lock      = Post_Translator::get_translation_lock_status( $post_id, $lang );
+		$stubborn  = Post_Translator::get_elementor_stubborn_field_diagnostics( $post_id, $lang );
 
 		return array(
 			'lang'               => $lang,
@@ -882,6 +883,7 @@ final class Ajax_Handler {
 			'elementor_error'    => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
 			'elementor_progress' => $progress,
 			'elementor'          => $elementor,
+			'stubborn_details'   => $stubborn,
 			'lock'               => $lock,
 			'needs_work'         => 'translated' !== $status || ! empty( $gaps['missing'] ),
 		);

@@ -216,8 +216,20 @@ trait Trait_Worker_Recovery {
 		$before_progress_at = absint( $job['partial_progress_at'] ?? 0 );
 
 		if ( self::should_prioritize_elementor_partial( $job ) ) {
-			self::reconcile_elementor_bulk_pin( $job );
-			$job = self::get_job_raw();
+			$pin_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+			$pin_lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+			if ( $pin_post_id > 0 && '' !== $pin_lang ) {
+				if ( Post_Translator::elementor_recovery_should_force_finalize( $pin_post_id, $pin_lang, $job ) ) {
+					Post_Translator::force_finalize_elementor_job_from_recovery( $pin_post_id, $pin_lang, 'kick-recovery' );
+					$job = self::get_job_raw();
+				} elseif ( ! Post_Translator::elementor_recovery_should_skip_queue_repair( $pin_post_id, $pin_lang, $job ) ) {
+					self::reconcile_elementor_bulk_pin( $job );
+					$job = self::get_job_raw();
+				} else {
+					Post_Translator::note_elementor_queue_repair_attempt( $pin_post_id, $pin_lang );
+				}
+			}
 		}
 
 		Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
@@ -252,6 +264,7 @@ trait Trait_Worker_Recovery {
 			self::should_prioritize_elementor_partial( $job )
 			&& $post_id > 0
 			&& '' !== $lang
+			&& ! Post_Translator::elementor_recovery_should_skip_queue_repair( $post_id, $lang, $job )
 			&& ! self::is_job_api_cooldown_active( $job )
 			&& (
 				self::is_elementor_progress_stalled( $job )
@@ -266,6 +279,22 @@ trait Trait_Worker_Recovery {
 		$after_progress = (string) ( $job['partial_progress'] ?? '' );
 		$progress_moved = $before_progress !== $after_progress
 			|| absint( $job['partial_progress_at'] ?? 0 ) > $before_progress_at;
+
+		if (
+			! $progress_moved
+			&& ! $burst_ran
+			&& $post_id > 0
+			&& '' !== $lang
+			&& self::should_prioritize_elementor_partial( $job )
+		) {
+			Post_Translator::note_elementor_queue_repair_attempt( $post_id, $lang );
+
+			if ( Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ) ) {
+				Post_Translator::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'kick-stale-progress' );
+				$job = self::get_job_raw();
+				$progress_moved = true;
+			}
+		}
 
 		if ( $progress_moved || $burst_ran ) {
 			$job['worker_heartbeat_at'] = time();

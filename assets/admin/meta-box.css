@@ -285,3 +285,21 @@
 	font-size: 11px;
 	word-break: break-all;
 }
+
+.polymart-ai-metabox__stubborn {
+	margin-top: 12px;
+	padding-top: 10px;
+	border-top: 1px dashed #dba617;
+}
+
+.polymart-ai-metabox__stubborn-item {
+	margin-bottom: 8px;
+}
+
+.polymart-ai-metabox__stubborn-preview {
+	display: inline-block;
+	margin-top: 4px;
+	font-size: 12px;
+	color: #50575e;
+	word-break: break-word;
+}

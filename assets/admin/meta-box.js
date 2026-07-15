@@ -297,6 +297,58 @@
 			.text(labels[status] || status);
 	}
 
+	function renderStubbornDetails(stubborn) {
+		const fields = stubborn && stubborn.fields ? stubborn.fields : [];
+
+		if (!fields.length) {
+			return '';
+		}
+
+		let html = '<div class="polymart-ai-metabox__stubborn">';
+		html += '<p><strong>' + (config.strings.stubbornHeading || 'فیلدهای سرسخت Elementor') + '</strong></p>';
+		html += '<ul class="polymart-ai-metabox__scan-list polymart-ai-metabox__scan-list--missing polymart-ai-metabox__stubborn-list">';
+
+		fields.forEach(function (field) {
+			const content = field.content || {};
+			const flags = [];
+
+			if (content.has_shortcode) {
+				flags.push(config.strings.stubbornFlagsShortcode || 'شورت‌کد');
+			}
+			if (content.has_html) {
+				flags.push(config.strings.stubbornFlagsHtml || 'HTML');
+			}
+			if (content.has_embed) {
+				flags.push(config.strings.stubbornFlagsEmbed || 'امبد');
+			}
+			if (content.has_script) {
+				flags.push(config.strings.stubbornFlagsScript || 'اسکریپت');
+			}
+
+			html += '<li class="polymart-ai-metabox__stubborn-item">';
+			html += '<code class="polymart-ai-metabox__path">' + (field.path || '') + '</code>';
+			html += ' — <strong>' + (field.reason_label || field.reason || '') + '</strong>';
+
+			if (field.detail) {
+				html += ' <span class="description">(' + field.detail + ')</span>';
+			}
+
+			if (flags.length) {
+				html += '<br><span class="description">' + flags.join(' + ') + '</span>';
+			}
+
+			if (content.preview) {
+				html += '<br><span class="polymart-ai-metabox__stubborn-preview">«' + content.preview + '»</span>';
+			}
+
+			html += '</li>';
+		});
+
+		html += '</ul></div>';
+
+		return html;
+	}
+
 	function renderScanResults(scan) {
 		const $container = $('.polymart-ai-metabox__scan-results');
 		const $unlockBtn = $('.polymart-ai-release-lock-btn');
@@ -404,6 +456,10 @@
 				html += '</ul>';
 			}
 			html += '</div>';
+		}
+
+		if (scan.stubborn_details) {
+			html += renderStubbornDetails(scan.stubborn_details);
 		}
 
 		if (scan.elementor_error) {
@@ -609,6 +665,14 @@
 	function applyTranslateProgressResponse(postId, lang, data) {
 		if (data.fields) {
 			populateFields(data.fields);
+		}
+
+		if (data.stubborn_details) {
+			if (!data.scan) {
+				data.scan = { lang: lang, stubborn_details: data.stubborn_details };
+			} else {
+				data.scan.stubborn_details = data.stubborn_details;
+			}
 		}
 
 		if (data.scan) {

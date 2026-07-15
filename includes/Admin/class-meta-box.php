@@ -632,6 +632,13 @@ final class Meta_Box {
 					'serverBusy'           => __( 'سرور مشغول است — ترجمه در پس‌زمینه ادامه می‌یابد، لطفاً صبر کنید…', 'polymart-ai' ),
 					'elementorFieldsShort' => __( 'فیلد JSON', 'polymart-ai' ),
 					'elementorPendingChunks' => __( 'بخش API در صف', 'polymart-ai' ),
+					'stubbornHeading'        => __( 'فیلدهای سرسخت Elementor (Stubborn)', 'polymart-ai' ),
+					'stubbornReason'         => __( 'علت', 'polymart-ai' ),
+					'stubbornPreview'        => __( 'پیش‌نمایش محتوا', 'polymart-ai' ),
+					'stubbornFlagsShortcode' => __( 'شورت‌کد', 'polymart-ai' ),
+					'stubbornFlagsHtml'      => __( 'HTML', 'polymart-ai' ),
+					'stubbornFlagsEmbed'     => __( 'امبد', 'polymart-ai' ),
+					'stubbornFlagsScript'    => __( 'اسکریپت', 'polymart-ai' ),
 				),
 			)
 		);

@@ -254,8 +254,17 @@ trait Trait_Queue_Run {
 		$did_recover     = self::force_recover_stalled_bulk_worker( 'kick' );
 
 		if ( ! $did_recover && self::should_prioritize_elementor_partial( $job ) ) {
-			self::reconcile_elementor_bulk_pin( $job );
-			$job = self::get_job_raw();
+			$pin_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+			$pin_lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+			if (
+				$pin_post_id > 0
+				&& '' !== $pin_lang
+				&& ! Post_Translator::elementor_recovery_should_skip_queue_repair( $pin_post_id, $pin_lang, $job )
+			) {
+				self::reconcile_elementor_bulk_pin( $job );
+				$job = self::get_job_raw();
+			}
 		}
 
 		if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {

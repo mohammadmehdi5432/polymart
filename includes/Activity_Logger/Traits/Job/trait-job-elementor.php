@@ -68,6 +68,16 @@ trait Trait_Job_Elementor {
 			return false;
 		}
 
+		if ( Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ) ) {
+			if ( Post_Translator::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'bulk-pin-recovery' ) ) {
+				return true;
+			}
+		}
+
+		if ( Post_Translator::elementor_recovery_should_skip_queue_repair( $post_id, $lang, $job ) ) {
+			return false;
+		}
+
 		$changed = false;
 
 		if (
