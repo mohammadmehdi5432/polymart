@@ -655,6 +655,91 @@ trait Trait_Job_State {
 	}
 
 	/**
+	 * Whether the normal Elementor pipeline should force-save partial work (not only kick/recovery).
+	 *
+	 * @param int                  $post_id Post ID.
+	 * @param string               $lang    Target language code.
+	 * @param array<string, mixed> $state   Optional partial state.
+	 * @return bool
+	 */
+	public static function elementor_should_force_finalize_in_pipeline( $post_id, $lang, array $state = array() ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$remaining = self::count_elementor_remaining_fields( $post_id, $lang );
+
+		if ( $remaining <= 0 ) {
+			return false;
+		}
+
+		if ( empty( $state ) ) {
+			$state = self::hydrate_elementor_job_partial_state(
+				$post_id,
+				$lang,
+				self::get_job_partial_state( $post_id, $lang )
+			);
+		}
+
+		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$done           = (int) ( $chunk_progress['done'] ?? 0 );
+		$total          = max( 1, (int) ( $chunk_progress['total'] ?? 1 ) );
+
+		$api_complete = self::elementor_job_primary_batches_exhausted( $post_id, $lang )
+			|| self::elementor_primary_schedule_locked( $post_id, $lang, $state )
+			|| self::elementor_job_api_schedule_complete( $post_id, $lang, $done, $total )
+			|| $done >= $total;
+
+		if ( ! $api_complete ) {
+			return false;
+		}
+
+		$stubborn = ! empty( $state['elementor_gap_fill'] )
+			|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
+			|| self::elementor_job_has_stubborn_remaining( $post_id, $lang );
+
+		if ( $stubborn ) {
+			return true;
+		}
+
+		if ( $remaining < 3 ) {
+			return true;
+		}
+
+		if ( absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= 1 ) {
+			return true;
+		}
+
+		if (
+			absint( $state['elementor_queue_repair_attempts'] ?? 0 ) >= 1
+			&& $remaining <= 5
+		) {
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Force-save stubborn Elementor tail fields during normal pipeline execution.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @param string $context Pipeline context tag.
+	 * @return bool True when finalize ran.
+	 */
+	public static function maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, $context = 'pipeline' ) {
+		if ( ! self::elementor_should_force_finalize_in_pipeline( $post_id, $lang ) ) {
+			return false;
+		}
+
+		return self::force_finalize_elementor_job_from_recovery( $post_id, $lang, $context );
+	}
+
+	/**
 	 * Whether kick/recovery must skip destructive Elementor queue rebuilds.
 	 *
 	 * @param int                  $post_id Post ID.
@@ -1282,6 +1367,20 @@ trait Trait_Job_State {
 		if (
 			self::is_elementor_translation_finalized( $post_id, $lang )
 			&& self::is_elementor_translation_current( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return false;
+		}
+
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+		) {
+			return false;
+		}
+
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
 			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
 		) {

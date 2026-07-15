@@ -465,6 +465,10 @@ trait Trait_Job_Runner {
 			$api_schedule_complete = self::elementor_job_api_schedule_complete( $post_id, $lang, $done_count, $progress_total );
 
 			if ( ! $truly_complete && $api_schedule_complete ) {
+				if ( self::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-empty-chunks' ) ) {
+					return self::pipeline_force_finalize_success_response( 'pipeline-empty-chunks' );
+				}
+
 				return self::finalize_elementor_job_slice( $post_id, $lang, $data, $map, $state, $done_count, $progress_total, $remaining );
 			}
 
@@ -1206,6 +1210,10 @@ trait Trait_Job_Runner {
 		}
 
 		if ( ! $truly_complete && $gap_fill_mode && ! empty( $remaining ) ) {
+			if ( self::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-gap-fill-end' ) ) {
+				return self::pipeline_force_finalize_success_response( 'pipeline-gap-fill-end' );
+			}
+
 			self::log_elementor_remaining_field_diagnostics(
 				$post_id,
 				$lang,

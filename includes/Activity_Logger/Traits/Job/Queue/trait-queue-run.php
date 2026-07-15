@@ -1179,6 +1179,14 @@ trait Trait_Queue_Run {
 
 		self::log_report( $post_id, $lang, $title_source, $title_translated, 'auto' );
 
+		if (
+			Post_Translator::uses_elementor_builder( $post_id )
+			&& Post_Translator::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-bulk-success' )
+		) {
+			Post_Translator::flush_translation_status_cache( $post_id );
+			clean_post_cache( $post_id );
+		}
+
 		$status = self::resolve_post_job_status( $post_id, $lang );
 		$already_counted = self::job_already_counted_success( $job, $post_id );
 		$gaps            = Post_Translator::get_translation_gaps( $post_id, $lang );

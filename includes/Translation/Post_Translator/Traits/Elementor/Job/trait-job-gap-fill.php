@@ -282,6 +282,10 @@ trait Trait_Job_Gap_Fill {
 			);
 		}
 
+		if ( self::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-stubborn-handoff' ) ) {
+			return self::pipeline_force_finalize_success_response( 'pipeline-stubborn-handoff' );
+		}
+
 		\PolymartAI\Activity_Logger::schedule_elementor_partial_follow_up( 0 );
 
 		return array(
@@ -484,6 +488,10 @@ trait Trait_Job_Gap_Fill {
 		self::clear_job_partial_state( $post_id, $lang, true );
 		self::flush_translation_status_cache( $post_id );
 
+		update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
+		update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
+		update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+
 		return array(
 			'done'           => true,
 			'phase'          => 'elementor',
@@ -492,6 +500,19 @@ trait Trait_Job_Gap_Fill {
 				/* translators: 1: forced field count */
 				__( 'ترجمه Elementor با تکمیل اجباری ذخیره شد (%1$d فیلد با متن اصلی).', 'polymart-ai' ),
 				$forced
+			),
+		);
+	}
+
+	private static function pipeline_force_finalize_success_response( $context ) {
+		return array(
+			'done'           => true,
+			'phase'          => 'elementor',
+			'phase_progress' => '',
+			'message'        => sprintf(
+				/* translators: 1: pipeline context tag */
+				__( 'ترجمه Elementor با تکمیل اجباری ذخیره شد (%1$s).', 'polymart-ai' ),
+				sanitize_text_field( (string) $context )
 			),
 		);
 	}
@@ -628,6 +649,10 @@ trait Trait_Job_Gap_Fill {
 
 		if ( ! empty( $remaining ) ) {
 			if ( self::elementor_job_primary_batches_exhausted( $post_id, $lang ) ) {
+				if ( self::maybe_force_finalize_elementor_tail_in_pipeline( $post_id, $lang, 'pipeline-slice-primary-done' ) ) {
+					return self::pipeline_force_finalize_success_response( 'pipeline-slice-primary-done' );
+				}
+
 				$stored_total  = self::read_elementor_slice_cursor_total( $post_id, $lang );
 				$stored_cursor = self::read_elementor_slice_cursor( $post_id, $lang );
 				$done_count    = max( $done_count, $stored_cursor );

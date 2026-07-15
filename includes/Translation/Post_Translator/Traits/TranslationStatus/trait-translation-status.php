@@ -132,6 +132,12 @@ trait Trait_Translation_Status {
 
 			if ( $post instanceof \WP_Post && ! empty( self::collect_persian_fields( $post, $lang ) ) ) {
 				$status = 'partial';
+			} elseif (
+				self::uses_elementor_builder( $post_id )
+				&& self::is_elementor_translation_finalized( $post_id, $lang )
+				&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+			) {
+				$status = 'translated';
 			} elseif ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
 				$status = 'partial';
 			} elseif (

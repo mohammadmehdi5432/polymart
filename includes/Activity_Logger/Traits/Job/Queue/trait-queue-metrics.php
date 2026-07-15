@@ -1054,6 +1054,17 @@ trait Trait_Queue_Metrics {
 		}
 
 		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
+			Post_Translator::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+			if (
+				Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+				&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			) {
+				return 'translated';
+			}
+		}
+
+		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
 			if (
 				Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
 				|| Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang )
