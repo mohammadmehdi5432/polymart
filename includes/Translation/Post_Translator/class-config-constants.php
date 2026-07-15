@@ -52,15 +52,15 @@ final class Config_Constants {
 	/** Maximum characters for a single field before it is split across requests. */
 	const AI_MAX_SINGLE_FIELD_CHARS = 2800;
 	/** Smaller Elementor JSON batches — paths are long and widgets nest deeply. */
-	const ELEMENTOR_AI_FIELD_CHUNK_SIZE = 3;
+	const ELEMENTOR_AI_FIELD_CHUNK_SIZE = 8;
 	/** Maximum combined characters per Elementor AI batch. */
-	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 2500;
+	const ELEMENTOR_AI_MAX_CHUNK_CHARS = 4500;
 	/** Elementor job batches for manual metabox / inline translate. */
-	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 6;
+	const ELEMENTOR_JOB_FIELD_CHUNK_SIZE = 16;
 	/** Elementor bulk job batches — group short fields; still capped by ELEMENTOR_JOB_MAX_CHUNK_CHARS. */
-	const ELEMENTOR_BULK_JOB_FIELD_CHUNK_SIZE = 3;
+	const ELEMENTOR_BULK_JOB_FIELD_CHUNK_SIZE = 6;
 	/** Maximum characters per Elementor job-step API call. */
-	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 1500;
+	const ELEMENTOR_JOB_MAX_CHUNK_CHARS = 4500;
 	/** Split very long Elementor text fields before calling the AI. */
 	const ELEMENTOR_LONG_FIELD_SEGMENT_CHARS = 1000;
 	/** Smaller segments during bulk jobs — faster Arvan responses, fewer 30s timeouts. */

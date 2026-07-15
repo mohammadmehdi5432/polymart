@@ -1549,7 +1549,8 @@ trait Trait_Chunking {
 	}
 
 	private static function chunk_elementor_payload_for_job( array $payload ) {
-		$chunk_size = \PolymartAI\Activity_Logger::is_bulk_job_running()
+		$is_bulk    = \PolymartAI\Activity_Logger::is_bulk_job_running();
+		$chunk_size = $is_bulk
 			? self::ELEMENTOR_BULK_JOB_FIELD_CHUNK_SIZE
 			: self::ELEMENTOR_JOB_FIELD_CHUNK_SIZE;
 
@@ -1561,11 +1562,26 @@ trait Trait_Chunking {
 		 */
 		$chunk_size = max( 1, (int) apply_filters( 'polymart_ai_elementor_job_field_chunk_size', $chunk_size, $payload ) );
 
-		$expanded = self::expand_elementor_payload_for_ai( $payload );
-		$chunks   = array();
-		$current  = array();
+		$expanded  = self::expand_elementor_payload_for_ai( $payload );
+		$max_chars = self::ELEMENTOR_JOB_MAX_CHUNK_CHARS;
+
+		// Footer / short templates: one (or two) API calls instead of 0/7 ghost queues.
+		if ( ! $is_bulk ) {
+			$total_chars = 0;
+
+			foreach ( $expanded as $text ) {
+				$total_chars += self::utf8_strlen( (string) $text );
+			}
+
+			if ( count( $expanded ) <= 24 && $total_chars <= 6000 ) {
+				$chunk_size = max( $chunk_size, count( $expanded ) );
+				$max_chars  = max( $max_chars, $total_chars + 250 );
+			}
+		}
+
+		$chunks        = array();
+		$current       = array();
 		$current_chars = 0;
-		$max_chars     = self::ELEMENTOR_JOB_MAX_CHUNK_CHARS;
 
 		// Group __segN by base widget so huge HTML fields pack ≤ N segs/request.
 		$segment_groups = array();

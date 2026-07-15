@@ -90,6 +90,12 @@ final class Translation_Scheduler_Coordinator {
 			return true;
 		}
 
+		// Interactive metabox already queued — do NOT kill/block it for Bulk.
+		// Bulk waits via should_defer_bulk_work() while metabox AS is live.
+		if ( Metabox_Action_Scheduler::has_any_live_as_actions() ) {
+			return false;
+		}
+
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			return true;
 		}
@@ -143,7 +149,12 @@ final class Translation_Scheduler_Coordinator {
 		$held = get_transient( self::GLOBAL_LOCK_KEY );
 
 		if ( false !== $held && (string) $held !== $owner ) {
-			return false;
+			// Metabox outranks bulk so footer/template translates don't sit at 0/N forever.
+			if ( self::OWNER_METABOX === $owner && self::OWNER_BULK === (string) $held ) {
+				delete_transient( self::GLOBAL_LOCK_KEY );
+			} else {
+				return false;
+			}
 		}
 
 		set_transient( self::GLOBAL_LOCK_KEY, $owner, self::GLOBAL_LOCK_TTL );

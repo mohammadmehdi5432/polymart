@@ -1073,11 +1073,13 @@ final class Metabox_Action_Scheduler {
 			Translation_Scheduler_Coordinator::clear_halt();
 		}
 
-		if ( Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
+		// Only hard-block metabox when Stop was pressed — never park interactive
+		// Elementor jobs behind a long Bulk queue (that caused endless 0/N UI).
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
 			return new \WP_Error(
-				'polymart_ai_bulk_job_active',
-				__( 'ترجمه خودکار در حال اجراست — ترجمه متاباکس تا پایان Bulk Job به تعویق افتاد. ابتدا Bulk را متوقف کنید یا صبر کنید.', 'polymart-ai' ),
-				array( 'deferred' => true )
+				'polymart_ai_scheduler_halted',
+				__( 'ترجمه متوقف شده است — دوباره «ترجمه و تکمیل» را بزنید.', 'polymart-ai' ),
+				array( 'halted' => true )
 			);
 		}
 
@@ -1565,9 +1567,16 @@ final class Metabox_Action_Scheduler {
 		}
 
 		if ( ! Translation_Scheduler_Coordinator::try_claim_global_worker( Translation_Scheduler_Coordinator::OWNER_METABOX ) ) {
-			if ( ! Translation_Scheduler_Coordinator::should_defer_metabox_work() ) {
-				self::chain_next( $post_id, $lang );
-			}
+			// Always re-queue — do not leave metabox stranded at 0/N when bulk held the lock.
+			self::chain_next( $post_id, $lang );
+			self::update_status(
+				$post_id,
+				$lang,
+				array(
+					'status'  => 'running',
+					'message' => __( 'منتظر آزاد شدن قفل کارگر… لحظه‌ای دیگر ادامه می‌دهد.', 'polymart-ai' ),
+				)
+			);
 
 			return;
 		}
