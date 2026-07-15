@@ -552,6 +552,7 @@ final class Ajax_Handler {
 				),
 				'scan'           => $scan,
 				'fields'         => self::collect_meta_fields_for_response( $post_id, $lang ),
+				'stubborn_details' => Post_Translator::get_elementor_stubborn_field_diagnostics( $post_id, $lang ),
 				'batch'          => $poll['batch'] ?? null,
 				'updated_at'     => absint( $poll['updated_at'] ?? 0 ),
 				'worker_mode'    => (string) ( $poll['worker_mode'] ?? 'as' ),

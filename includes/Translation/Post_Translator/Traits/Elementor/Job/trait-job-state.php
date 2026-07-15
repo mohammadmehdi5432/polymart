@@ -362,6 +362,103 @@ trait Trait_Job_State {
 		return self::elementor_primary_schedule_locked( $post_id, $lang, $state );
 	}
 
+	/**
+	 * Whether stubborn/long-tail Elementor fields are still blocking completion.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool
+	 */
+	public static function elementor_job_has_stubborn_remaining( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$state = self::get_job_partial_state( $post_id, $lang );
+
+		if (
+			! empty( $state['elementor_gap_fill'] )
+			|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
+		) {
+			return true;
+		}
+
+		$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $raw ) || '' === trim( $raw ) ) {
+			return false;
+		}
+
+		$data = json_decode( $raw, true );
+
+		if ( ! is_array( $data ) ) {
+			return false;
+		}
+
+		$source_payload = self::collect_elementor_translation_payload( $data );
+		$map            = self::merge_elementor_job_path_map( $post_id, $lang, $data, is_array( $state['elementor_map'] ?? null ) ? $state['elementor_map'] : array() );
+		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+		$remaining      = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		foreach ( $remaining as $path => $text ) {
+			if ( self::stubborn_elementor_field_is_long( (string) $path, (string) $text ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Drop stale success/finalized markers when Elementor is still incomplete on the storefront.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool True when completion markers were cleared.
+	 */
+	public static function invalidate_elementor_job_success_markers( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		$needs_work = self::elementor_needs_gap_fill_work( $post_id, $lang )
+			|| self::elementor_job_has_stubborn_remaining( $post_id, $lang )
+			|| self::post_needs_elementor_job_work( $post_id, $lang )
+			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
+			|| self::storefront_would_show_persian_source( $post_id, $lang );
+
+		if ( ! $needs_work ) {
+			return false;
+		}
+
+		self::repair_stale_elementor_completion_meta( $post_id, $lang );
+
+		$cleared = false;
+
+		if ( is_numeric( get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true ) ) ) {
+			delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
+			$cleared = true;
+		}
+
+		if ( '' !== trim( (string) get_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, true ) ) ) {
+			delete_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang );
+			$cleared = true;
+		}
+
+		if ( $cleared ) {
+			self::reset_elementor_runtime_caches();
+			self::flush_translation_status_cache( $post_id );
+		}
+
+		return $cleared;
+	}
+
 	public static function elementor_needs_gap_fill_work( $post_id, $lang ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );

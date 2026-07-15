@@ -541,6 +541,17 @@ trait Trait_Queue_Run {
 		$job['current_post_id'] = $post_id;
 		$job['step_started_at'] = time();
 
+		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
+			Post_Translator::invalidate_elementor_job_success_markers( $post_id, $lang );
+
+			if (
+				Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang )
+			) {
+				self::untrack_succeeded_post( $job, $post_id );
+			}
+		}
+
 		// Already done for this language — do not burn an AI call or spam "ترجمه شد".
 		if ( Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
 			if ( self::job_already_counted_success( $job, $post_id ) ) {

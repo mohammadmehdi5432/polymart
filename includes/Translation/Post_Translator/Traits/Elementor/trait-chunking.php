@@ -774,7 +774,7 @@ trait Trait_Chunking {
 		return $pruned;
 	}
 
-	private static function prepare_elementor_map_for_persist( array $map, array $source_payload ) {
+	private static function prepare_elementor_map_for_persist( array $map, array $source_payload, $allow_partial_segments = false ) {
 		$prepared = $map;
 
 		foreach ( $source_payload as $path => $text ) {
@@ -793,14 +793,20 @@ trait Trait_Chunking {
 				$seg_source = (string) ( $seg_lookup[ $seg_key ] ?? '' );
 
 				if (
-					! isset( $prepared[ $seg_key ] )
-					|| ! self::elementor_segment_is_resolved( $seg_key, $seg_source, $prepared )
+					isset( $prepared[ $seg_key ] )
+					&& self::elementor_segment_is_resolved( $seg_key, $seg_source, $prepared )
 				) {
-					$parts = array();
-					break;
+					$parts[] = (string) $prepared[ $seg_key ];
+					continue;
 				}
 
-				$parts[] = (string) $prepared[ $seg_key ];
+				if ( $allow_partial_segments && '' !== $seg_source ) {
+					$parts[] = $seg_source;
+					continue;
+				}
+
+				$parts = array();
+				break;
 			}
 
 			if ( empty( $parts ) ) {
@@ -815,6 +821,42 @@ trait Trait_Chunking {
 		}
 
 		return $prepared;
+	}
+
+	/**
+	 * Whether the in-memory map contains at least one field worth writing to _elementor_data_{lang}.
+	 *
+	 * @param array<string, string> $map            Translation map.
+	 * @param array<string, string> $source_payload Source payload.
+	 * @return bool
+	 */
+	private static function elementor_map_has_persistable_translations( array $map, array $source_payload ) {
+		if ( empty( $map ) ) {
+			return false;
+		}
+
+		$prepared = self::prepare_elementor_map_for_persist( $map, $source_payload, true );
+
+		foreach ( $source_payload as $path => $text ) {
+			$path = (string) $path;
+			$text = (string) $text;
+
+			if ( ! isset( $prepared[ $path ] ) ) {
+				continue;
+			}
+
+			$stored = (string) $prepared[ $path ];
+
+			if ( '' === trim( $stored ) ) {
+				continue;
+			}
+
+			if ( self::elementor_map_value_is_valid_translation( $path, $text, $stored ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private static function elementor_all_segments_present_in_map( $base, $source, array $raw_mapped ) {

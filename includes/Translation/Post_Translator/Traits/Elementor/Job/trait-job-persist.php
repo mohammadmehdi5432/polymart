@@ -50,7 +50,10 @@ trait Trait_Job_Persist {
 			self::merge_elementor_path_map( $post_id, $lang, $source_data, $map ),
 			$source_payload
 		);
-		$map            = self::prepare_elementor_map_for_persist( $map, $source_payload );
+		$allow_partial_segments = ! $complete
+			|| ! empty( $partial_state['elementor_gap_fill'] )
+			|| ! empty( $partial_state['elementor_gap_fill_stubborn_only'] );
+		$map            = self::prepare_elementor_map_for_persist( $map, $source_payload, $allow_partial_segments );
 		$chunk_progress = self::get_elementor_chunk_progress(
 			$post_id,
 			$lang,

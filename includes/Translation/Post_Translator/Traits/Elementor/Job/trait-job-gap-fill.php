@@ -108,6 +108,16 @@ trait Trait_Job_Gap_Fill {
 		}
 
 		if ( $ghost_ticks >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT ) {
+			self::log_elementor_remaining_field_diagnostics(
+				$post_id,
+				$lang,
+				$source_payload,
+				$map,
+				$skipped,
+				'force-finalize-ghost-limit',
+				$state
+			);
+
 			return self::force_finalize_elementor_job_with_fallback(
 				$post_id,
 				$lang,
@@ -127,6 +137,16 @@ trait Trait_Job_Gap_Fill {
 		);
 
 		if ( $stubborn_left > 0 ) {
+			self::log_elementor_remaining_field_diagnostics(
+				$post_id,
+				$lang,
+				$source_payload,
+				$map,
+				$skipped,
+				'stubborn-handoff',
+				$state
+			);
+
 			$stubborn_field_cap = min( 4, $stubborn_left );
 
 			if ( \PolymartAI\Activity_Logger::is_trusted_as_tick() ) {
@@ -197,9 +217,46 @@ trait Trait_Job_Gap_Fill {
 		$remaining_after = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
 
 		if (
+			absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= 2
+			&& ! empty( $remaining_after )
+			&& self::elementor_map_has_persistable_translations( $map, $source_payload )
+		) {
+			self::log_elementor_remaining_field_diagnostics(
+				$post_id,
+				$lang,
+				$source_payload,
+				$map,
+				$skipped,
+				'force-finalize-partial-persist',
+				$state
+			);
+
+			return self::force_finalize_elementor_job_with_fallback(
+				$post_id,
+				$lang,
+				$source_data,
+				$state,
+				$map,
+				$source_payload,
+				$text_mirrors,
+				$progress_total
+			);
+		}
+
+		if (
 			absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ) >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
 			&& ! empty( $remaining_after )
 		) {
+			self::log_elementor_remaining_field_diagnostics(
+				$post_id,
+				$lang,
+				$source_payload,
+				$map,
+				$skipped,
+				'force-finalize-tick-limit',
+				$state
+			);
+
 			return self::force_finalize_elementor_job_with_fallback(
 				$post_id,
 				$lang,
@@ -274,16 +331,15 @@ trait Trait_Job_Gap_Fill {
 			}
 
 			if ( ! empty( $remaining_blocked ) ) {
-				return array(
-					'done'           => false,
-					'phase'          => 'elementor',
-					'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-					'message'        => self::format_elementor_gap_fill_remaining_message(
-						$post_id,
-						$remaining_blocked,
-						$map
-					),
-					'recoverable'    => true,
+				return self::force_finalize_elementor_job_with_fallback(
+					$post_id,
+					$lang,
+					$source_data,
+					$state,
+					$map,
+					$source_payload,
+					$text_mirrors,
+					$progress_total
 				);
 			}
 		}
@@ -323,6 +379,7 @@ trait Trait_Job_Gap_Fill {
 		self::clear_elementor_primary_batches_lock( $post_id, $lang );
 		self::clear_elementor_slice_cursor( $post_id, $lang );
 		self::clear_job_partial_state( $post_id, $lang, true );
+		self::clear_elementor_stubborn_field_diagnostics( $post_id, $lang );
 		self::flush_translation_status_cache( $post_id );
 
 		return array(
@@ -351,6 +408,18 @@ trait Trait_Job_Gap_Fill {
 		$forced         = 0;
 		$accepted_paths = array();
 
+		if ( ! empty( $remaining ) ) {
+			self::log_elementor_remaining_field_diagnostics(
+				$post_id,
+				$lang,
+				$source_payload,
+				$map,
+				$skipped,
+				'force-finalize-fallback',
+				$state
+			);
+		}
+
 		foreach ( $remaining as $path => $text ) {
 			$path = (string) $path;
 			$text = (string) $text;
@@ -372,6 +441,7 @@ trait Trait_Job_Gap_Fill {
 		$map = self::expand_elementor_map_mirrors( $map, $text_mirrors );
 		$map = self::merge_elementor_path_map( $post_id, $lang, $source_data, $map );
 		$map = self::sanitize_elementor_translation_map( $map, $source_payload );
+		$map = self::prepare_elementor_map_for_persist( $map, $source_payload, true );
 		$state['elementor_map'] = $map;
 
 		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
@@ -627,15 +697,24 @@ trait Trait_Job_Gap_Fill {
 		);
 	}
 
-	private static function describe_elementor_field_translation_blocker( $path, $text, array $map ) {
+	private static function describe_elementor_field_translation_blocker( $path, $text, array $map, array $state = array() ) {
 		$path = (string) $path;
 		$text = (string) $text;
 		$chars = self::utf8_strlen( $text );
 		$detail = '';
 		$reason = 'unknown';
+		$content = self::analyze_elementor_field_content( $text );
+		$api_attempts = absint( $state['elementor_failures'][ $path ] ?? 0 );
+		$segment_failures = is_array( $state['elementor_segment_failures'] ?? null ) ? $state['elementor_segment_failures'] : array();
+		$is_stubborn_long = self::stubborn_elementor_field_is_long( $path, $text );
+
+		if ( $api_attempts >= self::ELEMENTOR_SEGMENT_MAX_RETRIES ) {
+			$reason = 'api_retries_exhausted';
+			$detail = sprintf( '%d/%d attempts', $api_attempts, self::ELEMENTOR_SEGMENT_MAX_RETRIES );
+		}
 
 		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
-		if ( ! empty( $seg_lookup ) ) {
+		if ( ! empty( $seg_lookup ) && 'api_retries_exhausted' !== $reason ) {
 			if (
 				isset( $map[ $path ] )
 				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
@@ -694,50 +773,227 @@ trait Trait_Job_Gap_Fill {
 				$detail = 'needs_full_field_or_all_segments';
 			}
 
-			return compact( 'path', 'reason', 'detail', 'chars' );
+			return array_merge(
+				compact( 'path', 'reason', 'detail', 'chars' ),
+				array(
+					'content'          => $content,
+					'is_stubborn_long' => $is_stubborn_long,
+					'api_attempts'     => $api_attempts,
+					'segment_count'    => count( $seg_lookup ),
+				)
+			);
 		}
 
-		if ( ! isset( $map[ $path ] ) ) {
-			$reason = 'not_in_map';
-		} else {
-			$translated = trim( (string) $map[ $path ] );
-
-			if ( '' === $translated ) {
-				$reason = 'empty_translation';
-			} elseif ( Persian_Detector::contains_persian( $translated ) ) {
-				$reason = 'persian_translation';
-			} elseif ( $translated === trim( $text ) ) {
-				$reason = 'unchanged_from_source';
-			} elseif ( self::utf8_strlen( $text ) > self::AI_MAX_SINGLE_FIELD_CHARS ) {
-				$reason = 'long_field_parts_incomplete';
-				$parts  = (int) ceil( self::utf8_strlen( $text ) / self::AI_MAX_SINGLE_FIELD_CHARS );
-				$have   = 0;
-
-				for ( $part = 1; $part <= $parts; $part++ ) {
-					$part_key = $path . '::__part' . $part;
-					if (
-						isset( $map[ $part_key ] )
-						&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $part_key ] )
-					) {
-						++$have;
-					}
-				}
-
-				$detail = sprintf( '%d/%d parts', $have, $parts );
+		if ( 'api_retries_exhausted' !== $reason ) {
+			if ( ! isset( $map[ $path ] ) ) {
+				$reason = 'not_in_map';
 			} else {
-				$reason = 'invalid_translation';
+				$translated = trim( (string) $map[ $path ] );
+
+				if ( '' === $translated ) {
+					$reason = 'empty_translation';
+				} elseif ( Persian_Detector::contains_persian( $translated ) ) {
+					$reason = 'persian_translation';
+				} elseif ( $translated === trim( $text ) ) {
+					$reason = 'unchanged_from_source';
+				} elseif ( self::utf8_strlen( $text ) > self::AI_MAX_SINGLE_FIELD_CHARS ) {
+					$reason = 'long_field_parts_incomplete';
+					$parts  = (int) ceil( self::utf8_strlen( $text ) / self::AI_MAX_SINGLE_FIELD_CHARS );
+					$have   = 0;
+
+					for ( $part = 1; $part <= $parts; $part++ ) {
+						$part_key = $path . '::__part' . $part;
+						if (
+							isset( $map[ $part_key ] )
+							&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $part_key ] )
+						) {
+							++$have;
+						}
+					}
+
+					$detail = sprintf( '%d/%d parts', $have, $parts );
+				} else {
+					$reason = 'invalid_translation';
+				}
 			}
 		}
 
 		if ( '' === $detail ) {
-			$detail = wp_trim_words(
-				wp_strip_all_tags( html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ),
-				10,
-				'…'
+			$detail = (string) ( $content['preview'] ?? '' );
+		}
+
+		return array_merge(
+			compact( 'path', 'reason', 'detail', 'chars' ),
+			array(
+				'content'          => $content,
+				'is_stubborn_long' => $is_stubborn_long,
+				'api_attempts'     => $api_attempts,
+				'segment_count'    => 0,
+			)
+		);
+	}
+
+	private static function analyze_elementor_field_content( $text ) {
+		$text = (string) $text;
+
+		if ( '' === $text ) {
+			return array(
+				'preview'       => '',
+				'char_count'    => 0,
+				'has_shortcode' => false,
+				'has_html'      => false,
+				'has_embed'     => false,
+				'has_script'    => false,
+				'has_persian'   => false,
 			);
 		}
 
-		return compact( 'path', 'reason', 'detail', 'chars' );
+		$plain = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+
+		return array(
+			'preview'       => mb_substr( wp_strip_all_tags( $plain ), 0, 180 ),
+			'char_count'    => self::utf8_strlen( $text ),
+			'has_shortcode' => (bool) preg_match( '/\[[\w-]+/', $plain ),
+			'has_html'      => (bool) preg_match( '/<(?:div|p|span|section|table|ul|ol|h[1-6]|a|img)\b/i', $plain ),
+			'has_embed'     => (bool) preg_match( '/<(?:iframe|embed|object|video|audio)\b/i', $plain ),
+			'has_script'    => false !== stripos( $plain, '<script' ) || false !== stripos( $plain, 'javascript:' ),
+			'has_persian'   => Persian_Detector::contains_persian( $plain ),
+		);
+	}
+
+	private static function get_stubborn_details_meta_key( $lang ) {
+		return '_polymart_ai_stubborn_details_' . sanitize_key( (string) $lang );
+	}
+
+	public static function get_elementor_stubborn_field_diagnostics( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return array();
+		}
+
+		$raw = get_post_meta( $post_id, self::get_stubborn_details_meta_key( $lang ), true );
+
+		if ( is_string( $raw ) && '' !== $raw ) {
+			$decoded = json_decode( $raw, true );
+
+			if ( is_array( $decoded ) ) {
+				return $decoded;
+			}
+		}
+
+		if ( is_array( $raw ) ) {
+			return $raw;
+		}
+
+		return array();
+	}
+
+	public static function clear_elementor_stubborn_field_diagnostics( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return;
+		}
+
+		delete_post_meta( $post_id, self::get_stubborn_details_meta_key( $lang ) );
+	}
+
+	private static function build_elementor_stubborn_field_report( $post_id, $lang, array $source_payload, array $map, array $skipped, array $state, $context ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$fields  = array();
+
+		$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
+
+		foreach ( $remaining as $path => $text ) {
+			if ( count( $fields ) >= 12 ) {
+				break;
+			}
+
+			$blocker = self::describe_elementor_field_translation_blocker( $path, $text, $map, $state );
+			$content = is_array( $blocker['content'] ?? null ) ? $blocker['content'] : array();
+
+			$fields[] = array(
+				'path'             => (string) ( $blocker['path'] ?? $path ),
+				'reason'           => (string) ( $blocker['reason'] ?? 'unknown' ),
+				'reason_label'     => self::format_stubborn_reason_label( (string) ( $blocker['reason'] ?? 'unknown' ) ),
+				'detail'           => (string) ( $blocker['detail'] ?? '' ),
+				'chars'            => (int) ( $blocker['chars'] ?? 0 ),
+				'is_stubborn_long' => ! empty( $blocker['is_stubborn_long'] ),
+				'api_attempts'     => (int) ( $blocker['api_attempts'] ?? 0 ),
+				'segment_count'    => (int) ( $blocker['segment_count'] ?? 0 ),
+				'content'          => $content,
+			);
+		}
+
+		return array(
+			'post_id'        => $post_id,
+			'lang'           => $lang,
+			'context'        => sanitize_text_field( (string) $context ),
+			'updated_at'     => time(),
+			'remaining'      => count( $remaining ),
+			'fields'         => $fields,
+			'ghost_ticks'    => absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 ),
+			'gap_fill_mode'  => ! empty( $state['elementor_gap_fill'] ),
+			'stubborn_only'  => ! empty( $state['elementor_gap_fill_stubborn_only'] ),
+		);
+	}
+
+	private static function format_stubborn_reason_label( $reason ) {
+		$labels = array(
+			'missing_segments'        => __( 'سگمنت‌های ترجمه ناقص', 'polymart-ai' ),
+			'invalid_segments'        => __( 'پاسخ AI برای سگمنت نامعتبر', 'polymart-ai' ),
+			'collapsed_base_missing'    => __( 'فیلد کامل یا همه سگمنت‌ها لازم است', 'polymart-ai' ),
+			'logic_mismatch'          => __( 'ناسازگاری منطق تشخیص تکمیل', 'polymart-ai' ),
+			'not_in_map'              => __( 'به AI ارسال نشده یا در map نیست', 'polymart-ai' ),
+			'empty_translation'       => __( 'AI پاسخ خالی داد', 'polymart-ai' ),
+			'persian_translation'     => __( 'AI همان فارسی را برگرداند', 'polymart-ai' ),
+			'unchanged_from_source'   => __( 'ترجمه بدون تغییر از منبع', 'polymart-ai' ),
+			'long_field_parts_incomplete' => __( 'بخش‌های فیلد بلند ناقص', 'polymart-ai' ),
+			'invalid_translation'     => __( 'ترجمه نامعتبر', 'polymart-ai' ),
+			'api_retries_exhausted'   => __( 'تلاش‌های API تمام شد', 'polymart-ai' ),
+		);
+
+		return $labels[ $reason ] ?? $reason;
+	}
+
+	private static function format_stubborn_content_flags_label( array $content ) {
+		$flags = array();
+
+		if ( ! empty( $content['has_shortcode'] ) ) {
+			$flags[] = __( 'شورت‌کد', 'polymart-ai' );
+		}
+		if ( ! empty( $content['has_html'] ) ) {
+			$flags[] = __( 'HTML', 'polymart-ai' );
+		}
+		if ( ! empty( $content['has_embed'] ) ) {
+			$flags[] = __( 'امبد/iframe', 'polymart-ai' );
+		}
+		if ( ! empty( $content['has_script'] ) ) {
+			$flags[] = __( 'اسکریپت', 'polymart-ai' );
+		}
+
+		return empty( $flags ) ? __( 'متن ساده', 'polymart-ai' ) : implode( ' + ', $flags );
+	}
+
+	private static function persist_elementor_stubborn_field_diagnostics( array $report ) {
+		$post_id = absint( $report['post_id'] ?? 0 );
+		$lang    = sanitize_key( (string) ( $report['lang'] ?? '' ) );
+
+		if ( $post_id <= 0 || '' === $lang || empty( $report['fields'] ) ) {
+			return;
+		}
+
+		$json = wp_json_encode( $report );
+
+		if ( false === $json || '' === $json ) {
+			return;
+		}
+
+		update_post_meta( $post_id, self::get_stubborn_details_meta_key( $lang ), $json );
 	}
 
 	private static function format_elementor_gap_fill_remaining_message( $post_id, array $remaining, array $map ) {
@@ -780,7 +1036,7 @@ trait Trait_Job_Gap_Fill {
 		);
 	}
 
-	private static function log_elementor_remaining_field_diagnostics( $post_id, $lang, array $source_payload, array $map, array $skipped, $context ) {
+	private static function log_elementor_remaining_field_diagnostics( $post_id, $lang, array $source_payload, array $map, array $skipped, $context, array $state = array() ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$context = sanitize_text_field( (string) $context );
@@ -795,42 +1051,69 @@ trait Trait_Job_Gap_Fill {
 			return;
 		}
 
-		$lines = array();
-		$max   = 8;
+		$report = self::build_elementor_stubborn_field_report(
+			$post_id,
+			$lang,
+			$source_payload,
+			$map,
+			$skipped,
+			$state,
+			$context
+		);
 
-		foreach ( $remaining as $path => $text ) {
-			if ( count( $lines ) >= $max ) {
-				break;
+		self::persist_elementor_stubborn_field_diagnostics( $report );
+
+		foreach ( $report['fields'] as $field ) {
+			$content = is_array( $field['content'] ?? null ) ? $field['content'] : array();
+			$flags   = self::format_stubborn_content_flags_label( $content );
+			$preview = (string) ( $content['preview'] ?? '' );
+
+			if ( '' !== $preview ) {
+				$preview = mb_substr( $preview, 0, 120 );
 			}
 
-			$blocker = self::describe_elementor_field_translation_blocker( $path, $text, $map );
-			$lines[] = sprintf(
-				'%s [%s: %s, %d chars]',
-				$blocker['path'],
-				$blocker['reason'],
-				$blocker['detail'],
-				(int) $blocker['chars']
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: field path, 3: reason label, 4: detail, 5: content flags, 6: preview */
+					__( 'Stubborn — #%1$d: %2$s — %3$s (%4$s) · %5$s · «%6$s»', 'polymart-ai' ),
+					$post_id,
+					(string) ( $field['path'] ?? '' ),
+					(string) ( $field['reason_label'] ?? ( $field['reason'] ?? 'unknown' ) ),
+					(string) ( $field['detail'] ?? '' ),
+					$flags,
+					$preview
+				),
+				array(
+					'post_id' => $post_id,
+					'lang'    => $lang,
+					'path'    => (string) ( $field['path'] ?? '' ),
+					'reason'  => (string) ( $field['reason'] ?? '' ),
+					'context' => $context,
+				)
 			);
 		}
 
-		$extra = count( $remaining ) > $max ? sprintf( ' +%d more', count( $remaining ) - $max ) : '';
+		$extra = (int) ( $report['remaining'] ?? count( $remaining ) ) > count( $report['fields'] )
+			? sprintf( ' +%d more', (int) $report['remaining'] - count( $report['fields'] ) )
+			: '';
 
 		\PolymartAI\Activity_Logger::log(
 			'warning',
 			sprintf(
-				/* translators: 1: post ID, 2: remaining count, 3: context, 4: field diagnostics */
-				__( 'Elementor — #%1$d: تشخیص %2$d فیلد باقی (%3$s) — %4$s%5$s', 'polymart-ai' ),
+				/* translators: 1: post ID, 2: remaining count, 3: context, 4: meta key hint */
+				__( 'Elementor — #%1$d: %2$d فیلد stubborn — جزئیات در %3$s و متا %4$s', 'polymart-ai' ),
 				$post_id,
-				count( $remaining ),
+				(int) ( $report['remaining'] ?? count( $remaining ) ),
 				$context,
-				implode( ' | ', $lines ),
-				$extra
+				self::get_stubborn_details_meta_key( $lang ) . $extra
 			),
 			array(
 				'post_id'   => $post_id,
 				'lang'      => $lang,
 				'remaining' => array_keys( $remaining ),
 				'context'   => $context,
+				'meta_key'  => self::get_stubborn_details_meta_key( $lang ),
 			)
 		);
 	}
@@ -1075,7 +1358,8 @@ trait Trait_Job_Gap_Fill {
 						'stubborn-long-partial-%s-%s',
 						$path,
 						(string) ( $blocker['reason'] ?? 'partial' )
-					)
+					),
+					$state
 				);
 			}
 		}

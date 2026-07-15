@@ -378,6 +378,16 @@ trait Trait_Queue_Metrics {
 				$job['current_post']['partial_progress'] = (string) ( $job['partial_progress'] ?? '' );
 			}
 
+			$job_lang = sanitize_key( (string) ( $job['lang'] ?? '' ) );
+			if ( '' !== $job_lang ) {
+				$stubborn = Post_Translator::get_elementor_stubborn_field_diagnostics( $current_post_id, $job_lang );
+				if ( ! empty( $stubborn['fields'] ) ) {
+					$job['current_post']['stubborn_count'] = (int) ( $stubborn['remaining'] ?? count( $stubborn['fields'] ) );
+					$job['current_post']['stubborn_fields'] = array_slice( $stubborn['fields'], 0, 5 );
+					$job['current_post']['stubborn_meta_key'] = '_polymart_ai_stubborn_details_' . $job_lang;
+				}
+			}
+
 			if ( is_array( $job['last_step'] ?? null ) && absint( $job['last_step']['post_id'] ?? 0 ) === $current_post_id ) {
 				$job['current_post']['step_status']  = (string) ( $job['last_step']['status'] ?? '' );
 				$job['current_post']['step_message'] = (string) ( $job['last_step']['message'] ?? '' );
@@ -1043,6 +1053,17 @@ trait Trait_Queue_Metrics {
 			return $status;
 		}
 
+		if ( Post_Translator::uses_elementor_builder( $post_id ) ) {
+			if (
+				Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang )
+				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+				|| Post_Translator::storefront_would_show_persian_source( $post_id, $lang )
+			) {
+				return 'partial';
+			}
+		}
+
 		$post = get_post( $post_id );
 
 		if ( ! $post instanceof \WP_Post ) {
@@ -1174,7 +1195,9 @@ trait Trait_Queue_Metrics {
 				continue;
 			}
 
-			if ( 'translated' === self::resolve_post_job_status( $post_id, $lang ) ) {
+			if ( 'translated' === self::resolve_post_job_status( $post_id, $lang )
+				&& ! Post_Translator::post_needs_translation_work( $post_id, $lang )
+			) {
 				$still_ok[] = $post_id;
 			} else {
 				self::track_partial_post( $job, $post_id );

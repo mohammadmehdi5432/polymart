@@ -185,7 +185,8 @@ trait Trait_Job_Runner {
 							$source_payload,
 							$map,
 							$skipped,
-							'gap-fill-start'
+							'gap-fill-start',
+							$state
 						);
 					}
 				} else {
@@ -1077,7 +1078,8 @@ trait Trait_Job_Runner {
 						$source_payload,
 						$map,
 						is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array(),
-						sprintf( 'chunk-%d-partial', $attempt_index )
+						sprintf( 'chunk-%d-partial', $attempt_index ),
+						$state
 					);
 				}
 			}
@@ -1210,7 +1212,8 @@ trait Trait_Job_Runner {
 				self::collect_elementor_translation_payload( $data ),
 				$map,
 				$skipped_list,
-				'gap-fill-tick-end'
+				'gap-fill-tick-end',
+				$state
 			);
 
 			$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );

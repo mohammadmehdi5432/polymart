@@ -68,7 +68,7 @@ final class Config_Constants {
 	/** Max API attempts per Elementor __segN key before source-text fallback. */
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = 5;
 	/** Empty stubborn hand-off ticks before force-saving with source-text fallback. */
-	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 8;
+	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = 3;
 	/** Base HTTP timeout (seconds) for a short Elementor job-step AI call. */
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT = 45;
 	/** Upper HTTP timeout (seconds) for heavy HTML / __segN Elementor slices. */
