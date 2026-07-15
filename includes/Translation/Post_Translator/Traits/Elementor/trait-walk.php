@@ -48,10 +48,14 @@ trait Trait_Walk {
 
 			$child_path = $path . '.' . (string) $key;
 
-			if ( is_string( $key ) && isset( self::$elementor_text_keys[ $key ] ) && is_string( $item ) ) {
+			if ( is_string( $item ) ) {
 				$value = trim( (string) $item );
 
-				if ( '' !== $value && Persian_Detector::contains_persian( $value ) && self::should_skip_elementor_setting_key( $key, $value ) ) {
+				if (
+					'' !== $value
+					&& Persian_Detector::contains_persian( $value )
+					&& ! self::should_collect_elementor_node_string( (string) $key, $value, false )
+				) {
 					$filtered[] = array(
 						'path'    => $child_path,
 						'preview' => $value,
@@ -73,7 +77,11 @@ trait Trait_Walk {
 			if ( is_string( $item ) ) {
 				$value = trim( (string) $item );
 
-				if ( '' !== $value && Persian_Detector::contains_persian( $value ) && self::should_skip_elementor_setting_key( (string) $key, $value ) ) {
+				if (
+					'' !== $value
+					&& Persian_Detector::contains_persian( $value )
+					&& ! self::should_collect_elementor_node_string( (string) $key, $value, true )
+				) {
 					$filtered[] = array(
 						'path'    => $child_path,
 						'preview' => $value,
@@ -100,8 +108,12 @@ trait Trait_Walk {
 
 			$child_path = $path . '.' . (string) $key;
 
-			if ( is_string( $key ) && isset( self::$elementor_text_keys[ $key ] ) && is_string( $item ) ) {
-				$value = Persian_Detector::only_persian_value( $item );
+			if ( is_string( $item ) ) {
+				if ( ! self::should_collect_elementor_node_string( (string) $key, $item, false ) ) {
+					continue;
+				}
+
+				$value = self::extract_elementor_translatable_string( $item );
 
 				if ( '' !== $value ) {
 					$payload[ $child_path ] = $value;
@@ -120,11 +132,11 @@ trait Trait_Walk {
 			$child_path = $path . '.' . (string) $key;
 
 			if ( is_string( $item ) ) {
-				if ( ! self::should_collect_elementor_setting_for_translation( (string) $key, $item ) ) {
+				if ( ! self::should_collect_elementor_node_string( (string) $key, $item, true ) ) {
 					continue;
 				}
 
-				$value = Persian_Detector::only_persian_value( $item );
+				$value = self::extract_elementor_translatable_string( $item );
 
 				if ( '' !== $value ) {
 					$payload[ $child_path ] = $value;
@@ -138,7 +150,19 @@ trait Trait_Walk {
 		}
 	}
 
-	private static function should_collect_elementor_setting_for_translation( $key, $value ) {
+	/**
+	 * Single gate for scanner, map generation, chunking, and gap-fill.
+	 *
+	 * @param string $key         Setting/node key.
+	 * @param mixed  $value       Raw value.
+	 * @param bool   $in_settings Whether the key lives under an Elementor settings tree.
+	 * @return bool
+	 */
+	private static function should_collect_elementor_node_string( $key, $value, $in_settings = true ) {
+		if ( ! is_string( $value ) ) {
+			return false;
+		}
+
 		$key = (string) $key;
 
 		if ( self::should_skip_elementor_setting_key( $key, $value ) ) {
@@ -161,6 +185,14 @@ trait Trait_Walk {
 		 * @param string $value   Setting value.
 		 */
 		return (bool) apply_filters( 'polymart_ai_elementor_include_setting_key', false, $key, (string) $value );
+	}
+
+	private static function should_collect_elementor_setting_for_translation( $key, $value ) {
+		return self::should_collect_elementor_node_string( (string) $key, $value, true );
+	}
+
+	private static function extract_elementor_translatable_string( $value ) {
+		return Persian_Detector::only_persian_value( (string) $value );
 	}
 
 	private static function is_elementor_user_text_setting_key( $key ) {
@@ -431,8 +463,12 @@ trait Trait_Walk {
 
 	private static function walk_elementor_persian_text( array $node, array &$chunks ) {
 		foreach ( $node as $key => $item ) {
-			if ( is_string( $key ) && isset( self::$elementor_text_keys[ $key ] ) && is_string( $item ) ) {
-				$value = Persian_Detector::only_persian_value( $item );
+			if ( is_string( $item ) ) {
+				if ( ! self::should_collect_elementor_node_string( (string) $key, $item, true ) ) {
+					continue;
+				}
+
+				$value = self::extract_elementor_translatable_string( $item );
 
 				if ( '' !== $value ) {
 					$chunks[] = $value;

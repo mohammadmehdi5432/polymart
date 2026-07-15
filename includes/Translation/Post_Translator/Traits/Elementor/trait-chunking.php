@@ -1143,7 +1143,33 @@ trait Trait_Chunking {
 
 	private static function merge_elementor_api_translations_into_map( array $raw_mapped, array $source_payload ) {
 		$raw_mapped = self::repair_elementor_segment_map_keys( $raw_mapped, $source_payload );
-		$mapped     = $raw_mapped;
+		$mapped     = array();
+
+		foreach ( $raw_mapped as $path => $value ) {
+			$path = (string) $path;
+
+			if ( '' === $path ) {
+				continue;
+			}
+
+			$source_text = (string) ( $source_payload[ $path ] ?? '' );
+
+			if ( preg_match( '/^(.+)::__(?:part|seg)\d+$/', $path, $matches ) ) {
+				$base = (string) $matches[1];
+
+				if ( '' === $source_text && preg_match( '/::__seg\d+$/', $path ) ) {
+					$base_text   = (string) ( $source_payload[ $base ] ?? '' );
+					$seg_lookup  = self::get_elementor_segment_source_lookup( $base, $base_text );
+					$source_text = (string) ( $seg_lookup[ $path ] ?? $source_text );
+				} elseif ( '' === $source_text && preg_match( '/::__part\d+$/', $path ) ) {
+					$source_text = (string) ( $source_payload[ $base ] ?? $source_text );
+				}
+			}
+
+			if ( self::elementor_map_value_is_valid_translation( $path, $source_text, (string) $value ) ) {
+				$mapped[ $path ] = trim( (string) $value );
+			}
+		}
 
 		foreach ( self::collapse_payload_parts( $raw_mapped ) as $base => $value ) {
 			$base = (string) $base;
@@ -1154,7 +1180,7 @@ trait Trait_Chunking {
 
 			$source = (string) ( $source_payload[ $base ] ?? '' );
 
-			if ( self::elementor_all_segments_present_in_map( $base, $source, $raw_mapped ) ) {
+			if ( self::elementor_all_segments_present_in_map( $base, $source, $mapped ) ) {
 				$mapped[ $base ] = (string) $value;
 				continue;
 			}
@@ -1308,6 +1334,23 @@ trait Trait_Chunking {
 		}
 
 		return $chunks;
+	}
+
+	/**
+	 * Canonical job payload bundle — same collapse/mirror rules for scanner, queue, and repair.
+	 *
+	 * @param array<string, mixed> $source_data Elementor JSON tree.
+	 * @return array{full: array<string, string>, payload: array<string, string>, mirrors: array<string, string[]>}
+	 */
+	private static function prepare_elementor_job_payload_bundle( array $source_data ) {
+		$full      = self::collect_elementor_translation_payload( $source_data );
+		$collapsed = self::collapse_duplicate_elementor_payload( $full );
+
+		return array(
+			'full'    => $full,
+			'payload' => $collapsed['payload'],
+			'mirrors' => $collapsed['mirrors'],
+		);
 	}
 
 	private static function collapse_duplicate_elementor_payload( array $payload ) {

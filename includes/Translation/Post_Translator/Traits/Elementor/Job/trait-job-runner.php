@@ -410,6 +410,22 @@ trait Trait_Job_Runner {
 							$post_id,
 							$lang
 						);
+
+						if ( self::elementor_primary_schedule_locked( $post_id, $lang, $state ) ) {
+							$skipped_guard = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+
+							return self::finalize_elementor_job_slice(
+								$post_id,
+								$lang,
+								$data,
+								$map,
+								$state,
+								max( $done_count_pre, $progress_total ),
+								$progress_total,
+								self::filter_remaining_elementor_payload( $source_payload, $map, $skipped_guard )
+							);
+						}
+
 						$blocker = self::get_elementor_job_finalize_blockers( $post_id, $lang, $data, $map, $state );
 
 						if ( null !== $blocker ) {
@@ -633,6 +649,60 @@ trait Trait_Job_Runner {
 
 			list( $aliased_payload, $alias_to_path ) = self::alias_elementor_payload_keys( $chunk );
 			$ai_options = self::build_elementor_chunk_ai_options( $chunk );
+
+			if ( empty( $aliased_payload ) && ! empty( $chunk ) ) {
+				\PolymartAI\Activity_Logger::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post ID, 2: chunk index */
+						__( 'Elementor — #%1$d: بخش %2$d پس از فیلتر خالی شد — رد شد و partial ذخیره می‌شود.', 'polymart-ai' ),
+						$post_id,
+						$slice_cursor + 1
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
+
+				self::release_stalled_elementor_chunk_fields( $chunk, $map, $source_payload, $state, $failures );
+				$map                    = self::sanitize_elementor_translation_map( $map, $source_payload );
+				$state['elementor_map'] = $map;
+				++$processed;
+
+				if ( $gap_fill_mode ) {
+					self::register_elementor_gap_fill_chunk_done( $state, $chunk );
+					$gap_fill_done = absint( $state['elementor_gap_fill_done'] ?? 0 );
+					self::sync_elementor_persist_map_state( $state, $map, $source_payload );
+					$commit_done = $progress_total;
+				} else {
+					++$slice_cursor;
+					$commit_done = $slice_cursor;
+				}
+
+				$committed = self::commit_elementor_chunk_progress_to_site(
+					$post_id,
+					$lang,
+					$data,
+					$state,
+					$map,
+					$commit_done,
+					$progress_total,
+					$gap_fill_mode
+				);
+
+				if ( is_wp_error( $committed ) ) {
+					return $committed;
+				}
+
+				if ( ! $gap_fill_mode ) {
+					self::write_elementor_slice_cursor( $post_id, $lang, $slice_cursor, $progress_total );
+					$state['elementor_chunk_index']      = $slice_cursor;
+					$state['elementor_slices_completed'] = $slice_cursor;
+				}
+
+				self::save_job_partial_state( $post_id, $lang, $state );
+				\PolymartAI\Activity_Logger::sync_elementor_partial_progress( $post_id, $lang );
+
+				continue;
+			}
 
 			if ( $gap_fill_mode ) {
 				$ai_options['max_timeout'] = max(

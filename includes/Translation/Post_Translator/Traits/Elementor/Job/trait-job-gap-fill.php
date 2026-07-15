@@ -580,6 +580,31 @@ trait Trait_Job_Gap_Fill {
 		$lang         = sanitize_key( (string) $lang );
 		$done_count   = max( 0, absint( $done_count ) );
 		$total_chunks = max( 1, absint( $total_chunks ) );
+		$blocker_code = sanitize_key( (string) ( $blocker['code'] ?? '' ) );
+
+		if (
+			in_array( $blocker_code, array( 'untranslated_fields', 'stored_persian' ), true )
+			&& self::elementor_primary_schedule_locked( $post_id, $lang, $state )
+		) {
+			$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
+			$remaining = self::filter_remaining_elementor_payload(
+				self::collect_elementor_translation_payload( $source_data ),
+				$map,
+				$skipped
+			);
+
+			return self::finalize_elementor_job_slice(
+				$post_id,
+				$lang,
+				$source_data,
+				$map,
+				$state,
+				$done_count,
+				$total_chunks,
+				$remaining
+			);
+		}
+
 		$message      = (string) ( $blocker['message'] ?? __( 'ترجمه Elementor ناقص است.', 'polymart-ai' ) );
 
 		\PolymartAI\Activity_Logger::log(

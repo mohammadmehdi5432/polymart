@@ -982,7 +982,8 @@ trait Trait_Job_State {
 		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$source    = self::collect_elementor_translation_payload( $data );
 		$remaining = self::filter_remaining_elementor_payload( $source, $map, $skipped );
-		$all_chunks = self::chunk_elementor_payload_for_job( $source );
+		$job_payload = self::prepare_elementor_job_payload_bundle( $data );
+		$all_chunks  = self::chunk_elementor_payload_for_job( $job_payload['payload'] );
 
 		if ( empty( $remaining ) ) {
 			return false;
@@ -990,7 +991,6 @@ trait Trait_Job_State {
 
 		$translated_count = max( 0, count( $source ) - count( $remaining ) );
 		$hydrated_state   = array_merge( $state, array( 'elementor_map' => $map ) );
-		$progress_done    = (int) self::get_elementor_chunk_progress( $post_id, $lang, $hydrated_state )['done'];
 		$stored_total     = self::read_elementor_slice_cursor_total( $post_id, $lang );
 		$chunk_total      = max( 1, count( $all_chunks ) );
 		$cursor           = self::resolve_elementor_slice_cursor( $post_id, $lang, $data, $hydrated_state );
@@ -1002,8 +1002,8 @@ trait Trait_Job_State {
 			return false;
 		}
 
-		$stale = $progress_done > $translated_count
-			|| $stored_total > $chunk_total
+		// Do not reset when API slices were marked processed but map is still empty — gap-fill must continue.
+		$stale = $stored_total > $chunk_total
 			|| ( 0 === $pending_chunks && count( $remaining ) > 0 && ! $cursor_at_end );
 
 		if ( ! $stale ) {
@@ -1206,8 +1206,8 @@ trait Trait_Job_State {
 
 		$api_cooldown_remaining = \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining();
 		$stale_cursor           = (int) $progress['done'] > max( 0, count( $source ) - count( $remaining ) ) && count( $remaining ) > 0;
-		$collapsed              = self::collapse_duplicate_elementor_payload( $source );
-		$api_batches            = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
+		$job_payload            = self::prepare_elementor_job_payload_bundle( $data );
+		$api_batches            = self::chunk_elementor_payload_for_job( $job_payload['payload'] );
 		$long_field_count       = 0;
 		$long_remaining_count   = 0;
 
@@ -1227,7 +1227,7 @@ trait Trait_Job_State {
 		$api_payload_samples    = array();
 		$sample_index           = 0;
 
-		foreach ( array_slice( $collapsed['payload'], 0, 4, true ) as $path => $text ) {
+		foreach ( array_slice( $job_payload['payload'], 0, 4, true ) as $path => $text ) {
 			$api_payload_samples[] = array(
 				'key'     => 'el_' . $sample_index,
 				'preview' => wp_trim_words( wp_strip_all_tags( html_entity_decode( (string) $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ), 16, '…' ),
@@ -1238,8 +1238,8 @@ trait Trait_Job_State {
 		return array(
 			'active'                 => true,
 			'source_field_count'     => count( $source ),
-			'unique_text_count'      => count( $collapsed['payload'] ),
-			'duplicate_field_count'  => max( 0, count( $source ) - count( $collapsed['payload'] ) ),
+			'unique_text_count'      => count( $job_payload['payload'] ),
+			'duplicate_field_count'  => max( 0, count( $source ) - count( $job_payload['payload'] ) ),
 			'api_batch_count'        => max( 1, count( $api_batches ) ),
 			'api_payload_samples'    => $api_payload_samples,
 			'remaining_field_count'  => count( $remaining ),

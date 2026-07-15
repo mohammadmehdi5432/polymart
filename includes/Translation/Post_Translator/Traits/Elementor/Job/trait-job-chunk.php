@@ -21,6 +21,29 @@ defined( 'ABSPATH' ) || exit;
 
 trait Trait_Job_Chunk {
 
+	private static function elementor_chunk_field_needs_translation( $path, $text, array $map, array $source_payload ) {
+		$path = (string) $path;
+		$text = (string) $text;
+
+		if ( preg_match( '/^(.+)::__(?:part|seg)\d+$/', $path, $matches ) ) {
+			$base      = (string) $matches[1];
+			$base_text = (string) ( $source_payload[ $base ] ?? $text );
+
+			if (
+				isset( $map[ $path ] )
+				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $map[ $path ] )
+			) {
+				return false;
+			}
+
+			return ! self::elementor_field_translation_complete( $base, $base_text, $map );
+		}
+
+		$source_text = (string) ( $source_payload[ $path ] ?? $text );
+
+		return ! self::elementor_field_translation_complete( $path, $source_text, $map );
+	}
+
 	private static function elementor_chunk_is_satisfied( array $chunk, array $map, array $source_payload ) {
 		if ( empty( $chunk ) ) {
 			return false;
@@ -106,12 +129,13 @@ trait Trait_Job_Chunk {
 
 	private static function compute_elementor_api_batch_progress( array $source_data, array $map, array $state = array() ) {
 		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
-		$payload   = self::collect_elementor_translation_payload( $source_data );
-		$remaining = self::filter_remaining_elementor_payload( $payload, $map, $skipped );
-		$collapsed_all       = self::collapse_duplicate_elementor_payload( $payload )['payload'];
-		$collapsed_remaining = self::collapse_duplicate_elementor_payload( $remaining )['payload'];
-		$all_chunks          = self::chunk_elementor_payload_for_job( $collapsed_all );
-		$left_chunks         = self::chunk_elementor_payload_for_job( $collapsed_remaining );
+		$job_payload = self::prepare_elementor_job_payload_bundle( $source_data );
+		$payload     = $job_payload['full'];
+		$remaining   = self::filter_remaining_elementor_payload( $payload, $map, $skipped );
+		$all_chunks  = self::chunk_elementor_payload_for_job( $job_payload['payload'] );
+		$left_chunks = self::chunk_elementor_payload_for_job(
+			self::collapse_duplicate_elementor_payload( $remaining )['payload']
+		);
 
 		return array(
 			'done'  => max( 0, count( $all_chunks ) - count( $left_chunks ) ),
@@ -124,8 +148,8 @@ trait Trait_Job_Chunk {
 		$lang    = sanitize_key( (string) $lang );
 
 		$source_payload = self::collect_elementor_translation_payload( $source_data );
-		$collapsed      = self::collapse_duplicate_elementor_payload( $source_payload );
-		$all_chunks     = self::chunk_elementor_payload_for_job( $collapsed['payload'] );
+		$job_payload    = self::prepare_elementor_job_payload_bundle( $source_data );
+		$all_chunks     = self::chunk_elementor_payload_for_job( $job_payload['payload'] );
 		$total          = max( 1, count( $all_chunks ) );
 
 		// Primary 24/24 is immutable — never re-queue base chunks during gap-fill/stubborn.
@@ -148,7 +172,7 @@ trait Trait_Job_Chunk {
 				'pending' => array(),
 				'total'   => $stored_total,
 				'cursor'  => $stored_cursor,
-				'mirrors' => $collapsed['mirrors'],
+				'mirrors' => $job_payload['mirrors'],
 			);
 		}
 
@@ -178,7 +202,7 @@ trait Trait_Job_Chunk {
 					continue;
 				}
 
-				if ( ! self::elementor_field_translation_complete( $path, (string) $text, $map ) ) {
+				if ( self::elementor_chunk_field_needs_translation( $path, (string) $text, $map, $source_payload ) ) {
 					$needs_work = true;
 					break;
 				}
@@ -197,7 +221,7 @@ trait Trait_Job_Chunk {
 			'pending' => $pending,
 			'total'   => $total,
 			'cursor'  => $cursor,
-			'mirrors' => $collapsed['mirrors'],
+			'mirrors' => $job_payload['mirrors'],
 		);
 	}
 
