@@ -867,16 +867,29 @@ final class AI_Client {
 			\PolymartAI\Language_Registry::get_default_language_code()
 		);
 
-		$system_prompt = implode(
-			' ',
-			array(
-				'You are a professional translator specializing in ' . $source_label . ' to ' . $target_label . ' translation for e-commerce and blog content.',
-				'Translate each value in the provided JSON object from ' . $source_label . ' to natural, fluent ' . $target_label . '.',
-				'Preserve HTML tags, shortcodes, URLs, and placeholders exactly as they appear.',
-				'Return ONLY one valid JSON object with the exact same keys as the input.',
-				'Every value must be a JSON string. Do not add markdown fences, comments, or extra keys.',
-			)
+		$system_rules = array(
+			'You are a professional translator specializing in ' . $source_label . ' to ' . $target_label . ' translation for e-commerce and blog content.',
+			'Translate each value in the provided JSON object from ' . $source_label . ' to natural, fluent ' . $target_label . '.',
+			'Preserve HTML tags, shortcodes, URLs, and placeholders exactly as they appear.',
+			'Return ONLY one valid JSON object with the exact same keys as the input.',
+			'Every value must be a JSON string. Do not add markdown fences, comments, or extra keys.',
 		);
+
+		$has_segment_keys = false;
+
+		foreach ( array_keys( $data_array ) as $field_key ) {
+			if ( false !== strpos( (string) $field_key, '__seg' ) ) {
+				$has_segment_keys = true;
+				break;
+			}
+		}
+
+		if ( $has_segment_keys ) {
+			$system_rules[] = 'Some keys end with __segN — these are HTML segment identifiers. Return every key unchanged, including the __seg suffix, and translate only the string values.';
+			$system_rules[] = 'Do not merge, rename, or drop __segN keys. Do not strip or rewrite HTML tag structure inside segment values.';
+		}
+
+		$system_prompt = implode( ' ', $system_rules );
 
 		$user_content = wp_json_encode(
 			$data_array,

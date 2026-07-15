@@ -775,7 +775,7 @@ trait Trait_Chunking {
 	}
 
 	private static function prepare_elementor_map_for_persist( array $map, array $source_payload, $allow_partial_segments = false ) {
-		$prepared = $map;
+		$prepared = self::repair_elementor_segment_map_keys( $map, $source_payload );
 
 		foreach ( $source_payload as $path => $text ) {
 			$path     = (string) $path;
@@ -786,34 +786,13 @@ trait Trait_Chunking {
 				continue;
 			}
 
-			$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
-			$parts      = array();
+			$assembled = self::assemble_elementor_segment_field( $path, $text, $prepared, $allow_partial_segments );
 
-			foreach ( $seg_keys as $seg_key ) {
-				$seg_source = (string) ( $seg_lookup[ $seg_key ] ?? '' );
-
-				if (
-					isset( $prepared[ $seg_key ] )
-					&& self::elementor_segment_is_resolved( $seg_key, $seg_source, $prepared )
-				) {
-					$parts[] = (string) $prepared[ $seg_key ];
-					continue;
-				}
-
-				if ( $allow_partial_segments && '' !== $seg_source ) {
-					$parts[] = $seg_source;
-					continue;
-				}
-
-				$parts = array();
-				break;
-			}
-
-			if ( empty( $parts ) ) {
+			if ( '' === $assembled ) {
 				continue;
 			}
 
-			$prepared[ $path ] = implode( '', $parts );
+			$prepared[ $path ] = $assembled;
 
 			foreach ( $seg_keys as $seg_key ) {
 				unset( $prepared[ $seg_key ] );
@@ -821,6 +800,170 @@ trait Trait_Chunking {
 		}
 
 		return $prepared;
+	}
+
+	/**
+	 * Merge available __segN translations; optionally gap-fill missing pieces with source HTML.
+	 *
+	 * @param string                $path                    Base field path.
+	 * @param string                $text                    Source field text.
+	 * @param array<string, string> $map                     Translation map.
+	 * @param bool                  $fill_missing_with_source When true, unresolved segments use source text.
+	 * @return string Assembled value or empty when nothing usable exists.
+	 */
+	private static function assemble_elementor_segment_field( $path, $text, array $map, $fill_missing_with_source = false ) {
+		$path     = (string) $path;
+		$text     = (string) $text;
+		$seg_keys = self::get_elementor_segment_keys( $path, $text );
+
+		if ( empty( $seg_keys ) ) {
+			return isset( $map[ $path ] ) ? (string) $map[ $path ] : '';
+		}
+
+		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+		$parts      = array();
+		$resolved   = 0;
+
+		foreach ( $seg_keys as $seg_key ) {
+			$seg_source = (string) ( $seg_lookup[ $seg_key ] ?? '' );
+
+			if (
+				isset( $map[ $seg_key ] )
+				&& self::elementor_segment_is_resolved( $seg_key, $seg_source, $map )
+			) {
+				$parts[] = (string) $map[ $seg_key ];
+				++$resolved;
+				continue;
+			}
+
+			if ( $fill_missing_with_source && '' !== $seg_source ) {
+				$parts[] = $seg_source;
+				continue;
+			}
+
+			// Resilient partial: keep translated segments already collected, source-fill the rest.
+			if ( $resolved > 0 ) {
+				return self::assemble_elementor_segment_field( $path, $text, $map, true );
+			}
+
+			return '';
+		}
+
+		if ( $resolved <= 0 ) {
+			return '';
+		}
+
+		return implode( '', $parts );
+	}
+
+	/**
+	 * Whether enough __segN pieces are translated to treat the long field as complete.
+	 *
+	 * @param string                $path Base field path.
+	 * @param string                $text Source field text.
+	 * @param array<string, string> $map  Translation map.
+	 * @return bool
+	 */
+	private static function elementor_segment_field_has_sufficient_coverage( $path, $text, array $map ) {
+		$path       = (string) $path;
+		$text       = (string) $text;
+		$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+
+		if ( empty( $seg_lookup ) ) {
+			return false;
+		}
+
+		$source_chars    = max( 1, self::utf8_strlen( $text ) );
+		$translated_chars = 0;
+		$resolved_count   = 0;
+
+		foreach ( $seg_lookup as $seg_key => $seg_source ) {
+			$seg_key    = (string) $seg_key;
+			$seg_source = (string) $seg_source;
+
+			if ( ! self::elementor_segment_is_resolved( $seg_key, $seg_source, $map ) ) {
+				continue;
+			}
+
+			++$resolved_count;
+			$translated_chars += self::utf8_strlen( (string) $map[ $seg_key ] );
+		}
+
+		if ( $resolved_count <= 0 ) {
+			return false;
+		}
+
+		$assembled = self::assemble_elementor_segment_field( $path, $text, $map, true );
+
+		if ( '' === $assembled ) {
+			return false;
+		}
+
+		if ( ! self::elementor_map_value_is_valid_translation( $path, $text, $assembled ) ) {
+			return false;
+		}
+
+		return $translated_chars >= (int) floor( $source_chars * 0.75 );
+	}
+
+	/**
+	 * Match AI responses that dropped the base path prefix but kept __segN suffixes.
+	 *
+	 * @param array<string, string> $map            Translation map.
+	 * @param array<string, string> $source_payload Source payload.
+	 * @return array<string, string>
+	 */
+	private static function repair_elementor_segment_map_keys( array $map, array $source_payload ) {
+		$repaired = $map;
+
+		foreach ( $source_payload as $path => $text ) {
+			$path       = (string) $path;
+			$text       = (string) $text;
+			$seg_lookup = self::get_elementor_segment_source_lookup( $path, $text );
+
+			if ( empty( $seg_lookup ) ) {
+				continue;
+			}
+
+			foreach ( $seg_lookup as $expected_key => $seg_source ) {
+				$expected_key = (string) $expected_key;
+				$seg_source   = (string) $seg_source;
+
+				if (
+					isset( $repaired[ $expected_key ] )
+					&& self::elementor_segment_is_resolved( $expected_key, $seg_source, $repaired )
+				) {
+					continue;
+				}
+
+				if ( ! preg_match( '/::__seg(\d+)$/', $expected_key, $matches ) ) {
+					continue;
+				}
+
+				$seg_index = (string) $matches[1];
+
+				foreach ( $repaired as $candidate_key => $candidate_value ) {
+					$candidate_key = (string) $candidate_key;
+
+					if ( $candidate_key === $expected_key ) {
+						continue;
+					}
+
+					if ( ! preg_match( '/::__seg' . preg_quote( $seg_index, '/' ) . '$/', $candidate_key ) ) {
+						continue;
+					}
+
+					if ( ! self::elementor_map_value_is_valid_translation( $expected_key, $seg_source, (string) $candidate_value ) ) {
+						continue;
+					}
+
+					$repaired[ $expected_key ] = (string) $candidate_value;
+					break;
+				}
+			}
+		}
+
+		return $repaired;
 	}
 
 	/**
@@ -903,7 +1046,8 @@ trait Trait_Chunking {
 	}
 
 	private static function merge_elementor_api_translations_into_map( array $raw_mapped, array $source_payload ) {
-		$mapped = $raw_mapped;
+		$raw_mapped = self::repair_elementor_segment_map_keys( $raw_mapped, $source_payload );
+		$mapped     = $raw_mapped;
 
 		foreach ( self::collapse_payload_parts( $raw_mapped ) as $base => $value ) {
 			$base = (string) $base;
@@ -955,9 +1099,11 @@ trait Trait_Chunking {
 			}
 
 			$all_segs_ok = true;
+			$resolved    = 0;
 
 			foreach ( $seg_lookup as $seg_key => $seg_source ) {
 				if ( self::elementor_segment_is_resolved( $seg_key, (string) $seg_source, $map ) ) {
+					++$resolved;
 					continue;
 				}
 
@@ -966,6 +1112,11 @@ trait Trait_Chunking {
 			}
 
 			if ( $all_segs_ok ) {
+				return true;
+			}
+
+			// Accept resilient partial assembly when most segment characters are translated.
+			if ( $resolved > 0 && self::elementor_segment_field_has_sufficient_coverage( $path, $text, $map ) ) {
 				return true;
 			}
 
@@ -1173,8 +1324,22 @@ trait Trait_Chunking {
 		$persist_map = is_array( $state['elementor_persist_map'] ?? null ) ? $state['elementor_persist_map'] : array();
 		$seg_map     = is_array( $state['elementor_seg_map'] ?? null ) ? $state['elementor_seg_map'] : array();
 		$rebuilt     = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
+		$merged      = array_merge( $rebuilt, $persist_map, $seg_map, $state_map, $overlay_map );
+		$payload     = self::collect_elementor_translation_payload( $source_data );
 
-		return array_merge( $rebuilt, $persist_map, $seg_map, $state_map, $overlay_map );
+		$merged = self::repair_elementor_segment_map_keys( $merged, $payload );
+
+		return self::expand_elementor_map_mirrors( $merged, self::get_elementor_text_mirror_paths( $payload ) );
+	}
+
+	private static function merge_elementor_path_map( $post_id, $lang, array $source_data, array $map ) {
+		$rebuilt = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
+		$merged  = array_merge( $rebuilt, $map );
+		$payload = self::collect_elementor_translation_payload( $source_data );
+
+		$merged = self::repair_elementor_segment_map_keys( $merged, $payload );
+
+		return self::expand_elementor_map_mirrors( $merged, self::get_elementor_text_mirror_paths( $payload ) );
 	}
 
 	private static function chunk_elementor_payload_for_ai( array $payload ) {
@@ -1239,12 +1404,6 @@ trait Trait_Chunking {
 		}
 
 		return $mapped;
-	}
-
-	private static function merge_elementor_path_map( $post_id, $lang, array $source_data, array $map ) {
-		$rebuilt = self::rebuild_elementor_map_from_saved_translation( $post_id, $lang, $source_data );
-
-		return array_merge( $rebuilt, $map );
 	}
 
 }

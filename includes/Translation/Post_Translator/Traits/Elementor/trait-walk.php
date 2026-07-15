@@ -148,6 +148,10 @@ trait Trait_Walk {
 			return true;
 		}
 
+		if ( self::is_elementor_probable_user_text_setting_key( $key ) ) {
+			return true;
+		}
+
 		/**
 		 * Include extra visible Elementor setting keys for this site.
 		 *
@@ -160,6 +164,76 @@ trait Trait_Walk {
 
 	private static function is_elementor_user_text_setting_key( $key ) {
 		return isset( self::$elementor_text_keys[ (string) $key ] );
+	}
+
+	/**
+	 * Heuristic for WoodMart / third-party widgets whose control keys are not in the static whitelist.
+	 *
+	 * @param string $key Setting key.
+	 * @return bool
+	 */
+	private static function is_elementor_probable_user_text_setting_key( $key ) {
+		$key = strtolower( (string) $key );
+
+		if ( '' === $key ) {
+			return false;
+		}
+
+		static $exact_keys = array(
+			'text'        => true,
+			'title'       => true,
+			'label'       => true,
+			'heading'     => true,
+			'subtitle'    => true,
+			'content'     => true,
+			'description' => true,
+			'caption'     => true,
+			'message'     => true,
+			'placeholder' => true,
+			'name'        => true,
+			'question'    => true,
+			'answer'      => true,
+		);
+
+		if ( isset( $exact_keys[ $key ] ) ) {
+			return true;
+		}
+
+		static $suffixes = array(
+			'_text',
+			'_title',
+			'_label',
+			'_heading',
+			'_subtitle',
+			'_content',
+			'_description',
+			'_placeholder',
+			'_message',
+			'_caption',
+			'_name',
+			'_question',
+			'_answer',
+			'_btn_text',
+			'_button_text',
+			'_link_text',
+			'_more_text',
+			'_read_more',
+		);
+
+		foreach ( $suffixes as $suffix ) {
+			if ( strlen( $key ) > strlen( $suffix ) && substr( $key, -strlen( $suffix ) ) === $suffix ) {
+				return true;
+			}
+		}
+
+		if ( preg_match(
+			'/^(?:btn|button|link|tab|item|slide|banner|box|cta|toggle|faq|panel|accordion|category|categories|heading|menu|list|info|hotspot|tooltip|counter|testimonial|team|icon|wd|woodmart)[_-]?(?:text|title|label|heading|content|description|subtitle|name|caption|placeholder|message|btn|button|link|more|cta)?$/',
+			$key
+		) ) {
+			return true;
+		}
+
+		return false;
 	}
 
 	private static function is_elementor_translatable_url_key( $key, $value ) {

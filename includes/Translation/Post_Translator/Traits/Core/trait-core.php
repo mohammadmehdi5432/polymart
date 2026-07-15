@@ -190,6 +190,10 @@ trait Trait_Core {
 	}
 
 	private static function filter_remaining_elementor_payload( array $payload, array $map, array $skipped = array() ) {
+		if ( ! empty( $payload ) ) {
+			$map = self::expand_elementor_map_mirrors( $map, self::get_elementor_text_mirror_paths( $payload ) );
+		}
+
 		$remaining      = array();
 		$skipped_lookup = array_flip( array_map( 'strval', $skipped ) );
 
