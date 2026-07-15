@@ -102,6 +102,20 @@ final class Universal_Translator {
 	private static $embedded_elementor_registered = false;
 
 	/**
+	 * Whether the main `_elementor_data` swap filter is registered.
+	 *
+	 * @var bool
+	 */
+	private static $elementor_swap_registered = false;
+
+	/**
+	 * Whether the Elementor element-cache bust filter is registered.
+	 *
+	 * @var bool
+	 */
+	private static $elementor_cache_bust_registered = false;
+
+	/**
 	 * Constructor.
 	 */
 	public function __construct() {
@@ -109,10 +123,14 @@ final class Universal_Translator {
 		add_filter( 'gettext_with_context', array( $this, 'filter_gettext_with_context' ), 20, 4 );
 		add_filter( 'ngettext', array( $this, 'filter_ngettext' ), 20, 5 );
 
-		// Register after the main query is resolved so product/layout context is reliable.
+		// Register BEFORE template_redirect — Elementor often reads `_elementor_data`
+		// during `wp` / CSS print, so waiting until template_redirect left /en/ on Persian source.
+		add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_swap_early' ), 20 );
+		add_action( 'wp', array( $this, 'maybe_register_elementor_metadata_filter' ), 0 );
 		add_action( 'template_redirect', array( $this, 'maybe_register_elementor_metadata_filter' ), 1 );
 		add_action( 'template_redirect', array( $this, 'maybe_register_embedded_elementor_filter' ), 1 );
 		add_action( 'init', array( $this, 'maybe_register_embedded_elementor_filter' ), 25 );
+		add_action( 'wp_head', array( $this, 'print_elementor_serve_debug_comment' ), 1 );
 
 		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_script_locale_data' ), 10000 );
 		add_action( 'wp_enqueue_scripts', array( $this, 'patch_companion_localized_strings' ), 10001 );
@@ -126,6 +144,11 @@ final class Universal_Translator {
 		if ( function_exists( 'acf' ) ) {
 			add_filter( 'acf/format_value', array( $this, 'filter_acf_value' ), 20, 3 );
 		}
+
+		// Also try immediately — language is bootstrapped from URI in Url_Router::__construct.
+		if ( ! is_admin() ) {
+			$this->maybe_register_elementor_swap_early();
+		}
 	}
 
 	/**
@@ -136,11 +159,29 @@ final class Universal_Translator {
 	private $elementor_main_post_id = null;
 
 	/**
-	 * Register `_elementor_data` interception on translated storefront URLs.
+	 * Register Elementor meta swap as soon as URI language is known (before main query).
 	 *
-	 * Only hooks when the main queried post already has a validated stored
-	 * Elementor companion from admin translation. Never runs on single-product
-	 * pages (Woodmart layout shell) or for nested cms_block templates.
+	 * @return void
+	 */
+	public function maybe_register_elementor_swap_early() {
+		if ( ! Url_Router::is_translated_request() || is_admin() ) {
+			return;
+		}
+
+		/**
+		 * Filter whether `_elementor_data` may be swapped for a stored companion JSON.
+		 *
+		 * @param bool $enabled Default true.
+		 */
+		if ( ! apply_filters( 'polymart_ai_enable_elementor_json_swap', true ) ) {
+			return;
+		}
+
+		$this->register_elementor_swap_filters();
+	}
+
+	/**
+	 * Pin the main post and ensure swap filters are active once the query is ready.
 	 *
 	 * @return void
 	 */
@@ -149,7 +190,12 @@ final class Universal_Translator {
 			return;
 		}
 
-		if ( Layout_Guard::is_single_product_context() || ! is_singular() ) {
+		if ( Layout_Guard::is_single_product_context() ) {
+			return;
+		}
+
+		// Static front page is singular; keep a front_page fallback for odd themes.
+		if ( ! is_singular() && ! is_front_page() ) {
 			return;
 		}
 
@@ -164,6 +210,10 @@ final class Universal_Translator {
 
 		$post_id = get_queried_object_id();
 
+		if ( $post_id <= 0 && is_front_page() ) {
+			$post_id = absint( get_option( 'page_on_front' ) );
+		}
+
 		if ( $post_id <= 0 || Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
 			return;
 		}
@@ -175,8 +225,24 @@ final class Universal_Translator {
 		}
 
 		$this->elementor_main_post_id = $post_id;
+		$this->register_elementor_swap_filters();
+	}
 
-		add_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 10, 4 );
+	/**
+	 * Hook get_post_metadata swap + element-cache bust (idempotent).
+	 *
+	 * @return void
+	 */
+	private function register_elementor_swap_filters() {
+		if ( ! self::$elementor_swap_registered ) {
+			self::$elementor_swap_registered = true;
+			add_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 5, 4 );
+		}
+
+		if ( ! self::$elementor_cache_bust_registered ) {
+			self::$elementor_cache_bust_registered = true;
+			add_filter( 'get_post_metadata', array( $this, 'filter_elementor_render_cache_bust' ), 5, 4 );
+		}
 	}
 
 	/**
@@ -402,7 +468,7 @@ final class Universal_Translator {
 	}
 
 	/**
-	 * Serve pre-translated Elementor JSON for the main queried post only.
+	 * Serve pre-translated Elementor JSON for the main queried post (and early reads of it).
 	 *
 	 * Storefront requests must never live-walk, json_decode, or reload the Persian
 	 * source document on every `_elementor_data` read — that duplicated multi-megabyte
@@ -415,14 +481,23 @@ final class Universal_Translator {
 	 * @return mixed
 	 */
 	public function filter_elementor_metadata( $value, $object_id, $meta_key, $single ) {
-		if ( '_elementor_data' !== $meta_key || ! $single ) {
+		if ( '_elementor_data' !== $meta_key ) {
+			return $value;
+		}
+
+		if ( ! Url_Router::is_translated_request() ) {
 			return $value;
 		}
 
 		$post_id = (int) $object_id;
-		$main_id = null !== $this->elementor_main_post_id ? (int) $this->elementor_main_post_id : get_queried_object_id();
 
-		if ( $post_id <= 0 || $main_id <= 0 || $post_id !== $main_id || null !== $value ) {
+		if ( $post_id <= 0 || Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
+			return $value;
+		}
+
+		// Once the main page is pinned, only swap that document here.
+		// Nested cms_block / popup are handled by filter_embedded_elementor_metadata.
+		if ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
 			return $value;
 		}
 
@@ -431,7 +506,7 @@ final class Universal_Translator {
 				return $value;
 			}
 
-			return $this->elementor_cache[ $post_id ];
+			return $this->wrap_elementor_meta_return( $this->elementor_cache[ $post_id ], $single );
 		}
 
 		if ( self::$elementor_metadata_depth > 0 ) {
@@ -440,7 +515,7 @@ final class Universal_Translator {
 
 		++self::$elementor_metadata_depth;
 
-		remove_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 10 );
+		remove_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 5 );
 
 		try {
 			$lang = Url_Router::get_current_language();
@@ -465,12 +540,112 @@ final class Universal_Translator {
 				return $value;
 			}
 
+			// Pin main post on first successful early swap (before wp query finishes).
+			if ( null === $this->elementor_main_post_id ) {
+				$this->elementor_main_post_id = $post_id;
+			}
+
 			$this->elementor_cache[ $post_id ] = $stored;
 
-			return $stored;
+			// Override even if another filter already short-circuited with FA JSON.
+			return $this->wrap_elementor_meta_return( $stored, $single );
 		} finally {
 			--self::$elementor_metadata_depth;
-			add_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 10, 4 );
+			add_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 5, 4 );
+		}
+	}
+
+	/**
+	 * Force Elementor to rebuild HTML from swapped JSON on translated URLs.
+	 *
+	 * Element Caching (`_elementor_element_cache`) would otherwise keep Persian HTML
+	 * even after `_elementor_data` is correctly swapped.
+	 *
+	 * @param mixed  $value     Short-circuit value.
+	 * @param int    $object_id Post ID.
+	 * @param string $meta_key  Meta key.
+	 * @param bool   $single    Single flag.
+	 * @return mixed
+	 */
+	public function filter_elementor_render_cache_bust( $value, $object_id, $meta_key, $single ) {
+		static $bust_keys = array(
+			'_elementor_element_cache' => true,
+		);
+
+		if ( ! isset( $bust_keys[ (string) $meta_key ] ) || ! Url_Router::is_translated_request() ) {
+			return $value;
+		}
+
+		$post_id = (int) $object_id;
+
+		if ( $post_id <= 0 || Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
+			return $value;
+		}
+
+		if ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
+			$post_type = get_post_type( $post_id );
+
+			if ( ! in_array( $post_type, array( 'cms_block', 'wd_popup' ), true ) ) {
+				return $value;
+			}
+		}
+
+		$lang = Url_Router::get_current_language();
+
+		if ( ! Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+			return $value;
+		}
+
+		return $single ? '' : array();
+	}
+
+	/**
+	 * Normalize get_post_metadata return shape for single vs multi reads.
+	 *
+	 * @param string $stored Stored companion JSON.
+	 * @param bool   $single Whether a single value was requested.
+	 * @return string|array<int, string>
+	 */
+	private function wrap_elementor_meta_return( $stored, $single ) {
+		$stored = (string) $stored;
+
+		return $single ? $stored : array( $stored );
+	}
+
+	/**
+	 * HTML debug marker so View Source proves front-end hooks ran on /en/.
+	 *
+	 * @return void
+	 */
+	public function print_elementor_serve_debug_comment() {
+		if ( is_admin() || ! Url_Router::is_translated_request() ) {
+			return;
+		}
+
+		$post_id  = get_queried_object_id();
+		$lang     = Url_Router::get_current_language();
+		$serving  = $post_id > 0 && Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
+		$filter   = self::$elementor_swap_registered ? 'on' : 'off';
+		$cached   = ( $post_id > 0 && array_key_exists( $post_id, $this->elementor_cache ) && self::ELEMENTOR_CACHE_UNCHANGED !== ( $this->elementor_cache[ $post_id ] ?? null ) ) ? 'hit' : 'miss';
+
+		printf(
+			"\n<!-- Polymart AI: Serving %s for Post ID %d | filter=%s cache=%s singular=%s front=%s -->\n",
+			esc_html( strtoupper( $lang ) ),
+			(int) $post_id,
+			esc_html( $filter ),
+			esc_html( $cached ),
+			is_singular() ? '1' : '0',
+			is_front_page() ? '1' : '0'
+		);
+
+		if ( ! $serving ) {
+			$explain = Post_Translator::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
+			$codes   = implode( ',', array_map( 'strval', (array) ( $explain['codes'] ?? array() ) ) );
+
+			printf(
+				"<!-- Polymart AI: NOT serving Elementor companion | codes=%s -->\n",
+				esc_html( $codes )
+			);
 		}
 	}
 
@@ -484,7 +659,7 @@ final class Universal_Translator {
 	 * @return mixed
 	 */
 	public function filter_embedded_elementor_metadata( $value, $object_id, $meta_key, $single ) {
-		if ( '_elementor_data' !== $meta_key || ! $single || null !== $value ) {
+		if ( '_elementor_data' !== $meta_key ) {
 			return $value;
 		}
 
@@ -505,7 +680,7 @@ final class Universal_Translator {
 				return $value;
 			}
 
-			return $this->elementor_cache[ $post_id ];
+			return $this->wrap_elementor_meta_return( $this->elementor_cache[ $post_id ], $single );
 		}
 
 		if ( self::$elementor_metadata_depth > 0 ) {
@@ -541,7 +716,7 @@ final class Universal_Translator {
 
 			$this->elementor_cache[ $post_id ] = $stored;
 
-			return $stored;
+			return $this->wrap_elementor_meta_return( $stored, $single );
 		} finally {
 			--self::$elementor_metadata_depth;
 			add_filter( 'get_post_metadata', array( $this, 'filter_embedded_elementor_metadata' ), 10, 4 );

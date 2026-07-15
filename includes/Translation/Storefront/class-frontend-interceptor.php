@@ -53,6 +53,11 @@ final class Frontend_Interceptor {
 		add_filter( 'the_excerpt', array( $this, 'filter_the_excerpt' ), 10 );
 		add_filter( 'the_posts', array( $this, 'filter_queried_posts' ), 20, 2 );
 
+		// Browser tab / SEO title — beat Rank Math & theme filters.
+		add_filter( 'pre_get_document_title', array( $this, 'filter_pre_get_document_title' ), 9999 );
+		add_filter( 'document_title_parts', array( $this, 'filter_document_title_parts' ), 9999 );
+		add_filter( 'rank_math/frontend/title', array( $this, 'filter_rank_math_title' ), 9999 );
+
 		/**
 		 * Intercepts get_post_meta() for custom plugin keys.
 		 *
@@ -94,6 +99,95 @@ final class Frontend_Interceptor {
 		}
 
 		return $this->get_stored_core_translation( (int) $post_id, 'post_title', $title );
+	}
+
+	/**
+	 * Replace `<title>` early when WordPress builds the document title.
+	 *
+	 * @param string $title Current document title.
+	 * @return string
+	 */
+	public function filter_pre_get_document_title( $title ) {
+		if ( ! $this->should_intercept() ) {
+			return $title;
+		}
+
+		$translated = $this->resolve_queried_document_title();
+
+		return '' !== $translated ? $translated : $title;
+	}
+
+	/**
+	 * Replace the title part of document_title_parts (themes / SEO plugins).
+	 *
+	 * @param array<string, string> $parts Title parts.
+	 * @return array<string, string>
+	 */
+	public function filter_document_title_parts( $parts ) {
+		if ( ! $this->should_intercept() || ! is_array( $parts ) ) {
+			return $parts;
+		}
+
+		$translated = $this->resolve_queried_document_title();
+
+		if ( '' !== $translated ) {
+			$parts['title'] = $translated;
+		}
+
+		return $parts;
+	}
+
+	/**
+	 * Rank Math frontend title override.
+	 *
+	 * @param string $title Rank Math title.
+	 * @return string
+	 */
+	public function filter_rank_math_title( $title ) {
+		if ( ! $this->should_intercept() ) {
+			return $title;
+		}
+
+		$translated = $this->resolve_queried_document_title();
+
+		return '' !== $translated ? $translated : $title;
+	}
+
+	/**
+	 * Resolve storefront document/page title from PolyMart translation metas.
+	 *
+	 * Prefers Rank Math EN title when present, otherwise core title_en.
+	 *
+	 * @return string
+	 */
+	private function resolve_queried_document_title() {
+		$post_id = get_queried_object_id();
+
+		if ( $post_id <= 0 && is_front_page() ) {
+			$post_id = absint( get_option( 'page_on_front' ) );
+		}
+
+		if ( $post_id <= 0 || Layout_Guard::should_preserve_post_data( $post_id ) ) {
+			return '';
+		}
+
+		$lang = $this->get_active_lang();
+
+		$rank_math_key = Post_Translator::get_custom_meta_key( 'rank_math_title', $lang );
+		$rank_math     = is_string( $rank_math_key ) ? trim( (string) get_post_meta( $post_id, $rank_math_key, true ) ) : '';
+
+		// Discovered / translated Rank Math title metas may use _en suffix pattern directly.
+		if ( '' === $rank_math ) {
+			$rank_math = trim( (string) get_post_meta( $post_id, 'rank_math_title_' . $lang, true ) );
+		}
+
+		if ( '' !== $rank_math && ! Persian_Detector::contains_persian( $rank_math ) ) {
+			return $rank_math;
+		}
+
+		$core = Post_Translator::resolve_storefront_core_field( $post_id, 'post_title', $lang );
+
+		return is_string( $core ) ? trim( $core ) : '';
 	}
 
 	/**
