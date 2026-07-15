@@ -358,7 +358,18 @@ trait Trait_Job_Gap_Fill {
 			array( 'post_id' => $post_id, 'lang' => $lang )
 		);
 
-		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
+		self::force_claim_translation_lock( $post_id, $lang );
+
+		$persisted = self::persist_elementor_job_progress(
+			$post_id,
+			$lang,
+			$source_data,
+			$map,
+			$progress_total,
+			$progress_total,
+			true,
+			true
+		);
 
 		if ( is_wp_error( $persisted ) ) {
 			return $persisted;
@@ -376,6 +387,7 @@ trait Trait_Job_Gap_Fill {
 			$state['elementor_seg_map'],
 			$state['elementor_stubborn_ghost_ticks'],
 			$state['elementor_stubborn_long_index'],
+			$state['elementor_long_gap_force_attempts'],
 			$state['elementor_segment_passthrough'],
 			$state['elementor_field_passthrough']
 		);
@@ -410,7 +422,11 @@ trait Trait_Job_Gap_Fill {
 		$skipped        = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$remaining      = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
 		$forced         = 0;
+		$forced_long    = 0;
 		$accepted_paths = array();
+
+		// Recovery / force-finalize must own the lock or the emergency save loops forever.
+		self::force_claim_translation_lock( $post_id, $lang );
 
 		if ( ! empty( $remaining ) ) {
 			self::log_elementor_remaining_field_diagnostics(
@@ -424,6 +440,15 @@ trait Trait_Job_Gap_Fill {
 			);
 		}
 
+		$ghost         = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
+		$long_attempts = absint( $state['elementor_long_gap_force_attempts'] ?? 0 );
+		// Prefer real AI retries first; after the attempt/ghost ceiling, accept long HTML
+		// with whatever segments we have (+ source for gaps) and close the job.
+		$accept_long_fallback = (
+			$ghost >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
+			|| $long_attempts >= self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT
+		);
+
 		$long_remaining = 0;
 
 		foreach ( $remaining as $path => $text ) {
@@ -434,16 +459,30 @@ trait Trait_Job_Gap_Fill {
 				continue;
 			}
 
-			// Keep long HTML/__segN fields in stubborn gap-fill — never accept Persian source
-			// as "done" for those widgets (homepage text_content was getting stuck that way).
-			if ( self::stubborn_elementor_field_is_long( $path, $text ) ) {
+			$is_long = self::stubborn_elementor_field_is_long( $path, $text );
+
+			if ( $is_long && ! $accept_long_fallback ) {
 				++$long_remaining;
 				continue;
 			}
 
+			// Prefer collapsing any already-translated __segN pieces before full source fallback.
+			if ( $is_long ) {
+				$map = self::prepare_elementor_map_for_persist( $map, array( $path => $text ), true );
+				if ( self::elementor_field_translation_complete( $path, $text, $map ) ) {
+					$accepted_paths[] = $path;
+					++$forced_long;
+					continue;
+				}
+			}
+
 			self::apply_elementor_field_source_fallback( $path, $text, $map, $state );
 			$accepted_paths[] = $path;
-			++$forced;
+			if ( $is_long ) {
+				++$forced_long;
+			} else {
+				++$forced;
+			}
 		}
 
 		if ( ! empty( $accepted_paths ) ) {
@@ -460,9 +499,10 @@ trait Trait_Job_Gap_Fill {
 		self::sync_elementor_persist_map_state( $state, $map, $source_payload );
 
 		if ( $long_remaining > 0 ) {
-			$state['elementor_gap_fill']              = true;
-			$state['elementor_gap_fill_stubborn_only'] = true;
-			unset( $state['elementor_stubborn_ghost_ticks'] );
+			$state['elementor_gap_fill']               = true;
+			$state['elementor_gap_fill_stubborn_only']  = true;
+			$state['elementor_long_gap_force_attempts'] = $long_attempts + 1;
+			// Do NOT reset ghost ticks — that erased progress and caused infinite recovery.
 
 			$persisted = self::persist_elementor_job_progress(
 				$post_id,
@@ -471,7 +511,8 @@ trait Trait_Job_Gap_Fill {
 				$map,
 				$progress_total,
 				$progress_total,
-				false
+				false,
+				true
 			);
 
 			if ( is_wp_error( $persisted ) ) {
@@ -484,11 +525,13 @@ trait Trait_Job_Gap_Fill {
 			\PolymartAI\Activity_Logger::log(
 				'warning',
 				sprintf(
-					/* translators: 1: post ID, 2: short forced count, 3: long remaining */
-					__( 'Elementor — #%1$d: %2$d فیلد کوتاه force شد؛ %3$d فیلد بلند HTML همچنان در gap-fill می‌ماند.', 'polymart-ai' ),
+					/* translators: 1: post ID, 2: short forced count, 3: long remaining, 4: attempts, 5: limit */
+					__( 'Elementor — #%1$d: %2$d فیلد کوتاه force شد؛ %3$d فیلد بلند HTML همچنان در gap-fill می‌ماند (تلاش %4$d/%5$d).', 'polymart-ai' ),
 					$post_id,
 					$forced,
-					$long_remaining
+					$long_remaining,
+					(int) $state['elementor_long_gap_force_attempts'],
+					self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
@@ -508,15 +551,30 @@ trait Trait_Job_Gap_Fill {
 		\PolymartAI\Activity_Logger::log(
 			'warning',
 			sprintf(
-				/* translators: 1: post ID, 2: forced field count */
-				__( 'Elementor — #%1$d: تکمیل اجباری — %2$d فیلد سرسخت با متن اصلی ذخیره شد و ترجمه روی سایت اعمال شد.', 'polymart-ai' ),
+				/* translators: 1: post ID, 2: forced short count, 3: forced long count */
+				__( 'Elementor — #%1$d: تکمیل اجباری — %2$d فیلد کوتاه و %3$d فیلد بلند HTML با fallback ذخیره شد و کار بسته شد.', 'polymart-ai' ),
 				$post_id,
-				$forced
+				$forced,
+				$forced_long
 			),
-			array( 'post_id' => $post_id, 'lang' => $lang, 'forced' => $forced )
+			array(
+				'post_id'     => $post_id,
+				'lang'        => $lang,
+				'forced'      => $forced,
+				'forced_long' => $forced_long,
+			)
 		);
 
-		$persisted = self::persist_elementor_job_progress( $post_id, $lang, $source_data, $map, $progress_total, $progress_total, true );
+		$persisted = self::persist_elementor_job_progress(
+			$post_id,
+			$lang,
+			$source_data,
+			$map,
+			$progress_total,
+			$progress_total,
+			true,
+			true
+		);
 
 		if ( is_wp_error( $persisted ) ) {
 			return $persisted;
@@ -534,6 +592,7 @@ trait Trait_Job_Gap_Fill {
 			$state['elementor_seg_map'],
 			$state['elementor_stubborn_ghost_ticks'],
 			$state['elementor_stubborn_long_index'],
+			$state['elementor_long_gap_force_attempts'],
 			$state['elementor_segment_passthrough'],
 			$state['elementor_field_passthrough']
 		);
@@ -553,8 +612,8 @@ trait Trait_Job_Gap_Fill {
 			'phase_progress' => '',
 			'message'        => sprintf(
 				/* translators: 1: forced field count */
-				__( 'ترجمه Elementor با تکمیل اجباری ذخیره شد (%1$d فیلد با متن اصلی).', 'polymart-ai' ),
-				$forced
+				__( 'ترجمه Elementor با تکمیل اجباری ذخیره شد (%1$d فیلد با fallback).', 'polymart-ai' ),
+				$forced + $forced_long
 			),
 		);
 	}
@@ -1913,6 +1972,10 @@ trait Trait_Job_Gap_Fill {
 		if ( self::count_elementor_remaining_fields( $post_id, $lang ) <= 0 ) {
 			return false;
 		}
+
+		// Bulk-pin / kick recovery runs on a different PHP worker than the stuck AS tick.
+		// Steal the lock before any emergency write so persist cannot soft-reject.
+		self::force_claim_translation_lock( $post_id, $lang );
 
 		$raw = get_post_meta( $post_id, '_elementor_data', true );
 

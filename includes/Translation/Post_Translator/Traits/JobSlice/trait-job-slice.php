@@ -774,7 +774,11 @@ trait Trait_Job_Slice {
 		return Translation_Lock::touch_translation_lock( $post_id, $lang );
 	}
 
-	private static function ensure_translation_lock_for_persist( $post_id, $lang ) {
+	private static function ensure_translation_lock_for_persist( $post_id, $lang, $force_claim = false ) {
+		if ( $force_claim ) {
+			return self::force_claim_translation_lock( $post_id, $lang );
+		}
+
 		if ( self::owns_translation_lock( $post_id, $lang ) ) {
 			return self::touch_translation_lock( $post_id, $lang );
 		}

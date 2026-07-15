@@ -80,6 +80,34 @@ final class Translation_Lock {
 	}
 
 	/**
+	 * Unconditionally take ownership of the lock (recovery / force-finalize saves).
+	 *
+	 * Emergency persist must never soft-fail because another worker still holds the claim.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language code.
+	 * @return bool Always true when ids are valid.
+	 */
+	public static function force_claim_translation_lock( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang ) {
+			return false;
+		}
+
+		$keys  = self::get_translation_lock_keys( $post_id, $lang );
+		$token = self::get_translation_lock_token();
+		$now   = time();
+
+		update_option( $keys['claim'], (string) $now, false );
+		update_option( $keys['owner'], $token, false );
+		set_transient( $keys['key'], $now, self::TRANSLATION_LOCK_TTL );
+
+		return true;
+	}
+
+	/**
 	 * Acquire a per-post lock so duplicate AI requests are rejected.
 	 *
 	 * @param int    $post_id Post ID.

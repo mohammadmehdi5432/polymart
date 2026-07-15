@@ -21,11 +21,11 @@ defined( 'ABSPATH' ) || exit;
 
 trait Trait_Job_Persist {
 
-	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false ) {
+	private static function persist_elementor_job_progress( $post_id, $lang, array $source_data, array $map, $done_count, $total_chunks, $complete = false, $force_lock = false ) {
 		\PolymartAI\Activity_Logger::bootstrap_job_worker_context();
 		\PolymartAI\Activity_Logger::touch_job_worker_heartbeat();
 
-		if ( ! self::ensure_translation_lock_for_persist( $post_id, $lang ) ) {
+		if ( ! self::ensure_translation_lock_for_persist( $post_id, $lang, (bool) $force_lock ) ) {
 			\PolymartAI\Activity_Logger::log(
 				'warning',
 				sprintf(

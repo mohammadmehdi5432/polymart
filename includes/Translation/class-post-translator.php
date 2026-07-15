@@ -64,6 +64,7 @@ final class Post_Translator {
 	const ELEMENTOR_BULK_LONG_FIELD_SEGMENT_CHARS = Post_Translator_Config::ELEMENTOR_BULK_LONG_FIELD_SEGMENT_CHARS;
 	const ELEMENTOR_SEGMENT_MAX_RETRIES = Post_Translator_Config::ELEMENTOR_SEGMENT_MAX_RETRIES;
 	const ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT = Post_Translator_Config::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT;
+	const ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT = Post_Translator_Config::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT;
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT = Post_Translator_Config::ELEMENTOR_JOB_REQUEST_TIMEOUT;
 	const ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX = Post_Translator_Config::ELEMENTOR_JOB_REQUEST_TIMEOUT_MAX;
 	const JOB_REQUEST_MIN_TIMEOUT = Post_Translator_Config::JOB_REQUEST_MIN_TIMEOUT;
@@ -214,6 +215,10 @@ final class Post_Translator {
 
 	public static function acquire_translation_lock( $post_id, $lang ) {
 		return Translation_Lock::acquire_translation_lock( $post_id, $lang );
+	}
+
+	public static function force_claim_translation_lock( $post_id, $lang ) {
+		return Translation_Lock::force_claim_translation_lock( $post_id, $lang );
 	}
 
 	public static function release_translation_lock( $post_id, $lang, $force = false ) {

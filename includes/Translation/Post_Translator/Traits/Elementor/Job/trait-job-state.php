@@ -138,7 +138,8 @@ trait Trait_Job_State {
 			'elementor_segment_failures'  => array(),
 			'elementor_segment_passthrough' => array(),
 			'elementor_field_passthrough' => array(),
-			'elementor_stubborn_ghost_ticks' => 0,
+			'elementor_stubborn_ghost_ticks'    => 0,
+			'elementor_long_gap_force_attempts' => 0,
 		);
 
 		$state = array_merge( $defaults, $state );
@@ -705,10 +706,14 @@ trait Trait_Job_State {
 		$repairs = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
 
 		// Gap-fill/stubborn must actually spend AS ticks on __segN / short leftovers
-		// before we force-accept Persian source. Finalizing on the first handoff tick
-		// left homepage long HTML fields untranslated while still marking can_serve.
+		// before we force-accept Persian source. After the attempt/ghost ceiling the
+		// force-finalize path may close long HTML with partial/source fallback.
 		if ( $stubborn ) {
-			return $ghost >= 4 || $repairs >= 2;
+			$long_attempts = absint( $state['elementor_long_gap_force_attempts'] ?? 0 );
+
+			return $ghost >= self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT
+				|| $long_attempts >= self::ELEMENTOR_LONG_GAP_FORCE_ATTEMPT_LIMIT
+				|| $repairs >= 2;
 		}
 
 		if ( $remaining < 3 && $ghost >= 2 ) {
