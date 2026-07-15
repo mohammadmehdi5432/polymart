@@ -254,9 +254,13 @@ trait Trait_Job_Elementor {
 			return;
 		}
 
+		// Allow re-pin when EN JSON still has Persian even if a soft finalize
+		// marked the companion "finalized" with empty remaining_payload.
 		if (
 			Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
 			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			&& Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
+			&& ! Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
 		) {
 			return;
 		}

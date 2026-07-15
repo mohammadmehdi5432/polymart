@@ -1458,8 +1458,17 @@ trait Trait_Chunking {
 		$path = (string) $path;
 		$text = (string) $text;
 
+		// "Accepted" force-finalize must NOT hide Persian leftovers — otherwise
+		// remaining_payload becomes empty while audit still says ناقص Elementor
+		// and the bulk job bounces to the next post forever.
 		if ( self::elementor_path_is_accepted( $path ) ) {
-			return true;
+			$mapped = isset( $map[ $path ] ) ? (string) $map[ $path ] : '';
+
+			if ( '' !== $mapped && ! Persian_Detector::contains_persian( $mapped ) ) {
+				return true;
+			}
+
+			// Persian / empty accepted → fall through to real completeness checks.
 		}
 
 		if (

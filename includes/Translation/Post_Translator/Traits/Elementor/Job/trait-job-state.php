@@ -70,9 +70,16 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		// Persian leftovers in EN JSON always need another Elementor tick —
+		// finalized/N/N alone is not "done" for the queue.
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return true;
+		}
+
 		if (
 			self::is_elementor_translation_finalized( $post_id, $lang )
 			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 		) {
 			return false;
 		}
@@ -1366,10 +1373,18 @@ trait Trait_Job_State {
 			}
 		}
 
+		// Never early-exit while EN Elementor JSON still has Persian — that was the
+		// bounce bug: N/N + finalized + accepted leftovers → queue advances, audit
+		// stays partial («بخش‌های Elementor»), then the same post comes back.
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return true;
+		}
+
 		if (
 			self::is_elementor_translation_finalized( $post_id, $lang )
 			&& self::is_elementor_translation_current( $post_id, $lang )
 			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 		) {
 			return false;
 		}
@@ -1377,6 +1392,7 @@ trait Trait_Job_State {
 		if (
 			self::is_elementor_translation_finalized( $post_id, $lang )
 			&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 		) {
 			return false;
 		}

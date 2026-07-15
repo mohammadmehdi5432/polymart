@@ -616,6 +616,48 @@ trait Trait_Job_Gap_Fill {
 		self::clear_job_partial_state( $post_id, $lang, true );
 		self::flush_translation_status_cache( $post_id );
 
+		$still_persian = self::stored_elementor_translation_has_persian( $post_id, $lang );
+
+		if ( $still_persian ) {
+			// Do NOT stamp status=translated / done=true — queue must keep the pin
+			// and gap-fill English, otherwise UI shows N/N then «ناقص ماند Elementor».
+			self::invalidate_elementor_job_success_markers( $post_id, $lang );
+			// Drop accepted-path short-circuit so Persian leftovers re-enter remaining.
+			delete_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ) );
+			self::$current_elementor_accepted_paths = array();
+
+			$reopens = absint( $state['elementor_force_persian_reopens'] ?? 0 ) + 1;
+
+			\PolymartAI\Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: reopen count */
+					__( 'Elementor — #%1$d: force-finalize هنوز Persian در EN JSON دارد — از صف خارج نشد؛ reopen gap-fill (%2$d).', 'polymart-ai' ),
+					$post_id,
+					$reopens
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
+			$reopen = self::hydrate_elementor_job_partial_state( $post_id, $lang, array() );
+			$reopen['elementor_gap_fill']               = true;
+			$reopen['elementor_gap_fill_stubborn_only'] = true;
+			$reopen['elementor_map']                    = $map;
+			$reopen['elementor_force_persian_reopens']  = $reopens;
+			// Reset counters so stubborn gets fresh AI attempts before next force.
+			$reopen['elementor_stubborn_ghost_ticks']      = 0;
+			$reopen['elementor_long_gap_force_attempts']   = 0;
+			self::save_job_partial_state( $post_id, $lang, $reopen );
+
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $reopen ),
+				'message'        => __( 'فیلدهای Elementor هنوز فارسی‌اند — ادامه ترجمه همین مورد.', 'polymart-ai' ),
+				'recoverable'    => true,
+			);
+		}
+
 		update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
 		update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
 		update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );

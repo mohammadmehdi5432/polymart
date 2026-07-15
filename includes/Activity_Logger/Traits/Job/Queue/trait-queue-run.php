@@ -1240,8 +1240,15 @@ trait Trait_Queue_Run {
 		$status = self::resolve_post_job_status( $post_id, $lang );
 		$already_counted = self::job_already_counted_success( $job, $post_id );
 		$gaps            = Post_Translator::get_translation_gaps( $post_id, $lang );
-		$elementor_done  = Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
-			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
+		$en_has_persian  = Post_Translator::uses_elementor_builder( $post_id )
+			&& Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang );
+		// Leave-queue only when companion is actually storefront-ready English.
+		// N/N + finalized alone caused bouncing «ناقص ماند — بخش‌های Elementor».
+		$elementor_done  = Post_Translator::uses_elementor_builder( $post_id )
+			&& Post_Translator::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+			&& ! $en_has_persian
+			&& Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang );
 
 		if ( 'translated' === $status ) {
 			self::track_succeeded_post( $job, $post_id );
@@ -1255,12 +1262,19 @@ trait Trait_Queue_Run {
 				|| ! empty( $partial_state['elementor_gap_fill_stubborn_only'] );
 
 			$elementor_needs_continuation = $gap_fill_pending
+				|| $en_has_persian
 				|| Post_Translator::post_needs_elementor_job_work( $post_id, $lang )
 				|| Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
 				|| Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
 				|| Post_Translator::should_run_elementor_job_slice( $post_id, $lang );
 
 			if ( $elementor_needs_continuation ) {
+				// Soft-finalize may have stamped finalized while Persian remains —
+				// reopen markers so the next AS tick can keep gap-filling THIS post.
+				if ( $en_has_persian ) {
+					Post_Translator::invalidate_elementor_job_success_markers( $post_id, $lang );
+				}
+
 				self::pin_job_for_elementor_post( $job, $post_id, $lang );
 
 				self::log(
