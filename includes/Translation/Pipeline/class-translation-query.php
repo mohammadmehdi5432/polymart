@@ -562,7 +562,7 @@ final class Translation_Query {
 			$candidates[] = $front;
 		}
 
-		foreach ( array( 'cms_block', 'woodmart_layout' ) as $post_type ) {
+		foreach ( array( 'cms_block', 'woodmart_layout', 'elementor_library' ) as $post_type ) {
 			$block_ids = get_posts(
 				array(
 					'post_type'              => $post_type,
@@ -659,7 +659,7 @@ final class Translation_Query {
 
 		$page_limit = $light ? 12 : 40;
 
-		foreach ( array( 'cms_block', 'woodmart_layout', 'page' ) as $post_type ) {
+		foreach ( array( 'cms_block', 'woodmart_layout', 'elementor_library', 'page' ) as $post_type ) {
 			$ids = get_posts(
 				array(
 					'post_type'              => $post_type,

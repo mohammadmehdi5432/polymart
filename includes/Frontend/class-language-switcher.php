@@ -426,6 +426,25 @@ final class Language_Switcher {
 				direction: ltr !important;
 				text-align: left !important;
 			}
+			/* Long Elementor text/HTML widgets often keep text-align:right from FA source */
+			body.ltr .elementor-widget-text-editor,
+			body.ltr .elementor-widget-text-editor .elementor-widget-container,
+			body.ltr .elementor-widget-text-editor .elementor-text-editor,
+			body.ltr .elementor-text-editor,
+			body.ltr .elementor-widget-theme-post-content,
+			body.ltr .elementor-widget-heading,
+			body.ltr .elementor-widget-heading .elementor-heading-title,
+			body.ltr .elementor-widget-html,
+			body.ltr .elementor-widget-html .elementor-widget-container {
+				direction: ltr !important;
+				text-align: left !important;
+			}
+			body.ltr .elementor-widget-text-editor p,
+			body.ltr .elementor-text-editor p,
+			body.ltr .elementor-widget-html p {
+				direction: ltr !important;
+				text-align: left !important;
+			}
 			body.ltr .knd-add-to-cart-widget form.cart,
 			body.ltr .knd-add-to-cart-widget .woocommerce-variation-add-to-cart,
 			body.ltr .knd-add-to-cart-widget .knd-buttons-row {

@@ -585,7 +585,7 @@ final class Universal_Translator {
 		if ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
 			$post_type = get_post_type( $post_id );
 
-			if ( ! in_array( $post_type, array( 'cms_block', 'wd_popup' ), true ) ) {
+			if ( ! in_array( $post_type, self::get_embedded_elementor_post_types(), true ) ) {
 				return $value;
 			}
 		}
@@ -650,7 +650,7 @@ final class Universal_Translator {
 	}
 
 	/**
-	 * Serve stored Elementor JSON for embedded cms_block / popup documents.
+	 * Serve stored Elementor JSON for embedded templates (footer/header Theme Builder, cms_block, …).
 	 *
 	 * @param mixed  $value     Short-circuit value (null = fetch from DB).
 	 * @param int    $object_id Post ID.
@@ -663,15 +663,27 @@ final class Universal_Translator {
 			return $value;
 		}
 
+		if ( ! Url_Router::is_translated_request() ) {
+			return $value;
+		}
+
 		$post_id = (int) $object_id;
 
-		if ( $post_id <= 0 || Layout_Guard::should_preserve_post_data( $post_id ) ) {
+		if ( $post_id <= 0 ) {
 			return $value;
 		}
 
 		$post_type = get_post_type( $post_id );
 
-		if ( ! in_array( $post_type, array( 'cms_block', 'wd_popup' ), true ) ) {
+		if ( ! in_array( $post_type, self::get_embedded_elementor_post_types(), true ) ) {
+			return $value;
+		}
+
+		// Woodmart single-product shells must keep Persian layout documents untouched.
+		if (
+			Layout_Guard::is_single_product_context()
+			&& in_array( $post_type, array( 'woodmart_layout', 'elementor_library' ), true )
+		) {
 			return $value;
 		}
 
@@ -721,6 +733,23 @@ final class Universal_Translator {
 			--self::$elementor_metadata_depth;
 			add_filter( 'get_post_metadata', array( $this, 'filter_embedded_elementor_metadata' ), 10, 4 );
 		}
+	}
+
+	/**
+	 * Post types that may embed Elementor JSON inside the main page (footer/header/HTML block).
+	 *
+	 * @return string[]
+	 */
+	private static function get_embedded_elementor_post_types() {
+		/**
+		 * Filter which post types get `_elementor_data_{lang}` swaps when nested in a page.
+		 *
+		 * @param string[] $types Post type slugs.
+		 */
+		return apply_filters(
+			'polymart_ai_embedded_elementor_post_types',
+			array( 'cms_block', 'wd_popup', 'elementor_library', 'woodmart_layout' )
+		);
 	}
 
 	/**

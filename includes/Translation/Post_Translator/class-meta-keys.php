@@ -56,6 +56,7 @@ final class Meta_Keys {
 		'woodmart_slide',
 		'cms_block',
 		'woodmart_layout',
+		'elementor_library',
 	);
 
 	/**
