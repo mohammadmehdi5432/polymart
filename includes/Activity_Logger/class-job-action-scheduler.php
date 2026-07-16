@@ -113,8 +113,8 @@ final class Job_Action_Scheduler {
 		add_action( self::HOOK, array( __CLASS__, 'handle_slice_action' ) );
 		add_action( 'action_scheduler_before_execute', array( __CLASS__, 'capture_before_execute' ), 1, 1 );
 
-		// Prefer WP-Cron / inline queue runs over AS HTTP async loopbacks while
-		// a PolyMart job is active (same firewall issue as our old loopback).
+		// AS async HTTP wake is allowed during bulk (see filter_async_runner) so the
+		// queue can continue with the SPA closed; slice mutex keeps it single-flight.
 		add_filter( 'action_scheduler_allow_async_request_runner', array( __CLASS__, 'filter_async_runner' ) );
 
 		// Older MariaDB / mis-detected versions throw SQL syntax errors on SKIP LOCKED
@@ -202,11 +202,9 @@ final class Job_Action_Scheduler {
 	 * @return bool
 	 */
 	public static function filter_async_runner( $allow ) {
-		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
-			return false;
-		}
-
-		return $allow;
+		// Allow AS HTTP async wake while bulk runs so the queue continues with the
+		// SPA closed. Single-flight slice mutex + batch_size=1 prevent overlap.
+		return (bool) $allow;
 	}
 
 	/**
@@ -986,9 +984,14 @@ final class Job_Action_Scheduler {
 			if (
 				! Translation_Scheduler_Coordinator::is_halted()
 				&& \PolymartAI\Activity_Logger::is_bulk_job_running()
-				&& ! self::has_pending_or_running()
 			) {
-				self::chain_next_slice_immediately();
+				if ( ! self::has_pending_or_running() ) {
+					self::chain_next_slice_immediately();
+				} else {
+					// Next slice already pending — wake it without waiting for the SPA.
+					\PolymartAI\Activity_Logger::spawn_job_loopback( false );
+					\PolymartAI\Activity_Logger::nudge_as_queue_runner();
+				}
 			}
 
 			return;
@@ -1089,19 +1092,21 @@ final class Job_Action_Scheduler {
 				@set_time_limit( 330 );
 			}
 
-			// Idempotent: never spawn a sibling while something is already live.
-			if ( self::has_pending_or_running() ) {
-				return;
-			}
-
+			// enqueue_next already allows "only this RUNNING action" + no pending sibling.
+			// Do NOT bail on has_pending_or_running() here — that killed the chain mid-callback
+			// (current action still RUNNING) and left the job dead when the SPA closed.
 			$action_id = self::enqueue_next( true, 0 );
-
-			if ( $action_id <= 0 ) {
-				return;
-			}
 
 			if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
 				self::cancel_all();
+				return;
+			}
+
+			// Nested QueueRunner inside the current AS callback deadlocks easily.
+			// Wake the next pending slice via loopback / AS async / cron instead.
+			if ( self::$current_action_id > 0 || $action_id <= 0 ) {
+				\PolymartAI\Activity_Logger::spawn_job_loopback( false );
+				\PolymartAI\Activity_Logger::nudge_as_queue_runner();
 				return;
 			}
 

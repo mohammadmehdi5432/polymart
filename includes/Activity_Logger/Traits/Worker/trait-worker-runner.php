@@ -36,6 +36,9 @@ trait Trait_Worker_Runner {
 		update_option( self::JOB_OPTION, $job, false );
 
 		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
+		// Headless keep-alive: do not wait for the SPA to poll/ensure.
+		self::spawn_job_loopback( false );
+		self::ping_wp_cron( true );
 	}
 
 	public static function nudge_as_queue_runner() {
@@ -45,6 +48,7 @@ trait Trait_Worker_Runner {
 
 		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
 		self::ping_wp_cron( true );
+		self::spawn_job_loopback( false );
 	}
 
 	public static function handle_loopback_tick() {
@@ -60,23 +64,87 @@ trait Trait_Worker_Runner {
 		self::$trusted_loopback_tick = true;
 
 		if ( ! self::is_bulk_job_running() ) {
+			self::$trusted_loopback_tick = false;
 			status_header( 200 );
 			exit( 'idle' );
 		}
 
-		self::keep_alive_as_worker();
+		$steps_before    = absint( self::get_job_raw()['steps'] ?? 0 );
+		$progress_before = absint( self::get_job_raw()['partial_progress_at'] ?? 0 );
 
-		self::$trusted_loopback_tick = false;
+		try {
+			self::keep_alive_as_worker();
+		} finally {
+			self::$trusted_loopback_tick = false;
+		}
+
+		// Chain only when work moved or a pending AS slice remains — avoid empty loops.
+		if ( self::is_bulk_job_running() && ! Translation_Scheduler_Coordinator::is_halted() ) {
+			$job_after = self::get_job_raw();
+			$moved     = absint( $job_after['steps'] ?? 0 ) > $steps_before
+				|| absint( $job_after['partial_progress_at'] ?? 0 ) > $progress_before;
+
+			if ( $moved || Job_Action_Scheduler::has_pending_or_running() ) {
+				delete_transient( self::LOOPBACK_GATE_KEY );
+				self::spawn_job_loopback( false );
+			}
+
+			self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
+		}
 
 		status_header( 200 );
 		exit( 'as' );
 	}
 
+	/**
+	 * Non-blocking admin-ajax wake so the next AS slice runs without the SPA.
+	 *
+	 * @param bool $force Also enqueue a pending slice first.
+	 * @return bool True when a loopback request was dispatched.
+	 */
 	public static function spawn_job_loopback( $force = false ) {
-		Job_Action_Scheduler::ensure_scheduled();
-		if ( $force ) {
-			Job_Action_Scheduler::enqueue_next( true );
+		if ( Translation_Scheduler_Coordinator::is_halted() || ! self::is_bulk_job_running() ) {
+			return false;
 		}
+
+		// Nested spawn from inside an active loopback tick would recurse forever.
+		if ( self::$trusted_loopback_tick ) {
+			return false;
+		}
+
+		Job_Action_Scheduler::ensure_scheduled();
+
+		if ( $force ) {
+			Job_Action_Scheduler::enqueue_next( true, 0 );
+		}
+
+		// Avoid stampeding loopbacks from nested enqueue/shutdown paths.
+		if ( get_transient( self::LOOPBACK_GATE_KEY ) ) {
+			return false;
+		}
+
+		set_transient( self::LOOPBACK_GATE_KEY, time(), 3 );
+
+		$url = add_query_arg(
+			array(
+				'action' => self::LOOPBACK_ACTION,
+				'token'  => self::get_loopback_token(),
+			),
+			admin_url( 'admin-ajax.php' )
+		);
+
+		// Fire-and-forget (same pattern as Action Scheduler AsyncRequest).
+		wp_remote_post(
+			$url,
+			array(
+				'timeout'   => 0.01,
+				'blocking'  => false,
+				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+				'cookies'   => array(),
+			)
+		);
+
+		return true;
 	}
 
 	private static function continue_job_chain( $delay_sec = null, $force = true ) {
@@ -294,18 +362,28 @@ trait Trait_Worker_Runner {
 	}
 
 	private static function maybe_ensure_pulse_quietly() {
+		if ( Translation_Scheduler_Coordinator::is_halted() ) {
+			return;
+		}
+
 		$job = get_option( self::JOB_OPTION, array() );
 
 		if ( ! is_array( $job ) || 'running' !== ( $job['status'] ?? '' ) ) {
 			return;
 		}
 
-		if ( wp_next_scheduled( self::CRON_PULSE_HOOK ) ) {
-			return;
+		if ( ! wp_next_scheduled( self::CRON_PULSE_HOOK ) ) {
+			wp_schedule_event( time() + 5, self::CRON_PULSE_SCHEDULE, self::CRON_PULSE_HOOK );
 		}
 
-		// Schedule only — never ping/spawn from HTML traffic.
-		wp_schedule_event( time() + 30, self::CRON_PULSE_SCHEDULE, self::CRON_PULSE_HOOK );
+		// Any front/admin hit can revive a headless stall (browser closed / no SPA).
+		$age = self::get_bulk_worker_activity_age();
+
+		if ( $age >= self::WORKER_FORCE_RECOVER_SEC ) {
+			Job_Action_Scheduler::ensure_scheduled();
+			self::spawn_job_loopback( true );
+			self::ping_wp_cron( true );
+		}
 	}
 
 	public static function maybe_heal_background_worker() {
@@ -457,11 +535,12 @@ trait Trait_Worker_Runner {
 	}
 
 	private static function spawn_cron_request( $force = false ) {
-		unset( $force );
-
 		if ( self::is_bulk_job_running() ) {
 			Job_Action_Scheduler::ensure_scheduled();
+			self::spawn_job_loopback( (bool) $force );
 		}
+
+		self::ping_wp_cron( (bool) $force );
 	}
 
 	public static function bootstrap_background_worker( $run_inline = true ) {
@@ -477,6 +556,8 @@ trait Trait_Worker_Runner {
 
 		$as_ok = Job_Action_Scheduler::is_available();
 
+		$loopback_spawned = false;
+
 		if ( $as_ok ) {
 			Job_Action_Scheduler::clear_slice_mutex();
 			Job_Action_Scheduler::enqueue_next( true, 0 );
@@ -484,8 +565,11 @@ trait Trait_Worker_Runner {
 			if ( $run_inline ) {
 				Job_Action_Scheduler::run_queue_inline( true );
 			}
+
+			$loopback_spawned = self::spawn_job_loopback( false );
 		} elseif ( $run_inline ) {
 			self::run_action_scheduler_batch( 2 );
+			$loopback_spawned = self::spawn_job_loopback( false );
 		}
 
 		$job = self::get_job_raw();
@@ -500,7 +584,7 @@ trait Trait_Worker_Runner {
 		$result['as_enqueued']         = $as_ok;
 		$result['worker_mode']         = $as_ok ? 'as' : 'cron';
 		$result['cli_spawned']         = false;
-		$result['loopback_spawned']    = false;
+		$result['loopback_spawned']    = (bool) $loopback_spawned;
 
 		return $result;
 	}

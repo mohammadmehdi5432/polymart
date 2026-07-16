@@ -355,6 +355,10 @@ trait Trait_Worker_Recovery {
 			)
 		);
 
+		// Headless resume: wake the next slice even if this request did limited work.
+		self::spawn_job_loopback( true );
+		self::nudge_as_queue_runner();
+
 		delete_transient( $mutex_key );
 
 		return $did_work;
