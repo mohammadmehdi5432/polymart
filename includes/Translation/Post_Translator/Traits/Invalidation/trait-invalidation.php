@@ -293,9 +293,25 @@ trait Trait_Invalidation {
 
 	private static function is_term_translation_current( $term_id, $field, $lang, $source ) {
 		$meta_key = self::get_term_meta_key( $field, $lang );
+		$stored   = get_term_meta( absint( $term_id ), $meta_key, true );
 
-		if ( ! self::has_meaningful_translation( get_term_meta( absint( $term_id ), $meta_key, true ) ) ) {
+		if ( ! self::has_meaningful_translation( $stored ) ) {
 			return false;
+		}
+
+		$lang = sanitize_key( (string) $lang );
+
+		if ( 'fa' !== $lang && ! self::is_clean_target_language_translation( $stored, $lang ) ) {
+			return false;
+		}
+
+		if ( 'fa' !== $lang ) {
+			$normalized_source = self::normalize_translation_plaintext( $source );
+			$normalized_stored = self::normalize_translation_plaintext( $stored );
+
+			if ( '' !== $normalized_source && hash_equals( $normalized_source, $normalized_stored ) ) {
+				return false;
+			}
 		}
 
 		$stored_hash = (string) get_term_meta( absint( $term_id ), self::get_term_source_hash_meta_key( $field, $lang ), true );

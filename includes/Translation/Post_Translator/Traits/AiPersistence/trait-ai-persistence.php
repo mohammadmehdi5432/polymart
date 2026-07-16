@@ -977,12 +977,29 @@ trait Trait_Ai_Persistence {
 			$meta_key = self::get_term_meta_key( $field, $lang );
 			$clean    = 'desc' === $field ? sanitize_textarea_field( $value ) : sanitize_text_field( $value );
 
-			if ( '' !== trim( $clean ) ) {
-				update_term_meta( $term_id, $meta_key, $clean );
-
-				$source = 'desc' === $field ? $term->description : $term->name;
-				update_term_meta( $term_id, self::get_term_source_hash_meta_key( $field, $lang ), md5( (string) $source ) );
+			if ( '' === trim( $clean ) ) {
+				continue;
 			}
+
+			$source_raw = 'desc' === $field ? (string) $term->description : (string) $term->name;
+			$source     = Persian_Detector::only_persian_value( $source_raw );
+			$source     = '' !== $source ? $source : $source_raw;
+
+			if ( 'fa' !== $lang ) {
+				if ( Persian_Detector::should_reject_ai_translation( $clean, $lang ) ) {
+					continue;
+				}
+
+				$normalized_source = self::normalize_translation_plaintext( $source );
+				$normalized_clean  = self::normalize_translation_plaintext( $clean );
+
+				if ( '' !== $normalized_source && hash_equals( $normalized_source, $normalized_clean ) ) {
+					continue;
+				}
+			}
+
+			update_term_meta( $term_id, $meta_key, $clean );
+			update_term_meta( $term_id, self::get_term_source_hash_meta_key( $field, $lang ), md5( (string) $source ) );
 		}
 	}
 

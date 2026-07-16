@@ -363,7 +363,7 @@ final class AI_Client {
 
 		$masked_payload = Shortcode_Masker::mask_payload( $data_array );
 
-		$payload = self::build_payload( $masked_payload, $model, $target_lang );
+		$payload = self::build_payload( $masked_payload, $model, $target_lang, $options );
 
 		if ( is_wp_error( $payload ) ) {
 			return $payload;
@@ -924,11 +924,15 @@ final class AI_Client {
 	 * @param string                $target_lang Target language code.
 	 * @return array<string, mixed>|\WP_Error
 	 */
-	private static function build_payload( array $data_array, $model, $target_lang = 'en' ) {
+	private static function build_payload( array $data_array, $model, $target_lang = 'en', array $options = array() ) {
 		$target_label = \PolymartAI\Language_Registry::get_language_label_for_ai( $target_lang );
-		$source_label = \PolymartAI\Language_Registry::get_language_label_for_ai(
-			\PolymartAI\Language_Registry::get_default_language_code()
-		);
+		$source_code  = sanitize_key( (string) ( $options['source_lang'] ?? '' ) );
+
+		if ( '' === $source_code ) {
+			$source_code = \PolymartAI\Language_Registry::get_default_language_code();
+		}
+
+		$source_label = \PolymartAI\Language_Registry::get_language_label_for_ai( $source_code );
 
 		$system_rules = array(
 			'You are a professional translator specializing in ' . $source_label . ' to ' . $target_label . ' translation for e-commerce and blog content.',
@@ -939,11 +943,21 @@ final class AI_Client {
 		);
 
 		$target_lang = sanitize_key( (string) $target_lang );
+		$source_code = sanitize_key( (string) ( $options['source_lang'] ?? '' ) );
+
+		if ( '' === $source_code ) {
+			$source_code = \PolymartAI\Language_Registry::get_default_language_code();
+		}
 
 		if ( 'ar' === $target_lang ) {
-			$system_rules[] = 'Critical: the source language is Persian (Farsi), which shares a script with Arabic but is a different language. You MUST output Modern Standard Arabic (MSA), never copy Persian phrasing.';
-			$system_rules[] = 'Do not return the same string as the input. Rewrite into natural Arabic (example: «حساب کاربری من» → «حسابي» or «حسابي الشخصي»; «مقالات» → «المقالات»).';
-			$system_rules[] = 'Avoid Persian-only letters (پ چ ژ گ) unless they appear inside an untranslatable brand name.';
+			if ( 'en' === $source_code ) {
+				$system_rules[] = 'Critical: translate from English into Modern Standard Arabic (MSA). Do not leave English words untranslated except brand names.';
+			} else {
+				$system_rules[] = 'Critical: the source language is Persian (Farsi), which shares a script with Arabic but is a different language. You MUST output Modern Standard Arabic (MSA), never copy Persian phrasing.';
+				$system_rules[] = 'Do not return the same string as the input. Rewrite into natural Arabic (example: «حساب کاربری من» → «حسابي» or «حسابي الشخصي»; «مقالات» → «المقالات»; «آینه قدی» → «مرآة كاملة الطول»).';
+				$system_rules[] = 'Short WooCommerce tags, categories, and attribute labels must also change into Arabic — never leave Persian product taxonomy terms unchanged.';
+				$system_rules[] = 'Avoid Persian-only letters (پ چ ژ گ) unless they appear inside an untranslatable brand name.';
+			}
 		} elseif ( 'en' === $target_lang ) {
 			$system_rules[] = 'Critical: output English only. Never leave Persian/Arabic-script wording in the translated values.';
 		}

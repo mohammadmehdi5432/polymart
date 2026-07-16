@@ -791,6 +791,23 @@ trait Trait_Job_Slice {
 					}
 				}
 
+				// Exhausted retries: bridge stubborn product tags/cats from English term meta.
+				if ( 'ar' === $lang && 'commerce' === $phase ) {
+					$bridged_terms = self::try_bridge_arabic_terms_from_english( $remaining );
+
+					if ( $bridged_terms <= 0 ) {
+						$bridged_terms = self::try_force_arabic_term_retry( $remaining );
+					}
+
+					if ( $bridged_terms > 0 ) {
+						$remaining = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
+
+						if ( empty( $remaining ) ) {
+							continue;
+						}
+					}
+				}
+
 				// Exhausted retries: continue to Elementor, but leave-queue must still
 				// wait for field gaps (see sync_bulk_job_after_elementor_finalize).
 				break;
@@ -903,6 +920,7 @@ trait Trait_Job_Slice {
 			array(
 				'skip_echo_retry' => false,
 				'temperature'     => 0.3,
+				'source_lang'     => 'en',
 			)
 		);
 
@@ -952,6 +970,205 @@ trait Trait_Job_Slice {
 		);
 
 		return self::is_field_translation_current( $post_id, 'post_title', 'ar', Persian_Detector::only_persian_value( $fa_title ) ?: $fa_title );
+	}
+
+	/**
+	 * Bridge stubborn FA product tags/categories to Arabic via existing English term meta.
+	 *
+	 * @param array<string, string> $remaining Commerce-phase remaining fields.
+	 * @return int Number of terms successfully bridged.
+	 */
+	private static function try_bridge_arabic_terms_from_english( array $remaining ) {
+		$settings = self::get_translation_settings();
+
+		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) || empty( $remaining ) ) {
+			return 0;
+		}
+
+		$api_key      = (string) $settings['api_key'];
+		$api_endpoint = rtrim( (string) $settings['api_endpoint'], '/' );
+		$ai_model     = AI_Client::resolve_model( (string) ( $settings['ai_model'] ?? '' ), $api_endpoint );
+		$bridged      = 0;
+		$payload      = array();
+		$fa_by_key    = array();
+
+		foreach ( $remaining as $source_key => $fa_source ) {
+			if ( ! is_string( $source_key ) || 1 !== preg_match( '/^term:(\d+):(name|desc)$/', $source_key, $matches ) ) {
+				continue;
+			}
+
+			$term_id = absint( $matches[1] );
+			$field   = 'desc' === $matches[2] ? 'desc' : 'name';
+			$en_text = trim( (string) get_term_meta( $term_id, self::get_term_meta_key( $field, 'en' ), true ) );
+
+			if ( '' === $en_text || ! Persian_Detector::is_latin_text( $en_text ) ) {
+				continue;
+			}
+
+			$payload[ $source_key ]   = $en_text;
+			$fa_by_key[ $source_key ] = (string) $fa_source;
+		}
+
+		if ( empty( $payload ) ) {
+			return 0;
+		}
+
+		$result = AI_Client::translate_fields(
+			$payload,
+			$api_key,
+			$api_endpoint,
+			$ai_model,
+			'ar',
+			array(
+				'source_lang'     => 'en',
+				'skip_echo_retry' => false,
+				'temperature'     => 0.35,
+			)
+		);
+
+		if ( is_wp_error( $result ) || ! is_array( $result ) || empty( $result ) ) {
+			return 0;
+		}
+
+		$to_save = array();
+
+		foreach ( $result as $source_key => $ar_text ) {
+			if ( ! is_string( $source_key ) || ! is_string( $ar_text ) || '' === trim( $ar_text ) ) {
+				continue;
+			}
+
+			if ( ! Persian_Detector::is_acceptable_translation_for_language( $ar_text, 'ar' ) ) {
+				continue;
+			}
+
+			$fa_source = (string) ( $fa_by_key[ $source_key ] ?? '' );
+
+			if (
+				'' !== $fa_source
+				&& self::normalize_translation_plaintext( $ar_text ) === self::normalize_translation_plaintext( $fa_source )
+			) {
+				continue;
+			}
+
+			$to_save[ $source_key ] = $ar_text;
+		}
+
+		if ( empty( $to_save ) ) {
+			return 0;
+		}
+
+		self::save_term_translations( $to_save, 'ar' );
+
+		foreach ( $to_save as $source_key => $ar_text ) {
+			if ( 1 !== preg_match( '/^term:(\d+):(name|desc)$/', $source_key, $matches ) ) {
+				continue;
+			}
+
+			$term_id   = absint( $matches[1] );
+			$field     = 'desc' === $matches[2] ? 'desc' : 'name';
+			$fa_source = (string) ( $fa_by_key[ $source_key ] ?? '' );
+
+			if ( self::is_term_translation_current( $term_id, $field, 'ar', $fa_source ) ) {
+				++$bridged;
+
+				$term = get_term( $term_id );
+				\PolymartAI\Activity_Logger::log(
+					'info',
+					sprintf(
+						/* translators: 1: term ID, 2: FA term name, 3: AR translation */
+						__( 'برچسب عربی #%1$d از روی انگلیسی پل زده شد («%2$s» → «%3$s»).', 'polymart-ai' ),
+						$term_id,
+						$term instanceof \WP_Term ? $term->name : $fa_source,
+						$ar_text
+					),
+					array( 'term_id' => $term_id, 'lang' => 'ar' )
+				);
+			}
+		}
+
+		return $bridged;
+	}
+
+	/**
+	 * Last-chance FA→AR retry for product tags that keep echoing at temperature 0.
+	 *
+	 * @param array<string, string> $remaining Commerce remaining fields.
+	 * @return int Number of terms saved successfully.
+	 */
+	private static function try_force_arabic_term_retry( array $remaining ) {
+		$settings = self::get_translation_settings();
+
+		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) || empty( $remaining ) ) {
+			return 0;
+		}
+
+		$payload = array();
+
+		foreach ( $remaining as $source_key => $fa_source ) {
+			if ( ! is_string( $source_key ) || ! self::is_term_payload_key( $source_key ) ) {
+				continue;
+			}
+
+			$fa_source = trim( (string) $fa_source );
+
+			if ( '' === $fa_source ) {
+				continue;
+			}
+
+			$payload[ $source_key ] = $fa_source;
+		}
+
+		if ( empty( $payload ) ) {
+			return 0;
+		}
+
+		$api_key      = (string) $settings['api_key'];
+		$api_endpoint = rtrim( (string) $settings['api_endpoint'], '/' );
+		$ai_model     = AI_Client::resolve_model( (string) ( $settings['ai_model'] ?? '' ), $api_endpoint );
+
+		$result = AI_Client::translate_fields(
+			$payload,
+			$api_key,
+			$api_endpoint,
+			$ai_model,
+			'ar',
+			array(
+				'temperature'     => 0.55,
+				'skip_echo_retry' => false,
+			)
+		);
+
+		if ( is_wp_error( $result ) || ! is_array( $result ) || empty( $result ) ) {
+			return 0;
+		}
+
+		self::save_term_translations( $result, 'ar' );
+
+		$ok = 0;
+
+		foreach ( $payload as $source_key => $fa_source ) {
+			if ( 1 !== preg_match( '/^term:(\d+):(name|desc)$/', $source_key, $matches ) ) {
+				continue;
+			}
+
+			if ( self::is_term_translation_current( absint( $matches[1] ), 'desc' === $matches[2] ? 'desc' : 'name', 'ar', $fa_source ) ) {
+				++$ok;
+			}
+		}
+
+		if ( $ok > 0 ) {
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: %d: number of product terms */
+					__( 'برچسب‌های محصول عربی با تلاش اجباری ذخیره شد (%d مورد).', 'polymart-ai' ),
+					$ok
+				),
+				array( 'lang' => 'ar' )
+			);
+		}
+
+		return $ok;
 	}
 
 	public static function refresh_translation_lock( $post_id, $lang ) {
