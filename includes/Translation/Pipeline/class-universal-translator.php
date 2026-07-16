@@ -7,6 +7,7 @@
 
 namespace PolymartAI\Translation\Pipeline;
 
+use PolymartAI\Language_Registry;
 use PolymartAI\Frontend\Storefront_Script_Guard;
 use PolymartAI\Routing\Url_Router;
 
@@ -116,6 +117,13 @@ final class Universal_Translator {
 	private static $elementor_cache_bust_registered = false;
 
 	/**
+	 * Post IDs whose polluted `_elementor_element_cache` row was deleted this request.
+	 *
+	 * @var array<int, true>
+	 */
+	private static $purged_element_caches = array();
+
+	/**
 	 * Constructor.
 	 */
 	public function __construct() {
@@ -126,11 +134,16 @@ final class Universal_Translator {
 		// Register BEFORE template_redirect — Elementor often reads `_elementor_data`
 		// during `wp` / CSS print, so waiting until template_redirect left /en/ on Persian source.
 		add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_swap_early' ), 20 );
+		add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_cache_guard' ), 20 );
 		add_action( 'wp', array( $this, 'maybe_register_elementor_metadata_filter' ), 0 );
 		add_action( 'template_redirect', array( $this, 'maybe_register_elementor_metadata_filter' ), 1 );
 		add_action( 'template_redirect', array( $this, 'maybe_register_embedded_elementor_filter' ), 1 );
 		add_action( 'init', array( $this, 'maybe_register_embedded_elementor_filter' ), 25 );
 		add_action( 'wp_head', array( $this, 'print_elementor_serve_debug_comment' ), 1 );
+
+		// /en/ renders must not persist English HTML into `_elementor_element_cache` or FA URLs inherit it.
+		add_filter( 'update_post_metadata', array( $this, 'block_elementor_element_cache_persist' ), 10, 5 );
+		add_filter( 'add_post_metadata', array( $this, 'block_elementor_element_cache_add' ), 10, 5 );
 
 		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_script_locale_data' ), 10000 );
 		add_action( 'wp_enqueue_scripts', array( $this, 'patch_companion_localized_strings' ), 10001 );
@@ -147,6 +160,7 @@ final class Universal_Translator {
 
 		// Also try immediately — language is bootstrapped from URI in Url_Router::__construct.
 		if ( ! is_admin() ) {
+			$this->maybe_register_elementor_cache_guard();
 			$this->maybe_register_elementor_swap_early();
 		}
 	}
@@ -178,6 +192,8 @@ final class Universal_Translator {
 		}
 
 		$this->register_elementor_swap_filters();
+		$this->maybe_register_elementor_cache_guard();
+		$this->pin_early_storefront_main_post();
 		// Footer/header Theme Builder templates read meta during render — same early window as homepage.
 		$this->maybe_register_embedded_elementor_filter();
 	}
@@ -228,10 +244,12 @@ final class Universal_Translator {
 
 		$this->elementor_main_post_id = $post_id;
 		$this->register_elementor_swap_filters();
+		$this->maybe_register_elementor_cache_guard();
+		$this->maybe_register_embedded_elementor_filter();
 	}
 
 	/**
-	 * Hook get_post_metadata swap + element-cache bust (idempotent).
+	 * Hook get_post_metadata JSON swap for translated URLs (idempotent).
 	 *
 	 * @return void
 	 */
@@ -239,6 +257,19 @@ final class Universal_Translator {
 		if ( ! self::$elementor_swap_registered ) {
 			self::$elementor_swap_registered = true;
 			add_filter( 'get_post_metadata', array( $this, 'filter_elementor_metadata' ), 5, 4 );
+		}
+	}
+
+	/**
+	 * Register element-cache bust on every storefront request (FA + /en/).
+	 *
+	 * /en/ always busts so swapped JSON renders; unprefixed FA busts only polluted EN cache.
+	 *
+	 * @return void
+	 */
+	public function maybe_register_elementor_cache_guard() {
+		if ( is_admin() ) {
+			return;
 		}
 
 		if ( ! self::$elementor_cache_bust_registered ) {
@@ -578,32 +609,104 @@ final class Universal_Translator {
 			'_elementor_element_cache' => true,
 		);
 
-		if ( ! isset( $bust_keys[ (string) $meta_key ] ) || ! Url_Router::is_translated_request() ) {
+		if ( ! isset( $bust_keys[ (string) $meta_key ] ) || is_admin() ) {
 			return $value;
 		}
 
 		$post_id = (int) $object_id;
 
-		if ( $post_id <= 0 || ! $this->should_bust_elementor_render_cache( $post_id ) ) {
+		if ( $post_id <= 0 || ! $this->should_bust_elementor_render_cache( $post_id, $value ) ) {
 			return $value;
+		}
+
+		if ( ! Url_Router::is_translated_request() ) {
+			$this->purge_stale_elementor_element_cache( $post_id );
 		}
 
 		return $single ? '' : array();
 	}
 
 	/**
+	 * Block Elementor from saving rendered HTML cache while serving /en/ (or /ar/).
+	 *
+	 * Otherwise one English visit overwrites FA element cache in the database and
+	 * unprefixed URLs show English footer/header until cache is cleared manually.
+	 *
+	 * @param mixed  $check      Short-circuit return (false = block).
+	 * @param int    $object_id  Post ID.
+	 * @param string $meta_key   Meta key.
+	 * @param mixed  $meta_value New value.
+	 * @param mixed  $prev_value Previous value.
+	 * @return mixed
+	 */
+	public function block_elementor_element_cache_persist( $check, $object_id, $meta_key, $meta_value, $prev_value ) {
+		unset( $meta_value, $prev_value );
+
+		if ( '_elementor_element_cache' !== (string) $meta_key || ! Url_Router::is_translated_request() ) {
+			return $check;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Block first-time element-cache writes on translated storefront URLs.
+	 *
+	 * @param mixed  $check     Short-circuit return (false = block).
+	 * @param int    $object_id Post ID.
+	 * @param string $meta_key  Meta key.
+	 * @param mixed  $meta_value Value.
+	 * @param bool   $unique    Unique flag.
+	 * @return mixed
+	 */
+	public function block_elementor_element_cache_add( $check, $object_id, $meta_key, $meta_value, $unique ) {
+		unset( $meta_value, $unique );
+
+		if ( '_elementor_element_cache' !== (string) $meta_key || ! Url_Router::is_translated_request() ) {
+			return $check;
+		}
+
+		return false;
+	}
+
+	/**
 	 * Whether Elementor element-cache HTML may be discarded so companion JSON is used.
+	 *
+	 * @param int   $post_id              Post ID.
+	 * @param mixed $short_circuit_value  Existing get_post_metadata short-circuit value.
+	 * @return bool
+	 */
+	private function should_bust_elementor_render_cache( $post_id, $short_circuit_value = null ) {
+		$post_id = (int) $post_id;
+
+		if ( $post_id <= 0 || ! $this->is_eligible_for_elementor_cache_management( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! Url_Router::is_translated_request() ) {
+			if ( ! $this->post_has_servable_elementor_companion( $post_id ) ) {
+				return false;
+			}
+
+			return $this->is_elementor_element_cache_polluted_for_default_language( $post_id, $short_circuit_value );
+		}
+
+		$lang = Url_Router::get_current_language();
+
+		return Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
+	}
+
+	/**
+	 * Whether this post may participate in element-cache busting (main page or embedded templates).
 	 *
 	 * @param int $post_id Post ID.
 	 * @return bool
 	 */
-	private function should_bust_elementor_render_cache( $post_id ) {
+	private function is_eligible_for_elementor_cache_management( $post_id ) {
 		$post_id   = (int) $post_id;
 		$post_type = get_post_type( $post_id );
 		$embedded  = in_array( $post_type, self::get_embedded_elementor_post_types(), true );
 
-		// Structural shells (footer/header library): allow only via embedded swap path;
-		// never rewrite product single layout documents.
 		if ( Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
 			if ( ! $embedded ) {
 				return false;
@@ -615,16 +718,290 @@ final class Universal_Translator {
 			) {
 				return false;
 			}
-		} elseif ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
-			// Non-structural nested docs: only bust when they are known embed types.
-			if ( ! $embedded ) {
-				return false;
+
+			return true;
+		}
+
+		if ( null !== $this->elementor_main_post_id && $post_id !== (int) $this->elementor_main_post_id ) {
+			return $embedded;
+		}
+
+		$main_post_id = $this->resolve_storefront_main_post_id();
+
+		if ( $main_post_id > 0 && $post_id !== $main_post_id ) {
+			return $embedded;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether any non-default language has finalized Elementor JSON ready to serve.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	private function post_has_servable_elementor_companion( $post_id ) {
+		foreach ( Language_Registry::get_languages() as $language ) {
+			if ( ! empty( $language['is_default'] ) ) {
+				continue;
 			}
+
+			$code = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+			if ( '' === $code ) {
+				continue;
+			}
+
+			if ( Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $code ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Detect English HTML cached in DB after an /en/ visit (FA source, non-FA cache).
+	 *
+	 * @param int   $post_id             Post ID.
+	 * @param mixed $short_circuit_value Existing metadata short-circuit.
+	 * @return bool
+	 */
+	private function is_elementor_element_cache_polluted_for_default_language( $post_id, $short_circuit_value ) {
+		$cached = $this->peek_elementor_element_cache( $post_id, $short_circuit_value );
+
+		if ( '' === trim( $cached ) ) {
+			return false;
+		}
+
+		$visible = $this->extract_elementor_cache_visible_text( $cached );
+
+		// Ignore tiny/icon-only caches; require real body copy before calling it polluted.
+		if ( mb_strlen( trim( $visible ) ) < 12 ) {
+			return false;
+		}
+
+		if ( Persian_Detector::contains_persian( $visible ) ) {
+			return false;
+		}
+
+		$source_json = get_post_meta( $post_id, '_elementor_data', true );
+
+		if ( ! is_string( $source_json ) || '' === $source_json ) {
+			return false;
+		}
+
+		$source_visible = $this->extract_elementor_cache_visible_text( $source_json );
+
+		return Persian_Detector::contains_persian( $source_visible ) || Persian_Detector::contains_persian( $source_json );
+	}
+
+	/**
+	 * Strip Elementor HTML cache down to user-facing text (ignore inline CSS/font rules).
+	 *
+	 * @param string $payload Cached HTML or JSON string.
+	 * @return string
+	 */
+	private function extract_elementor_cache_visible_text( $payload ) {
+		if ( ! is_string( $payload ) || '' === $payload ) {
+			return '';
+		}
+
+		if ( '{' === $payload[0] || '[' === $payload[0] ) {
+			return $payload;
+		}
+
+		$html = preg_replace( '/<style[^>]*>.*?<\/style>/is', '', $payload );
+		$html = preg_replace( '/<script[^>]*>.*?<\/script>/is', '', (string) $html );
+
+		return wp_strip_all_tags( (string) $html );
+	}
+
+	/**
+	 * Delete a poisoned element-cache row once so FA URLs rebuild Persian HTML.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return void
+	 */
+	private function purge_stale_elementor_element_cache( $post_id ) {
+		$post_id = (int) $post_id;
+
+		if ( $post_id <= 0 || isset( self::$purged_element_caches[ $post_id ] ) ) {
+			return;
+		}
+
+		self::$purged_element_caches[ $post_id ] = true;
+		delete_post_meta( $post_id, '_elementor_element_cache' );
+	}
+
+	/**
+	 * Pin static front page before the main query (homepage reads meta during `wp`).
+	 *
+	 * @return void
+	 */
+	private function pin_early_storefront_main_post() {
+		if ( null !== $this->elementor_main_post_id ) {
+			return;
+		}
+
+		$post_id = $this->resolve_early_storefront_post_id();
+
+		if ( $post_id <= 0 || Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
+			return;
+		}
+
+		if ( ! Url_Router::is_translated_request() ) {
+			return;
 		}
 
 		$lang = Url_Router::get_current_language();
 
-		return Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
+		if ( ! Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+			return;
+		}
+
+		$this->elementor_main_post_id = $post_id;
+	}
+
+	/**
+	 * Resolve homepage post ID from URI before WP_Query (e.g. /en/ static front page).
+	 *
+	 * @return int
+	 */
+	private function resolve_early_storefront_post_id() {
+		if ( null !== $this->elementor_main_post_id ) {
+			return (int) $this->elementor_main_post_id;
+		}
+
+		$queried = get_queried_object_id();
+
+		if ( $queried > 0 ) {
+			return $queried;
+		}
+
+		if ( 'page' !== get_option( 'show_on_front' ) ) {
+			return 0;
+		}
+
+		$front_id = absint( get_option( 'page_on_front' ) );
+
+		if ( $front_id <= 0 ) {
+			return 0;
+		}
+
+		if ( Url_Router::is_translated_request() && $this->is_translated_home_request() ) {
+			return $front_id;
+		}
+
+		if ( ! Url_Router::is_translated_request() && $this->is_default_language_home_request() ) {
+			return $front_id;
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Whether the request path is the translated homepage (e.g. /en/ or /en).
+	 *
+	 * @return bool
+	 */
+	private function is_translated_home_request() {
+		if ( ! Url_Router::is_translated_request() ) {
+			return false;
+		}
+
+		$lang = Url_Router::get_current_language();
+		$path = $this->normalize_request_path();
+
+		return $path === $lang;
+	}
+
+	/**
+	 * Whether the request path is the unprefixed default-language homepage.
+	 *
+	 * @return bool
+	 */
+	private function is_default_language_home_request() {
+		if ( Url_Router::is_translated_request() ) {
+			return false;
+		}
+
+		return '' === $this->normalize_request_path();
+	}
+
+	/**
+	 * Request path relative to the WordPress install subdirectory.
+	 *
+	 * @return string
+	 */
+	private function normalize_request_path() {
+		if ( ! isset( $_SERVER['REQUEST_URI'] ) ) {
+			return '';
+		}
+
+		$path = wp_parse_url( wp_unslash( (string) $_SERVER['REQUEST_URI'] ), PHP_URL_PATH );
+
+		if ( ! is_string( $path ) ) {
+			return '';
+		}
+
+		$path   = trim( $path, '/' );
+		$subdir = trim( (string) wp_parse_url( home_url( '/' ), PHP_URL_PATH ), '/' );
+
+		if ( '' !== $subdir && 0 === strpos( $path, $subdir ) ) {
+			$path = trim( substr( $path, strlen( $subdir ) ), '/' );
+		}
+
+		return $path;
+	}
+
+	/**
+	 * Resolve the storefront main document ID (queried object or static front page).
+	 *
+	 * @return int
+	 */
+	private function resolve_storefront_main_post_id() {
+		$post_id = get_queried_object_id();
+
+		if ( $post_id <= 0 && ( is_front_page() || $this->is_default_language_home_request() || $this->is_translated_home_request() ) ) {
+			$post_id = absint( get_option( 'page_on_front' ) );
+		}
+
+		if ( $post_id <= 0 ) {
+			$post_id = $this->resolve_early_storefront_post_id();
+		}
+
+		return (int) $post_id;
+	}
+
+	/**
+	 * Read `_elementor_element_cache` without re-entering get_post_metadata filters.
+	 *
+	 * @param int   $post_id             Post ID.
+	 * @param mixed $short_circuit_value Value passed into the metadata filter.
+	 * @return string
+	 */
+	private function peek_elementor_element_cache( $post_id, $short_circuit_value ) {
+		if ( null !== $short_circuit_value ) {
+			if ( is_array( $short_circuit_value ) ) {
+				return isset( $short_circuit_value[0] ) ? (string) $short_circuit_value[0] : '';
+			}
+
+			return is_string( $short_circuit_value ) ? $short_circuit_value : '';
+		}
+
+		global $wpdb;
+
+		$row = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s LIMIT 1",
+				(int) $post_id,
+				'_elementor_element_cache'
+			)
+		);
+
+		return is_string( $row ) ? $row : '';
 	}
 
 	/**
@@ -650,12 +1027,13 @@ final class Universal_Translator {
 			return;
 		}
 
-		$post_id  = get_queried_object_id();
+		$post_id  = $this->resolve_storefront_main_post_id();
 		$lang     = Url_Router::get_current_language();
 		$serving  = $post_id > 0 && Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
 		$filter   = self::$elementor_swap_registered ? 'on' : 'off';
 		$embedded = self::$embedded_elementor_registered ? 'on' : 'off';
 		$cached   = ( $post_id > 0 && array_key_exists( $post_id, $this->elementor_cache ) && self::ELEMENTOR_CACHE_UNCHANGED !== ( $this->elementor_cache[ $post_id ] ?? null ) ) ? 'hit' : 'miss';
+		$main_pin = null !== $this->elementor_main_post_id ? (string) (int) $this->elementor_main_post_id : '-';
 
 		$embedded_hits = array();
 
@@ -678,12 +1056,13 @@ final class Universal_Translator {
 		}
 
 		printf(
-			"\n<!-- Polymart AI: Serving %s for Post ID %d | filter=%s embedded=%s cache=%s singular=%s front=%s embeds=%s -->\n",
+			"\n<!-- Polymart AI: Serving %s for Post ID %d | filter=%s embedded=%s cache=%s pin=%s singular=%s front=%s embeds=%s -->\n",
 			esc_html( strtoupper( $lang ) ),
 			(int) $post_id,
 			esc_html( $filter ),
 			esc_html( $embedded ),
 			esc_html( $cached ),
+			esc_html( $main_pin ),
 			is_singular() ? '1' : '0',
 			is_front_page() ? '1' : '0',
 			esc_html( $embedded_hits ? implode( ',', $embedded_hits ) : '-' )
