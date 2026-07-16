@@ -68,5 +68,6 @@ final class Config_Constants {
 	const LOOPBACK_ACTION      = 'polymart_ai_job_loopback';
 	const LOOPBACK_TOKEN_OPTION = 'polymart_ai_job_loopback_token';
 	const LOOPBACK_GATE_KEY    = 'polymart_ai_job_loopback_gate';
-	const LOOPBACK_GATE_SEC    = 1;
+	/** Min seconds between emergency loopback wakes (prevents 503 stampede). */
+	const LOOPBACK_GATE_SEC    = 25;
 }

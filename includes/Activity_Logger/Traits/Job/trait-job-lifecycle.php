@@ -498,7 +498,6 @@ trait Trait_Job_Lifecycle {
 		Job_Action_Scheduler::cancel_all();
 		// Run the first tick inline so progress does not wait for SPA poll / cron.
 		self::bootstrap_background_worker( true );
-		self::spawn_job_loopback( false );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -577,7 +576,6 @@ trait Trait_Job_Lifecycle {
 
 			self::save_job( $job );
 			self::bootstrap_background_worker( true );
-			self::spawn_job_loopback( false );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}
