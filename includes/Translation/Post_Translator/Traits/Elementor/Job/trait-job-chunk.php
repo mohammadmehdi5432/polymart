@@ -139,7 +139,7 @@ trait Trait_Job_Chunk {
 
 		return array(
 			'done'  => max( 0, count( $all_chunks ) - count( $left_chunks ) ),
-			'total' => max( 1, count( $all_chunks ) ),
+			'total' => count( $all_chunks ),
 		);
 	}
 

@@ -560,40 +560,76 @@ trait Trait_Job_Runner {
 			}
 
 			if ( ! $truly_complete ) {
-				if ( ! empty( $remaining ) && $done_count >= $progress_total ) {
-					\PolymartAI\Activity_Logger::log(
-						'info',
-						sprintf(
-							/* translators: 1: post ID, 2: completed batches, 3: total batches */
-							__( 'Elementor — #%1$d: همه %2$d از %3$d بخش API انجام شد — در حال نهایی‌سازی…', 'polymart-ai' ),
-							$post_id,
-							$done_count,
-							$progress_total
-						),
-						array( 'post_id' => $post_id, 'lang' => $lang )
+				if ( ! empty( $remaining ) && empty( $chunks ) ) {
+					// Deadlock escape: progress showed 0/1 with an empty chunk queue while
+					// filter_remaining still had fields — force one API batch from leftovers.
+					$forced_bundle = self::collapse_duplicate_elementor_payload( $remaining );
+					$forced_chunks = self::chunk_elementor_payload_for_job(
+						is_array( $forced_bundle['payload'] ?? null ) ? $forced_bundle['payload'] : $remaining
+					);
+
+					if ( ! empty( $forced_chunks ) ) {
+						$chunks         = $forced_chunks;
+						$progress_total = max( $progress_total, count( $forced_chunks ), 1 );
+						$state['elementor_chunks_total'] = $progress_total;
+						$state['elementor_gap_fill']     = true;
+						self::save_job_partial_state( $post_id, $lang, $state );
+
+						\PolymartAI\Activity_Logger::log(
+							'warning',
+							sprintf(
+								/* translators: 1: post ID, 2: remaining fields, 3: forced batches */
+								__( 'Elementor — #%1$d: صف خالی بود ولی %2$d فیلد مانده — اجبار %3$d بخش API', 'polymart-ai' ),
+								$post_id,
+								count( $remaining ),
+								count( $forced_chunks )
+							),
+							array( 'post_id' => $post_id, 'lang' => $lang )
+						);
+						// Fall through to the API batch loop below (chunks no longer empty).
+					}
+				}
+
+				if ( empty( $chunks ) ) {
+					if ( ! empty( $remaining ) && $done_count >= $progress_total ) {
+						\PolymartAI\Activity_Logger::log(
+							'info',
+							sprintf(
+								/* translators: 1: post ID, 2: completed batches, 3: total batches */
+								__( 'Elementor — #%1$d: همه %2$d از %3$d بخش API انجام شد — در حال نهایی‌سازی…', 'polymart-ai' ),
+								$post_id,
+								$done_count,
+								$progress_total
+							),
+							array( 'post_id' => $post_id, 'lang' => $lang )
+						);
+					}
+
+					$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
+
+					if ( is_wp_error( $persisted ) ) {
+						return $persisted;
+					}
+
+					$state['elementor_map']              = $map;
+					$state['elementor_chunk_index']      = $done_count;
+					$state['elementor_slices_completed'] = $done_count;
+					$state['elementor_chunks_total']     = $progress_total;
+					self::save_job_partial_state( $post_id, $lang, $state );
+
+					return array(
+						'done'           => false,
+						'phase'          => 'elementor',
+						'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+						'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
 					);
 				}
-
-				$persisted = self::persist_elementor_job_progress( $post_id, $lang, $data, $map, $done_count, $progress_total );
-
-				if ( is_wp_error( $persisted ) ) {
-					return $persisted;
-				}
-
-				$state['elementor_map']              = $map;
-				$state['elementor_chunk_index']      = $done_count;
-				$state['elementor_slices_completed'] = $done_count;
-				$state['elementor_chunks_total']     = $progress_total;
-				self::save_job_partial_state( $post_id, $lang, $state );
-
-				return array(
-					'done'           => false,
-					'phase'          => 'elementor',
-					'phase_progress' => self::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-					'message'        => self::format_elementor_job_slice_status_message( $post_id, $lang, $state ),
-				);
 			}
 
+			// Forced leftover batches: skip finalize and continue into the API loop below.
+			if ( ! empty( $chunks ) ) {
+				// no-op — fall through past this empty-queue block
+			} else {
 			$blocker = self::get_elementor_job_finalize_blockers( $post_id, $lang, $data, $map, $state );
 
 			if ( null !== $blocker ) {
@@ -615,6 +651,7 @@ trait Trait_Job_Runner {
 				'phase_progress' => '',
 				'message'        => __( 'ترجمه Elementor تکمیل شد.', 'polymart-ai' ),
 			);
+			}
 		}
 
 		$source_total    = max( 1, absint( $state['elementor_chunks_total'] ?? 0 ) );

@@ -369,6 +369,10 @@ final class AI_Client {
 			return $payload;
 		}
 
+		if ( isset( $options['temperature'] ) && is_numeric( $options['temperature'] ) ) {
+			$payload['temperature'] = max( 0, min( 1, (float) $options['temperature'] ) );
+		}
+
 		/**
 		 * Filter the outbound request payload before it is sent to ArvanCloud AI.
 		 *
@@ -750,7 +754,45 @@ final class AI_Client {
 		$result = self::send_translation_request( $data_array, $api_key, $endpoint, $model, $target_lang, $options );
 
 		if ( ! is_wp_error( $result ) ) {
-			return self::merge_partial_translations( $data_array, $result, $api_key, $endpoint, $model, $target_lang, $options );
+			$merged = self::merge_partial_translations( $data_array, $result, $api_key, $endpoint, $model, $target_lang, $options );
+
+			if ( ! is_wp_error( $merged ) && empty( $options['skip_echo_retry'] ) ) {
+				$echoed = self::collect_echoed_source_keys( $data_array, $merged, $target_lang );
+
+				// Arabic titles often come back as copied Farsi at temperature 0 — one harder retry.
+				if ( ! empty( $echoed ) && in_array( sanitize_key( (string) $target_lang ), array( 'ar', 'en' ), true ) ) {
+					$retry_payload = array_intersect_key( $data_array, array_flip( $echoed ) );
+					$retry_opts    = array_merge(
+						$options,
+						array(
+							'skip_echo_retry' => true,
+							'temperature'     => 0.4,
+						)
+					);
+					$retry = self::send_translation_request( $retry_payload, $api_key, $endpoint, $model, $target_lang, $retry_opts );
+
+					if ( ! is_wp_error( $retry ) && is_array( $retry ) ) {
+						foreach ( $retry as $key => $value ) {
+							if ( ! is_string( $key ) || ! is_string( $value ) || '' === trim( $value ) ) {
+								continue;
+							}
+
+							if ( self::translation_echoes_source( (string) ( $data_array[ $key ] ?? '' ), $value, $target_lang ) ) {
+								continue;
+							}
+
+							$merged[ $key ] = $value;
+						}
+					}
+				}
+
+				// Never hand echoed source copies to persistence (would stay «ناقص — عنوان»).
+				foreach ( self::collect_echoed_source_keys( $data_array, $merged, $target_lang ) as $echo_key ) {
+					unset( $merged[ $echo_key ] );
+				}
+			}
+
+			return $merged;
 		}
 
 		if ( count( $data_array ) <= 1 ) {
@@ -895,6 +937,16 @@ final class AI_Client {
 			'Return ONLY one valid JSON object with the exact same keys as the input.',
 			'Every value must be a JSON string. Do not add markdown fences, comments, or extra keys.',
 		);
+
+		$target_lang = sanitize_key( (string) $target_lang );
+
+		if ( 'ar' === $target_lang ) {
+			$system_rules[] = 'Critical: the source language is Persian (Farsi), which shares a script with Arabic but is a different language. You MUST output Modern Standard Arabic (MSA), never copy Persian phrasing.';
+			$system_rules[] = 'Do not return the same string as the input. Rewrite into natural Arabic (example: «حساب کاربری من» → «حسابي» or «حسابي الشخصي»; «مقالات» → «المقالات»).';
+			$system_rules[] = 'Avoid Persian-only letters (پ چ ژ گ) unless they appear inside an untranslatable brand name.';
+		} elseif ( 'en' === $target_lang ) {
+			$system_rules[] = 'Critical: output English only. Never leave Persian/Arabic-script wording in the translated values.';
+		}
 
 		$has_segment_keys = false;
 
@@ -1378,6 +1430,51 @@ final class AI_Client {
 		}
 
 		return $validated;
+	}
+
+	/**
+	 * Whether AI output is an unusable copy of the source text.
+	 *
+	 * @param string $source      Source text.
+	 * @param string $translated  AI output.
+	 * @param string $target_lang Target language (unused; kept for call-site clarity).
+	 * @return bool
+	 */
+	private static function translation_echoes_source( $source, $translated, $target_lang = '' ) {
+		unset( $target_lang );
+
+		$source     = trim( preg_replace( '/\s+/u', ' ', wp_strip_all_tags( html_entity_decode( (string) $source, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) );
+		$translated = trim( preg_replace( '/\s+/u', ' ', wp_strip_all_tags( html_entity_decode( (string) $translated, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) );
+
+		if ( '' === $source || '' === $translated ) {
+			return false;
+		}
+
+		return hash_equals( $source, $translated );
+	}
+
+	/**
+	 * Keys whose AI output still matches the source.
+	 *
+	 * @param array<string, string> $source       Source payload.
+	 * @param array<string, string> $translations AI output.
+	 * @param string                $target_lang  Target language.
+	 * @return array<int, string>
+	 */
+	private static function collect_echoed_source_keys( array $source, array $translations, $target_lang ) {
+		$echoed = array();
+
+		foreach ( $source as $key => $text ) {
+			if ( ! is_string( $key ) || ! isset( $translations[ $key ] ) || ! is_string( $translations[ $key ] ) ) {
+				continue;
+			}
+
+			if ( self::translation_echoes_source( (string) $text, (string) $translations[ $key ], $target_lang ) ) {
+				$echoed[] = $key;
+			}
+		}
+
+		return $echoed;
 	}
 
 	/**

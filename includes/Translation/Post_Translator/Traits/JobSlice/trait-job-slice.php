@@ -778,6 +778,19 @@ trait Trait_Job_Slice {
 					);
 				}
 
+				// Exhausted retries: try English title as a bridge for Arabic before Elementor.
+				if ( 'ar' === $lang && isset( $remaining['post_title'] ) ) {
+					$bridged = self::try_bridge_arabic_title_from_english( $post_id, $lang );
+
+					if ( $bridged ) {
+						$remaining = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
+
+						if ( empty( $remaining ) ) {
+							continue;
+						}
+					}
+				}
+
 				// Exhausted retries: continue to Elementor, but leave-queue must still
 				// wait for field gaps (see sync_bulk_job_after_elementor_finalize).
 				break;
@@ -848,6 +861,97 @@ trait Trait_Job_Slice {
 		self::save_job_partial_state( $post_id, $lang, $state );
 
 		return $state;
+	}
+
+	/**
+	 * When FA→AR title keeps echoing, translate the existing English title to Arabic.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language (ar).
+	 * @return bool True when an Arabic title was saved.
+	 */
+	private static function try_bridge_arabic_title_from_english( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || 'ar' !== $lang ) {
+			return false;
+		}
+
+		$en_title = trim( (string) get_post_meta( $post_id, self::get_meta_key( 'title', 'en' ), true ) );
+
+		if ( '' === $en_title || ! Persian_Detector::is_latin_text( $en_title ) ) {
+			return false;
+		}
+
+		$settings = self::get_translation_settings();
+
+		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) ) {
+			return false;
+		}
+
+		$api_key      = (string) $settings['api_key'];
+		$api_endpoint = rtrim( (string) $settings['api_endpoint'], '/' );
+		$ai_model     = AI_Client::resolve_model( (string) ( $settings['ai_model'] ?? '' ), $api_endpoint );
+
+		$result = AI_Client::translate_fields(
+			array( 'post_title' => $en_title ),
+			$api_key,
+			$api_endpoint,
+			$ai_model,
+			'ar',
+			array(
+				'skip_echo_retry' => false,
+				'temperature'     => 0.3,
+			)
+		);
+
+		if ( is_wp_error( $result ) || empty( $result['post_title'] ) || ! is_string( $result['post_title'] ) ) {
+			return false;
+		}
+
+		$post = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post ) {
+			return false;
+		}
+
+		$fa_title = (string) $post->post_title;
+
+		if ( self::normalize_translation_plaintext( $result['post_title'] ) === self::normalize_translation_plaintext( $fa_title ) ) {
+			return false;
+		}
+
+		if ( ! Persian_Detector::is_acceptable_translation_for_language( $result['post_title'], 'ar' ) ) {
+			return false;
+		}
+
+		$save = self::save_ai_translations(
+			$post_id,
+			array( 'post_title' => $result['post_title'] ),
+			'ar',
+			array(
+				'skip_elementor' => true,
+				'keep_lock'      => true,
+			)
+		);
+
+		if ( is_wp_error( $save ) ) {
+			return false;
+		}
+
+		\PolymartAI\Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: 1: post ID, 2: English title */
+				__( 'عنوان عربی #%1$d از روی عنوان انگلیسی پل زده شد («%2$s»).', 'polymart-ai' ),
+				$post_id,
+				$en_title
+			),
+			array( 'post_id' => $post_id, 'lang' => 'ar' )
+		);
+
+		return self::is_field_translation_current( $post_id, 'post_title', 'ar', Persian_Detector::only_persian_value( $fa_title ) ?: $fa_title );
 	}
 
 	public static function refresh_translation_lock( $post_id, $lang ) {

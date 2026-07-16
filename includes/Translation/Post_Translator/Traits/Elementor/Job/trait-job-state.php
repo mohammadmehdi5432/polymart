@@ -495,7 +495,21 @@ trait Trait_Job_State {
 		$state    = self::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
 		$progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
 		$done     = (int) $progress['done'];
-		$total    = max( 1, (int) $progress['total'] );
+		$total    = (int) $progress['total'];
+
+		// Empty chunk schedule used to force total=1 → perpetual UI «0/1» with no API work.
+		if ( $total <= 0 ) {
+			$remaining = self::count_elementor_remaining_fields( $post_id, $lang );
+
+			if ( $remaining <= 0
+				&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			) {
+				return '1/1';
+			}
+
+			$total = max( 1, $remaining );
+			$done  = 0;
+		}
 
 		$cursor       = self::read_elementor_slice_cursor( $post_id, $lang );
 		$stored_total = self::read_elementor_slice_cursor_total( $post_id, $lang );

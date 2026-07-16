@@ -271,7 +271,10 @@ function polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang ) {
 			),
 			'_polymart_ai_elementor_progress_' . $lang  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ),
 			'_polymart_ai_elementor_error_' . $lang     => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
-			'title_en'                                          => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
+			'title_fa'                                          => (string) $post->post_title,
+			'title_en'                                          => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', 'en' ), true ),
+			'title_' . $lang                                    => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
+			'title_meta_key_' . $lang                           => \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ),
 		),
 	);
 }
@@ -355,7 +358,10 @@ function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
 			'_polymart_ai_elementor_finalized_' . $lang => (string) get_post_meta( $post_id, '_polymart_ai_elementor_finalized_' . $lang, true ),
 			'_polymart_ai_elementor_progress_' . $lang  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ),
 			'_polymart_ai_elementor_error_' . $lang       => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
-			'title_en'                              => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
+			'title_fa'                              => (string) $post->post_title,
+			'title_en'                              => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', 'en' ), true ),
+			'title_' . $lang                        => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
+			'title_meta_key_' . $lang               => \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ),
 		),
 	);
 }

@@ -283,7 +283,7 @@ trait Trait_Job_Cursor {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 		$done    = 0;
-		$total   = 1;
+		$total   = 0;
 
 		if ( $post_id > 0 && '' !== $lang ) {
 			$raw = get_post_meta( $post_id, '_elementor_data', true );
