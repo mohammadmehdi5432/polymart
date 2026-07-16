@@ -214,7 +214,18 @@ trait Trait_Job_Lifecycle {
 		}
 
 		Translation_Scheduler_Coordinator::clear_halt();
-		Metabox_Action_Scheduler::cancel_all_plugin_actions();
+
+		// Fast AS purge only — do NOT page Metabox failed/canceled rows here (that hung Start after Stop).
+		if ( Job_Action_Scheduler::is_available() ) {
+			Job_Action_Scheduler::cancel_all();
+			Job_Action_Scheduler::clear_slice_mutex();
+		}
+
+		if ( function_exists( 'as_unschedule_all_actions' ) && class_exists( '\PolymartAI\Activity_Logger\Metabox_Action_Scheduler' ) ) {
+			as_unschedule_all_actions( Metabox_Action_Scheduler::HOOK, array(), Metabox_Action_Scheduler::GROUP );
+			as_unschedule_all_actions( Metabox_Action_Scheduler::HOOK, null, Metabox_Action_Scheduler::GROUP );
+		}
+
 		Translation_Scheduler_Coordinator::try_claim_global_worker( Translation_Scheduler_Coordinator::OWNER_BULK );
 
 		$existing        = wp_parse_args( self::get_job_raw(), self::empty_job() );
@@ -259,68 +270,25 @@ trait Trait_Job_Lifecycle {
 		Post_Translator::flush_translation_status_cache();
 		REST_API::invalidate_stats_cache();
 
-		// Fast start: light probes only — heavy index reconcile runs during worker ticks.
-		$issues         = Translation_Query::collect_storefront_translation_issues( $lang, 8, true );
-		$issue_ids      = array_values( array_filter( array_map( 'absint', wp_list_pluck( $issues, 'post_id' ) ) ) );
-		$priority_probe = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
-		$front          = absint( get_option( 'page_on_front' ) );
-		$repair_ids     = array_values(
-			array_unique(
-				array_filter(
-					array_map(
-						'absint',
-						array_merge(
-							array_slice( $issue_ids, 0, 4 ),
-							array_slice( $priority_probe, 0, 4 ),
-							$front > 0 ? array( $front ) : array()
-						)
-					)
-				)
-			)
-		);
-
-		self::reconcile_start_probe_posts( $lang, array_slice( $repair_ids, 0, 4 ) );
-
+		// Ultra-light Start: index stats + SQL seed only.
+		// Do NOT call collect_storefront_translation_issues / post_needs_translation_work
+		// across hundreds of Elementor posts — that was the «در حال شروع…» hang.
+		$front      = absint( get_option( 'page_on_front' ) );
 		$stats      = Translation_Query::compute_translation_stats( $lang, false );
 		$menu_needs = Menu_Translator::count_untranslated( $lang );
 		$needs_work = (int) $stats['untranslated'] + (int) $stats['partial'] + $menu_needs;
 		$total      = $needs_work;
-		$probe_ids  = $issue_ids;
+		$issues     = array();
+		$issue_ids  = array();
+		$probe_ids  = array();
 
-		if ( ! empty( $priority_probe ) ) {
-			$needs_work = max( $needs_work, count( $priority_probe ) );
-			$total      = max( $total, $needs_work );
-		}
+		if ( $front > 0 ) {
+			$front_status = (string) get_post_meta( $front, Post_Translator::get_status_index_meta_key( $lang ), true );
 
-		if ( ! empty( $issue_ids ) ) {
-			$needs_work = max( $needs_work, count( $issue_ids ) );
-			$total      = max( $total, $needs_work );
-		}
-
-		if ( ! empty( $priority_probe ) ) {
-			$probe_ids = array_values( array_unique( array_merge( $probe_ids, $priority_probe ) ) );
-		}
-
-		if ( $front > 0 && Post_Translator::post_needs_translation_work( $front, $lang ) ) {
-			$probe_ids = array_values( array_unique( array_merge( array( $front ), $probe_ids ) ) );
-		}
-
-		if ( $total <= 0 && ! empty( $probe_ids ) ) {
-			$needs_work = max( count( $probe_ids ), $menu_needs );
-			$total      = $needs_work;
-		}
-
-		if ( $total <= 0 ) {
-			$probe_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, 8, true );
-
-			if ( ! empty( $probe_ids ) ) {
-				$stats      = Translation_Query::compute_translation_stats( $lang, false );
-				$needs_work = max(
-					count( $probe_ids ),
-					(int) $stats['untranslated'] + (int) $stats['partial'],
-					$menu_needs
-				);
-				$total      = $needs_work;
+			if ( 'translated' !== $front_status ) {
+				$probe_ids[] = $front;
+				$needs_work  = max( $needs_work, 1 );
+				$total       = max( $total, $needs_work );
 			}
 		}
 
@@ -335,7 +303,11 @@ trait Trait_Job_Lifecycle {
 				);
 			}
 
-			$needs_work = max( 1, $menu_needs );
+			if ( $probe_post > 0 ) {
+				$probe_ids[] = $probe_post;
+			}
+
+			$needs_work = max( 1, $menu_needs, count( $probe_ids ) );
 			$total      = $needs_work;
 		}
 
@@ -356,10 +328,6 @@ trait Trait_Job_Lifecycle {
 
 		if ( empty( $seed_ids ) && ! empty( $issue_ids ) ) {
 			$seed_ids = array_values( array_unique( array_map( 'absint', $issue_ids ) ) );
-		}
-
-		if ( empty( $seed_ids ) ) {
-			$seed_ids = Translation_Query::probe_priority_unfinished_post_ids( $lang, $seed_limit, true );
 		}
 
 		if ( empty( $seed_ids ) ) {
@@ -407,14 +375,19 @@ trait Trait_Job_Lifecycle {
 			);
 		}
 
-		if ( $front > 0 && Post_Translator::post_needs_translation_work( $front, $lang ) ) {
-			$seed_ids = array_values(
-				array_unique(
-					array_merge( array( $front ), $seed_ids )
-				)
-			);
-			$needs_work = max( $needs_work, 1 );
-			$total      = max( $total, $needs_work );
+		// Prefer index status for homepage — avoid Elementor decode on Start.
+		if ( $front > 0 ) {
+			$front_status = (string) get_post_meta( $front, Post_Translator::get_status_index_meta_key( $lang ), true );
+
+			if ( 'translated' !== $front_status ) {
+				$seed_ids = array_values(
+					array_unique(
+						array_merge( array( $front ), $seed_ids )
+					)
+				);
+				$needs_work = max( $needs_work, 1 );
+				$total      = max( $total, $needs_work );
+			}
 		}
 
 		if ( empty( $seed_ids ) && $menu_needs <= 0 ) {

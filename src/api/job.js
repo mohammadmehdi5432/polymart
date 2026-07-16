@@ -99,8 +99,12 @@ export async function jobAction(action, lang = 'en', extra = {}) {
     : action === 'start' || action === 'stop'
       ? JOB_START_STOP_TIMEOUT_MS
       : JOB_FETCH_TIMEOUT_MS;
-  const { data } = await withRetries(() =>
-    api.post('/translation-job', { action, lang, ...extra }, { timeout })
+  // Start/stop must not retry 4× on gateway 503 — that left the UI on «در حال شروع…» for minutes.
+  const retries =
+    action === 'start' || action === 'stop' || action === 'pause' ? 0 : JOB_FETCH_RETRIES;
+  const { data } = await withRetries(
+    () => api.post('/translation-job', { action, lang, ...extra }, { timeout }),
+    { retries }
   );
   return data;
 }

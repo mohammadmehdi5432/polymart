@@ -1388,18 +1388,17 @@ trait Trait_Job_State {
 			return false;
 		}
 
-		self::bind_elementor_accepted_paths_context( $post_id, $lang );
-
-		if ( ! self::should_require_elementor_translation( $post_id ) ) {
+		// Trust sealed + current hash without decoding EN/source trees (Start probes).
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& self::is_elementor_translation_current( $post_id, $lang )
+		) {
 			return false;
 		}
 
-		// Sealed clean companion: map leftovers (__segN bookkeeping) must not re-pin the job.
-		if (
-			self::is_elementor_translation_finalized( $post_id, $lang )
-			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
-			&& self::is_elementor_translation_current( $post_id, $lang )
-		) {
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
+
+		if ( ! self::should_require_elementor_translation( $post_id ) ) {
 			return false;
 		}
 
@@ -1438,8 +1437,16 @@ trait Trait_Job_State {
 			return false;
 		}
 
+		// Cheap meta gate first — avoid repair/persian-scan during Start/probe storms.
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& self::is_elementor_translation_current( $post_id, $lang )
+			&& ! self::elementor_job_has_durable_partial_state( $post_id, $lang )
+		) {
+			return false;
+		}
+
 		self::bind_elementor_accepted_paths_context( $post_id, $lang );
-		self::repair_stale_elementor_completion_meta( $post_id, $lang );
 
 		if ( self::elementor_job_api_schedule_complete( $post_id, $lang ) ) {
 			if (

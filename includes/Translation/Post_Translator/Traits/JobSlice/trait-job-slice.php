@@ -1404,20 +1404,29 @@ trait Trait_Job_Slice {
 			return false;
 		}
 
+		// Never repair/decode Elementor trees here — Start/probes call this on dozens of posts
+		// and the old repair+remaining_payload path timed out the REST start request (503 / «در حال شروع…»).
 		if ( self::uses_elementor_builder( $post_id ) ) {
-			self::repair_stale_elementor_completion_meta( $post_id, $lang );
-			self::repair_completed_elementor_job_meta( $post_id, $lang );
-		}
-
-		if ( self::storefront_would_show_persian_source( $post_id, $lang ) ) {
-			return true;
-		}
-
-		if (
-			self::post_needs_elementor_job_work( $post_id, $lang )
-			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
-		) {
-			return true;
+			if (
+				self::is_elementor_translation_finalized( $post_id, $lang )
+				&& self::is_elementor_translation_current( $post_id, $lang )
+			) {
+				// Elementor companion sealed — only title/core gaps can still need work below.
+			} elseif ( self::elementor_job_has_durable_partial_state( $post_id, $lang ) ) {
+				return true;
+			} elseif (
+				self::should_require_elementor_translation( $post_id )
+				&& self::has_elementor_persian_content( $post_id )
+				&& ! self::is_elementor_translation_finalized( $post_id, $lang )
+			) {
+				return true;
+			} elseif (
+				self::should_require_elementor_translation( $post_id )
+				&& self::has_elementor_persian_content( $post_id )
+				&& ! self::is_elementor_translation_current( $post_id, $lang )
+			) {
+				return true;
+			}
 		}
 
 		if ( ! self::post_has_persian_content( $post ) ) {

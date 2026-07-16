@@ -314,6 +314,7 @@ final class Metabox_Action_Scheduler {
 			as_unschedule_all_actions( self::HOOK, null, self::GROUP );
 		}
 
+		// Cap pagination — scanning every failed/canceled row hung Start/Stop after long Elementor runs.
 		if ( ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
 			return $removed;
 		}
@@ -322,11 +323,11 @@ final class Metabox_Action_Scheduler {
 		$statuses = array(
 			\ActionScheduler_Store::STATUS_PENDING,
 			\ActionScheduler_Store::STATUS_FAILED,
-			\ActionScheduler_Store::STATUS_CANCELED,
 		);
 
 		foreach ( $statuses as $store_status ) {
-			$page = 1;
+			$page  = 1;
+			$pages = 0;
 
 			do {
 				$actions = as_get_scheduled_actions(
@@ -362,7 +363,8 @@ final class Metabox_Action_Scheduler {
 				}
 
 				++$page;
-			} while ( count( $actions ) >= 50 );
+				++$pages;
+			} while ( count( $actions ) >= 50 && $pages < 4 );
 		}
 
 		return $removed;
