@@ -257,9 +257,15 @@ trait Trait_Chunking {
 			in_array( $seg_key, self::$current_elementor_segment_passthrough, true )
 			&& $value === $seg_source
 		) {
-			// Persian source-fallback is a temporary placeholder — never treat it as resolved
-			// or gap-fill will mark the long HTML field complete while customers still see FA.
-			return ! Persian_Detector::contains_persian( $value );
+			// Echoed source-fallback is never "done" for Arabic (FA shares the script).
+			// For EN/Latin targets, only accept when the echoed source is already Latin.
+			$lang = self::get_elementor_target_lang();
+
+			if ( 'ar' === $lang ) {
+				return false;
+			}
+
+			return ! Persian_Detector::contains_arabic_script( $value );
 		}
 
 		return self::elementor_map_value_is_valid_translation( $seg_key, $seg_source, $value );
@@ -283,7 +289,31 @@ trait Trait_Chunking {
 	 * @return void
 	 */
 	public static function bind_elementor_accepted_paths_context( $post_id, $lang ) {
+		$lang = sanitize_key( (string) $lang );
+
+		self::$current_elementor_target_lang    = '' !== $lang ? $lang : 'en';
 		self::$current_elementor_accepted_paths = self::get_elementor_accepted_paths( $post_id, $lang );
+	}
+
+	/**
+	 * Active Elementor job target language (defaults to en).
+	 *
+	 * @return string
+	 */
+	private static function get_elementor_target_lang() {
+		$lang = sanitize_key( (string) self::$current_elementor_target_lang );
+
+		return '' !== $lang ? $lang : 'en';
+	}
+
+	/**
+	 * Whether AI/map text should be discarded for the bound target language.
+	 *
+	 * @param string $translated Candidate translation.
+	 * @return bool
+	 */
+	private static function elementor_rejects_translated_text( $translated ) {
+		return Persian_Detector::should_reject_ai_translation( $translated, self::get_elementor_target_lang() );
 	}
 
 	private static function elementor_path_is_accepted( $path ) {
@@ -475,12 +505,12 @@ trait Trait_Chunking {
 				continue;
 			}
 
-			// Soft keep: already-English map value that validity helpers might still reject
-			// (e.g. shortcode edge cases) must never be overwritten with Persian source.
+			// Soft keep: already-valid map value that validity helpers might still reject
+			// (e.g. shortcode edge cases) must never be overwritten with FA source.
 			if (
 				isset( $map[ $seg_key ] )
 				&& '' !== trim( (string) $map[ $seg_key ] )
-				&& ! Persian_Detector::contains_persian( (string) $map[ $seg_key ] )
+				&& ! self::elementor_rejects_translated_text( (string) $map[ $seg_key ] )
 				&& (string) $map[ $seg_key ] !== $seg_source
 			) {
 				++$kept;
@@ -761,7 +791,7 @@ trait Trait_Chunking {
 			$translated = Shortcode_Masker::restore_shortcodes( $source_text, $translated );
 		}
 
-		if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+		if ( '' === $translated || self::elementor_rejects_translated_text( $translated ) ) {
 			return false;
 		}
 
@@ -797,7 +827,7 @@ trait Trait_Chunking {
 		$source_text = (string) $source_text;
 		$translated  = (string) $translated;
 
-		if ( '' === trim( $translated ) || Persian_Detector::contains_persian( $translated ) ) {
+		if ( '' === trim( $translated ) || self::elementor_rejects_translated_text( $translated ) ) {
 			return false;
 		}
 
@@ -1113,13 +1143,13 @@ trait Trait_Chunking {
 				continue;
 			}
 
-			// Never overwrite a clean English base with a Persian hybrid.
+			// Never overwrite a clean target-language base with a source-script hybrid.
 			if (
 				isset( $prepared[ $path ] )
 				&& self::elementor_map_value_is_valid_translation( $path, $text, (string) $prepared[ $path ] )
-				&& Persian_Detector::contains_persian( $assembled )
+				&& self::elementor_rejects_translated_text( $assembled )
 			) {
-				// Keep English base AND retain any English __segN that still help repairs.
+				// Keep valid base AND retain any good __segN that still help repairs.
 				continue;
 			}
 
@@ -1464,11 +1494,11 @@ trait Trait_Chunking {
 		if ( self::elementor_path_is_accepted( $path ) ) {
 			$mapped = isset( $map[ $path ] ) ? (string) $map[ $path ] : '';
 
-			if ( '' !== $mapped && ! Persian_Detector::contains_persian( $mapped ) ) {
+			if ( '' !== $mapped && ! self::elementor_rejects_translated_text( $mapped ) ) {
 				return true;
 			}
 
-			// Persian / empty accepted → fall through to real completeness checks.
+			// Unusable / empty accepted → fall through to real completeness checks.
 		}
 
 		if (
@@ -1476,8 +1506,12 @@ trait Trait_Chunking {
 			&& isset( $map[ $path ] )
 			&& (string) $map[ $path ] === $text
 		) {
-			// Same rule as segments: Persian source placeholders are not complete translations.
-			return ! Persian_Detector::contains_persian( $text );
+			// Same rule as segments: echoed FA source is not complete for ar/en targets.
+			if ( 'ar' === self::get_elementor_target_lang() ) {
+				return false;
+			}
+
+			return ! Persian_Detector::contains_arabic_script( $text );
 		}
 
 		// For very long Elementor fields, require all __segN pieces (or one collapsed base value).

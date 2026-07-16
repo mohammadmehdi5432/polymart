@@ -57,7 +57,7 @@ trait Trait_Job_Chunk {
 				$base        = $matches[1];
 				$source_text = (string) ( $source_payload[ $base ] ?? $text );
 
-				if ( isset( $map[ $path ] ) && '' !== trim( (string) $map[ $path ] ) && ! Persian_Detector::contains_persian( (string) $map[ $path ] ) ) {
+				if ( isset( $map[ $path ] ) && '' !== trim( (string) $map[ $path ] ) && ! self::elementor_rejects_translated_text( (string) $map[ $path ] ) ) {
 					continue;
 				}
 
@@ -264,12 +264,12 @@ trait Trait_Job_Chunk {
 				continue;
 			}
 
-			// Still the Persian source — not a completed translation.
+			// Still the source text — not a completed translation.
 			if ( $translated === trim( (string) $source_raw ) ) {
 				continue;
 			}
 
-			if ( Persian_Detector::contains_persian( $translated ) ) {
+			if ( Persian_Detector::should_reject_ai_translation( $translated, $lang ) ) {
 				continue;
 			}
 

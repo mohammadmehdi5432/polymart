@@ -228,6 +228,14 @@ trait Trait_Config_State {
 	private static $current_elementor_accepted_paths = array();
 
 	/**
+	 * Target language for the active Elementor job (en, ar, …).
+	 * Used so Arabic AI output is not rejected by the shared Arabic/Persian Unicode check.
+	 *
+	 * @var string
+	 */
+	private static $current_elementor_target_lang = 'en';
+
+	/**
 	 * Reset Elementor runtime caches (PHP 8.2+ — cannot unset static properties).
 	 *
 	 * @return void

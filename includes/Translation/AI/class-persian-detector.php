@@ -98,6 +98,30 @@ final class Persian_Detector {
 	}
 
 	/**
+	 * Whether AI output should be discarded for the active target language.
+	 *
+	 * Critical for Arabic: contains_persian() matches the shared Arabic Unicode
+	 * block, so valid Arabic translations must NOT be rejected as "Persian".
+	 *
+	 * @param mixed  $translated AI output.
+	 * @param string $lang       Target language code (en, ar, …).
+	 * @return bool True when the value must be rejected.
+	 */
+	public static function should_reject_ai_translation( $translated, $lang = 'en' ) {
+		if ( ! is_string( $translated ) || '' === trim( $translated ) ) {
+			return true;
+		}
+
+		$lang = sanitize_key( (string) $lang );
+
+		if ( '' === $lang ) {
+			$lang = 'en';
+		}
+
+		return ! self::is_acceptable_translation_for_language( $translated, $lang );
+	}
+
+	/**
 	 * Check whether a string is primarily Latin/English (no Persian script).
 	 *
 	 * @param mixed $text Text to inspect.

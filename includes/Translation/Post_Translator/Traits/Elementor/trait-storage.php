@@ -698,7 +698,13 @@ trait Trait_Storage {
 		foreach ( $payload as $text ) {
 			$text = (string) $text;
 
-			if ( '' !== trim( $text ) && Persian_Detector::contains_persian( $text ) ) {
+			if ( '' === trim( $text ) ) {
+				continue;
+			}
+
+			// Language-aware: Arabic storefront JSON uses the same Unicode block as FA.
+			// Rejecting "contains_persian" here made every Arabic page look unfinished.
+			if ( ! Persian_Detector::is_acceptable_translation_for_language( $text, $lang ) ) {
 				$persian_bits[] = $text;
 			}
 		}

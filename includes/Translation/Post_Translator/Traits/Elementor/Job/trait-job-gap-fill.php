@@ -1218,8 +1218,8 @@ trait Trait_Job_Gap_Fill {
 				$translated = trim( (string) $map[ $seg_key ] );
 				if ( '' === $translated ) {
 					$bad[] = $seg_key . ':empty';
-				} elseif ( Persian_Detector::contains_persian( $translated ) ) {
-					$bad[] = $seg_key . ':persian';
+				} elseif ( self::elementor_rejects_translated_text( $translated ) ) {
+					$bad[] = $seg_key . ':wrong_script';
 				} elseif ( $translated === trim( (string) $seg_source ) ) {
 					$bad[] = $seg_key . ':unchanged';
 				}
@@ -1271,7 +1271,7 @@ trait Trait_Job_Gap_Fill {
 
 				if ( '' === $translated ) {
 					$reason = 'empty_translation';
-				} elseif ( Persian_Detector::contains_persian( $translated ) ) {
+				} elseif ( self::elementor_rejects_translated_text( $translated ) ) {
 					$reason = 'persian_translation';
 				} elseif ( $translated === trim( $text ) ) {
 					$reason = 'unchanged_from_source';
@@ -1429,7 +1429,7 @@ trait Trait_Job_Gap_Fill {
 			'logic_mismatch'          => __( 'ناسازگاری منطق تشخیص تکمیل', 'polymart-ai' ),
 			'not_in_map'              => __( 'به AI ارسال نشده یا در map نیست', 'polymart-ai' ),
 			'empty_translation'       => __( 'AI پاسخ خالی داد', 'polymart-ai' ),
-			'persian_translation'     => __( 'AI همان فارسی را برگرداند', 'polymart-ai' ),
+			'persian_translation'     => __( 'AI همان فارسی را برگرداند / اسکریپت نامعتبر برای زبان هدف', 'polymart-ai' ),
 			'unchanged_from_source'   => __( 'ترجمه بدون تغییر از منبع', 'polymart-ai' ),
 			'long_field_parts_incomplete' => __( 'بخش‌های فیلد بلند ناقص', 'polymart-ai' ),
 			'invalid_translation'     => __( 'ترجمه نامعتبر', 'polymart-ai' ),
@@ -2174,7 +2174,7 @@ trait Trait_Job_Gap_Fill {
 				$map_path   = (string) $map_path;
 				$translated = trim( (string) $translated );
 
-				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+				if ( '' === $translated || self::elementor_rejects_translated_text( $translated ) ) {
 					\PolymartAI\Activity_Logger::log(
 						'warning',
 						sprintf(
@@ -2182,7 +2182,7 @@ trait Trait_Job_Gap_Fill {
 							__( 'Elementor — #%1$d: stubborn رد شد — %2$s (%3$s)', 'polymart-ai' ),
 							absint( $post_id ),
 							$map_path,
-							'' === $translated ? 'empty' : 'persian'
+							'' === $translated ? 'empty' : 'wrong_script'
 						),
 						array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $map_path )
 					);

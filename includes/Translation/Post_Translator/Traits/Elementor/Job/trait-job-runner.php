@@ -1038,7 +1038,7 @@ trait Trait_Job_Runner {
 					continue;
 				}
 
-				if ( '' === $translated || Persian_Detector::contains_persian( $translated ) ) {
+				if ( '' === $translated || self::elementor_rejects_translated_text( $translated ) ) {
 					if ( $gap_fill_mode ) {
 						\PolymartAI\Activity_Logger::log(
 							'warning',
@@ -1047,7 +1047,7 @@ trait Trait_Job_Runner {
 								__( 'Elementor — #%1$d: رد پاسخ API برای %2$s — %3$s', 'polymart-ai' ),
 								$post_id,
 								$path,
-								'' === $translated ? 'empty' : 'persian'
+								'' === $translated ? 'empty' : 'wrong_script'
 							),
 							array( 'post_id' => $post_id, 'lang' => $lang, 'path' => $path )
 						);
@@ -1107,7 +1107,7 @@ trait Trait_Job_Runner {
 					'warning',
 					sprintf(
 						/* translators: 1: post ID, 2: chunk index, 3: field path */
-						__( 'Elementor — #%1$d: بخش %2$d پاسخ خالی یا فارسی از API (%3$s)', 'polymart-ai' ),
+						__( 'Elementor — #%1$d: بخش %2$d پاسخ خالی یا نامعتبر از API (%3$s)', 'polymart-ai' ),
 						$post_id,
 						$attempt_index,
 						'' !== $first_path ? $first_path : '…'
