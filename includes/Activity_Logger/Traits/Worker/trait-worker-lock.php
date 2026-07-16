@@ -183,7 +183,8 @@ trait Trait_Worker_Lock {
 
 		$job['current_post_id'] = null;
 		$job['step_started_at'] = null;
-		$job['worker_heartbeat_at'] = time();
+		// Do NOT refresh worker_heartbeat_at here — recovery used to, which made a
+		// dead worker look lively and blocked enqueue/inline for another 60s loop.
 		self::save_job( $job );
 	}
 

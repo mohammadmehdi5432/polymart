@@ -242,7 +242,8 @@ trait Trait_Worker_Recovery {
 			}
 		}
 
-		Job_Action_Scheduler::recover_stale_running_actions( Job_Action_Scheduler::STALE_RUNNING_SEC );
+		Job_Action_Scheduler::fail_all_running_bulk_actions();
+		Job_Action_Scheduler::recover_stale_running_actions( max( 30, min( $age, Job_Action_Scheduler::STALE_RUNNING_SEC ) ) );
 		Job_Action_Scheduler::clear_slice_mutex();
 		self::release_stale_locks_for_as( min( $age, Job_Action_Scheduler::STALE_RUNNING_SEC ) );
 		self::force_unlock_step_now();
@@ -255,17 +256,40 @@ trait Trait_Worker_Recovery {
 		$job = self::get_job_raw();
 		self::recover_stalled_job_picker( $job, $lang, true );
 		unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
-		$job['worker_recovered_at']    = time();
-		$job['worker_recover_reason']  = sanitize_key( (string) $reason );
+		$job['worker_recover_reason'] = sanitize_key( (string) $reason );
 		self::save_job( $job );
 
 		self::ensure_recurring_pulse();
 
-		$burst_ran = false;
+		$burst_ran   = false;
+		$as_enqueued = 0;
+		$as_ran      = 0;
 
 		if ( Job_Action_Scheduler::is_available() ) {
-			Job_Action_Scheduler::enqueue_next( true, 0 );
-			Job_Action_Scheduler::run_queue_inline( true );
+			$as_enqueued = Job_Action_Scheduler::enqueue_next( true, 0 );
+			$as_ran      = Job_Action_Scheduler::run_queue_inline( true );
+
+			// Zombie clear + enqueue can still leave the runner idle; force one direct batch.
+			if ( $as_ran <= 0 && ! Job_Action_Scheduler::is_slice_execution_active() ) {
+				$job           = self::get_job_raw();
+				$steps_before  = absint( $job['steps'] ?? 0 );
+				$progress_at_b = absint( $job['partial_progress_at'] ?? 0 );
+
+				if ( self::should_prioritize_elementor_partial( $job ) ) {
+					$cap = self::get_elementor_partial_step_cap( $job );
+					self::run_action_scheduler_batch( max( 1, $cap ), Job_Action_Scheduler::SLICE_BUDGET_SEC );
+				} else {
+					self::run_action_scheduler_batch( 1, Job_Action_Scheduler::SLICE_BUDGET_SEC );
+				}
+
+				$job_after_batch = self::get_job_raw();
+				if (
+					absint( $job_after_batch['steps'] ?? 0 ) > $steps_before
+					|| absint( $job_after_batch['partial_progress_at'] ?? 0 ) > $progress_at_b
+				) {
+					$as_ran = 1;
+				}
+			}
 		}
 
 		$job = self::get_job_raw();
@@ -280,6 +304,7 @@ trait Trait_Worker_Recovery {
 				self::is_elementor_progress_stalled( $job )
 				|| Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang )
 				|| Post_Translator::elementor_job_api_slices_pending( $post_id, $lang )
+				|| ( ! $as_enqueued && $as_ran <= 0 )
 			)
 		) {
 			$burst_ran = self::run_pinned_elementor_work( true );
@@ -306,12 +331,19 @@ trait Trait_Worker_Recovery {
 			}
 		}
 
-		if ( $progress_moved || $burst_ran ) {
+		$did_work = $progress_moved || $burst_ran || $as_ran > 0 || $as_enqueued > 0;
+
+		$job = self::get_job_raw();
+		$job['worker_recovered_at']   = time();
+		$job['worker_recover_reason'] = sanitize_key( (string) $reason );
+
+		if ( $did_work ) {
 			$job['worker_heartbeat_at'] = time();
 			$job['last_cron_at']        = time();
 			$job['last_worker']         = wp_doing_cron() ? 'cron' : self::resolve_last_worker_label();
-			self::save_job( $job );
 		}
+
+		self::save_job( $job );
 
 		self::log(
 			'warning',
@@ -323,7 +355,9 @@ trait Trait_Worker_Recovery {
 			)
 		);
 
-		return true;
+		delete_transient( $mutex_key );
+
+		return $did_work;
 	}
 
 }

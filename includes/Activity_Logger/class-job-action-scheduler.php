@@ -905,7 +905,10 @@ final class Job_Action_Scheduler {
 					self::chain_next_slice_immediately();
 				}
 			} else {
-				\PolymartAI\Activity_Logger::nudge_as_queue_runner();
+				// Non-productive batch: still re-chain so idle ticks cannot kill the queue.
+				self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
+				self::clear_slice_mutex();
+				self::chain_next_slice_immediately();
 			}
 		}
 	}
@@ -1227,27 +1230,14 @@ final class Job_Action_Scheduler {
 		$recovered      = 0;
 
 		// AS "modified" does not tick during long batches — trust the job heartbeat instead.
+		// A dead PHP claim still refreshes AS "modified", so when the job is not lively
+		// every RUNNING row for our hook is a zombie and must be failed (not filtered by age).
 		if ( \PolymartAI\Activity_Logger::is_bulk_worker_lively( $older_than_sec ) ) {
 			return 0;
 		}
 
 		try {
-			$store = \ActionScheduler::store();
-			$ids   = $store->query_actions(
-				array(
-					'hook'             => self::HOOK,
-					'group'            => self::GROUP,
-					'status'           => \ActionScheduler_Store::STATUS_RUNNING,
-					'modified'         => time() - $older_than_sec,
-					'modified_compare' => '<=',
-					'per_page'         => 20,
-					'orderby'          => 'none',
-				)
-			);
-
-			if ( ! is_array( $ids ) ) {
-				$ids = array();
-			}
+			$ids = self::query_running_action_ids( 50 );
 
 			foreach ( $ids as $action_id ) {
 				$action_id = absint( $action_id );
@@ -1282,6 +1272,26 @@ final class Job_Action_Scheduler {
 		}
 
 		return $recovered;
+	}
+
+	/**
+	 * Fail every RUNNING bulk-slice action (recovery / stop). Ignores AS modified age.
+	 *
+	 * @return int Number of actions failed.
+	 */
+	public static function fail_all_running_bulk_actions() {
+		if ( ! self::is_available() ) {
+			return 0;
+		}
+
+		$failed = 0;
+
+		foreach ( self::query_running_action_ids( 50 ) as $action_id ) {
+			self::mark_action_failed( $action_id );
+			++$failed;
+		}
+
+		return $failed;
 	}
 
 	/**
@@ -1376,6 +1386,19 @@ final class Job_Action_Scheduler {
 		$activity_age = \PolymartAI\Activity_Logger::get_bulk_worker_activity_age();
 
 		if ( $activity_age >= self::SLICE_BUDGET_SEC ) {
+			return false;
+		}
+
+		// Align with force-recover: silent past recover window → RUNNING/mutex are zombies.
+		$recover_sec = max(
+			45,
+			min(
+				120,
+				(int) apply_filters( 'polymart_ai_worker_force_recover_sec', 60 )
+			)
+		);
+
+		if ( $activity_age >= $recover_sec ) {
 			return false;
 		}
 
@@ -1485,9 +1508,7 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	private static function fail_all_running_actions() {
-		foreach ( self::query_running_action_ids( 50 ) as $action_id ) {
-			self::mark_action_failed( $action_id );
-		}
+		self::fail_all_running_bulk_actions();
 	}
 
 	/**

@@ -167,15 +167,26 @@ trait Trait_Queue_Run {
 				self::release_step_lock();
 			}
 
-			self::touch_worker_heartbeat();
+			$idle_or_deferred = is_array( $result )
+				&& ( ! empty( $result['idle_tick'] ) || ! empty( $result['step_deferred'] ) );
+
+			// Idle/deferred ticks must not refresh heartbeat — that masked dead workers
+			// and pushed force-recover into a no-op 60s loop.
+			if ( ! $idle_or_deferred ) {
+				self::touch_worker_heartbeat();
+			}
 
 			++$steps_run;
 
 			$job = self::get_job_raw();
-			$job['last_cron_at']         = time();
-			$job['worker_heartbeat_at']  = time();
+			$job['last_cron_at']        = time();
 			$job['last_cron_steps']     = $steps_run;
 			$job['last_worker']         = $worker_label;
+
+			if ( ! $idle_or_deferred ) {
+				$job['worker_heartbeat_at'] = time();
+			}
+
 			self::save_job( $job );
 
 			if ( 'running' !== ( $job['status'] ?? '' ) ) {
@@ -222,13 +233,22 @@ trait Trait_Queue_Run {
 		}
 
 		if ( is_array( $last_result ) ) {
-			$last_result['last_cron_at']        = time();
-			$last_result['worker_heartbeat_at'] = time();
-			$last_result['last_cron_steps']     = $steps_run;
-			$last_result['last_worker']         = $worker_label;
-			$last_result['cron_scheduled']      = (bool) self::get_next_worker_cron();
-			$last_result['next_cron_at']        = self::get_next_worker_cron() ?: null;
-			$last_result['worker_lock']         = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
+			$last_result['last_cron_at']     = time();
+			$last_result['last_cron_steps']  = $steps_run;
+			$last_result['last_worker']      = $worker_label;
+			$last_result['cron_scheduled']   = (bool) self::get_next_worker_cron();
+			$last_result['next_cron_at']     = self::get_next_worker_cron() ?: null;
+			$last_result['worker_lock']      = (bool) get_transient( self::STEP_LOCK_KEY ) || (bool) get_option( self::STEP_LOCK_CLAIM_KEY );
+
+			if (
+				empty( $last_result['idle_tick'] )
+				&& empty( $last_result['step_deferred'] )
+			) {
+				$last_result['worker_heartbeat_at'] = time();
+			} else {
+				$last_result['worker_heartbeat_at'] = absint( self::get_job_raw()['worker_heartbeat_at'] ?? 0 );
+			}
+
 			self::$trusted_job_tick = false;
 
 			if (
@@ -343,13 +363,18 @@ trait Trait_Queue_Run {
 	 * @param bool                 $inline_tick     Inline worker tick processed work.
 	 */
 	private static function kick_worker_moved_queue( $before_progress, $after, $did_recover, $direct_tick, $inline_tick ) {
-		if ( $did_recover || $direct_tick || $inline_tick ) {
+		if ( $direct_tick || $inline_tick ) {
 			return true;
 		}
 
+		// Recovery alone is not success — only when it actually moved progress / chained work.
 		$after_progress = (string) ( $after['partial_progress'] ?? '' );
 
-		return '' !== $after_progress && $before_progress !== $after_progress;
+		if ( '' !== $after_progress && $before_progress !== $after_progress ) {
+			return true;
+		}
+
+		return (bool) $did_recover;
 	}
 
 	public static function process_job_step() {
