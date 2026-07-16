@@ -37,19 +37,7 @@ function polymart_ai_queue_diag_bootstrap() {
 add_action(
 	'admin_menu',
 	static function () {
-		$cap = class_exists( '\PolymartAI\REST_API' )
-			? \PolymartAI\REST_API::required_admin_capability()
-			: 'manage_options';
-
-		add_submenu_page(
-			'polymart-ai',
-			'رفع اشکال PolyMart',
-			'رفع اشکال',
-			$cap,
-			'polymart-ai-troubleshoot',
-			'polymart_ai_render_troubleshoot_page'
-		);
-
+		// Hidden raw diagnostic (troubleshoot UI is registered from Admin after parent menu).
 		add_submenu_page(
 			null,
 			'PolyMart Queue Debug',
@@ -58,7 +46,8 @@ add_action(
 			'polymart-ai-queue-debug',
 			'polymart_ai_render_queue_diagnostic_page'
 		);
-	}
+	},
+	99
 );
 
 /**
@@ -67,7 +56,15 @@ add_action(
  * @return void
  */
 function polymart_ai_queue_diag_maybe_send_json_early() {
-	if ( ! is_admin() || ! current_user_can( 'manage_options' ) ) {
+	if ( ! is_admin() ) {
+		return;
+	}
+
+	$cap = class_exists( '\PolymartAI\REST_API' )
+		? \PolymartAI\REST_API::required_admin_capability()
+		: 'manage_options';
+
+	if ( ! current_user_can( $cap ) ) {
 		return;
 	}
 
@@ -90,6 +87,9 @@ function polymart_ai_queue_diag_maybe_send_json_early() {
 
 add_action( 'load-admin_page_polymart-ai-queue-debug', 'polymart_ai_queue_diag_maybe_send_json_early' );
 add_action( 'load-polymart-ai_page_polymart-ai-troubleshoot', 'polymart_ai_queue_diag_maybe_send_json_early' );
+add_action( 'load-toplevel_page_polymart-ai-troubleshoot', 'polymart_ai_queue_diag_maybe_send_json_early' );
+// Fallback before capability die when menu hook name mismatches.
+add_action( 'admin_init', 'polymart_ai_queue_diag_maybe_send_json_early', 0 );
 
 /**
  * AJAX endpoint — pure JSON, no admin HTML chrome.
@@ -693,6 +693,16 @@ function polymart_ai_queue_diag_build_recommendations( array $report ) {
 
 	if ( ! empty( $job['pinned_on_post'] ) && 'running' === (string) ( $job['status'] ?? '' ) ) {
 		$hints[] = 'این پست الان روی ترجمه خودکار قفل است — اگر بیش از ۵ دقیقه پیشرفت نکرد، خروجی JSON را بفرست.';
+	}
+
+	if ( empty( $report['action_scheduler_events'] ) && ! empty( $job['pinned_on_post'] ) && ! empty( $job['worker_lively'] ) ) {
+		$hints[] = 'کارگر زنده است ولی هیچ event اکشن‌اسکژولر برای این پست نیست — احتمال گیر روی stubborn بدون AS؛ Stop سپس Start یا Shift+ترجمه در متاباکس.';
+	}
+
+	$reopens = absint( $report['job_partial_state']['elementor_force_persian_reopens'] ?? 0 );
+
+	if ( $reopens >= 3 ) {
+		$hints[] = 'force-finalize بیش از ۳ بار reopen شده — بعد دیپلوی فیکس، یک بار Stop/Start ترجمه خودکار کافی است تا فیلد سرسخت accept و آزاد شود.';
 	}
 
 	if ( ! empty( $recovery['should_force_finalize'] ) ) {

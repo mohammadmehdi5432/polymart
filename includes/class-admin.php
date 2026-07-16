@@ -112,6 +112,18 @@ final class Admin {
 			'polymart-ai-logs',
 			array( $this, 'render_logs_page' )
 		);
+
+		// Must register after parent `polymart-ai` exists — otherwise WP orphan menus 404.
+		if ( function_exists( 'polymart_ai_render_troubleshoot_page' ) ) {
+			$this->page_hooks['troubleshoot'] = add_submenu_page(
+				'polymart-ai',
+				__( 'رفع اشکال', 'polymart-ai' ),
+				__( 'رفع اشکال', 'polymart-ai' ),
+				REST_API::required_admin_capability(),
+				'polymart-ai-troubleshoot',
+				'polymart_ai_render_troubleshoot_page'
+			);
+		}
 	}
 
 	/**

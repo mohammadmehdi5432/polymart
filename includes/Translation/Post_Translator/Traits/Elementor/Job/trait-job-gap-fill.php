@@ -68,6 +68,13 @@ trait Trait_Job_Gap_Fill {
 		self::bind_elementor_segment_passthrough_context( $state );
 		self::ensure_elementor_stubborn_handoff( $post_id, $lang, $state, $source_payload, $map, $progress_total );
 
+		// Stale kill/timeout errors must not block recovery UI / storefront serve gates.
+		$error_meta = (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true );
+
+		if ( '' !== trim( $error_meta ) && false !== strpos( $error_meta, 'Action Scheduler' ) ) {
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+		}
+
 		$skipped   = is_array( $state['elementor_skipped'] ?? null ) ? $state['elementor_skipped'] : array();
 		$remaining = self::filter_remaining_elementor_payload( $source_payload, $map, $skipped );
 
@@ -448,16 +455,17 @@ trait Trait_Job_Gap_Fill {
 		$ghost         = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
 		$long_attempts = absint( $state['elementor_long_gap_force_attempts'] ?? 0 );
 		$long_limit    = self::resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, $state );
+		$reopens       = absint( $state['elementor_force_persian_reopens'] ?? 0 );
 		// Prefer real AI retries first; after the attempt/ghost ceiling, accept long HTML
 		// with whatever English segments we already have (+ source only for gaps).
 		$accept_long_fallback = (
 			$ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 			|| $long_attempts >= $long_limit
+			|| $reopens >= 3
 			|| (
 				// Single stubborn leftover with missing __segN after primary N/N — don't pin forever.
 				1 === count( $remaining )
-				&& $ghost >= 1
-				&& $long_attempts >= 1
+				&& ( $ghost >= 1 || $reopens >= 1 || $long_attempts >= 1 )
 			)
 		);
 
@@ -625,14 +633,91 @@ trait Trait_Job_Gap_Fill {
 		$still_persian = self::stored_elementor_translation_has_persian( $post_id, $lang );
 
 		if ( $still_persian ) {
+			$reopens = absint( $state['elementor_force_persian_reopens'] ?? 0 ) + 1;
+
+			// After repeated reopen loops, force-accept leftover long fields and finalize.
+			if ( $reopens >= 3 && ! empty( $remaining ) && count( $remaining ) <= 2 ) {
+				$accepted_escape = array();
+
+				foreach ( array_keys( $remaining ) as $skip_path ) {
+					$skip_path = (string) $skip_path;
+					$text      = (string) ( $remaining[ $skip_path ] ?? '' );
+
+					if ( '' === $text ) {
+						continue;
+					}
+
+					self::accept_elementor_long_field_with_partial_fallback( $skip_path, $text, $map, $state );
+					$accepted_escape[] = $skip_path;
+				}
+
+				if ( ! empty( $accepted_escape ) ) {
+					self::save_elementor_accepted_paths( $post_id, $lang, $accepted_escape );
+					self::bind_elementor_accepted_paths_context( $post_id, $lang );
+				}
+
+				$map = self::prepare_elementor_map_for_persist( $map, $source_payload, true );
+
+				$persisted = self::persist_elementor_job_progress(
+					$post_id,
+					$lang,
+					$source_data,
+					$map,
+					$progress_total,
+					$progress_total,
+					true,
+					true
+				);
+
+				if ( ! is_wp_error( $persisted ) ) {
+					delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+					self::clear_elementor_primary_batches_lock( $post_id, $lang );
+					self::clear_elementor_slice_cursor( $post_id, $lang );
+					self::clear_job_partial_state( $post_id, $lang, true );
+					self::flush_translation_status_cache( $post_id );
+					self::reset_elementor_runtime_caches();
+
+					$hash = self::compute_elementor_source_hash( $post_id );
+
+					if ( '' !== $hash ) {
+						update_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), $hash );
+					}
+
+					update_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), time() );
+					update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
+					update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
+					update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+
+					\PolymartAI\Activity_Logger::log(
+						'warning',
+						sprintf(
+							/* translators: 1: post ID, 2: reopen count, 3: skipped field count */
+							__( 'Elementor — #%1$d: پس از %2$d reopen، %3$d فیلد سرسخت accept و finalize شد.', 'polymart-ai' ),
+							$post_id,
+							$reopens,
+							count( $accepted_escape )
+						),
+						array( 'post_id' => $post_id, 'lang' => $lang )
+					);
+
+					return array(
+						'done'           => true,
+						'phase'          => 'elementor',
+						'phase_progress' => '',
+						'message'        => __( 'ترجمه Elementor با accept فیلد سرسخت تکمیل شد.', 'polymart-ai' ),
+					);
+				}
+			}
+
 			// Do NOT stamp status=translated / done=true — queue must keep the pin
 			// and gap-fill English, otherwise UI shows N/N then «ناقص ماند Elementor».
 			self::invalidate_elementor_job_success_markers( $post_id, $lang );
-			// Drop accepted-path short-circuit so Persian leftovers re-enter remaining.
-			delete_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ) );
-			self::$current_elementor_accepted_paths = array();
 
-			$reopens = absint( $state['elementor_force_persian_reopens'] ?? 0 ) + 1;
+			// Keep accepted paths after repeated reopens so the next force can finalize.
+			if ( $reopens < 2 ) {
+				delete_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ) );
+				self::$current_elementor_accepted_paths = array();
+			}
 
 			\PolymartAI\Activity_Logger::log(
 				'warning',
@@ -650,9 +735,20 @@ trait Trait_Job_Gap_Fill {
 			$reopen['elementor_gap_fill_stubborn_only'] = true;
 			$reopen['elementor_map']                    = $map;
 			$reopen['elementor_force_persian_reopens']  = $reopens;
-			// Reset counters so stubborn gets fresh AI attempts before next force.
-			$reopen['elementor_stubborn_ghost_ticks']      = 0;
-			$reopen['elementor_long_gap_force_attempts']   = 0;
+
+			if ( $reopens >= 2 ) {
+				// Keep pressure high so the next tick force-accepts instead of resetting forever.
+				$reopen['elementor_stubborn_ghost_ticks']    = max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, 2 );
+				$reopen['elementor_long_gap_force_attempts'] = max( 1, absint( $state['elementor_long_gap_force_attempts'] ?? 0 ) + 1 );
+			} else {
+				// Reset counters so stubborn gets fresh AI attempts before next force.
+				$reopen['elementor_stubborn_ghost_ticks']    = 0;
+				$reopen['elementor_long_gap_force_attempts'] = 0;
+			}
+
+			// Stale kill/timeout error blocks storefront serve and confuses recovery UI.
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+
 			self::save_job_partial_state( $post_id, $lang, $reopen );
 
 			return array(

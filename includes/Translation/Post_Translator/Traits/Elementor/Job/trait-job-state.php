@@ -719,6 +719,12 @@ trait Trait_Job_State {
 
 		$ghost   = absint( $state['elementor_stubborn_ghost_ticks'] ?? 0 );
 		$repairs = absint( $state['elementor_queue_repair_attempts'] ?? 0 );
+		$reopens = absint( $state['elementor_force_persian_reopens'] ?? 0 );
+
+		// Escape hatch: one leftover long field after repeated force→reopen loops (#21870).
+		if ( $stubborn && 1 === $remaining && $reopens >= 3 ) {
+			return true;
+		}
 
 		// Gap-fill/stubborn must actually spend AS ticks on __segN / short leftovers
 		// before we force-accept Persian source. Huge HTML widgets need more ticks
@@ -729,7 +735,8 @@ trait Trait_Job_State {
 
 			return $ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 				|| $long_attempts >= $long_limit
-				|| $repairs >= 3;
+				|| $repairs >= 3
+				|| ( 1 === $remaining && $ghost >= 1 && $reopens >= 1 );
 		}
 
 		if ( $remaining < 3 && $ghost >= 2 ) {

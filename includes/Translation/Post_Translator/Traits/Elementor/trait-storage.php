@@ -685,12 +685,27 @@ trait Trait_Storage {
 
 		$payload = self::collect_elementor_translation_payload( $data );
 
-		// Do not ignore "accepted" fallback paths — if Persian is still in the stored
-		// JSON, storefront must not treat the companion as customer-ready English.
-		self::$stored_elementor_persian_cache[ $key ] = implode(
-			"\n\n",
-			array_unique( array_filter( array_values( $payload ) ) )
-		);
+		// Force-accepted fallback paths (partial __segN + source gaps) are intentional leftovers.
+		// Counting them as "still Persian" caused infinite force→reopen loops (#21870).
+		$accepted = self::get_elementor_accepted_paths( $post_id, $lang );
+
+		if ( ! empty( $accepted ) ) {
+			foreach ( $accepted as $accepted_path ) {
+				unset( $payload[ (string) $accepted_path ] );
+			}
+		}
+
+		$persian_bits = array();
+
+		foreach ( $payload as $text ) {
+			$text = (string) $text;
+
+			if ( '' !== trim( $text ) && Persian_Detector::contains_persian( $text ) ) {
+				$persian_bits[] = $text;
+			}
+		}
+
+		self::$stored_elementor_persian_cache[ $key ] = implode( "\n\n", array_unique( $persian_bits ) );
 
 		return self::$stored_elementor_persian_cache[ $key ];
 	}
