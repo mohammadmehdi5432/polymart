@@ -181,7 +181,7 @@ final class Frontend_Interceptor {
 			$rank_math = trim( (string) get_post_meta( $post_id, 'rank_math_title_' . $lang, true ) );
 		}
 
-		if ( '' !== $rank_math && ! Persian_Detector::contains_persian( $rank_math ) ) {
+		if ( '' !== $rank_math && Persian_Detector::is_acceptable_translation_for_language( $rank_math, $lang ) ) {
 			return $rank_math;
 		}
 

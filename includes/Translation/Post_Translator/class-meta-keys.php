@@ -145,6 +145,13 @@ final class Meta_Keys {
 
 		$lang = sanitize_key( (string) $lang );
 
+		// Never treat language-suffixed companions as Persian *source* fields.
+		// Without this, audit/cache calls with empty $lang re-queue rank_math_*_ar
+		// forever as "Rank Math … Ar (ar)" after Arabic Elementor already finished.
+		if ( self::meta_key_has_language_suffix( $meta_key ) ) {
+			return false;
+		}
+
 		if ( '' !== $lang && preg_match( '/_' . preg_quote( $lang, '/' ) . '$/', $meta_key ) ) {
 			return false;
 		}
@@ -171,6 +178,40 @@ final class Meta_Keys {
 		 * @param string $lang     Target language code.
 		 */
 		return (bool) apply_filters( 'polymart_ai_is_translatable_meta_key', true, $meta_key, $lang );
+	}
+
+	/**
+	 * Whether a meta key already ends with a known PolyMart language code (_en, _ar, …).
+	 *
+	 * @param string $meta_key Meta key.
+	 * @return bool
+	 */
+	public static function meta_key_has_language_suffix( $meta_key ) {
+		$meta_key = (string) $meta_key;
+
+		if ( '' === $meta_key || ! preg_match( '/_([a-z]{2,3})$/', $meta_key, $matches ) ) {
+			return false;
+		}
+
+		$code = sanitize_key( (string) $matches[1] );
+
+		if ( '' === $code ) {
+			return false;
+		}
+
+		$known = array( 'en', 'ar', 'fa', 'zh', 'tr', 'de', 'fr', 'es', 'ru', 'ja', 'ko', 'it', 'pt', 'hi' );
+
+		if ( class_exists( '\PolymartAI\Language_Registry' ) ) {
+			foreach ( \PolymartAI\Language_Registry::get_languages() as $language ) {
+				$lang_code = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+				if ( '' !== $lang_code ) {
+					$known[] = $lang_code;
+				}
+			}
+		}
+
+		return in_array( $code, array_values( array_unique( $known ) ), true );
 	}
 
 	/**

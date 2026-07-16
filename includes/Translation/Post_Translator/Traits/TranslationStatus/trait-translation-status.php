@@ -291,7 +291,7 @@ trait Trait_Translation_Status {
 			);
 		}
 
-		foreach ( self::get_discovered_meta_fields_cached( $post_id ) as $meta_key => $source ) {
+		foreach ( self::get_discovered_meta_fields_cached( $post_id, $lang ) as $meta_key => $source ) {
 			if ( self::is_commerce_product_post( $post_id, $post ) ) {
 				break;
 			}
@@ -497,16 +497,23 @@ trait Trait_Translation_Status {
 		);
 	}
 
-	private static function get_discovered_meta_fields_cached( $post_id ) {
+	private static function get_discovered_meta_fields_cached( $post_id, $lang = '' ) {
 		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$cache_key = $post_id . ':' . $lang;
 
-		if ( isset( self::$discovered_meta_cache[ $post_id ] ) ) {
+		if ( isset( self::$discovered_meta_cache[ $cache_key ] ) ) {
+			return self::$discovered_meta_cache[ $cache_key ];
+		}
+
+		// Backward-compatible numeric cache key used by older call sites.
+		if ( '' === $lang && isset( self::$discovered_meta_cache[ $post_id ] ) ) {
 			return self::$discovered_meta_cache[ $post_id ];
 		}
 
-		self::$discovered_meta_cache[ $post_id ] = self::collect_discovered_meta_fields( $post_id );
+		self::$discovered_meta_cache[ $cache_key ] = self::collect_discovered_meta_fields( $post_id, $lang );
 
-		return self::$discovered_meta_cache[ $post_id ];
+		return self::$discovered_meta_cache[ $cache_key ];
 	}
 
 	public static function get_status_index_meta_key( $lang ) {
