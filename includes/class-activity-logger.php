@@ -99,6 +99,7 @@ final class Activity_Logger {
 	const CRON_FAST_INTERVAL_SEC  = Activity_Logger_Config::CRON_FAST_INTERVAL_SEC;
 	const CRON_HEAL_STALE_SEC     = Activity_Logger_Config::CRON_HEAL_STALE_SEC;
 	const WORKER_FORCE_RECOVER_SEC = Activity_Logger_Config::WORKER_FORCE_RECOVER_SEC;
+	const WORKER_ABANDON_CANCEL_SEC = Activity_Logger_Config::WORKER_ABANDON_CANCEL_SEC;
 
 	const CRON_INTERVAL_SERVER_SEC = Activity_Logger_Config::CRON_INTERVAL_SERVER_SEC;
 

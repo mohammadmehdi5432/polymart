@@ -403,6 +403,10 @@ trait Trait_Worker_Runner {
 			return null;
 		}
 
+		if ( self::maybe_auto_cancel_abandoned_bulk_job() ) {
+			return self::normalize_job_for_response( self::get_job_raw(), false );
+		}
+
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::ensure_scheduled();
 
@@ -427,7 +431,7 @@ trait Trait_Worker_Runner {
 
 		// Stalled worker: force recovery then run the full ensure/kick path.
 		if ( $age >= $stale_sec ) {
-			self::force_recover_stalled_bulk_worker( 'cron_heal' );
+			self::force_recover_stalled_bulk_worker( 'cron_heal', true );
 
 			return self::kick_worker();
 		}
@@ -601,15 +605,18 @@ trait Trait_Worker_Runner {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		if ( self::maybe_auto_cancel_abandoned_bulk_job() ) {
+			$job = self::get_job_raw();
+			$job['worker_ensured'] = false;
+			$job['abandoned']     = true;
+
+			return self::normalize_job_for_response( $job, false );
+		}
+
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
 			return self::normalize_job_for_response( $job, false );
-		}
-
-		if ( self::should_prioritize_elementor_partial( $job ) ) {
-			self::reconcile_elementor_bulk_pin( $job );
-			$job = self::get_job_raw();
 		}
 
 		if ( self::is_job_api_cooldown_active( $job ) ) {
@@ -626,17 +633,11 @@ trait Trait_Worker_Runner {
 			return self::normalize_job_for_response( $job, false );
 		}
 
-		if ( self::force_recover_stalled_bulk_worker( 'ensure' ) ) {
-			return self::kick_worker();
-		}
+		// Light path only: unlock + rechain. Never run AI / Elementor inline from ensure
+		// (SPA poll/refresh was doing that → HTTP 500 / site freeze).
+		self::soft_revive_stalled_bulk_worker( 'ensure' );
 
-		if ( self::maybe_restore_elementor_pin_from_queue( $job ) ) {
-			self::save_job( $job );
-		}
-
-		$slice_active = Job_Action_Scheduler::is_slice_execution_active();
-
-		if ( ! $slice_active ) {
+		if ( ! Job_Action_Scheduler::is_slice_execution_active() ) {
 			$released_stale_lock = self::force_release_step_lock_if_idle();
 			$released_stale_lock = self::maybe_release_stale_step_lock() || $released_stale_lock;
 		} else {
@@ -645,10 +646,9 @@ trait Trait_Worker_Runner {
 
 		$job  = self::get_job_raw();
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-		$last = self::get_worker_real_activity_at( $job );
-		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
+		$age  = self::get_bulk_worker_activity_age();
 
-		if ( $released_stale_lock || ( $age >= self::PICK_STALL_SEC ) ) {
+		if ( $released_stale_lock || $age >= self::PICK_STALL_SEC ) {
 			if ( self::recover_stalled_job_picker( $job, $lang, $released_stale_lock ) ) {
 				self::save_job( $job );
 			}
@@ -657,97 +657,12 @@ trait Trait_Worker_Runner {
 		self::ensure_recurring_pulse();
 		Job_Action_Scheduler::ensure_scheduled();
 
-		$job  = self::get_job_raw();
-		$last = self::get_worker_real_activity_at( $job );
-		$age  = $last > 0 ? ( time() - $last ) : PHP_INT_MAX;
-
-		if (
-			self::should_prioritize_elementor_partial( $job )
-			&& 'running' === ( $job['status'] ?? '' )
-		) {
-			$parsed = self::parse_job_phase_progress( (string) ( $job['partial_progress'] ?? '' ) );
-			$gap_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
-			$gap_lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-			$gap_pending = $gap_post_id > 0 && '' !== $gap_lang
-				&& Post_Translator::elementor_needs_gap_fill_work( $gap_post_id, $gap_lang );
-
-			if (
-				$gap_pending
-				|| (
-					is_array( $parsed )
-					&& $parsed['total'] > 0
-					&& $parsed['done'] >= $parsed['total']
-				)
-			) {
-				if ( $age >= ( $gap_pending ? 4 : 8 ) ) {
-					self::schedule_elementor_partial_follow_up( 0 );
-				}
-			}
+		if ( Job_Action_Scheduler::is_available() && ! Job_Action_Scheduler::is_slice_execution_active() ) {
+			Job_Action_Scheduler::enqueue_next( true, 0 );
 		}
 
-		$busy = self::is_step_lock_held_fresh();
-		$stale_sec = Job_Action_Scheduler::STALE_RUNNING_SEC;
-
-		if ( $busy && $age >= self::LOCK_FORCE_IDLE_SEC && ! self::is_bulk_worker_lively( $stale_sec ) ) {
-			$job     = self::get_job_raw();
-			$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
-			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
-
-			if ( $post_id > 0 && '' !== $lang ) {
-				Post_Translator::release_stale_translation_lock( $post_id, $lang, self::LOCK_FORCE_IDLE_SEC );
-			}
-
-			self::release_step_lock();
-			$busy                = false;
-			$released_stale_lock = true;
-		}
-
-		$as_pending  = Job_Action_Scheduler::has_pending_or_running();
-		$worker_dead = ! self::is_bulk_worker_lively( $stale_sec );
-
-		if ( $worker_dead && self::should_prioritize_elementor_partial( $job ) ) {
-			$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
-
-			if ( $post_id > 0 && '' !== $lang ) {
-				$lock_status = Post_Translator::get_translation_lock_status( $post_id, $lang );
-
-				if ( ! empty( $lock_status['held'] ) && empty( $lock_status['owned_by_self'] ) ) {
-					if ( ! Post_Translator::release_stale_translation_lock( $post_id, $lang, min( $age, 60 ) ) && $age >= $stale_sec ) {
-						Post_Translator::release_translation_lock( $post_id, $lang, true );
-					}
-
-					unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
-					self::save_job( $job );
-					$job = self::get_job_raw();
-				}
-			}
-		}
-
-		$should_tick = $worker_dead || $as_pending || $age >= self::get_ensure_inline_idle_sec();
-
-		if ( $should_tick && Job_Action_Scheduler::is_available() ) {
-			$needs_recovery = $worker_dead
-				|| $age >= self::PICK_STALL_SEC
-				|| ( $as_pending && ! $slice_active && $age >= 20 );
-			$force_inline   = ! $slice_active && $needs_recovery;
-			$as_status      = Job_Action_Scheduler::status_payload();
-
-			if ( ! empty( $as_status['slice_active'] ) && ! $worker_dead ) {
-				Job_Action_Scheduler::enqueue_next( true, 0 );
-			} else {
-				Job_Action_Scheduler::run_queue_inline( $force_inline );
-			}
-
-			$job = self::get_job_raw();
-			$job['worker_inline_tick'] = true;
-			self::save_job( $job );
-		} elseif ( $should_tick && ! $slice_active ) {
-			self::run_inline_worker_tick( 2, 90 );
-
-			$job = self::get_job_raw();
-			$job['worker_inline_tick'] = true;
-			self::save_job( $job );
-		}
+		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
+		self::ping_wp_cron( true );
 
 		$next = self::get_next_worker_cron();
 		$job  = self::get_job_raw();
@@ -761,19 +676,11 @@ trait Trait_Worker_Runner {
 		$job['as_pending']          = ! empty( $as['pending'] );
 		$job['as_available']        = ! empty( $as['available'] );
 		$job['worker_mode']         = ! empty( $as['available'] ) ? 'as' : 'cron';
+		$job['worker_soft']         = true;
 
 		if ( $released_stale_lock ) {
 			$job['lock_recovered'] = true;
 			self::log( 'warning', __( 'قفل مرحلهٔ گیرکرده آزاد شد — صف Action Scheduler دوباره شروع می‌کند.', 'polymart-ai' ) );
-		}
-
-		if (
-			self::should_prioritize_elementor_partial( $job )
-			&& self::is_elementor_progress_stalled( $job )
-			&& ! self::is_job_api_cooldown_active( $job )
-		) {
-			self::run_pinned_elementor_work( true );
-			$job = self::get_job_raw();
 		}
 
 		self::save_job( $job );

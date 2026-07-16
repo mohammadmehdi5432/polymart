@@ -183,14 +183,185 @@ trait Trait_Worker_Recovery {
 	}
 
 	/**
+	 * Auto-pause a bulk job that has been silent too long (browser closed / dead worker).
+	 *
+	 * @return bool True when the job was paused as abandoned.
+	 */
+	public static function maybe_auto_cancel_abandoned_bulk_job() {
+		if ( Translation_Scheduler_Coordinator::is_halted() || ! self::is_bulk_job_running() ) {
+			return false;
+		}
+
+		$age   = self::get_bulk_worker_activity_age();
+		$limit = max(
+			180,
+			min(
+				1800,
+				(int) apply_filters( 'polymart_ai_worker_abandon_cancel_sec', self::WORKER_ABANDON_CANCEL_SEC )
+			)
+		);
+
+		if ( $age < $limit ) {
+			return false;
+		}
+
+		$mutex_key = 'polymart_ai_abandon_cancel_mux';
+		if ( get_transient( $mutex_key ) ) {
+			return false;
+		}
+		set_transient( $mutex_key, time(), 90 );
+
+		$job  = self::get_job_raw();
+		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		foreach (
+			array_unique(
+				array_filter(
+					array(
+						absint( $job['partial_post_id'] ?? 0 ),
+						absint( $job['current_post_id'] ?? 0 ),
+					)
+				)
+			) as $post_id
+		) {
+			if ( $post_id > 0 && '' !== $lang ) {
+				Post_Translator::release_translation_lock( $post_id, $lang, true );
+			}
+		}
+
+		self::unschedule_background_worker();
+		self::release_step_lock();
+		Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
+
+		$job = self::get_job_raw();
+		$job['status']          = 'paused';
+		$job['pause_reason']    = 'abandoned';
+		$job['current_post_id'] = null;
+		$job['step_started_at'] = null;
+		$job['pick_started_at'] = null;
+		$job['last_error']      = sprintf(
+			/* translators: %d: idle seconds before auto-cancel */
+			__( 'کارگر بیش از %d ثانیه بدون فعالیت بود — فرآیند خودکار لغو شد. برای ادامه «ادامه» یا «شروع» را بزنید.', 'polymart-ai' ),
+			$limit
+		);
+		unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
+		self::save_job( $job );
+
+		self::log(
+			'warning',
+			sprintf(
+				/* translators: %d: idle seconds */
+				__( 'ترجمه خودکار پس از %dث سکوت کارگر لغو شد (رها شدن / مرورگر بسته).', 'polymart-ai' ),
+				$age
+			)
+		);
+
+		delete_transient( $mutex_key );
+
+		return true;
+	}
+
+	/**
+	 * Light revive: unlock + re-enqueue AS only. Never runs AI / Elementor inline.
+	 * Safe for SPA ensure / poll paths that previously caused HTTP 500.
+	 *
+	 * @param string $reason Short diagnostic tag.
+	 * @return bool True when revive actions ran.
+	 */
+	public static function soft_revive_stalled_bulk_worker( $reason = 'soft' ) {
+		if ( Translation_Scheduler_Coordinator::is_halted() || ! self::is_bulk_job_running() ) {
+			return false;
+		}
+
+		if ( self::maybe_auto_cancel_abandoned_bulk_job() ) {
+			return false;
+		}
+
+		$mutex_key = 'polymart_ai_worker_soft_revive_mux';
+		if ( get_transient( $mutex_key ) ) {
+			return false;
+		}
+		set_transient( $mutex_key, time(), 20 );
+
+		$job  = self::get_job_raw();
+		$age  = self::get_bulk_worker_activity_age();
+		$need = max(
+			25,
+			min(
+				90,
+				(int) apply_filters( 'polymart_ai_worker_soft_revive_sec', 35 )
+			)
+		);
+
+		if ( $age < $need ) {
+			delete_transient( $mutex_key );
+			return false;
+		}
+
+		$lang    = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+		$post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
+
+		Job_Action_Scheduler::recover_stale_running_actions( max( 30, min( $age, Job_Action_Scheduler::STALE_RUNNING_SEC ) ) );
+		Job_Action_Scheduler::clear_slice_mutex_if_stale();
+		self::release_stale_locks_for_as( min( $age, Job_Action_Scheduler::STALE_RUNNING_SEC ) );
+		self::force_unlock_step_now();
+
+		if ( $post_id > 0 && '' !== $lang ) {
+			Post_Translator::release_stale_translation_lock( $post_id, $lang, min( $age, 90 ) );
+		}
+
+		$job = self::get_job_raw();
+		self::recover_stalled_job_picker( $job, $lang, false );
+		unset( $job['step_deferred'], $job['step_deferred_reason'], $job['step_deferred_message'] );
+		$job['worker_recover_reason'] = sanitize_key( (string) $reason );
+		$job['worker_recovered_at']   = time();
+		self::save_job( $job );
+
+		self::ensure_recurring_pulse();
+
+		$enqueued = 0;
+		if ( Job_Action_Scheduler::is_available() ) {
+			$enqueued = Job_Action_Scheduler::enqueue_next( true, 0 );
+		}
+
+		self::nudge_as_queue_runner();
+		self::schedule_chain_safety_pulse( self::AS_CRON_SAFETY_SEC );
+		self::ping_wp_cron( true );
+
+		delete_transient( $mutex_key );
+
+		return $enqueued > 0 || $age >= $need;
+	}
+
+	/**
 	 * Break AS/step-lock deadlocks after prolonged silence (cron + admin ensure).
 	 *
 	 * @param string $reason Short diagnostic tag.
+	 * @param bool   $heavy  When false, unlock/rechain only (no inline AI / Elementor burst).
 	 * @return bool True when recovery actions ran.
 	 */
-	public static function force_recover_stalled_bulk_worker( $reason = '' ) {
+	public static function force_recover_stalled_bulk_worker( $reason = '', $heavy = true ) {
 		if ( Translation_Scheduler_Coordinator::is_halted() || ! self::is_bulk_job_running() ) {
 			return false;
+		}
+
+		if ( self::maybe_auto_cancel_abandoned_bulk_job() ) {
+			return false;
+		}
+
+		// Admin/SPA ensure must stay light — heavy recovery here caused HTTP 500 on refresh.
+		if ( ! $heavy ) {
+			return self::soft_revive_stalled_bulk_worker( '' !== $reason ? $reason : 'soft' );
+		}
+
+		// Only run heavy inline AI from trusted worker contexts (cron / AS / loopback).
+		$allow_heavy = wp_doing_cron()
+			|| self::$trusted_as_tick
+			|| self::$trusted_loopback_tick
+			|| self::$trusted_job_tick;
+
+		if ( ! $allow_heavy ) {
+			return self::soft_revive_stalled_bulk_worker( '' !== $reason ? $reason : 'soft' );
 		}
 
 		$mutex_key = 'polymart_ai_worker_recover_mux';

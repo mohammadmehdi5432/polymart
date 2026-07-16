@@ -275,14 +275,38 @@ trait Trait_Queue_Run {
 			return self::normalize_job_for_response( self::get_job_raw(), false );
 		}
 
+		if ( self::maybe_auto_cancel_abandoned_bulk_job() ) {
+			return self::normalize_job_for_response( self::get_job_raw(), false );
+		}
+
 		$job = self::get_job_raw();
 
 		if ( 'running' !== ( $job['status'] ?? '' ) ) {
 			return self::normalize_job_for_response( $job, false );
 		}
 
+		$age           = self::get_bulk_worker_activity_age();
+		$allow_heavy   = wp_doing_cron()
+			|| self::$trusted_as_tick
+			|| self::$trusted_loopback_tick
+			|| self::$trusted_job_tick
+			|| self::$trusted_admin_worker;
+		// SPA/admin kick after long silence must stay light — Elementor burst caused HTTP 500.
+		$spa_soft_only = ! $allow_heavy && $age >= 120;
+
+		if ( $spa_soft_only ) {
+			self::soft_revive_stalled_bulk_worker( 'kick_soft' );
+			$out = self::normalize_job_for_response( self::get_job_raw(), false );
+			$out['worker_kicked'] = true;
+			$out['worker_soft']   = true;
+			$out['as_pending']    = Job_Action_Scheduler::has_pending_or_running();
+			$out['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
+
+			return $out;
+		}
+
 		$before_progress = (string) ( $job['partial_progress'] ?? '' );
-		$did_recover     = self::force_recover_stalled_bulk_worker( 'kick' );
+		$did_recover     = self::force_recover_stalled_bulk_worker( 'kick', $allow_heavy );
 
 		if ( ! $did_recover && self::should_prioritize_elementor_partial( $job ) ) {
 			$pin_post_id = absint( $job['partial_post_id'] ?? 0 ) ?: absint( $job['current_post_id'] ?? 0 );
@@ -311,6 +335,31 @@ trait Trait_Queue_Run {
 
 		if ( Job_Action_Scheduler::is_available() && ! Job_Action_Scheduler::is_slice_execution_active() ) {
 			Job_Action_Scheduler::enqueue_next( true, 0 );
+		}
+
+		// From SPA: one short tick only — never AS runner (300s Elementor) or page burst.
+		if ( ! $allow_heavy ) {
+			$result = null;
+
+			if ( ! Job_Action_Scheduler::is_slice_execution_active() && $age >= 35 ) {
+				$result = self::run_inline_worker_tick( 1, 45 );
+			}
+
+			$out = is_array( $result )
+				? $result
+				: self::normalize_job_for_response( self::get_job_raw(), false );
+			$out['worker_mode']   = Job_Action_Scheduler::is_available() ? 'as' : 'cron';
+			$out['worker_kicked'] = self::kick_worker_moved_queue(
+				$before_progress,
+				$out,
+				$did_recover,
+				false,
+				(bool) ( $out['worker_inline_tick'] ?? false ) || is_array( $result )
+			);
+			$out['as_pending'] = Job_Action_Scheduler::has_pending_or_running();
+			$out['worker_soft'] = true;
+
+			return $out;
 		}
 
 		$result = self::run_inline_worker_tick();

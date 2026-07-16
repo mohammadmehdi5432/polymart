@@ -54,6 +54,10 @@ trait Trait_Init {
 			return;
 		}
 
+		if ( self::maybe_auto_cancel_abandoned_bulk_job() ) {
+			return;
+		}
+
 		$age = self::get_bulk_worker_activity_age();
 
 		if ( $age < self::WORKER_FORCE_RECOVER_SEC ) {
@@ -63,8 +67,8 @@ trait Trait_Init {
 		self::$trusted_as_tick = true;
 
 		try {
-			self::force_recover_stalled_bulk_worker( 'as_queue' );
-			self::kick_worker();
+			// AS queue context may run heavy recovery; do not also kick (double Elementor burst).
+			self::force_recover_stalled_bulk_worker( 'as_queue', true );
 		} finally {
 			self::$trusted_as_tick = false;
 		}

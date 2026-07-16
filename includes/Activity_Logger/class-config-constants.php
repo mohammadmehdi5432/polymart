@@ -52,6 +52,12 @@ final class Config_Constants {
 	const CRON_HEAL_STALE_SEC    = 35;
 	/** Force-unlock AS mutex, step lock, and re-chain after this many idle seconds. */
 	const WORKER_FORCE_RECOVER_SEC = 60;
+	/**
+	 * Auto-pause a bulk job after this many seconds with no real worker activity.
+	 * Prevents zombie "running" jobs (and SPA kick storms → HTTP 500) when the
+	 * browser tab is closed and Action Scheduler cannot keep the chain alive.
+	 */
+	const WORKER_ABANDON_CANCEL_SEC = 480;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per Action Scheduler / cron batch. */
 	const CRON_STEP_BUDGET_SEC = 55;

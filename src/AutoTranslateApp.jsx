@@ -26,6 +26,10 @@ const ENSURE_MIN_INTERVAL_MS = 15000;
 const KICK_MIN_INTERVAL_MS = 45000;
 /** Same progress + repeated kick log suppression. */
 const KICK_LOG_MIN_INTERVAL_MS = 45000;
+/** After this silence, SPA only soft-revives (never heavy kick) — matches server soft path. */
+const KICK_SOFT_ONLY_SEC = 120;
+/** Server auto-cancels around this idle window — SPA must stop kick storms. */
+const ABANDON_CANCEL_SEC = 480;
 /** Elementor chunk idle before monitor treats worker as stale (seconds). */
 const ELEMENTOR_BATCH_IDLE_SEC = 45;
 const ELEMENTOR_GAP_FILL_IDLE_SEC = 12;
@@ -971,6 +975,18 @@ export default function AutoTranslateApp() {
               type: 'error',
               message: data.last_error || 'ترجمه به‌خاطر خطای API متوقف شد.',
             });
+          } else if (data.pause_reason === 'abandoned') {
+            appendLog(
+              data.last_error ||
+                'کارگر مدت زیادی بدون فعالیت بود — فرآیند لغو شد. «ادامه» یا «شروع» را بزنید.',
+              'warning'
+            );
+            setNotice({
+              type: 'warning',
+              message:
+                data.last_error ||
+                'کارگر رها شده بود و خودکار لغو شد — برای ادامه «ادامه» یا «شروع» را بزنید.',
+            });
           } else if (data.pause_reason === 'stalled' || data.pause_reason === 'pick_stalled') {
             appendLog(data.last_error || 'صف ترجمه گیر کرد.', 'warning');
             setNotice({
@@ -997,7 +1013,10 @@ export default function AutoTranslateApp() {
         if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
           const nowMs = Date.now();
           const progressKey = `${data.partial_post_id ?? ''}:${data.partial_progress ?? ''}`;
+          // Long silence: never heavy kick (HTTP 500). Soft ensure cancels at ABANDON_CANCEL_SEC.
+          const softOnly = activityAge >= KICK_SOFT_ONLY_SEC;
           const canKick =
+            !softOnly &&
             !data?.as_slice_active &&
             !data?.as_running &&
             (elementorStalled || activityAge >= CRON_STALE_SEC) &&
@@ -1034,12 +1053,37 @@ export default function AutoTranslateApp() {
                 lastKickAtRef.current = nowMs;
                 lastKickProgressRef.current = progressKey;
               }
+              if (recovered?.abandoned || recovered?.pause_reason === 'abandoned') {
+                if (isActiveRef.current) {
+                  appendLog(
+                    recovered?.last_error ||
+                      'کارگر رها شده بود — فرآیند خودکار لغو شد.',
+                    'warning'
+                  );
+                  setNotice({
+                    type: 'warning',
+                    message:
+                      recovered?.last_error ||
+                      'کارگر رها شده بود و خودکار لغو شد — «ادامه» یا «شروع» را بزنید.',
+                  });
+                }
+                writeAutoRunFlag(false);
+                if (recovered && isActiveRef.current) {
+                  applyJobUpdate(recovered);
+                }
+                return;
+              }
               if (recovered?.worker_direct_tick && isActiveRef.current) {
                 appendLog('اجرای مستقیم Elementor — صف AS دور زده شد.', 'success');
               } else if (recovered?.worker_kicked && isActiveRef.current) {
                 if (nowMs - lastKickLogAtRef.current >= KICK_LOG_MIN_INTERVAL_MS) {
                   lastKickLogAtRef.current = nowMs;
-                  appendLog('تیک kick اجرا شد — صف دوباره جلو می‌رود.', 'success');
+                  appendLog(
+                    recovered?.worker_soft
+                      ? 'بیدار کردن سبک کارگر — صف دوباره زنجیره شد.'
+                      : 'تیک kick اجرا شد — صف دوباره جلو می‌رود.',
+                    'success'
+                  );
                 }
               } else if (recovered?.worker_inline_tick && isActiveRef.current) {
                 appendLog('تیک بازیابی اجرا شد — صف دوباره جلو می‌رود.', 'success');
@@ -1052,13 +1096,13 @@ export default function AutoTranslateApp() {
               }
 
               const tickJob = recovered || data;
-              const nowMs = Date.now();
+              const stampMs = Date.now();
 
               if (
                 tickJob?.status === 'running' &&
-                nowMs - lastWorkerTickLogAtRef.current >= 15000
+                stampMs - lastWorkerTickLogAtRef.current >= 15000
               ) {
-                lastWorkerTickLogAtRef.current = nowMs;
+                lastWorkerTickLogAtRef.current = stampMs;
 
                 if (isElementorPartialJob(tickJob)) {
                   appendLog(
@@ -1589,6 +1633,12 @@ export default function AutoTranslateApp() {
               }
               return `در حال اجرا — آخرین تیک ${cronAgeSec}ث پیش`;
             }
+            if (cronAgeSec >= ABANDON_CANCEL_SEC) {
+              return `کارگر رها شده (${cronAgeSec}ث) — در حال لغو خودکار…`;
+            }
+            if (cronAgeSec >= KICK_SOFT_ONLY_SEC) {
+              return `کارگر متوقف شد (${cronAgeSec}ث) — بیدار کردن سبک…`;
+            }
             if (cronAgeSec < 25) {
               return `بین دو تیک — بیدار کردن کارگر (${cronAgeSec}ث)`;
             }
@@ -1602,7 +1652,9 @@ export default function AutoTranslateApp() {
       : isPaused
         ? isOutdated
           ? 'نیاز به اجرای مجدد'
-          : 'متوقف'
+          : job?.pause_reason === 'abandoned'
+            ? 'لغو به‌خاطر رها شدن کارگر'
+            : 'متوقف'
         : job?.status === 'completed'
           ? 'تمام شد'
           : 'آماده';
@@ -1619,7 +1671,9 @@ export default function AutoTranslateApp() {
           همین صف را تیک می‌زند — بدون CLI و بدون HTTP Loopback.
         </p>
         <p className="mt-1">
-          بستن این تب صف را متوقف نمی‌کند. ووکامرس باید فعال باشد تا Action Scheduler در دسترس باشد.
+          بستن این تب صف را فوراً متوقف نمی‌کند؛ اگر کارگر حدود ۸ دقیقه بدون فعالیت بماند، فرآیند
+          خودکار لغو می‌شود تا بتوانید دوباره «شروع» بزنید. ووکامرس باید فعال باشد تا Action
+          Scheduler در دسترس باشد.
         </p>
       </div>
 

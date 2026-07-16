@@ -95,6 +95,8 @@ trait Trait_Job_Lifecycle {
 		self::mark_job_poll_request();
 
 		try {
+			self::maybe_auto_cancel_abandoned_bulk_job();
+
 			return self::get_job( false );
 		} finally {
 			self::$job_poll_request = false;
