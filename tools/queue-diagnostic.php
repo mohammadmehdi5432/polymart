@@ -9,6 +9,8 @@
  *   Remaining: /wp-admin/admin.php?page=polymart-ai-queue-debug&view=remaining
  *   Mismatch:  /wp-admin/admin.php?page=polymart-ai-queue-debug&view=mismatch
  *   Post:      /wp-admin/admin.php?page=polymart-ai-queue-debug&view=post&post_id=1021&lang=en&format=json
+ *   Troubleshoot UI: /wp-admin/admin.php?page=polymart-ai-troubleshoot&post_id=21870&lang=en
+ *   Troubleshoot JSON: append &format=json to troubleshoot URL
  *   JSON:      append &format=json  OR  admin-ajax.php?action=polymart_ai_queue_debug&view=summary&lang=en
  *   Compact:   add &compact=1 (summary JSON only — short)
  *
@@ -35,6 +37,19 @@ function polymart_ai_queue_diag_bootstrap() {
 add_action(
 	'admin_menu',
 	static function () {
+		$cap = class_exists( '\PolymartAI\REST_API' )
+			? \PolymartAI\REST_API::required_admin_capability()
+			: 'manage_options';
+
+		add_submenu_page(
+			'polymart-ai',
+			'رفع اشکال PolyMart',
+			'رفع اشکال',
+			$cap,
+			'polymart-ai-troubleshoot',
+			'polymart_ai_render_troubleshoot_page'
+		);
+
 		add_submenu_page(
 			null,
 			'PolyMart Queue Debug',
@@ -57,7 +72,9 @@ function polymart_ai_queue_diag_maybe_send_json_early() {
 	}
 
 	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-	if ( ! isset( $_GET['page'] ) || 'polymart-ai-queue-debug' !== $_GET['page'] ) {
+	$page = sanitize_key( (string) ( $_GET['page'] ?? '' ) );
+
+	if ( ! in_array( $page, array( 'polymart-ai-queue-debug', 'polymart-ai-troubleshoot' ), true ) ) {
 		return;
 	}
 
@@ -72,6 +89,7 @@ function polymart_ai_queue_diag_maybe_send_json_early() {
 }
 
 add_action( 'load-admin_page_polymart-ai-queue-debug', 'polymart_ai_queue_diag_maybe_send_json_early' );
+add_action( 'load-polymart-ai_page_polymart-ai-troubleshoot', 'polymart_ai_queue_diag_maybe_send_json_early' );
 
 /**
  * AJAX endpoint — pure JSON, no admin HTML chrome.
@@ -99,9 +117,15 @@ function polymart_ai_queue_diag_send_json_response() {
 	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$lang    = sanitize_key( (string) ( $_GET['lang'] ?? 'en' ) );
 	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-	$view    = sanitize_key( (string) ( $_GET['view'] ?? 'summary' ) );
+	$page    = sanitize_key( (string) ( $_GET['page'] ?? 'polymart-ai-queue-debug' ) );
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$view    = sanitize_key( (string) ( $_GET['view'] ?? '' ) );
 	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 	$compact = ! empty( $_GET['compact'] );
+
+	if ( 'polymart-ai-troubleshoot' === $page && '' === $view ) {
+		$view = 'troubleshoot';
+	}
 
 	if ( '' === $view ) {
 		$view = 'summary';
@@ -133,23 +157,39 @@ function polymart_ai_queue_diag_send_json_response() {
 /**
  * @return string
  */
-function polymart_ai_queue_diag_base_url() {
+function polymart_ai_queue_diag_base_url( $page = 'polymart-ai-queue-debug' ) {
+	$page = sanitize_key( (string) $page );
+
+	if ( 'polymart-ai-troubleshoot' === $page ) {
+		return admin_url( 'admin.php?page=polymart-ai-troubleshoot' );
+	}
+
 	return admin_url( 'admin.php?page=polymart-ai-queue-debug' );
 }
 
 /**
  * @param string               $view   View slug.
  * @param array<string, mixed> $extra  Extra query args.
+ * @param string               $page   Admin page slug.
  * @return string
  */
-function polymart_ai_queue_diag_url( $view = 'summary', array $extra = array() ) {
+function polymart_ai_queue_diag_url( $view = 'summary', array $extra = array(), $page = 'polymart-ai-queue-debug' ) {
+	$page = sanitize_key( (string) $page );
+
+	if ( 'troubleshoot' === sanitize_key( (string) $view ) ) {
+		$page = 'polymart-ai-troubleshoot';
+	}
+
 	$args = array_merge(
 		array(
-			'page' => 'polymart-ai-queue-debug',
-			'view' => sanitize_key( (string) $view ),
+			'page' => $page,
 		),
 		$extra
 	);
+
+	if ( 'polymart-ai-queue-debug' === $page ) {
+		$args['view'] = sanitize_key( (string) $view );
+	}
 
 	return add_query_arg( $args, admin_url( 'admin.php' ) );
 }
@@ -536,6 +576,240 @@ function polymart_ai_queue_diag_mismatches( $lang, $limit = 40 ) {
 }
 
 /**
+ * Trim heavy Elementor map blobs for JSON export.
+ *
+ * @param array<string, mixed> $state Partial job state.
+ * @return array<string, mixed>
+ */
+function polymart_ai_queue_diag_summarize_partial_state( array $state ) {
+	$summary = $state;
+
+	foreach ( array( 'elementor_map', 'elementor_persist_map', 'elementor_seg_map' ) as $map_key ) {
+		if ( ! isset( $summary[ $map_key ] ) || ! is_array( $summary[ $map_key ] ) ) {
+			continue;
+		}
+
+		$keys = array_keys( $summary[ $map_key ] );
+		$summary[ $map_key . '_count' ]       = count( $keys );
+		$summary[ $map_key . '_sample_keys' ] = array_slice( array_map( 'strval', $keys ), 0, 16 );
+		unset( $summary[ $map_key ] );
+	}
+
+	return $summary;
+}
+
+/**
+ * List Action Scheduler rows for one post/language.
+ *
+ * @param int    $post_id Post ID.
+ * @param string $lang    Language code.
+ * @return array<int, array<string, mixed>>
+ */
+function polymart_ai_queue_diag_list_as_actions( $post_id, $lang ) {
+	$post_id = absint( $post_id );
+	$lang    = sanitize_key( (string) $lang );
+	$rows    = array();
+
+	if ( $post_id <= 0 || '' === $lang || ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler_Store' ) ) {
+		return $rows;
+	}
+
+	$hooks = array(
+		array(
+			'label' => 'bulk_slice',
+			'hook'  => \PolymartAI\Activity_Logger\Job_Action_Scheduler::HOOK,
+			'group' => \PolymartAI\Activity_Logger\Job_Action_Scheduler::GROUP,
+		),
+		array(
+			'label' => 'metabox_slice',
+			'hook'  => \PolymartAI\Activity_Logger\Metabox_Action_Scheduler::HOOK,
+			'group' => \PolymartAI\Activity_Logger\Metabox_Action_Scheduler::GROUP,
+		),
+	);
+
+	$statuses = array(
+		\ActionScheduler_Store::STATUS_PENDING,
+		\ActionScheduler_Store::STATUS_RUNNING,
+		\ActionScheduler_Store::STATUS_FAILED,
+	);
+
+	foreach ( $hooks as $hook_row ) {
+		foreach ( $statuses as $status ) {
+			$actions = as_get_scheduled_actions(
+				array(
+					'hook'     => (string) $hook_row['hook'],
+					'group'    => (string) $hook_row['group'],
+					'status'   => $status,
+					'per_page' => 20,
+				)
+			);
+
+			if ( empty( $actions ) ) {
+				continue;
+			}
+
+			foreach ( $actions as $action ) {
+				if ( ! is_object( $action ) || ! method_exists( $action, 'get_args' ) ) {
+					continue;
+				}
+
+				$args = $action->get_args();
+
+				if ( absint( $args['post_id'] ?? 0 ) !== $post_id || sanitize_key( (string) ( $args['lang'] ?? '' ) ) !== $lang ) {
+					continue;
+				}
+
+				$schedule = method_exists( $action, 'get_schedule' ) ? $action->get_schedule() : null;
+				$when     = ( $schedule && method_exists( $schedule, 'get_date' ) ) ? $schedule->get_date() : null;
+
+				$rows[] = array(
+					'label'     => (string) $hook_row['label'],
+					'hook'      => (string) $hook_row['hook'],
+					'action_id' => method_exists( $action, 'get_id' ) ? absint( $action->get_id() ) : 0,
+					'status'    => (string) $status,
+					'scheduled' => ( $when && method_exists( $when, 'format' ) ) ? $when->format( 'c' ) : '',
+					'args'      => $args,
+				);
+			}
+		}
+	}
+
+	return $rows;
+}
+
+/**
+ * Build human-readable hints from troubleshoot payload.
+ *
+ * @param array<string, mixed> $report Troubleshoot report.
+ * @return string[]
+ */
+function polymart_ai_queue_diag_build_recommendations( array $report ) {
+	$hints    = array();
+	$job      = (array) ( $report['bulk_job'] ?? array() );
+	$recovery = (array) ( $report['recovery'] ?? array() );
+	$scan     = (array) ( $report['elementor_scan'] ?? array() );
+	$stubborn = (array) ( $report['stubborn_details'] ?? array() );
+	$lock     = (array) ( $report['lock'] ?? array() );
+
+	if ( ! empty( $job['pinned_on_post'] ) && 'running' === (string) ( $job['status'] ?? '' ) ) {
+		$hints[] = 'این پست الان روی ترجمه خودکار قفل است — اگر بیش از ۵ دقیقه پیشرفت نکرد، خروجی JSON را بفرست.';
+	}
+
+	if ( ! empty( $recovery['should_force_finalize'] ) ) {
+		$hints[] = 'سیستم آماده force-finalize است — یک بار Stop ترجمه خودکار بزن و دوباره Start کن، یا متاباکس همان پست را با Shift+ترجمه ادامه بده.';
+	}
+
+	if ( ! empty( $stubborn['fields'] ) ) {
+		$first = (array) ( $stubborn['fields'][0] ?? array() );
+		$reason = (string) ( $first['reason'] ?? '' );
+
+		if ( 'missing_segments' === $reason ) {
+			$hints[] = 'فیلد سرسخت سگمنت‌های __segN ناقص دارد — معمولاً با ۲–۳ tick دیگر AS یا یک بار Shift+ترجمه در متاباکس حل می‌شود.';
+		} elseif ( 'api_retries_exhausted' === $reason ) {
+			$hints[] = 'تلاش‌های API برای این فیلد تمام شده — JSON را بفرست تا مسیر دستی/force بررسی شود.';
+		} elseif ( 'logic_mismatch' === $reason ) {
+			$hints[] = 'فیلد در map کامل به نظر می‌رسد ولی هنوز remaining است — احتمال باگ assemble؛ JSON کامل لازم است.';
+		}
+	}
+
+	if ( ! empty( $scan['api_cooldown_active'] ) ) {
+		$hints[] = 'API cooldown فعال است — چند دقیقه صبر کن یا cooldown را در لاگ‌ها چک کن.';
+	}
+
+	if ( ! empty( $lock['locked'] ) && empty( $report['action_scheduler_events'] ) ) {
+		$hints[] = 'قفل فعال است ولی event AS برای این پست دیده نشد — zombie lock محتمل است؛ «آزاد کردن قفل» در متاباکس را بزن.';
+	}
+
+	if ( empty( $hints ) ) {
+		$hints[] = 'اگر هنوز گیر کرده، JSON زیر را کپی کن و بفرست.';
+	}
+
+	return $hints;
+}
+
+/**
+ * Full troubleshoot bundle for one post (job, stubborn, AS, recovery).
+ *
+ * @param int    $post_id Post ID.
+ * @param string $lang    Language code.
+ * @return array<string, mixed>
+ */
+function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
+	$post_id = absint( $post_id );
+	$lang    = sanitize_key( (string) $lang );
+
+	$snapshot = polymart_ai_queue_diag_post_snapshot( $post_id, $lang );
+
+	if ( ! empty( $snapshot['error'] ) ) {
+		return $snapshot;
+	}
+
+	$state_raw = \PolymartAI\Translation\Post_Translator::get_job_partial_state( $post_id, $lang );
+	$state     = method_exists( '\PolymartAI\Translation\Post_Translator', 'hydrate_elementor_job_partial_state' )
+		? \PolymartAI\Translation\Post_Translator::hydrate_elementor_job_partial_state( $post_id, $lang, $state_raw )
+		: $state_raw;
+
+	$job = \PolymartAI\Activity_Logger::get_job( false );
+	$pinned = absint( $job['partial_post_id'] ?? 0 );
+
+	if ( $pinned <= 0 ) {
+		$pinned = absint( $job['current_post_id'] ?? 0 );
+	}
+
+	$recovery = array(
+		'has_stubborn_remaining'   => \PolymartAI\Translation\Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang ),
+		'needs_gap_fill'           => \PolymartAI\Translation\Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang ),
+		'has_remaining_payload'    => \PolymartAI\Translation\Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ),
+		'should_force_finalize'    => \PolymartAI\Translation\Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ),
+		'pipeline_force_finalize'  => \PolymartAI\Translation\Post_Translator::elementor_should_force_finalize_in_pipeline( $post_id, $lang, $state ),
+		'progress_marker'          => \PolymartAI\Translation\Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state ),
+		'remaining_field_count'    => method_exists( '\PolymartAI\Translation\Post_Translator', 'count_elementor_remaining_fields' )
+			? \PolymartAI\Translation\Post_Translator::count_elementor_remaining_fields( $post_id, $lang )
+			: null,
+	);
+
+	$report = array(
+		'post_id'                 => $post_id,
+		'lang'                    => $lang,
+		'title'                   => (string) ( $snapshot['title'] ?? '' ),
+		'post_type'               => (string) ( $snapshot['post_type'] ?? '' ),
+		'edit_url'                => (string) ( $snapshot['edit_url'] ?? '' ),
+		'snapshot'                => $snapshot,
+		'elementor_scan'          => method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_scan_diagnostics' )
+			? \PolymartAI\Translation\Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang )
+			: null,
+		'stubborn_details'        => \PolymartAI\Translation\Post_Translator::get_elementor_stubborn_field_diagnostics( $post_id, $lang ),
+		'job_partial_state'       => polymart_ai_queue_diag_summarize_partial_state( $state ),
+		'lock'                    => \PolymartAI\Translation\Post_Translator::get_translation_lock_status( $post_id, $lang ),
+		'recovery'                => $recovery,
+		'action_scheduler_events' => polymart_ai_queue_diag_list_as_actions( $post_id, $lang ),
+		'bulk_job'                => array(
+			'status'          => (string) ( $job['status'] ?? 'idle' ),
+			'lang'            => (string) ( $job['lang'] ?? '' ),
+			'remaining'       => (int) ( $job['remaining'] ?? 0 ),
+			'partial_post_id' => (int) ( $job['partial_post_id'] ?? 0 ),
+			'pinned_on_post'  => ( $pinned === $post_id ),
+			'worker_lively'   => \PolymartAI\Activity_Logger::is_bulk_worker_lively( 180 ),
+			'api_cooldown'    => \PolymartAI\Activity_Logger::get_job_api_cooldown_remaining(),
+		),
+		'meta_keys'               => array(
+			'partial'   => '_polymart_ai_job_partial_' . $lang,
+			'elementor' => method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_meta_key' )
+				? \PolymartAI\Translation\Post_Translator::get_elementor_meta_key( $lang )
+				: '_elementor_data_' . $lang,
+			'stubborn'  => '_polymart_ai_stubborn_details_' . $lang,
+			'finalized' => '_polymart_ai_elementor_finalized_' . $lang,
+			'progress'  => '_polymart_ai_elementor_progress_' . $lang,
+			'error'     => '_polymart_ai_elementor_error_' . $lang,
+		),
+	);
+
+	$report['recommendations'] = polymart_ai_queue_diag_build_recommendations( $report );
+
+	return $report;
+}
+
+/**
  * @param string $view View slug.
  * @param string $lang Language code.
  * @return array<string, mixed>
@@ -568,6 +842,7 @@ function polymart_ai_queue_diag_collect( $view, $lang, $compact = false ) {
 			'remaining'    => polymart_ai_queue_diag_url( 'remaining', array( 'lang' => $lang ) ),
 			'mismatch'     => polymart_ai_queue_diag_url( 'mismatch', array( 'lang' => $lang ) ),
 			'post'         => polymart_ai_queue_diag_url( 'post', array( 'lang' => $lang, 'post_id' => absint( $_GET['post_id'] ?? get_option( 'page_on_front' ) ) ) ), // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			'troubleshoot' => polymart_ai_queue_diag_url( 'troubleshoot', array( 'lang' => $lang, 'post_id' => absint( $_GET['post_id'] ?? 0 ) ), 'polymart-ai-troubleshoot' ), // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			'json_compact' => add_query_arg( array( 'format' => 'json', 'compact' => '1' ), polymart_ai_queue_diag_url( $view, array( 'lang' => $lang ) ) ),
 			'json_ajax'    => $ajax_json,
 		),
@@ -602,6 +877,16 @@ function polymart_ai_queue_diag_collect( $view, $lang, $compact = false ) {
 		case 'post':
 			$post_id = absint( $_GET['post_id'] ?? get_option( 'page_on_front' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			$data['post'] = polymart_ai_queue_diag_post_snapshot( $post_id, $lang );
+			break;
+
+		case 'troubleshoot':
+			$post_id = absint( $_GET['post_id'] ?? 0 ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$data['troubleshoot'] = $post_id > 0
+				? polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang )
+				: array(
+					'error'   => 'missing_post_id',
+					'message' => 'شناسه پست را وارد کنید.',
+				);
 			break;
 
 		default:
@@ -781,4 +1066,193 @@ function polymart_ai_render_queue_diagnostic_page() {
 	}
 
 	polymart_ai_queue_diag_render_html( $data );
+}
+
+/**
+ * User-facing troubleshoot page (رفع اشکال).
+ *
+ * @return void
+ */
+function polymart_ai_render_troubleshoot_page() {
+	$cap = class_exists( '\PolymartAI\REST_API' )
+		? \PolymartAI\REST_API::required_admin_capability()
+		: 'manage_options';
+
+	if ( ! current_user_can( $cap ) ) {
+		wp_die( esc_html__( 'Sorry, you are not allowed to access this page.', 'polymart-ai' ) );
+	}
+
+	polymart_ai_queue_diag_bootstrap();
+
+	$lang    = sanitize_key( (string) ( $_GET['lang'] ?? 'en' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$post_id = absint( $_GET['post_id'] ?? 0 ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+
+	if ( '' === $lang ) {
+		$lang = 'en';
+	}
+
+	$data = array(
+		'view' => 'troubleshoot',
+		'lang' => $lang,
+	);
+
+	if ( $post_id > 0 ) {
+		try {
+			$data['troubleshoot'] = polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang );
+		} catch ( \Throwable $exception ) {
+			$data['error'] = $exception->getMessage();
+		}
+	}
+
+	$json_url = add_query_arg(
+		array(
+			'page'     => 'polymart-ai-troubleshoot',
+			'post_id'  => $post_id,
+			'lang'     => $lang,
+			'format'   => 'json',
+		),
+		admin_url( 'admin.php' )
+	);
+
+	$ajax_url = add_query_arg(
+		array(
+			'action'  => 'polymart_ai_queue_debug',
+			'view'    => 'troubleshoot',
+			'post_id' => $post_id,
+			'lang'    => $lang,
+		),
+		admin_url( 'admin-ajax.php' )
+	);
+
+	$report = (array) ( $data['troubleshoot'] ?? array() );
+	?>
+	<div class="wrap polymart-troubleshoot">
+		<h1>رفع اشکال ترجمه PolyMart</h1>
+		<p>شناسه پست را وارد کن، گزارش کامل (قفل، stubborn، Action Scheduler، recovery) را ببین و JSON را برای توسعه‌دهنده بفرست.</p>
+
+		<form method="get" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>" style="max-width:720px;margin:16px 0 24px;padding:16px;background:#fff;border:1px solid #ccd0d4;border-radius:4px;">
+			<input type="hidden" name="page" value="polymart-ai-troubleshoot" />
+			<table class="form-table" role="presentation" style="margin:0;">
+				<tr>
+					<th scope="row"><label for="polymart-troubleshoot-post-id">شناسه پست</label></th>
+					<td><input name="post_id" id="polymart-troubleshoot-post-id" type="number" min="1" class="regular-text" value="<?php echo esc_attr( (string) $post_id ); ?>" placeholder="21870" required /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="polymart-troubleshoot-lang">زبان</label></th>
+					<td><input name="lang" id="polymart-troubleshoot-lang" type="text" class="regular-text" value="<?php echo esc_attr( $lang ); ?>" /></td>
+				</tr>
+			</table>
+			<?php submit_button( 'نمایش گزارش', 'primary', '', false ); ?>
+		</form>
+
+		<?php if ( ! empty( $data['error'] ) ) : ?>
+			<div class="notice notice-error"><p><?php echo esc_html( (string) $data['error'] ); ?></p></div>
+		<?php endif; ?>
+
+		<?php if ( $post_id > 0 && ! empty( $report ) && empty( $report['error'] ) ) : ?>
+			<?php
+			$recovery = (array) ( $report['recovery'] ?? array() );
+			$scan     = (array) ( $report['elementor_scan'] ?? array() );
+			$stubborn = (array) ( $report['stubborn_details'] ?? array() );
+			$bulk     = (array) ( $report['bulk_job'] ?? array() );
+			$lock     = (array) ( $report['lock'] ?? array() );
+			?>
+			<h2>#<?php echo esc_html( (string) $post_id ); ?> — <?php echo esc_html( (string) ( $report['title'] ?? '' ) ); ?></h2>
+			<p>
+				نوع: <code><?php echo esc_html( (string) ( $report['post_type'] ?? '' ) ); ?></code>
+				<?php if ( ! empty( $report['edit_url'] ) ) : ?>
+					— <a href="<?php echo esc_url( (string) $report['edit_url'] ); ?>">ویرایش پست</a>
+				<?php endif; ?>
+			</p>
+
+			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;max-width:1100px;margin-bottom:20px;">
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>وضعیت زنده</strong><br />
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $report['snapshot']['live_status'] ?? '' ) ); ?></code>
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>پیشرفت Elementor</strong><br />
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $recovery['progress_marker'] ?? '' ) ); ?></code>
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>فیلد باقی‌مانده</strong><br />
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $scan['remaining_field_count'] ?? $recovery['remaining_field_count'] ?? '' ) ); ?></code>
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>قفل</strong><br />
+					<code><?php echo esc_html( ! empty( $lock['locked'] ) ? 'فعال' : 'خاموش' ); ?></code>
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>ترجمه خودکار</strong><br />
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $bulk['status'] ?? 'idle' ) ); ?></code>
+					<?php if ( ! empty( $bulk['pinned_on_post'] ) ) : ?> (روی همین پست)<?php endif; ?>
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>AS events</strong><br />
+					<code><?php echo esc_html( (string) count( (array) ( $report['action_scheduler_events'] ?? array() ) ) ); ?></code>
+				</div>
+			</div>
+
+			<?php if ( ! empty( $report['recommendations'] ) ) : ?>
+				<h3>پیشنهاد</h3>
+				<ul style="max-width:900px;">
+					<?php foreach ( (array) $report['recommendations'] as $hint ) : ?>
+						<li><?php echo esc_html( (string) $hint ); ?></li>
+					<?php endforeach; ?>
+				</ul>
+			<?php endif; ?>
+
+			<?php if ( ! empty( $stubborn['fields'] ) ) : ?>
+				<h3>فیلدهای سرسخت</h3>
+				<table class="widefat striped" style="max-width:1100px;">
+					<thead>
+						<tr>
+							<th>مسیر</th>
+							<th>دلیل</th>
+							<th>کاراکتر</th>
+							<th>سگمنت</th>
+							<th>پیش‌نمایش</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( (array) $stubborn['fields'] as $field ) : ?>
+							<?php $field = (array) $field; ?>
+							<tr>
+								<td><code><?php echo esc_html( (string) ( $field['path'] ?? '' ) ); ?></code></td>
+								<td><?php echo esc_html( (string) ( $field['reason_label'] ?? $field['reason'] ?? '' ) ); ?></td>
+								<td><?php echo esc_html( (string) ( $field['chars'] ?? '' ) ); ?></td>
+								<td><?php echo esc_html( (string) ( $field['segment_count'] ?? '' ) ); ?></td>
+								<td><?php echo esc_html( (string) ( $field['content']['preview'] ?? '' ) ); ?></td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			<?php endif; ?>
+
+			<h3>لینک JSON</h3>
+			<ul style="font-family:monospace;font-size:13px;">
+				<li><a href="<?php echo esc_url( $json_url ); ?>" target="_blank" rel="noopener"><?php echo esc_html( $json_url ); ?></a></li>
+				<li><a href="<?php echo esc_url( $ajax_url ); ?>" target="_blank" rel="noopener"><?php echo esc_html( $ajax_url ); ?></a></li>
+			</ul>
+
+			<h3>JSON کامل (کپی کن و بفرست)</h3>
+			<textarea id="polymart-troubleshoot-json" readonly rows="24" style="width:100%;font-family:monospace;font-size:12px;"><?php
+				echo esc_textarea(
+					wp_json_encode(
+						array(
+							'generated_at' => gmdate( 'c' ),
+							'view'         => 'troubleshoot',
+							'lang'         => $lang,
+							'troubleshoot' => $report,
+						),
+						JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT
+					)
+				);
+			?></textarea>
+			<p><button type="button" class="button" onclick="(function(){var t=document.getElementById('polymart-troubleshoot-json');t.select();document.execCommand('copy');})();">کپی JSON</button></p>
+		<?php elseif ( $post_id > 0 && ! empty( $report['error'] ) ) : ?>
+			<div class="notice notice-warning"><p><?php echo esc_html( polymart_ai_queue_diag_str( $report['error'] ) ); ?></p></div>
+		<?php endif; ?>
+	</div>
+	<?php
 }
