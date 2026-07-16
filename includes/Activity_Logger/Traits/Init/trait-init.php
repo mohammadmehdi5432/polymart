@@ -74,4 +74,27 @@ trait Trait_Init {
 		}
 	}
 
+	/**
+	 * Tear down workers/locks/AS when the plugin is deactivated.
+	 *
+	 * @return void
+	 */
+	public static function deactivate() {
+		Translation_Scheduler_Coordinator::halt_all_schedulers();
+		self::unschedule_background_worker();
+		self::release_step_lock();
+		Translation_Scheduler_Coordinator::cancel_all_plugin_actions();
+		Translation_Scheduler_Coordinator::release_global_worker( null );
+
+		$cleared               = self::empty_job();
+		$cleared['updated_at'] = time();
+		update_option( self::JOB_OPTION, $cleared, false );
+
+		delete_transient( 'polymart_ai_cron_ping_gate' );
+		delete_transient( 'polymart_ai_worker_recover_mux' );
+		delete_transient( 'polymart_ai_worker_soft_revive_mux' );
+		delete_transient( 'polymart_ai_abandon_cancel_mux' );
+		delete_transient( self::LOOPBACK_GATE_KEY );
+	}
+
 }

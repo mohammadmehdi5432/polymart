@@ -591,7 +591,11 @@ trait Trait_Queue_Metrics {
 			absint( $job['last_cron_at'] ?? 0 ),
 			absint( $job['worker_heartbeat_at'] ?? 0 ),
 			absint( $job['step_started_at'] ?? 0 ),
-			absint( $job['partial_progress_at'] ?? 0 )
+			absint( $job['partial_progress_at'] ?? 0 ),
+			// Fresh Start/Resume must count as activity — otherwise abandon fires before the first tick.
+			absint( $job['started_at'] ?? 0 ),
+			absint( $job['worker_scheduled_at'] ?? 0 ),
+			absint( $job['updated_at'] ?? 0 )
 		);
 	}
 

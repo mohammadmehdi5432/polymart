@@ -119,6 +119,7 @@ register_activation_hook( __FILE__, array( 'PolymartAI\Routing\Url_Router', 'act
 register_deactivation_hook( __FILE__, array( 'PolymartAI\Routing\Url_Router', 'deactivate' ) );
 register_activation_hook( __FILE__, array( 'PolymartAI\Frontend\Currency', 'maybe_schedule_cron' ) );
 register_deactivation_hook( __FILE__, array( 'PolymartAI\Frontend\Currency', 'unschedule_cron' ) );
+register_deactivation_hook( __FILE__, array( 'PolymartAI\Activity_Logger', 'deactivate' ) );
 
 /**
  * Returns the main plugin instance.

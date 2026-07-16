@@ -27,9 +27,9 @@ const KICK_MIN_INTERVAL_MS = 45000;
 /** Same progress + repeated kick log suppression. */
 const KICK_LOG_MIN_INTERVAL_MS = 45000;
 /** After this silence, SPA only soft-revives (never heavy kick) — matches server soft path. */
-const KICK_SOFT_ONLY_SEC = 120;
+const KICK_SOFT_ONLY_SEC = 45;
 /** Server auto-cancels around this idle window — SPA must stop kick storms. */
-const ABANDON_CANCEL_SEC = 480;
+const ABANDON_CANCEL_SEC = 900;
 /** Elementor chunk idle before monitor treats worker as stale (seconds). */
 const ELEMENTOR_BATCH_IDLE_SEC = 45;
 const ELEMENTOR_GAP_FILL_IDLE_SEC = 12;
@@ -44,6 +44,7 @@ function latestWorkerStamp(job, includeScheduled = false) {
     Number(job?.last_cron_at || 0),
     Number(job?.worker_heartbeat_at || 0),
     Number(job?.partial_progress_at || 0),
+    Number(job?.started_at || 0),
     includeScheduled ? Number(job?.worker_scheduled_at || 0) : 0
   );
 }
@@ -1013,15 +1014,8 @@ export default function AutoTranslateApp() {
         if (data.status === 'running' && (!isCronHealthy(data) || elementorNeedsKick) && !ensureInFlight) {
           const nowMs = Date.now();
           const progressKey = `${data.partial_post_id ?? ''}:${data.partial_progress ?? ''}`;
-          // Long silence: never heavy kick (HTTP 500). Soft ensure cancels at ABANDON_CANCEL_SEC.
-          const softOnly = activityAge >= KICK_SOFT_ONLY_SEC;
-          const canKick =
-            !softOnly &&
-            !data?.as_slice_active &&
-            !data?.as_running &&
-            (elementorStalled || activityAge >= CRON_STALE_SEC) &&
-            nowMs - lastKickAtRef.current >= KICK_MIN_INTERVAL_MS &&
-            (lastKickProgressRef.current !== progressKey || activityAge >= CRON_STALE_SEC + 15);
+          const softOnly = true; // Monitor never heavy-kicks — AS/cron self-heal.
+          const canKick = false;
           const canEnsure = nowMs - lastEnsureAt >= ENSURE_MIN_INTERVAL_MS;
 
           if (!canKick && !canEnsure) {
@@ -1186,6 +1180,16 @@ export default function AutoTranslateApp() {
     lastKickProgressRef.current = '';
     setActionPending('start');
     appendLog(`در حال آماده‌سازی صف ترجمه برای ${targetLabel}…`);
+
+    // Abandoned/paused leftovers must not block a clean Start.
+    if (job?.status === 'paused' || job?.pause_reason === 'abandoned') {
+      appendLog('وضعیت رها‌شده پاک می‌شود و ترجمه از نو شروع می‌شود…', 'info');
+      try {
+        await jobAction('stop', targetLang);
+      } catch (error) {
+        // Continue — start_job also clears paused/abandoned state.
+      }
+    }
 
     const runStart = async () => {
       const data = await jobAction('start', targetLang);
@@ -1671,8 +1675,8 @@ export default function AutoTranslateApp() {
           همین صف را تیک می‌زند — بدون CLI و بدون HTTP Loopback.
         </p>
         <p className="mt-1">
-          بستن این تب صف را فوراً متوقف نمی‌کند؛ اگر کارگر حدود ۸ دقیقه بدون فعالیت بماند، فرآیند
-          خودکار لغو می‌شود تا بتوانید دوباره «شروع» بزنید. ووکامرس باید فعال باشد تا Action
+          بستن این تب صف را فوراً متوقف نمی‌کند؛ اگر کارگر حدود ۱۵ دقیقه بدون فعالیت بماند، فرآیند
+          خودکار pause می‌شود تا بتوانید «ادامه» یا «شروع» بزنید. ووکامرس باید فعال باشد تا Action
           Scheduler در دسترس باشد.
         </p>
       </div>

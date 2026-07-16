@@ -473,22 +473,26 @@ trait Trait_Job_Lifecycle {
 			),
 			'live_stats_at'      => time(),
 			'live_stats_steps'   => 0,
-			'processed'       => 0,
-			'steps'           => 0,
-			'succeeded'       => 0,
-			'succeeded_ids'   => array(),
-			'partial'         => 0,
-			'partial_ids'     => array(),
-			'exhausted_ids'   => array(),
-			'failed'          => 0,
-			'skipped'         => 0,
-			'current_post_id' => null,
-			'last_error'      => null,
-			'started_at'      => time(),
-			'updated_at'      => time(),
-			'phase'           => 'posts',
-			'last_menu_id'    => 0,
-			'menu_remaining'  => $menu_needs,
+			'processed'            => 0,
+			'steps'                => 0,
+			'succeeded'            => 0,
+			'succeeded_ids'        => array(),
+			'partial'              => 0,
+			'partial_ids'          => array(),
+			'exhausted_ids'        => array(),
+			'failed'               => 0,
+			'skipped'              => 0,
+			'current_post_id'      => null,
+			'last_error'           => null,
+			'pause_reason'         => null,
+			'started_at'           => time(),
+			'updated_at'           => time(),
+			'worker_heartbeat_at'  => time(),
+			'last_cron_at'         => time(),
+			'worker_scheduled_at'  => time(),
+			'phase'                => 'posts',
+			'last_menu_id'         => 0,
+			'menu_remaining'       => $menu_needs,
 		);
 
 		self::save_job( $job );
@@ -498,8 +502,8 @@ trait Trait_Job_Lifecycle {
 		}
 
 		Job_Action_Scheduler::cancel_all();
-		// Run the first tick inline so progress does not wait for SPA poll / cron.
-		self::bootstrap_background_worker( true );
+		// Light Start: enqueue AS + wake cron — never run AI inline in the Start HTTP request.
+		self::bootstrap_background_worker( false );
 		self::ping_wp_cron( true );
 		self::log(
 			'info',
@@ -552,12 +556,23 @@ trait Trait_Job_Lifecycle {
 		if ( in_array( $job['status'], array( 'paused', 'running' ), true ) ) {
 			$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
-			$job['status']          = 'running';
-			$job['last_error']      = null;
-			$job['pause_reason']    = null;
-			$job['current_post_id'] = null;
-			$job['step_started_at'] = null;
-			$job['pick_started_at'] = null;
+			$job['status']               = 'running';
+			$job['last_error']           = null;
+			$job['pause_reason']         = null;
+			$job['current_post_id']      = null;
+			$job['step_started_at']      = null;
+			$job['pick_started_at']      = null;
+			$job['worker_heartbeat_at']  = time();
+			$job['last_cron_at']         = time();
+			$job['worker_scheduled_at']  = time();
+			$job['updated_at']           = time();
+			// Treat resume as a fresh activity window for abandon grace.
+			if ( absint( $job['started_at'] ?? 0 ) <= 0 ) {
+				$job['started_at'] = time();
+			} else {
+				// Refresh grace clock without wiping durable progress counters.
+				$job['started_at'] = time();
+			}
 
 			self::release_step_lock();
 
@@ -577,7 +592,7 @@ trait Trait_Job_Lifecycle {
 			self::recover_stalled_job_picker( $job, $lang, true );
 
 			self::save_job( $job );
-			self::bootstrap_background_worker( true );
+			self::bootstrap_background_worker( false );
 			self::ping_wp_cron( true );
 			self::log( 'info', __( 'ترجمه خودکار از سر گرفته شد (Action Scheduler).', 'polymart-ai' ) );
 		}

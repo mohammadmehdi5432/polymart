@@ -633,7 +633,7 @@ trait Trait_Job_Elementor {
 		);
 
 		try {
-			$result = self::run_elementor_page_burst( 300 );
+			$result = self::run_elementor_page_burst( 90 );
 			$worked = is_array( $result )
 				&& (
 					! empty( $result['elementor_burst'] )

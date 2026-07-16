@@ -507,16 +507,17 @@ trait Trait_Worker_Runner {
 	}
 
 	public static function ping_wp_cron( $force = false ) {
-		if ( ! $force ) {
-			$gate = get_transient( 'polymart_ai_cron_ping_gate' );
+		$gate = get_transient( 'polymart_ai_cron_ping_gate' );
 
-			if ( $gate ) {
-				return;
-			}
-
-			$gate_ttl = self::is_bulk_job_running() ? 15 : 45;
-			set_transient( 'polymart_ai_cron_ping_gate', 1, $gate_ttl );
+		if ( $gate ) {
+			return;
 		}
+
+		// Even "force" must respect a short gate — overlapping wp-cron.php workers caused 503.
+		$gate_ttl = self::is_bulk_job_running()
+			? ( $force ? 12 : 20 )
+			: 45;
+		set_transient( 'polymart_ai_cron_ping_gate', 1, $gate_ttl );
 
 		if ( self::is_bulk_job_running() ) {
 			Job_Action_Scheduler::ensure_scheduled();

@@ -45,7 +45,7 @@ final class Config_Constants {
 	/** Safety reschedule while a tick is mid-flight (fatal recovery). */
 	const CRON_SAFETY_SEC      = 120;
 	/** Faster AS fallback when inline chaining does not start the next slice. */
-	const AS_CRON_SAFETY_SEC   = 3;
+	const AS_CRON_SAFETY_SEC   = 15;
 	/** Self-rescheduling keep-alive between AS batches (when wp-cron is available). */
 	const CRON_FAST_INTERVAL_SEC = 12;
 	/** Idle age before wp-cron runs the same recovery path as the admin ensure button. */
@@ -53,11 +53,12 @@ final class Config_Constants {
 	/** Force-unlock AS mutex, step lock, and re-chain after this many idle seconds. */
 	const WORKER_FORCE_RECOVER_SEC = 60;
 	/**
-	 * Auto-pause a bulk job after this many seconds with no real worker activity.
-	 * Prevents zombie "running" jobs (and SPA kick storms → HTTP 500) when the
-	 * browser tab is closed and Action Scheduler cannot keep the chain alive.
+	 * Auto-pause after this many seconds with no real worker activity.
+	 * Grace after Start/Resume is enforced separately (never abandon a fresh run).
 	 */
-	const WORKER_ABANDON_CANCEL_SEC = 480;
+	const WORKER_ABANDON_CANCEL_SEC = 900;
+	/** Never auto-abandon within this many seconds of started_at. */
+	const WORKER_ABANDON_GRACE_SEC = 600;
 	const CRON_INTERVAL_SERVER_SEC = 1;
 	/** Seconds of wall-clock work allowed per Action Scheduler / cron batch. */
 	const CRON_STEP_BUDGET_SEC = 55;

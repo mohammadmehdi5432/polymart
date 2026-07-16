@@ -30,10 +30,10 @@ final class Job_Action_Scheduler {
 	const STALE_RUNNING_SEC = 90;
 
 	/** Wall-clock budget for one AS slice callback (shared-host safe). */
-	const SLICE_BUDGET_SEC = 120;
+	const SLICE_BUDGET_SEC = 75;
 
 	/** Total wall-clock budget per AS HTTP request (many products back-to-back). */
-	const REQUEST_BUDGET_SEC = 150;
+	const REQUEST_BUDGET_SEC = 90;
 
 	/** Default delay when chaining via shutdown only (0 = ASAP). */
 	const CHAIN_DELAY_SEC = 0;
@@ -744,11 +744,11 @@ final class Job_Action_Scheduler {
 		$job_step         = \PolymartAI\Activity_Logger::get_job_for_as_debug();
 		$elementor_burst  = \PolymartAI\Activity_Logger::should_prioritize_elementor_partial( $job_step );
 		$request_budget   = $elementor_burst
-			? max( self::REQUEST_BUDGET_SEC, 300 )
+			? max( self::REQUEST_BUDGET_SEC, 90 )
 			: self::REQUEST_BUDGET_SEC;
 
 		if ( $elementor_burst && function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 330 );
+			@set_time_limit( 120 );
 		}
 
 		if ( $elementor_burst ) {
@@ -1161,7 +1161,7 @@ final class Job_Action_Scheduler {
 			}
 
 			if ( function_exists( 'set_time_limit' ) ) {
-				@set_time_limit( 330 );
+				@set_time_limit( 120 );
 			}
 
 			// enqueue_next already allows "only this RUNNING action" + no pending sibling.
@@ -1632,13 +1632,13 @@ final class Job_Action_Scheduler {
 		$time_limit = (int) apply_filters(
 			'polymart_ai_as_queue_time_limit',
 			\PolymartAI\Activity_Logger::is_bulk_job_running()
-				? ( $elementor ? 300 : 120 )
+				? ( $elementor ? 90 : 70 )
 				: 55
 		);
 		$batch_size = (int) apply_filters( 'polymart_ai_as_queue_batch_size', 1 );
 
 		$time_filter = static function () use ( $time_limit, $elementor ) {
-			$cap = $elementor ? 330 : 70;
+			$cap = $elementor ? 100 : 70;
 
 			return max( 25, min( $cap, $time_limit ) );
 		};

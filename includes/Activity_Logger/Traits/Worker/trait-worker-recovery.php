@@ -192,9 +192,24 @@ trait Trait_Worker_Recovery {
 			return false;
 		}
 
+		$job       = self::get_job_raw();
+		$started   = absint( $job['started_at'] ?? 0 );
+		$grace_sec = max(
+			120,
+			min(
+				1800,
+				(int) apply_filters( 'polymart_ai_worker_abandon_grace_sec', self::WORKER_ABANDON_GRACE_SEC )
+			)
+		);
+
+		// Never abandon a freshly started/resumed job — Start used to race poll and pause immediately.
+		if ( $started > 0 && ( time() - $started ) < $grace_sec ) {
+			return false;
+		}
+
 		$age   = self::get_bulk_worker_activity_age();
 		$limit = max(
-			180,
+			300,
 			min(
 				1800,
 				(int) apply_filters( 'polymart_ai_worker_abandon_cancel_sec', self::WORKER_ABANDON_CANCEL_SEC )
@@ -211,7 +226,6 @@ trait Trait_Worker_Recovery {
 		}
 		set_transient( $mutex_key, time(), 90 );
 
-		$job  = self::get_job_raw();
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
 
 		foreach (
