@@ -1001,8 +1001,20 @@ trait Trait_Job_Lifecycle {
 				continue;
 			}
 
-			Post_Translator::repair_stale_elementor_completion_meta( $post_id, $lang );
-			Post_Translator::repair_completed_elementor_job_meta( $post_id, $lang );
+			// Huge Elementor trees (#21870) — full repair at Start timed out / 503'd the REST call.
+			// Leave repair to AS worker ticks; Start must return quickly.
+			$elementor_bytes = strlen( (string) get_post_meta( $post_id, '_elementor_data', true ) );
+
+			if ( $elementor_bytes > 350000 ) {
+				continue;
+			}
+
+			try {
+				Post_Translator::repair_stale_elementor_completion_meta( $post_id, $lang );
+				Post_Translator::repair_completed_elementor_job_meta( $post_id, $lang );
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+				// Never let probe repair kill start_job().
+			}
 		}
 	}
 

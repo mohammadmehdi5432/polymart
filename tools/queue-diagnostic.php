@@ -219,6 +219,63 @@ function polymart_ai_queue_diag_str( $value ) {
  * @param string $lang    Language code.
  * @return array<string, mixed>
  */
+/**
+ * Meta-only post snapshot — safe for huge Elementor posts (avoids 503).
+ *
+ * @param int    $post_id Post ID.
+ * @param string $lang    Language.
+ * @return array<string, mixed>
+ */
+function polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang ) {
+	$post_id = absint( $post_id );
+	$lang    = sanitize_key( (string) $lang );
+	$post    = get_post( $post_id );
+
+	if ( ! $post instanceof \WP_Post ) {
+		return array(
+			'post_id' => $post_id,
+			'error'   => 'post_not_found',
+		);
+	}
+
+	$status_key    = \PolymartAI\Translation\Post_Translator::get_status_index_meta_key( $lang );
+	$elementor_key = method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_meta_key' )
+		? \PolymartAI\Translation\Post_Translator::get_elementor_meta_key( $lang )
+		: '_elementor_data_' . $lang;
+	$source_bytes  = strlen( (string) get_post_meta( $post_id, '_elementor_data', true ) );
+	$en_bytes      = strlen( (string) get_post_meta( $post_id, $elementor_key, true ) );
+	$partial_raw   = get_post_meta( $post_id, '_polymart_ai_job_partial_' . $lang, true );
+	$partial_bytes = is_string( $partial_raw ) ? strlen( $partial_raw ) : ( is_array( $partial_raw ) ? strlen( (string) wp_json_encode( $partial_raw ) ) : 0 );
+
+	return array(
+		'post_id'     => $post_id,
+		'title'       => get_the_title( $post_id ),
+		'post_type'   => $post->post_type,
+		'post_status' => $post->post_status,
+		'edit_url'    => get_edit_post_link( $post_id, 'raw' ),
+		'view_url_fa' => get_permalink( $post_id ),
+		'index_status'=> (string) get_post_meta( $post_id, $status_key, true ),
+		'persian_flag'=> (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::PERSIAN_CONTENT_FLAG_META, true ),
+		'uses_elementor' => \PolymartAI\Translation\Post_Translator::uses_elementor_builder( $post_id ),
+		'light'       => true,
+		'meta'        => array(
+			'_elementor_edit_mode'                              => (string) get_post_meta( $post_id, '_elementor_edit_mode', true ),
+			'_elementor_data_bytes'                             => $source_bytes,
+			$elementor_key . '_bytes'                           => $en_bytes,
+			'_polymart_ai_job_partial_' . $lang . '_bytes'      => $partial_bytes,
+			'_polymart_ai_elementor_finalized_' . $lang => (string) get_post_meta( $post_id, '_polymart_ai_elementor_finalized_' . $lang, true ),
+			'source_hash'                              => (string) get_post_meta(
+				$post_id,
+				\PolymartAI\Translation\Post_Translator::get_elementor_source_hash_meta_key( $lang ),
+				true
+			),
+			'_polymart_ai_elementor_progress_' . $lang  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ),
+			'_polymart_ai_elementor_error_' . $lang     => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
+			'title_en'                                          => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
+		),
+	);
+}
+
 function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
 	$post_id = absint( $post_id );
 	$lang    = sanitize_key( (string) $lang );
@@ -235,19 +292,39 @@ function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
 
 	\PolymartAI\Translation\Post_Translator::flush_translation_status_cache( $post_id );
 
-	if ( \PolymartAI\Translation\Post_Translator::uses_elementor_builder( $post_id ) ) {
-		\PolymartAI\Translation\Post_Translator::repair_stale_elementor_completion_meta( $post_id, $lang );
-		\PolymartAI\Translation\Post_Translator::repair_completed_elementor_job_meta( $post_id, $lang );
-		\PolymartAI\Translation\Post_Translator::flush_translation_status_cache( $post_id );
-	}
-
+	// Never mutate/repair inside diagnostics — that decoded huge Elementor trees and caused 503.
 	$elementor_key = method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_meta_key' )
 		? \PolymartAI\Translation\Post_Translator::get_elementor_meta_key( $lang )
 		: '_elementor_data_' . $lang;
 
-	$serve = method_exists( '\PolymartAI\Translation\Post_Translator', 'explain_elementor_storefront_serve_blockers' )
-		? \PolymartAI\Translation\Post_Translator::explain_elementor_storefront_serve_blockers( $post_id, $lang, false )
-		: array( 'ok' => null, 'codes' => array(), 'messages' => array(), 'meta' => array() );
+	$serve = array( 'ok' => null, 'codes' => array(), 'messages' => array(), 'meta' => array() );
+	$scan  = null;
+	$ready = null;
+	$stored_persian = null;
+
+	try {
+		if ( method_exists( '\PolymartAI\Translation\Post_Translator', 'explain_elementor_storefront_serve_blockers' ) ) {
+			$serve = \PolymartAI\Translation\Post_Translator::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
+		}
+	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+		$serve = array( 'ok' => null, 'codes' => array( 'snapshot_error' ), 'messages' => array( $e->getMessage() ), 'meta' => array() );
+	}
+
+	try {
+		$scan = method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_scan_diagnostics' )
+			? \PolymartAI\Translation\Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang )
+			: null;
+	} catch ( \Throwable $e ) {
+		$scan = array( 'active' => true, 'error' => $e->getMessage() );
+	}
+
+	try {
+		$ready = method_exists( '\PolymartAI\Translation\Post_Translator', 'elementor_translation_is_storefront_ready' )
+			? \PolymartAI\Translation\Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
+			: null;
+		$stored_persian = \PolymartAI\Translation\Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang );
+	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+	}
 
 	return array(
 		'post_id'              => $post_id,
@@ -266,13 +343,9 @@ function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
 		'uses_elementor'       => \PolymartAI\Translation\Post_Translator::uses_elementor_builder( $post_id ),
 		'can_serve_elementor'  => ! empty( $serve['ok'] ),
 		'can_serve_details'    => $serve,
-		'elementor_scan'       => method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_scan_diagnostics' )
-			? \PolymartAI\Translation\Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang )
-			: null,
-		'elementor_storefront_ready' => method_exists( '\PolymartAI\Translation\Post_Translator', 'elementor_translation_is_storefront_ready' )
-			? \PolymartAI\Translation\Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
-			: null,
-		'stored_elementor_persian' => \PolymartAI\Translation\Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang ),
+		'elementor_scan'       => $scan,
+		'elementor_storefront_ready' => $ready,
+		'stored_elementor_persian' => $stored_persian,
 		'needs_elementor_job'  => \PolymartAI\Translation\Post_Translator::post_needs_elementor_job_work( $post_id, $lang ),
 		'gap_reason'           => \PolymartAI\Translation\Post_Translator::describe_translation_gap( $post_id, $lang ),
 		'gaps_missing'         => array_values( array_map( 'strval', (array) ( \PolymartAI\Translation\Post_Translator::get_translation_gaps( $post_id, $lang )['missing'] ?? array() ) ) ),
@@ -748,18 +821,60 @@ function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
 	$post_id = absint( $post_id );
 	$lang    = sanitize_key( (string) $lang );
 
-	$snapshot = polymart_ai_queue_diag_post_snapshot( $post_id, $lang );
+	// Default LIGHT — full Elementor decode/scan on #21870-class posts caused 503.
+	// Pass full=1 (or light=0) only when you explicitly need the heavy report.
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+	$want_full = ! empty( $_GET['full'] ) || ( isset( $_GET['light'] ) && '0' === (string) $_GET['light'] );
+	$light     = ! $want_full;
+
+	$snapshot = $light
+		? polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang )
+		: polymart_ai_queue_diag_post_snapshot( $post_id, $lang );
 
 	if ( ! empty( $snapshot['error'] ) ) {
 		return $snapshot;
 	}
 
-	$state_raw = \PolymartAI\Translation\Post_Translator::get_job_partial_state( $post_id, $lang );
-	$state     = method_exists( '\PolymartAI\Translation\Post_Translator', 'hydrate_elementor_job_partial_state' )
-		? \PolymartAI\Translation\Post_Translator::hydrate_elementor_job_partial_state( $post_id, $lang, $state_raw )
-		: $state_raw;
+	$partial_meta_key = '_polymart_ai_job_partial_' . $lang;
+	$partial_raw      = get_post_meta( $post_id, $partial_meta_key, true );
+	$partial_bytes    = is_string( $partial_raw )
+		? strlen( $partial_raw )
+		: strlen( (string) wp_json_encode( $partial_raw ) );
 
-	$job = \PolymartAI\Activity_Logger::get_job( false );
+	if ( $light && $partial_bytes > 400000 ) {
+		$state = array(
+			'phase'         => 'elementor',
+			'partial_bytes' => $partial_bytes,
+			'skipped_load'  => true,
+			'note'          => 'partial state too large for light report',
+		);
+	} else {
+		$state_raw = is_array( $partial_raw )
+			? $partial_raw
+			: \PolymartAI\Translation\Post_Translator::get_job_partial_state( $post_id, $lang );
+		$state     = is_array( $state_raw ) ? $state_raw : array();
+
+		// Never hydrate (decode+merge map) in light mode — that alone can 503 huge posts.
+		if ( ! $light ) {
+			try {
+				if ( method_exists( '\PolymartAI\Translation\Post_Translator', 'hydrate_elementor_job_partial_state' ) ) {
+					$state = \PolymartAI\Translation\Post_Translator::hydrate_elementor_job_partial_state( $post_id, $lang, $state );
+				}
+			} catch ( \Throwable $e ) {
+				$state = is_array( $state_raw ) ? $state_raw : array();
+			}
+		} else {
+			// Drop bulky maps early so the HTML/JSON response stays small.
+			foreach ( array( 'elementor_map', 'elementor_persist_map', 'elementor_seg_map' ) as $map_key ) {
+				if ( isset( $state[ $map_key ] ) && is_array( $state[ $map_key ] ) ) {
+					$state[ $map_key . '_count' ] = count( $state[ $map_key ] );
+					unset( $state[ $map_key ] );
+				}
+			}
+		}
+	}
+
+	$job    = \PolymartAI\Activity_Logger::get_job( false );
 	$pinned = absint( $job['partial_post_id'] ?? 0 );
 
 	if ( $pinned <= 0 ) {
@@ -767,16 +882,76 @@ function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
 	}
 
 	$recovery = array(
-		'has_stubborn_remaining'   => \PolymartAI\Translation\Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang ),
-		'needs_gap_fill'           => \PolymartAI\Translation\Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang ),
-		'has_remaining_payload'    => \PolymartAI\Translation\Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ),
-		'should_force_finalize'    => \PolymartAI\Translation\Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ),
-		'pipeline_force_finalize'  => \PolymartAI\Translation\Post_Translator::elementor_should_force_finalize_in_pipeline( $post_id, $lang, $state ),
-		'progress_marker'          => \PolymartAI\Translation\Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state ),
-		'remaining_field_count'    => method_exists( '\PolymartAI\Translation\Post_Translator', 'count_elementor_remaining_fields' )
-			? \PolymartAI\Translation\Post_Translator::count_elementor_remaining_fields( $post_id, $lang )
-			: null,
+		'has_stubborn_remaining'  => null,
+		'needs_gap_fill'          => null,
+		'has_remaining_payload'   => null,
+		'should_force_finalize'   => null,
+		'pipeline_force_finalize' => null,
+		'progress_marker'         => (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ),
+		'remaining_field_count'   => null,
+		'errors'                  => array(),
 	);
+
+	$safe = static function ( $label, $callback ) use ( &$recovery ) {
+		try {
+			return $callback();
+		} catch ( \Throwable $e ) {
+			$recovery['errors'][] = $label . ': ' . $e->getMessage();
+
+			return null;
+		}
+	};
+
+	if ( ! $light ) {
+		$recovery['progress_marker'] = (string) $safe(
+			'progress_marker',
+			static function () use ( $post_id, $lang, $state ) {
+				return \PolymartAI\Translation\Post_Translator::format_elementor_job_progress_marker( $post_id, $lang, $state );
+			}
+		);
+
+		$recovery['remaining_field_count'] = $safe(
+			'remaining_field_count',
+			static function () use ( $post_id, $lang ) {
+				return method_exists( '\PolymartAI\Translation\Post_Translator', 'count_elementor_remaining_fields' )
+					? \PolymartAI\Translation\Post_Translator::count_elementor_remaining_fields( $post_id, $lang )
+					: null;
+			}
+		);
+
+		$recovery['has_stubborn_remaining'] = $safe(
+			'has_stubborn_remaining',
+			static function () use ( $post_id, $lang ) {
+				return \PolymartAI\Translation\Post_Translator::elementor_job_has_stubborn_remaining( $post_id, $lang );
+			}
+		);
+		$recovery['needs_gap_fill'] = $safe(
+			'needs_gap_fill',
+			static function () use ( $post_id, $lang ) {
+				return \PolymartAI\Translation\Post_Translator::elementor_needs_gap_fill_work( $post_id, $lang );
+			}
+		);
+		$recovery['has_remaining_payload'] = $safe(
+			'has_remaining_payload',
+			static function () use ( $post_id, $lang ) {
+				return \PolymartAI\Translation\Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang );
+			}
+		);
+		$recovery['should_force_finalize'] = $safe(
+			'should_force_finalize',
+			static function () use ( $post_id, $lang, $job ) {
+				return \PolymartAI\Translation\Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job );
+			}
+		);
+		$recovery['pipeline_force_finalize'] = $safe(
+			'pipeline_force_finalize',
+			static function () use ( $post_id, $lang, $state ) {
+				return \PolymartAI\Translation\Post_Translator::elementor_should_force_finalize_in_pipeline( $post_id, $lang, $state );
+			}
+		);
+	}
+
+	$scan = is_array( $snapshot['elementor_scan'] ?? null ) ? $snapshot['elementor_scan'] : null;
 
 	$report = array(
 		'post_id'                 => $post_id,
@@ -785,14 +960,12 @@ function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
 		'post_type'               => (string) ( $snapshot['post_type'] ?? '' ),
 		'edit_url'                => (string) ( $snapshot['edit_url'] ?? '' ),
 		'snapshot'                => $snapshot,
-		'elementor_scan'          => method_exists( '\PolymartAI\Translation\Post_Translator', 'get_elementor_scan_diagnostics' )
-			? \PolymartAI\Translation\Post_Translator::get_elementor_scan_diagnostics( $post_id, $lang )
-			: null,
+		'elementor_scan'          => $scan,
 		'stubborn_details'        => \PolymartAI\Translation\Post_Translator::get_elementor_stubborn_field_diagnostics( $post_id, $lang ),
 		'job_partial_state'       => polymart_ai_queue_diag_summarize_partial_state( $state ),
 		'lock'                    => \PolymartAI\Translation\Post_Translator::get_translation_lock_status( $post_id, $lang ),
 		'recovery'                => $recovery,
-		'action_scheduler_events' => polymart_ai_queue_diag_list_as_actions( $post_id, $lang ),
+		'action_scheduler_events' => array(),
 		'bulk_job'                => array(
 			'status'          => (string) ( $job['status'] ?? 'idle' ),
 			'lang'            => (string) ( $job['lang'] ?? '' ),
@@ -812,7 +985,18 @@ function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
 			'progress'  => '_polymart_ai_elementor_progress_' . $lang,
 			'error'     => '_polymart_ai_elementor_error_' . $lang,
 		),
+		'light'                   => (bool) $light,
 	);
+
+	if ( ! $light ) {
+		try {
+			$report['action_scheduler_events'] = polymart_ai_queue_diag_list_as_actions( $post_id, $lang );
+		} catch ( \Throwable $e ) {
+			$report['action_scheduler_events'] = array();
+			$recovery['errors'][]              = 'as_events: ' . $e->getMessage();
+			$report['recovery']                = $recovery;
+		}
+	}
 
 	$report['recommendations'] = polymart_ai_queue_diag_build_recommendations( $report );
 
@@ -1151,9 +1335,24 @@ function polymart_ai_render_troubleshoot_page() {
 					<th scope="row"><label for="polymart-troubleshoot-lang">زبان</label></th>
 					<td><input name="lang" id="polymart-troubleshoot-lang" type="text" class="regular-text" value="<?php echo esc_attr( $lang ); ?>" /></td>
 				</tr>
+				<tr>
+					<th scope="row">جزئیات</th>
+					<td>
+						<label>
+							<input type="checkbox" name="full" value="1" <?php checked( ! empty( $_GET['full'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended ?> />
+							گزارش کامل (سنگین — ممکن است روی پست‌های بزرگ Elementor خطای ۵۰۳ بدهد)
+						</label>
+					</td>
+				</tr>
 			</table>
 			<?php submit_button( 'نمایش گزارش', 'primary', '', false ); ?>
 		</form>
+
+		<p style="max-width:720px;">
+			گزارش پیش‌فرض سبک است (فقط متا، قفل، stubborn ذخیره‌شده، وضعیت صف).
+			برای JSON سبک:
+			<code><?php echo esc_html( add_query_arg( array( 'page' => 'polymart-ai-troubleshoot', 'post_id' => $post_id ?: 21870, 'lang' => $lang, 'format' => 'json' ), admin_url( 'admin.php' ) ) ); ?></code>
+		</p>
 
 		<?php if ( ! empty( $data['error'] ) ) : ?>
 			<div class="notice notice-error"><p><?php echo esc_html( (string) $data['error'] ); ?></p></div>
@@ -1168,6 +1367,9 @@ function polymart_ai_render_troubleshoot_page() {
 			$lock     = (array) ( $report['lock'] ?? array() );
 			?>
 			<h2>#<?php echo esc_html( (string) $post_id ); ?> — <?php echo esc_html( (string) ( $report['title'] ?? '' ) ); ?></h2>
+			<?php if ( ! empty( $report['light'] ) ) : ?>
+				<div class="notice notice-info inline"><p>گزارش سبک (بدون decode کامل Elementor). برای گزارش کامل تیک «گزارش کامل» را بزن — روی پست‌های خیلی بزرگ ممکن است ۵۰۳ بدهد.</p></div>
+			<?php endif; ?>
 			<p>
 				نوع: <code><?php echo esc_html( (string) ( $report['post_type'] ?? '' ) ); ?></code>
 				<?php if ( ! empty( $report['edit_url'] ) ) : ?>

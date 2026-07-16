@@ -69,22 +69,37 @@ trait Trait_Job_Elementor {
 		}
 
 		// #21870-style: EN JSON clean but pin stuck on not_finalized / missing __seg map.
-		if (
-			! Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
-			&& is_string( Post_Translator::get_stored_elementor_json( $post_id, $lang ) )
-			&& (
-				Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
-				|| ! Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
-			)
-		) {
-			if ( Post_Translator::seal_clean_elementor_companion( $post_id, $lang ) ) {
-				return true;
+		// Keep this narrow — never seal mid-job posts that still need AI work.
+		// Skip heavy decode paths on ensure when Elementor source is huge (avoids 503).
+		$elementor_bytes = strlen( (string) get_post_meta( $post_id, '_elementor_data', true ) );
+		$allow_heavy     = $elementor_bytes <= 350000
+			|| self::is_trusted_job_worker()
+			|| wp_doing_cron()
+			|| ( defined( 'WP_CLI' ) && WP_CLI );
+
+		try {
+			if (
+				$allow_heavy
+				&& ! Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
+				&& is_string( Post_Translator::get_stored_elementor_json( $post_id, $lang ) )
+				&& ! Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
+			) {
+				$remaining = Post_Translator::count_elementor_remaining_fields( $post_id, $lang );
+
+				if ( $remaining <= 1 && Post_Translator::seal_clean_elementor_companion( $post_id, $lang ) ) {
+					return true;
+				}
 			}
+		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
+			// Never let seal fatals kill start/ensure requests.
 		}
 
-		if ( Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ) ) {
-			if ( Post_Translator::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'bulk-pin-recovery' ) ) {
-				return true;
+		if ( $allow_heavy && Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ) ) {
+			try {
+				if ( Post_Translator::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'bulk-pin-recovery' ) ) {
+					return true;
+				}
+			} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 			}
 		}
 

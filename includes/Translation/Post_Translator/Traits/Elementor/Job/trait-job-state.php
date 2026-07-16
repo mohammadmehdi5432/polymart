@@ -707,12 +707,6 @@ trait Trait_Job_State {
 		$stored_clean = ! self::stored_elementor_translation_has_persian( $post_id, $lang )
 			&& is_string( self::get_stored_elementor_json( $post_id, $lang ) );
 
-		// EN companion already clean (no whitelist Persian) but map still lists 1–2 long
-		// leftovers / stale hash — seal without waiting for primary N/N (#21870).
-		if ( $stored_clean && $remaining <= 2 ) {
-			return true;
-		}
-
 		$api_complete = self::elementor_job_primary_batches_exhausted( $post_id, $lang )
 			|| self::elementor_primary_schedule_locked( $post_id, $lang, $state )
 			|| self::elementor_job_api_schedule_complete( $post_id, $lang, $done, $total )
@@ -722,6 +716,19 @@ trait Trait_Job_State {
 				$remaining <= 1
 				&& $done >= max( 1, (int) floor( $total * 0.8 ) )
 			);
+
+		// EN companion clean + nearly done primary schedule, or explicit stubborn handoff.
+		if (
+			$stored_clean
+			&& $remaining <= 1
+			&& (
+				$api_complete
+				|| ! empty( $state['elementor_gap_fill'] )
+				|| ! empty( $state['elementor_gap_fill_stubborn_only'] )
+			)
+		) {
+			return true;
+		}
 
 		if ( ! $api_complete ) {
 			return false;
@@ -750,7 +757,7 @@ trait Trait_Job_State {
 			return $ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 				|| $long_attempts >= $long_limit
 				|| $repairs >= 3
-				|| ( 1 === $remaining && ( $ghost >= 1 || $reopens >= 1 || $stored_clean ) );
+				|| ( 1 === $remaining && $stored_clean && ( $ghost >= 1 || $reopens >= 1 || $long_attempts >= 1 ) );
 		}
 
 		if ( $remaining < 3 && $ghost >= 2 ) {

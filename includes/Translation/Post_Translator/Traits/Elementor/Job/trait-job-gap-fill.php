@@ -457,16 +457,23 @@ trait Trait_Job_Gap_Fill {
 		$long_limit    = self::resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, $state );
 		$reopens       = absint( $state['elementor_force_persian_reopens'] ?? 0 );
 		$stored_clean  = ! self::stored_elementor_translation_has_persian( $post_id, $lang );
+		$chunk_progress = self::get_elementor_chunk_progress( $post_id, $lang, $state );
+		$done_ratio_ok  = (int) ( $chunk_progress['done'] ?? 0 ) >= max( 1, (int) floor( max( 1, (int) ( $chunk_progress['total'] ?? 1 ) ) * 0.8 ) );
 		// Prefer real AI retries first; after the attempt/ghost ceiling, accept long HTML
 		// with whatever English segments we already have (+ source only for gaps).
 		$accept_long_fallback = (
 			$ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 			|| $long_attempts >= $long_limit
 			|| $reopens >= 2
-			|| $stored_clean
+			|| (
+				1 === count( $remaining )
+				&& $stored_clean
+				&& ( $ghost >= 1 || $reopens >= 1 || $long_attempts >= 1 || $done_ratio_ok )
+			)
 			|| (
 				// Single stubborn leftover with missing __segN after primary N/N — don't pin forever.
 				1 === count( $remaining )
+				&& ( $ghost >= 1 || $reopens >= 1 || $long_attempts >= 1 )
 			)
 		);
 
@@ -862,55 +869,81 @@ trait Trait_Job_Gap_Fill {
 	 * @return bool
 	 */
 	public static function seal_clean_elementor_companion( $post_id, $lang ) {
+		static $inflight = array();
+
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
+		$guard   = $post_id . ':' . $lang;
 
 		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
 			return false;
 		}
 
-		if ( ! is_string( self::get_stored_elementor_json( $post_id, $lang ) ) ) {
+		if ( isset( $inflight[ $guard ] ) ) {
 			return false;
 		}
 
-		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+		$inflight[ $guard ] = true;
+
+		try {
+			if ( ! is_string( self::get_stored_elementor_json( $post_id, $lang ) ) ) {
+				return false;
+			}
+
+			if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+				return false;
+			}
+
+			self::force_claim_translation_lock( $post_id, $lang );
+
+			// Stored EN JSON is already clean — do not re-apply segment source fallbacks
+			// (that would reintroduce Persian into a good companion). Only stamp readiness.
+			self::clear_job_partial_state( $post_id, $lang, true );
+			self::clear_elementor_slice_cursor( $post_id, $lang );
+			self::clear_elementor_primary_batches_lock( $post_id, $lang );
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+			delete_post_meta( $post_id, self::get_stubborn_details_meta_key( $lang ) );
+			self::save_elementor_source_hash( $post_id, $lang );
+			self::mark_elementor_translation_finalized( $post_id, $lang );
+			update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
+			update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
+			update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+			self::reset_elementor_runtime_caches();
+			self::flush_translation_status_cache( $post_id );
+			self::release_translation_lock( $post_id, $lang, true );
+
+			if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+				\PolymartAI\Activity_Logger::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
+			}
+
+			\PolymartAI\Activity_Logger::log(
+				'info',
+				sprintf(
+					/* translators: 1: post ID */
+					__( 'Elementor — #%1$d: companion انگلیسی تمیز seal شد (finalized + hash).', 'polymart-ai' ),
+					$post_id
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
+			return true;
+		} catch ( \Throwable $e ) {
+			\PolymartAI\Activity_Logger::log(
+				'error',
+				sprintf(
+					/* translators: 1: post ID, 2: error */
+					__( 'Elementor — #%1$d: seal ناموفق (%2$s)', 'polymart-ai' ),
+					$post_id,
+					$e->getMessage()
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
 			return false;
+		} finally {
+			unset( $inflight[ $guard ] );
 		}
-
-		self::force_claim_translation_lock( $post_id, $lang );
-
-		// Stored EN JSON is already clean — do not re-apply segment source fallbacks
-		// (that would reintroduce Persian into a good companion). Only stamp readiness.
-		self::clear_job_partial_state( $post_id, $lang, true );
-		self::clear_elementor_slice_cursor( $post_id, $lang );
-		self::clear_elementor_primary_batches_lock( $post_id, $lang );
-		delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
-		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
-		delete_post_meta( $post_id, self::get_stubborn_details_meta_key( $lang ) );
-		self::save_elementor_source_hash( $post_id, $lang );
-		self::mark_elementor_translation_finalized( $post_id, $lang );
-		update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
-		update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
-		update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
-		self::reset_elementor_runtime_caches();
-		self::flush_translation_status_cache( $post_id );
-		self::release_translation_lock( $post_id, $lang, true );
-
-		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
-			\PolymartAI\Activity_Logger::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
-		}
-
-		\PolymartAI\Activity_Logger::log(
-			'info',
-			sprintf(
-				/* translators: 1: post ID */
-				__( 'Elementor — #%1$d: companion انگلیسی تمیز seal شد (finalized + hash).', 'polymart-ai' ),
-				$post_id
-			),
-			array( 'post_id' => $post_id, 'lang' => $lang )
-		);
-
-		return true;
 	}
 
 	private static function get_elementor_job_finalize_blockers( $post_id, $lang, array $source_data, array $map, array $state ) {
@@ -2260,9 +2293,13 @@ trait Trait_Job_Gap_Fill {
 			return false;
 		}
 
-		// Clean EN companion stuck on not_finalized / stale hash / map leftovers.
-		if (
-			! self::stored_elementor_translation_has_persian( $post_id, $lang )
+		// Clean EN companion stuck on not_finalized / stale hash — only when map is nearly empty.
+		// Sealing every "clean" companion (even with many remaining map paths) caused ensure/start
+		// timeouts on huge Elementor posts when persian-scan + remaining-count ran back-to-back.
+		$remaining_count = self::count_elementor_remaining_fields( $post_id, $lang );
+
+		if ( $remaining_count <= 1
+			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
 			&& is_string( self::get_stored_elementor_json( $post_id, $lang ) )
 		) {
 			if ( self::seal_clean_elementor_companion( $post_id, $lang ) ) {
@@ -2270,14 +2307,7 @@ trait Trait_Job_Gap_Fill {
 			}
 		}
 
-		if ( self::count_elementor_remaining_fields( $post_id, $lang ) <= 0 ) {
-			if (
-				! self::stored_elementor_translation_has_persian( $post_id, $lang )
-				&& is_string( self::get_stored_elementor_json( $post_id, $lang ) )
-			) {
-				return self::seal_clean_elementor_companion( $post_id, $lang );
-			}
-
+		if ( $remaining_count <= 0 ) {
 			return false;
 		}
 
