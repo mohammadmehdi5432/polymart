@@ -456,16 +456,17 @@ trait Trait_Job_Gap_Fill {
 		$long_attempts = absint( $state['elementor_long_gap_force_attempts'] ?? 0 );
 		$long_limit    = self::resolve_elementor_long_gap_force_attempt_limit( $post_id, $lang, $state );
 		$reopens       = absint( $state['elementor_force_persian_reopens'] ?? 0 );
+		$stored_clean  = ! self::stored_elementor_translation_has_persian( $post_id, $lang );
 		// Prefer real AI retries first; after the attempt/ghost ceiling, accept long HTML
 		// with whatever English segments we already have (+ source only for gaps).
 		$accept_long_fallback = (
 			$ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 			|| $long_attempts >= $long_limit
-			|| $reopens >= 3
+			|| $reopens >= 2
+			|| $stored_clean
 			|| (
 				// Single stubborn leftover with missing __segN after primary N/N — don't pin forever.
 				1 === count( $remaining )
-				&& ( $ghost >= 1 || $reopens >= 1 || $long_attempts >= 1 )
 			)
 		);
 
@@ -803,14 +804,38 @@ trait Trait_Job_Gap_Fill {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
 
+		if ( $post_id <= 0 || '' === $lang ) {
+			return array(
+				'done'           => false,
+				'phase'          => 'elementor',
+				'phase_progress' => '',
+				'message'        => __( 'Elementor هنوز فارسی دارد — تکمیل اجباری رد شد؛ ادامه gap-fill.', 'polymart-ai' ),
+				'recoverable'    => true,
+			);
+		}
+
+		// Force path may have written English JSON but left not_finalized / stale hash.
+		// Seal markers when the companion is already clean so the pin can release.
 		if (
-			$post_id > 0
-			&& '' !== $lang
-			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			&& is_string( self::get_stored_elementor_json( $post_id, $lang ) )
+		) {
+			self::seal_clean_elementor_companion( $post_id, $lang );
+
+			if ( self::elementor_translation_is_storefront_ready( $post_id, $lang ) ) {
+				return self::pipeline_force_finalize_success_response( $context );
+			}
+		}
+
+		if (
+			! self::stored_elementor_translation_has_persian( $post_id, $lang )
 			&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 		) {
 			return self::pipeline_force_finalize_success_response( $context );
 		}
+
+		$blockers = self::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
+		$codes    = implode( ',', array_map( 'strval', (array) ( $blockers['codes'] ?? array() ) ) );
 
 		return array(
 			'done'           => false,
@@ -820,9 +845,72 @@ trait Trait_Job_Gap_Fill {
 				$lang,
 				self::get_job_partial_state( $post_id, $lang )
 			),
-			'message'        => __( 'Elementor هنوز فارسی دارد — تکمیل اجباری رد شد؛ ادامه gap-fill.', 'polymart-ai' ),
+			'message'        => sprintf(
+				/* translators: 1: blocker codes */
+				__( 'تکمیل اجباری Elementor رد شد (%1$s) — ادامه gap-fill.', 'polymart-ai' ),
+				'' !== $codes ? $codes : 'not_ready'
+			),
 			'recoverable'    => true,
 		);
+	}
+
+	/**
+	 * Stamp finalized + source hash and clear durable partials when EN JSON is clean.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	public static function seal_clean_elementor_companion( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! is_string( self::get_stored_elementor_json( $post_id, $lang ) ) ) {
+			return false;
+		}
+
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return false;
+		}
+
+		self::force_claim_translation_lock( $post_id, $lang );
+
+		// Stored EN JSON is already clean — do not re-apply segment source fallbacks
+		// (that would reintroduce Persian into a good companion). Only stamp readiness.
+		self::clear_job_partial_state( $post_id, $lang, true );
+		self::clear_elementor_slice_cursor( $post_id, $lang );
+		self::clear_elementor_primary_batches_lock( $post_id, $lang );
+		delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+		delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+		delete_post_meta( $post_id, self::get_stubborn_details_meta_key( $lang ) );
+		self::save_elementor_source_hash( $post_id, $lang );
+		self::mark_elementor_translation_finalized( $post_id, $lang );
+		update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
+		update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
+		update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+		self::reset_elementor_runtime_caches();
+		self::flush_translation_status_cache( $post_id );
+		self::release_translation_lock( $post_id, $lang, true );
+
+		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+			\PolymartAI\Activity_Logger::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
+		}
+
+		\PolymartAI\Activity_Logger::log(
+			'info',
+			sprintf(
+				/* translators: 1: post ID */
+				__( 'Elementor — #%1$d: companion انگلیسی تمیز seal شد (finalized + hash).', 'polymart-ai' ),
+				$post_id
+			),
+			array( 'post_id' => $post_id, 'lang' => $lang )
+		);
+
+		return true;
 	}
 
 	private static function get_elementor_job_finalize_blockers( $post_id, $lang, array $source_data, array $map, array $state ) {
@@ -2172,7 +2260,24 @@ trait Trait_Job_Gap_Fill {
 			return false;
 		}
 
+		// Clean EN companion stuck on not_finalized / stale hash / map leftovers.
+		if (
+			! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			&& is_string( self::get_stored_elementor_json( $post_id, $lang ) )
+		) {
+			if ( self::seal_clean_elementor_companion( $post_id, $lang ) ) {
+				return true;
+			}
+		}
+
 		if ( self::count_elementor_remaining_fields( $post_id, $lang ) <= 0 ) {
+			if (
+				! self::stored_elementor_translation_has_persian( $post_id, $lang )
+				&& is_string( self::get_stored_elementor_json( $post_id, $lang ) )
+			) {
+				return self::seal_clean_elementor_companion( $post_id, $lang );
+			}
+
 			return false;
 		}
 

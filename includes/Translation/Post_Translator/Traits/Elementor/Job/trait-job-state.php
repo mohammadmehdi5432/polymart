@@ -704,10 +704,24 @@ trait Trait_Job_State {
 		$done           = (int) ( $chunk_progress['done'] ?? 0 );
 		$total          = max( 1, (int) ( $chunk_progress['total'] ?? 1 ) );
 
+		$stored_clean = ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			&& is_string( self::get_stored_elementor_json( $post_id, $lang ) );
+
+		// EN companion already clean (no whitelist Persian) but map still lists 1–2 long
+		// leftovers / stale hash — seal without waiting for primary N/N (#21870).
+		if ( $stored_clean && $remaining <= 2 ) {
+			return true;
+		}
+
 		$api_complete = self::elementor_job_primary_batches_exhausted( $post_id, $lang )
 			|| self::elementor_primary_schedule_locked( $post_id, $lang, $state )
 			|| self::elementor_job_api_schedule_complete( $post_id, $lang, $done, $total )
-			|| $done >= $total;
+			|| $done >= $total
+			|| (
+				// Stubborn handoff with cursor stuck below total (e.g. 27/30) must still force.
+				$remaining <= 1
+				&& $done >= max( 1, (int) floor( $total * 0.8 ) )
+			);
 
 		if ( ! $api_complete ) {
 			return false;
@@ -722,7 +736,7 @@ trait Trait_Job_State {
 		$reopens = absint( $state['elementor_force_persian_reopens'] ?? 0 );
 
 		// Escape hatch: one leftover long field after repeated force→reopen loops (#21870).
-		if ( $stubborn && 1 === $remaining && $reopens >= 3 ) {
+		if ( $stubborn && 1 === $remaining && ( $reopens >= 2 || $stored_clean ) ) {
 			return true;
 		}
 
@@ -736,7 +750,7 @@ trait Trait_Job_State {
 			return $ghost >= max( self::ELEMENTOR_STUBBORN_GHOST_LOOP_LIMIT, min( 8, $long_limit ) )
 				|| $long_attempts >= $long_limit
 				|| $repairs >= 3
-				|| ( 1 === $remaining && $ghost >= 1 && $reopens >= 1 );
+				|| ( 1 === $remaining && ( $ghost >= 1 || $reopens >= 1 || $stored_clean ) );
 		}
 
 		if ( $remaining < 3 && $ghost >= 2 ) {
@@ -1370,6 +1384,15 @@ trait Trait_Job_State {
 		self::bind_elementor_accepted_paths_context( $post_id, $lang );
 
 		if ( ! self::should_require_elementor_translation( $post_id ) ) {
+			return false;
+		}
+
+		// Sealed clean companion: map leftovers (__segN bookkeeping) must not re-pin the job.
+		if (
+			self::is_elementor_translation_finalized( $post_id, $lang )
+			&& ! self::stored_elementor_translation_has_persian( $post_id, $lang )
+			&& self::is_elementor_translation_current( $post_id, $lang )
+		) {
 			return false;
 		}
 

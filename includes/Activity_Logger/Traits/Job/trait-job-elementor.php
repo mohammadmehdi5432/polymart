@@ -68,6 +68,20 @@ trait Trait_Job_Elementor {
 			return false;
 		}
 
+		// #21870-style: EN JSON clean but pin stuck on not_finalized / missing __seg map.
+		if (
+			! Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang )
+			&& is_string( Post_Translator::get_stored_elementor_json( $post_id, $lang ) )
+			&& (
+				Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang )
+				|| ! Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang )
+			)
+		) {
+			if ( Post_Translator::seal_clean_elementor_companion( $post_id, $lang ) ) {
+				return true;
+			}
+		}
+
 		if ( Post_Translator::elementor_recovery_should_force_finalize( $post_id, $lang, $job ) ) {
 			if ( Post_Translator::force_finalize_elementor_job_from_recovery( $post_id, $lang, 'bulk-pin-recovery' ) ) {
 				return true;
