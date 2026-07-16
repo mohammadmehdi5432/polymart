@@ -294,10 +294,47 @@ trait Trait_Ai_Persistence {
 
 	private static function save_ai_translations_internal( $post_id, array $translations, $lang = 'en', array $options = array() ) {
 		$lang = sanitize_key( (string) $lang );
+		$post = get_post( absint( $post_id ) );
 
 		foreach ( $translations as $source_key => $value ) {
 			if ( is_string( $value ) || is_numeric( $value ) ) {
 				$translations[ $source_key ] = self::normalize_ai_translation_value( $value );
+			}
+		}
+
+		// Drop unusable AI replies before persist — equal-to-source FA copies were saved
+		// for Arabic titles then rejected by is_field_translation_current (ناقص ماند — عنوان).
+		if ( $post instanceof \WP_Post && 'fa' !== $lang ) {
+			foreach ( $translations as $source_key => $value ) {
+				if ( ! is_string( $source_key ) || ! is_string( $value ) || '' === trim( $value ) ) {
+					continue;
+				}
+
+				if ( Persian_Detector::should_reject_ai_translation( $value, $lang ) ) {
+					unset( $translations[ $source_key ] );
+					continue;
+				}
+
+				if (
+					self::is_term_payload_key( $source_key )
+					|| self::is_variation_title_payload_key( $source_key )
+					|| 0 === strpos( $source_key, 'product_attr' )
+				) {
+					continue;
+				}
+
+				$source_text = self::get_field_source_text( $post, $source_key );
+
+				if ( '' === trim( (string) $source_text ) ) {
+					continue;
+				}
+
+				$normalized_source = self::normalize_translation_plaintext( $source_text );
+				$normalized_value  = self::normalize_translation_plaintext( $value );
+
+				if ( '' !== $normalized_source && hash_equals( $normalized_source, $normalized_value ) ) {
+					unset( $translations[ $source_key ] );
+				}
 			}
 		}
 

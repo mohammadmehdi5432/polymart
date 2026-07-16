@@ -741,6 +741,49 @@ trait Trait_Job_Slice {
 	private static function finalize_job_field_phases( $post_id, $lang, array &$state ) {
 		unset( $state['field_translations'] );
 
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$post    = get_post( $post_id );
+
+		// Never advance to Elementor while title/meta gaps remain (Arabic bulk left
+		// «ناقص — عنوان» after field chunks advanced despite equal-source AI replies).
+		if ( $post instanceof \WP_Post ) {
+			foreach ( self::get_job_field_phases() as $phase ) {
+				$remaining = self::collect_persian_fields_for_job_phase( $post, $lang, $phase );
+
+				if ( empty( $remaining ) ) {
+					continue;
+				}
+
+				$retries = absint( $state['field_gap_retries'] ?? 0 );
+				$max     = (int) apply_filters( 'polymart_ai_job_field_gap_retries', 3, $post_id, $lang, $phase );
+
+				if ( $retries < max( 1, $max ) ) {
+					$state['phase']             = $phase;
+					$state['field_chunk_index'] = 0;
+					$state['field_gap_retries'] = $retries + 1;
+					self::save_job_partial_state( $post_id, $lang, $state );
+
+					return array(
+						'done'           => false,
+						'phase'          => $phase,
+						'phase_progress' => '0/' . max( 1, count( self::chunk_payload_for_job_phase( $remaining, $phase, $post_id ) ) ),
+						'message'        => sprintf(
+							/* translators: 1: phase label, 2: remaining field count, 3: attempt */
+							__( '%1$s هنوز ناقص است — %2$d فیلد باقی‌مانده (تلاش %3$d)؛ Elementor شروع نمی‌شود.', 'polymart-ai' ),
+							self::get_job_field_phase_label( $phase ),
+							count( $remaining ),
+							$retries + 1
+						),
+					);
+				}
+
+				// Exhausted retries: continue to Elementor, but leave-queue must still
+				// wait for field gaps (see sync_bulk_job_after_elementor_finalize).
+				break;
+			}
+		}
+
 		if (
 			self::post_needs_elementor_job_work( $post_id, $lang )
 			|| self::elementor_job_has_remaining_payload( $post_id, $lang )
@@ -764,6 +807,47 @@ trait Trait_Job_Slice {
 			'phase_progress' => '',
 			'message'        => __( 'ترجمه این مورد تکمیل شد.', 'polymart-ai' ),
 		);
+	}
+
+	/**
+	 * Whether non-Elementor source fields still need translation for this language.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language.
+	 * @return bool
+	 */
+	public static function has_remaining_field_gaps_for_job( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+		$post    = get_post( $post_id );
+
+		if ( ! $post instanceof \WP_Post || '' === $lang ) {
+			return false;
+		}
+
+		return ! empty( self::collect_persian_fields( $post, $lang ) );
+	}
+
+	/**
+	 * After Elementor seals, reopen the job partial on remaining core/commerce fields.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language.
+	 * @return array<string, mixed>|null New partial state, or null when no field gaps.
+	 */
+	public static function reopen_job_partial_for_remaining_fields( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::has_remaining_field_gaps_for_job( $post_id, $lang ) ) {
+			return null;
+		}
+
+		self::clear_job_partial_state( $post_id, $lang, true );
+		$state = self::build_initial_job_partial_state( $post_id, $lang );
+		self::save_job_partial_state( $post_id, $lang, $state );
+
+		return $state;
 	}
 
 	public static function refresh_translation_lock( $post_id, $lang ) {
@@ -1031,6 +1115,21 @@ trait Trait_Job_Slice {
 			$state = self::build_initial_job_partial_state( $post_id, $lang, $post );
 		}
 
+		// Only demote Elementor→core when Elementor has not started yet. Mid-job demote
+		// would wipe durable Elementor progress every tick while title retries loop.
+		if (
+			'elementor' === sanitize_key( (string) ( $state['phase'] ?? '' ) )
+			&& self::has_remaining_field_gaps_for_job( $post_id, $lang )
+			&& ! self::job_partial_state_has_progress( $post_id, $lang, $state )
+			&& ! is_string( self::get_stored_elementor_json( $post_id, $lang ) )
+		) {
+			$reopened = self::reopen_job_partial_for_remaining_fields( $post_id, $lang );
+
+			if ( is_array( $reopened ) && ! empty( $reopened['phase'] ) ) {
+				$state = $reopened;
+			}
+		}
+
 		if ( 'complete' === (string) ( $state['phase'] ?? '' ) ) {
 			self::clear_job_partial_state( $post_id, $lang, true );
 
@@ -1295,7 +1394,8 @@ trait Trait_Job_Slice {
 					return true;
 				}
 
-				return false;
+				// Elementor companion can be ready while title/excerpt still show FA on /ar/.
+				// Fall through to core field checks instead of early-returning false.
 			}
 		}
 

@@ -123,7 +123,7 @@ trait Trait_Translation_Status {
 			return self::$translation_status_cache[ $cache_key ];
 		}
 
-		$audit = self::sanitize_translation_audit( self::compute_translation_audit( $post_id, $lang ), $post_id );
+			$audit = self::sanitize_translation_audit( self::compute_translation_audit( $post_id, $lang ), $post_id );
 
 		$status = (string) ( $audit['status'] ?? 'untranslated' );
 
@@ -152,6 +152,7 @@ trait Trait_Translation_Status {
 				&& self::is_elementor_translation_finalized( $post_id, $lang )
 				&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 				&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
+				&& ( ! $post instanceof \WP_Post || empty( self::collect_persian_fields( $post, $lang ) ) )
 			) {
 				$status = 'translated';
 			}

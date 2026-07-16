@@ -1287,6 +1287,26 @@ trait Trait_Queue_Run {
 					),
 					array( 'post_id' => $post_id, 'lang' => $lang )
 				);
+			} elseif ( $elementor_done && Post_Translator::has_remaining_field_gaps_for_job( $post_id, $lang ) ) {
+				$state = Post_Translator::reopen_job_partial_for_remaining_fields( $post_id, $lang );
+				$phase = sanitize_key( (string) ( is_array( $state ) ? ( $state['phase'] ?? 'core' ) : 'core' ) );
+				$missing = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'فیلدهای متنی', 'polymart-ai' );
+
+				$job['partial_post_id']  = $post_id;
+				$job['partial_phase']    = $phase;
+				$job['partial_progress'] = null;
+				unset( $job['step_partial'] );
+
+				self::log(
+					'warning',
+					sprintf(
+						/* translators: 1: post title, 2: missing fields */
+						__( '«%1$s» — Elementor تمام شد ولی هنوز ناقص است (%2$s)؛ ادامه روی فیلدهای متنی.', 'polymart-ai' ),
+						$title_source,
+						$missing
+					),
+					array( 'post_id' => $post_id, 'lang' => $lang )
+				);
 			} elseif ( $elementor_done ) {
 				$job['partial_post_id']  = null;
 				$job['partial_phase']    = null;

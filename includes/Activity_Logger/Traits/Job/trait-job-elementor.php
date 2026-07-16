@@ -652,6 +652,45 @@ trait Trait_Job_Elementor {
 			return;
 		}
 
+		// Elementor-ready alone is not enough — Arabic jobs were leaving the queue
+		// while title/meta still showed «ناقص» and then thrashing recovery every 60s.
+		if ( Post_Translator::has_remaining_field_gaps_for_job( $post_id, $lang ) ) {
+			$state = Post_Translator::reopen_job_partial_for_remaining_fields( $post_id, $lang );
+
+			self::untrack_succeeded_post( $job, $post_id );
+			self::track_partial_post( $job, $post_id );
+
+			$phase = sanitize_key( (string) ( is_array( $state ) ? ( $state['phase'] ?? 'core' ) : 'core' ) );
+			$job['partial_post_id']  = $post_id;
+			$job['partial_phase']    = $phase;
+			$job['partial_progress'] = is_array( $state )
+				? (string) ( $state['phase_progress'] ?? '0/1' )
+				: '0/1';
+			$job['current_post_id']  = null;
+			$job['step_started_at']  = null;
+
+			Post_Translator::flush_translation_status_cache( $post_id );
+			REST_API::invalidate_stats_cache();
+			self::save_job( $job );
+
+			$title = get_the_title( $post_id ) ?: ( '#' . $post_id );
+			$gaps  = Post_Translator::get_translation_gaps( $post_id, $lang );
+			$missing = ! empty( $gaps['missing'] ) ? implode( ', ', $gaps['missing'] ) : __( 'فیلدهای متنی', 'polymart-ai' );
+
+			self::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post title, 2: missing labels */
+					__( '«%1$s» — Elementor تمام شد ولی هنوز ناقص است (%2$s)؛ برای تکمیل فیلدها در صف می‌ماند.', 'polymart-ai' ),
+					$title,
+					$missing
+				),
+				array( 'post_id' => $post_id, 'lang' => $lang )
+			);
+
+			return;
+		}
+
 		$was_new = ! self::job_already_counted_success( $job, $post_id );
 		self::track_succeeded_post( $job, $post_id );
 		self::clear_partial_post( $job, $post_id );

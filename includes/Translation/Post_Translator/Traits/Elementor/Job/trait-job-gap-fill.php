@@ -908,21 +908,25 @@ trait Trait_Job_Gap_Fill {
 			self::mark_elementor_translation_finalized( $post_id, $lang );
 			update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
 			update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
-			update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+			// Never force status=translated — title/meta gaps must keep the index honest.
 			self::reset_elementor_runtime_caches();
 			self::flush_translation_status_cache( $post_id );
+			self::sync_translation_index_meta( $post_id, $lang );
 			self::release_translation_lock( $post_id, $lang, true );
 
 			if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 				\PolymartAI\Activity_Logger::sync_bulk_job_after_elementor_finalize( $post_id, $lang );
 			}
 
+			$lang_label = \PolymartAI\Language_Registry::get_language_label_for_ai( $lang );
+
 			\PolymartAI\Activity_Logger::log(
 				'info',
 				sprintf(
-					/* translators: 1: post ID */
-					__( 'Elementor — #%1$d: companion انگلیسی تمیز seal شد (finalized + hash).', 'polymart-ai' ),
-					$post_id
+					/* translators: 1: post ID, 2: language label */
+					__( 'Elementor — #%1$d: companion %2$s تمیز seal شد (finalized + hash).', 'polymart-ai' ),
+					$post_id,
+					$lang_label
 				),
 				array( 'post_id' => $post_id, 'lang' => $lang )
 			);
