@@ -116,6 +116,73 @@ final class Job_Action_Scheduler {
 		// Prefer WP-Cron / inline queue runs over AS HTTP async loopbacks while
 		// a PolyMart job is active (same firewall issue as our old loopback).
 		add_filter( 'action_scheduler_allow_async_request_runner', array( __CLASS__, 'filter_async_runner' ) );
+
+		// Older MariaDB / mis-detected versions throw SQL syntax errors on SKIP LOCKED
+		// during claim_actions — prefer the compatible claim path.
+		add_filter( 'action_scheduler_db_supports_skip_locked', array( __CLASS__, 'filter_skip_locked_support' ), 20 );
+	}
+
+	/**
+	 * Disable SKIP LOCKED when the DB cannot safely use it.
+	 *
+	 * Mis-detected MariaDB versions produce claim SQL that fails near WHERE /
+	 * SKIP LOCKED and stalls the PolyMart translation queue.
+	 *
+	 * @param bool $supported Whether Action Scheduler thinks SKIP LOCKED is OK.
+	 * @return bool
+	 */
+	public static function filter_skip_locked_support( $supported ) {
+		if ( ! $supported ) {
+			return false;
+		}
+
+		global $wpdb;
+
+		$server = is_object( $wpdb ) && method_exists( $wpdb, 'db_server_info' )
+			? (string) $wpdb->db_server_info()
+			: '';
+
+		if ( '' === $server || false === stripos( $server, 'MariaDB' ) ) {
+			return (bool) $supported;
+		}
+
+		// Old PHP prefixes MariaDB versions with "5.5.5-" — strip before comparing.
+		$server = preg_replace( '/^5\.5\.5-/', '', $server );
+
+		if ( preg_match( '/(?P<ver>\d+\.\d+\.\d+)/', $server, $match ) ) {
+			return version_compare( $match['ver'], '10.6.0', '>=' );
+		}
+
+		return false;
+	}
+
+	/**
+	 * Ensure Action Scheduler custom table names are registered on $wpdb.
+	 *
+	 * Empty `$wpdb->actionscheduler_actions` produces claim SQL that starts at
+	 * WHERE and throws: "syntax error ... near 'WHERE claim_id = 0...'".
+	 *
+	 * @return void
+	 */
+	public static function ensure_as_table_names() {
+		global $wpdb;
+
+		if ( ! is_object( $wpdb ) ) {
+			return;
+		}
+
+		$tables = array(
+			'actionscheduler_actions',
+			'actionscheduler_claims',
+			'actionscheduler_groups',
+			'actionscheduler_logs',
+		);
+
+		foreach ( $tables as $table ) {
+			if ( empty( $wpdb->$table ) ) {
+				$wpdb->$table = $wpdb->prefix . $table;
+			}
+		}
 	}
 
 	/**
@@ -1454,6 +1521,7 @@ final class Job_Action_Scheduler {
 			return 0;
 		}
 
+		self::ensure_as_table_names();
 		self::prune_duplicate_pending_slices();
 		self::ensure_scheduled();
 
@@ -1484,6 +1552,8 @@ final class Job_Action_Scheduler {
 		add_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
 		add_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
 
+		$claim_failed = false;
+
 		try {
 			$runner = \ActionScheduler_QueueRunner::instance();
 			$done   = (int) $runner->run( 'PolymartAI' );
@@ -1496,13 +1566,16 @@ final class Job_Action_Scheduler {
 					$e->getMessage()
 				)
 			);
-			$done = 0;
+			$done         = 0;
+			$claim_failed = true;
 		}
 
 		remove_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
 		remove_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
 
-		if ( $done <= 0 && $force_inline && \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
+		// Claim SQL failures must fall back to the direct batch path, otherwise
+		// the bulk job stalls with "Unable to claim actions".
+		if ( $done <= 0 && ( $force_inline || $claim_failed ) && \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			// Never spawn a parallel inline batch while AS or the slice mutex owns the job.
 			if ( self::is_slice_execution_active() && self::$current_action_id <= 0 ) {
 				$job         = \PolymartAI\Activity_Logger::get_job_for_as_debug();

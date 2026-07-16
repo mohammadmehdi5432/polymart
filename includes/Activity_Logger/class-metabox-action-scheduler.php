@@ -2065,6 +2065,8 @@ final class Metabox_Action_Scheduler {
 			return 0;
 		}
 
+		Job_Action_Scheduler::ensure_as_table_names();
+
 		$time_limit = (int) apply_filters( 'polymart_ai_metabox_as_queue_time_limit', 90 );
 		$batch_size = (int) apply_filters( 'polymart_ai_metabox_as_queue_batch_size', 1 );
 
@@ -2078,17 +2080,20 @@ final class Metabox_Action_Scheduler {
 		add_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
 		add_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
 
+		$claim_failed = false;
+
 		try {
 			$runner = \ActionScheduler_QueueRunner::instance();
 			$done   = (int) $runner->run( 'PolymartAI-Metabox' );
 		} catch ( \Throwable $e ) {
-			$done = 0;
+			$done         = 0;
+			$claim_failed = true;
 		}
 
 		remove_filter( 'action_scheduler_queue_runner_time_limit', $time_filter, 50 );
 		remove_filter( 'action_scheduler_queue_runner_batch_size', $batch_filter, 50 );
 
-		if ( $done <= 0 && $force_inline ) {
+		if ( $done <= 0 && ( $force_inline || $claim_failed ) ) {
 			self::run_metabox_batch_inline_fallback();
 		}
 

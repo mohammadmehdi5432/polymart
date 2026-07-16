@@ -405,7 +405,10 @@ final class Language_Registry {
 		$new_prefixes = self::collect_prefixes( $sanitized );
 
 		if ( $old_prefixes !== $new_prefixes ) {
-			flush_rewrite_rules();
+			// Re-register rules for the just-saved prefixes, then flush.
+			// Bare flush_rewrite_rules() would persist only rules from init
+			// (missing newly enabled prefixes like /ar/).
+			\PolymartAI\Routing\Url_Router::refresh_rewrite_rules();
 		}
 
 		return self::format_for_api( $sanitized );

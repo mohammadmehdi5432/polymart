@@ -74,6 +74,7 @@ final class Url_Router {
 		add_filter( 'determine_locale', array( $this, 'filter_frontend_locale' ), 20 );
 
 		add_action( 'init', array( $this, 'register_rewrite_rules' ) );
+		add_action( 'init', array( $this, 'maybe_heal_missing_language_rewrite_rules' ), 99 );
 		add_filter( 'query_vars', array( $this, 'register_query_vars' ) );
 		add_action( 'parse_request', array( $this, 'resolve_language_request' ), 5 );
 		add_filter( 'redirect_canonical', array( $this, 'disable_canonical_redirect_for_translated_urls' ), 10, 2 );
@@ -93,10 +94,7 @@ final class Url_Router {
 	 */
 	public static function activate() {
 		Language_Registry::maybe_seed_defaults();
-
-		$router = new self();
-		$router->register_rewrite_rules();
-		flush_rewrite_rules();
+		self::refresh_rewrite_rules();
 	}
 
 	/**
@@ -470,6 +468,15 @@ final class Url_Router {
 	 * @return void
 	 */
 	public function register_rewrite_rules() {
+		self::register_language_rewrite_rules();
+	}
+
+	/**
+	 * Add rewrite tags and per-language prefix rules (no flush).
+	 *
+	 * @return void
+	 */
+	public static function register_language_rewrite_rules() {
 		Language_Registry::maybe_seed_defaults();
 
 		add_rewrite_tag( '%' . self::QUERY_VAR . '%', '([^&]+)' );
@@ -479,7 +486,7 @@ final class Url_Router {
 			$prefix = preg_quote( (string) $language['url_prefix'], '#' );
 			$code   = (string) $language['code'];
 
-			$home_query = self::QUERY_VAR . '=' . $code;
+			$home_query    = self::QUERY_VAR . '=' . $code;
 			$front_page_id = self::get_static_front_page_id();
 
 			if ( $front_page_id > 0 ) {
@@ -501,13 +508,102 @@ final class Url_Router {
 	}
 
 	/**
+	 * Re-register language rewrite rules, then persist them.
+	 *
+	 * Must be used whenever language prefixes change. Calling flush_rewrite_rules()
+	 * alone only saves rules already registered earlier in the request (usually
+	 * from init) — newly added prefixes like /ar/ would otherwise 404 until a
+	 * manual Permalinks save.
+	 *
+	 * @return void
+	 */
+	public static function refresh_rewrite_rules() {
+		self::register_language_rewrite_rules();
+		flush_rewrite_rules( false );
+	}
+
+	/**
 	 * Flush rewrite rules when the static front page configuration changes.
 	 *
 	 * @return void
 	 */
 	public function flush_rewrite_rules_on_front_page_change() {
-		$this->register_rewrite_rules();
-		flush_rewrite_rules();
+		self::refresh_rewrite_rules();
+	}
+
+	/**
+	 * One-shot heal when stored rewrite rules omit an enabled language prefix.
+	 *
+	 * Covers production sites that added /ar/ (etc.) before refresh_rewrite_rules
+	 * existed — without requiring a second Languages save.
+	 *
+	 * @return void
+	 */
+	public function maybe_heal_missing_language_rewrite_rules() {
+		if ( wp_installing() ) {
+			return;
+		}
+
+		$routed = Language_Registry::get_routed_languages();
+
+		if ( empty( $routed ) ) {
+			return;
+		}
+
+		$stored = get_option( 'rewrite_rules' );
+
+		if ( ! is_array( $stored ) || empty( $stored ) ) {
+			return;
+		}
+
+		foreach ( $routed as $language ) {
+			$prefix = sanitize_key( (string) ( $language['url_prefix'] ?? '' ) );
+
+			if ( '' === $prefix ) {
+				continue;
+			}
+
+			if ( self::rewrite_rules_contain_language_prefix( $stored, $prefix ) ) {
+				continue;
+			}
+
+			if ( get_transient( 'polymart_ai_rewrite_heal_lock' ) ) {
+				return;
+			}
+
+			set_transient( 'polymart_ai_rewrite_heal_lock', 1, 120 );
+			self::refresh_rewrite_rules();
+
+			return;
+		}
+	}
+
+	/**
+	 * Whether the rewrite_rules option includes rules for a language URL prefix.
+	 *
+	 * @param array<string, string> $rules  Stored rewrite rules.
+	 * @param string                $prefix Language URL prefix (e.g. ar).
+	 * @return bool
+	 */
+	private static function rewrite_rules_contain_language_prefix( array $rules, $prefix ) {
+		$prefix = sanitize_key( (string) $prefix );
+
+		if ( '' === $prefix ) {
+			return true;
+		}
+
+		$home_pattern = '^' . $prefix . '/?$';
+		$path_needle  = '^' . $prefix . '/';
+
+		foreach ( array_keys( $rules ) as $rule ) {
+			$rule = (string) $rule;
+
+			if ( $rule === $home_pattern || 0 === strpos( $rule, $path_needle ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
