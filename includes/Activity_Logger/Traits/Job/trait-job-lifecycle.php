@@ -159,7 +159,13 @@ trait Trait_Job_Lifecycle {
 				}
 
 				if ( empty( $job['partial_post_id'] ) && absint( $fresh['partial_post_id'] ?? 0 ) > 0 ) {
-					$job['partial_post_id'] = absint( $fresh['partial_post_id'] );
+					$fresh_pin = absint( $fresh['partial_post_id'] );
+					$pin_lang  = sanitize_key( (string) ( $job['lang'] ?? $fresh['lang'] ?? '' ) );
+
+					// Do not resurrect Elementor pins after seal/leave-queue cleared them.
+					if ( '' === $pin_lang || ! self::elementor_companion_is_bulk_complete( $fresh_pin, $pin_lang ) ) {
+						$job['partial_post_id'] = $fresh_pin;
+					}
 				}
 			} else {
 				foreach ( array( 'deferred_queue', 'retry_queue' ) as $queue_key ) {

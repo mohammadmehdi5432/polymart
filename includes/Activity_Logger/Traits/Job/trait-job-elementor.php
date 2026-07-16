@@ -226,6 +226,10 @@ trait Trait_Job_Elementor {
 			return false;
 		}
 
+		if ( self::elementor_companion_is_bulk_complete( $post_id, $lang ) ) {
+			return false;
+		}
+
 		$job_phase  = sanitize_key( (string) ( $job['partial_phase'] ?? '' ) );
 		$post_state = Post_Translator::get_job_partial_state( $post_id, $lang );
 		$post_phase = sanitize_key( (string) ( $post_state['phase'] ?? '' ) );
@@ -325,6 +329,19 @@ trait Trait_Job_Elementor {
 
 	public static function should_prioritize_elementor_partial( array $job ) {
 		$lang = sanitize_key( (string) ( $job['lang'] ?? 'en' ) );
+
+		// Heal ghost pins left after seal (library templates especially).
+		$pinned = absint( $job['partial_post_id'] ?? 0 );
+
+		if ( $pinned > 0 && '' !== $lang && self::elementor_companion_is_bulk_complete( $pinned, $lang ) ) {
+			$job['partial_post_id']  = null;
+			$job['partial_phase']    = null;
+			$job['partial_progress'] = null;
+			unset( $job['step_partial'] );
+			self::save_job( $job );
+
+			return false;
+		}
 
 		if ( self::job_has_active_elementor_pin( $job, $lang ) ) {
 			return true;

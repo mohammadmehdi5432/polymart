@@ -89,6 +89,22 @@ trait Trait_Worker_Heartbeat {
 			return;
 		}
 
+		// After seal/leave-queue, never re-pin Elementor library templates (caused
+		// «تماس باما در ساری» to stay pinned with no AS work → recovery thrash).
+		if ( self::elementor_companion_is_bulk_complete( $post_id, $lang ) ) {
+			if ( absint( $job['partial_post_id'] ?? 0 ) === $post_id ) {
+				$job['partial_post_id']  = null;
+				$job['partial_phase']    = null;
+				$job['partial_progress'] = null;
+				unset( $job['step_partial'] );
+				$job['worker_heartbeat_at'] = time();
+				$job['last_cron_at']        = time();
+				self::save_job( $job );
+			}
+
+			return;
+		}
+
 		$marker = Post_Translator::format_elementor_job_progress_marker( $post_id, $lang );
 
 		if ( '' === $marker || ! preg_match( '/^\d+\/\d+/', $marker ) ) {
@@ -124,6 +140,40 @@ trait Trait_Worker_Heartbeat {
 		$job['worker_heartbeat_at'] = time();
 		$job['last_cron_at']        = time();
 		self::save_job( $job );
+	}
+
+	/**
+	 * Whether Elementor work for this post is finished for the active bulk language.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language code.
+	 * @return bool
+	 */
+	private static function elementor_companion_is_bulk_complete( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! Post_Translator::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! Post_Translator::is_elementor_translation_finalized( $post_id, $lang ) ) {
+			return false;
+		}
+
+		if ( Post_Translator::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
+			return false;
+		}
+
+		if ( Post_Translator::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return false;
+		}
+
+		if ( ! Post_Translator::elementor_translation_is_storefront_ready( $post_id, $lang ) ) {
+			return false;
+		}
+
+		return ! Post_Translator::has_remaining_field_gaps_for_job( $post_id, $lang );
 	}
 
 	private static function touch_worker_heartbeat() {
