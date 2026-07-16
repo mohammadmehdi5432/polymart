@@ -58,6 +58,11 @@ trait Trait_Queue_Pick {
 			);
 		}
 
+		// Drop stale deferred seeds that failed the actionable filter so they cannot pin the picker.
+		if ( ! empty( self::get_deferred_queue( $job ) ) ) {
+			$job['deferred_queue'] = array();
+		}
+
 		$exhausted_ids = self::get_exhausted_job_post_ids( $job );
 		$retry_queue   = array_values(
 			array_filter(
@@ -253,8 +258,9 @@ trait Trait_Queue_Pick {
 	}
 
 	private static function get_forward_scan_exclude_ids( array $job ) {
-		$deferred = array_map( 'absint', self::get_deferred_queue( $job ) );
-		$partial  = absint( $job['partial_post_id'] ?? 0 );
+		// Only exclude IDs we are actively holding. Do NOT exclude the full deferred_queue —
+		// non-actionable seeds left in deferred were blocking find_next forever (empty picker).
+		$partial = absint( $job['partial_post_id'] ?? 0 );
 
 		return array_values(
 			array_unique(
@@ -262,7 +268,6 @@ trait Trait_Queue_Pick {
 					array_merge(
 						self::get_exhausted_job_post_ids( $job ),
 						self::get_parked_ids( $job ),
-						$deferred,
 						$partial > 0 ? array( $partial ) : array(),
 						array_map( 'absint', is_array( $job['succeeded_ids'] ?? null ) ? $job['succeeded_ids'] : array() )
 					)

@@ -57,10 +57,8 @@ trait Trait_Storage {
 		$finalized = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
 
 		if ( is_numeric( $finalized ) && absint( $finalized ) > 0 ) {
-			if ( self::elementor_job_has_remaining_payload( $post_id, $lang ) ) {
-				return false;
-			}
-
+			// Trust the stamp. Do NOT call elementor_job_has_remaining_payload() here —
+			// that created infinite recursion with remaining's finalized check and 503'd /en/.
 			return true;
 		}
 

@@ -1404,26 +1404,20 @@ trait Trait_Job_Slice {
 			return false;
 		}
 
-		// Never repair/decode Elementor trees here — Start/probes call this on dozens of posts
-		// and the old repair+remaining_payload path timed out the REST start request (503 / «در حال شروع…»).
+		// Cheap Elementor gates only (no repair / remaining_payload decode on probe paths).
 		if ( self::uses_elementor_builder( $post_id ) ) {
+			$finalized_raw = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
+			$is_finalized  = is_numeric( $finalized_raw ) && absint( $finalized_raw ) > 0;
+			$is_current    = self::is_elementor_translation_current( $post_id, $lang );
+
+			if ( self::elementor_job_has_durable_partial_state( $post_id, $lang ) ) {
+				return true;
+			}
+
 			if (
-				self::is_elementor_translation_finalized( $post_id, $lang )
-				&& self::is_elementor_translation_current( $post_id, $lang )
-			) {
-				// Elementor companion sealed — only title/core gaps can still need work below.
-			} elseif ( self::elementor_job_has_durable_partial_state( $post_id, $lang ) ) {
-				return true;
-			} elseif (
 				self::should_require_elementor_translation( $post_id )
 				&& self::has_elementor_persian_content( $post_id )
-				&& ! self::is_elementor_translation_finalized( $post_id, $lang )
-			) {
-				return true;
-			} elseif (
-				self::should_require_elementor_translation( $post_id )
-				&& self::has_elementor_persian_content( $post_id )
-				&& ! self::is_elementor_translation_current( $post_id, $lang )
+				&& ( ! $is_finalized || ! $is_current )
 			) {
 				return true;
 			}

@@ -1388,9 +1388,13 @@ trait Trait_Job_State {
 			return false;
 		}
 
-		// Trust sealed + current hash without decoding EN/source trees (Start probes).
+		// Fast path: read finalized META directly — never call is_elementor_translation_finalized()
+		// (that function used to call this method → infinite recursion → site-wide 503).
+		$finalized = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
+
 		if (
-			self::is_elementor_translation_finalized( $post_id, $lang )
+			is_numeric( $finalized )
+			&& absint( $finalized ) > 0
 			&& self::is_elementor_translation_current( $post_id, $lang )
 		) {
 			return false;
