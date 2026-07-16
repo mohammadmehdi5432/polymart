@@ -120,6 +120,18 @@ final class Job_Action_Scheduler {
 		// Older MariaDB / mis-detected versions throw SQL syntax errors on SKIP LOCKED
 		// during claim_actions — prefer the compatible claim path.
 		add_filter( 'action_scheduler_db_supports_skip_locked', array( __CLASS__, 'filter_skip_locked_support' ), 20 );
+
+		// Empty $wpdb->actionscheduler_* yields SQL "FROM a" / "Table 'db.a' doesn't exist"
+		// (Query Monitor often attributes it to Rank Math). Heal early and often.
+		self::ensure_as_table_names();
+		add_action( 'action_scheduler_init', array( __CLASS__, 'ensure_as_table_names' ), 1 );
+		add_action( 'plugins_loaded', array( __CLASS__, 'ensure_as_table_names' ), 100 );
+		add_action( 'init', array( __CLASS__, 'ensure_as_table_names' ), 1 );
+		add_action( 'admin_init', array( __CLASS__, 'ensure_as_table_names' ), 1 );
+		add_action( 'rest_api_init', array( __CLASS__, 'ensure_as_table_names' ), 1 );
+		add_action( 'wp_loaded', array( __CLASS__, 'ensure_as_table_names' ), 1 );
+		// Last-resort rewrite if anything queries AS while table props are empty.
+		add_filter( 'query', array( __CLASS__, 'filter_heal_broken_as_sql' ), 1 );
 	}
 
 	/**
@@ -159,15 +171,16 @@ final class Job_Action_Scheduler {
 	/**
 	 * Ensure Action Scheduler custom table names are registered on $wpdb.
 	 *
-	 * Empty `$wpdb->actionscheduler_actions` produces claim SQL that starts at
-	 * WHERE and throws: "syntax error ... near 'WHERE claim_id = 0...'".
+	 * Empty `$wpdb->actionscheduler_actions` produces SQL like `FROM a` and
+	 * MySQL error: Table 'db.a' doesn't exist — every count/claim then fails and
+	 * the bulk worker stalls in a wake/idle loop.
 	 *
 	 * @return void
 	 */
 	public static function ensure_as_table_names() {
 		global $wpdb;
 
-		if ( ! is_object( $wpdb ) ) {
+		if ( ! is_object( $wpdb ) || ! isset( $wpdb->prefix ) ) {
 			return;
 		}
 
@@ -179,10 +192,60 @@ final class Job_Action_Scheduler {
 		);
 
 		foreach ( $tables as $table ) {
-			if ( empty( $wpdb->$table ) ) {
-				$wpdb->$table = $wpdb->prefix . $table;
+			$expected = $wpdb->prefix . $table;
+
+			// Always force the correct prefixed name (empty OR stale/wrong value).
+			if ( ! isset( $wpdb->$table ) || (string) $wpdb->$table !== $expected ) {
+				$wpdb->$table = $expected;
+			}
+
+			if ( isset( $wpdb->tables ) && is_array( $wpdb->tables ) && ! in_array( $table, $wpdb->tables, true ) ) {
+				$wpdb->tables[] = $table;
 			}
 		}
+	}
+
+	/**
+	 * Action Scheduler store with table names healed first.
+	 *
+	 * @return \ActionScheduler_Store
+	 */
+	private static function as_store() {
+		self::ensure_as_table_names();
+
+		return \ActionScheduler::store();
+	}
+
+	/**
+	 * Rewrite broken AS SQL when table names were empty (`FROM a` / `JOIN g`).
+	 *
+	 * @param string $query SQL.
+	 * @return string
+	 */
+	public static function filter_heal_broken_as_sql( $query ) {
+		if ( ! is_string( $query ) || false === stripos( $query, 'from a' ) || false === stripos( $query, 'join g' ) ) {
+			return $query;
+		}
+
+		if ( false === stripos( $query, 'action_id' ) ) {
+			return $query;
+		}
+
+		self::ensure_as_table_names();
+
+		global $wpdb;
+
+		$actions = isset( $wpdb->actionscheduler_actions ) ? (string) $wpdb->actionscheduler_actions : '';
+		$groups  = isset( $wpdb->actionscheduler_groups ) ? (string) $wpdb->actionscheduler_groups : '';
+
+		if ( '' === $actions || '' === $groups || 'a' === $actions || 'g' === $groups ) {
+			return $query;
+		}
+
+		$healed = preg_replace( '/\bFROM\s+a\b/i', 'FROM ' . $actions . ' a', $query, 1 );
+		$healed = preg_replace( '/\bLEFT\s+JOIN\s+g\b/i', 'LEFT JOIN ' . $groups . ' g', (string) $healed, 1 );
+
+		return is_string( $healed ) ? $healed : $query;
 	}
 
 	/**
@@ -192,6 +255,7 @@ final class Job_Action_Scheduler {
 	 * @return void
 	 */
 	public static function capture_before_execute( $action_id ) {
+		self::ensure_as_table_names();
 		self::$captured_action_id = absint( $action_id );
 	}
 
@@ -227,6 +291,8 @@ final class Job_Action_Scheduler {
 		if ( ! self::is_available() ) {
 			return 0;
 		}
+
+		self::ensure_as_table_names();
 
 		if ( $force && ! \PolymartAI\Activity_Logger::is_bulk_worker_lively( self::STALE_RUNNING_SEC ) ) {
 			self::recover_stale_running_actions( self::STALE_RUNNING_SEC );
@@ -421,6 +487,8 @@ final class Job_Action_Scheduler {
 			return false;
 		}
 
+		self::ensure_as_table_names();
+
 		if ( function_exists( 'as_has_scheduled_action' ) && as_has_scheduled_action( self::HOOK, null, self::GROUP ) ) {
 			return true;
 		}
@@ -448,7 +516,7 @@ final class Job_Action_Scheduler {
 		$cancelled = 0;
 
 		try {
-			$store = \ActionScheduler::store();
+			$store = self::as_store();
 			$ids   = $store->query_actions(
 				array(
 					'hook'     => self::HOOK,
@@ -492,7 +560,7 @@ final class Job_Action_Scheduler {
 		$cancelled = 0;
 
 		try {
-			$store = \ActionScheduler::store();
+			$store = self::as_store();
 			$ids   = $store->query_actions(
 				array(
 					'hook'     => self::HOOK,
@@ -537,6 +605,7 @@ final class Job_Action_Scheduler {
 			return;
 		}
 
+		self::ensure_as_table_names();
 		self::fail_all_running_actions();
 		self::clear_slice_mutex();
 
@@ -552,6 +621,8 @@ final class Job_Action_Scheduler {
 	 */
 	public static function handle_slice_action( ...$unused ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter
 		unset( $unused );
+
+		self::ensure_as_table_names();
 
 		// Pre-execution brake: Stop/Pause must kill the tick before any AI work.
 		if ( Translation_Scheduler_Coordinator::should_abort_bulk_work() ) {
@@ -1309,7 +1380,7 @@ final class Job_Action_Scheduler {
 		}
 
 		try {
-			$store = \ActionScheduler::store();
+			$store = self::as_store();
 			$count = $store->query_actions(
 				array(
 					'hook'     => self::HOOK,
@@ -1336,7 +1407,7 @@ final class Job_Action_Scheduler {
 		}
 
 		try {
-			$store = \ActionScheduler::store();
+			$store = self::as_store();
 			$ids   = $store->query_actions(
 				array(
 					'hook'     => self::HOOK,
@@ -1502,7 +1573,7 @@ final class Job_Action_Scheduler {
 		}
 
 		try {
-			\ActionScheduler::store()->mark_failure( $action_id );
+			self::as_store()->mark_failure( $action_id );
 		} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 		}
 	}
