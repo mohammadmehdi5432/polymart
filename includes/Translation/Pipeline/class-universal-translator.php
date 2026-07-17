@@ -1068,6 +1068,10 @@ final class Universal_Translator {
 			esc_html( $embedded_hits ? implode( ',', $embedded_hits ) : '-' )
 		);
 
+		if ( $serving && $post_id > 0 && ! Post_Translator::is_elementor_translation_current( $post_id, $lang ) ) {
+			echo "<!-- Polymart AI: companion served with stale source hash (Elementor reshuffle) — status may show partial -->\n";
+		}
+
 		if ( ! $serving ) {
 			$explain = Post_Translator::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
 			$codes   = implode( ',', array_map( 'strval', (array) ( $explain['codes'] ?? array() ) ) );

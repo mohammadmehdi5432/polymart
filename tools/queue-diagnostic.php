@@ -269,6 +269,9 @@ function polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang ) {
 				\PolymartAI\Translation\Post_Translator::get_elementor_source_hash_meta_key( $lang ),
 				true
 			),
+			'source_hash_current'                      => method_exists( '\PolymartAI\Translation\Post_Translator', 'is_elementor_translation_current' )
+				? (bool) \PolymartAI\Translation\Post_Translator::is_elementor_translation_current( $post_id, $lang )
+				: null,
 			'_polymart_ai_elementor_progress_' . $lang  => (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ),
 			'_polymart_ai_elementor_error_' . $lang     => (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ),
 			'title_fa'                                          => (string) $post->post_title,
@@ -276,6 +279,41 @@ function polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang ) {
 			'title_' . $lang                                    => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
 			'title_meta_key_' . $lang                           => \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ),
 		),
+		'can_serve_light' => ( static function () use ( $post_id, $lang, $en_bytes ) {
+			$finalized_raw = (string) get_post_meta( $post_id, '_polymart_ai_elementor_finalized_' . $lang, true );
+			$error         = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ) );
+			$progress      = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ) );
+			$hash_current  = method_exists( '\PolymartAI\Translation\Post_Translator', 'is_elementor_translation_current' )
+				? (bool) \PolymartAI\Translation\Post_Translator::is_elementor_translation_current( $post_id, $lang )
+				: null;
+			$codes         = array();
+
+			if ( $en_bytes <= 2 ) {
+				$codes[] = 'missing_companion_json';
+			}
+
+			if ( '' === $finalized_raw || ! is_numeric( $finalized_raw ) ) {
+				$codes[] = 'not_finalized';
+			}
+
+			if ( '' !== $error ) {
+				$codes[] = 'hard_error_meta';
+			}
+
+			if ( '' !== $progress ) {
+				$codes[] = 'progress_meta_present';
+			}
+
+			return array(
+				'ok'                => empty( $codes ),
+				'codes'             => $codes,
+				'hash_current'      => $hash_current,
+				'source_hash_stale' => ( false === $hash_current ),
+				'finalized'         => ( '' !== $finalized_raw && is_numeric( $finalized_raw ) ),
+				'stored_bytes'      => $en_bytes,
+				'note'              => 'Cheap meta gate only — use full=1 for has_persian / elementor_scan.',
+			);
+		} )(),
 	);
 }
 

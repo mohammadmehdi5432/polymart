@@ -463,10 +463,11 @@ trait Trait_Storage {
 
 		if ( '' !== $progress ) {
 			// Finalized jobs sometimes keep a human-readable progress marker (e.g. 24/24).
+			// Do not treat source_hash mismatch as a progress lock — Elementor reshuffles
+			// often stale the raw hash while the companion is still the right document.
 			if (
 				! self::is_elementor_progress_message( $progress )
 				|| ! $finalized
-				|| ! $hash_current
 				|| $has_persian
 			) {
 				$codes[]    = 'progress_meta_blocks_serve';
@@ -496,9 +497,13 @@ trait Trait_Storage {
 			$messages[] = __( 'JSON ترجمه‌شده هنوز فیلدهای فارسی whitelist دارد.', 'polymart-ai' );
 		}
 
+		// Hash mismatch must NOT block storefront serve. Elementor often rewrites
+		// `_elementor_data` (key order, CSS ids, empty settings) without changing copy —
+		// that stamped source_hash_stale and made /ar|/en fall back to full Persian while
+		// a finalized companion sat unused (homepage #1021). Status/queue still see
+		// hash_current=false via meta and can re-translate when text actually changes.
 		if ( ! $hash_current ) {
-			$codes[]    = 'source_hash_stale';
-			$messages[] = __( 'هش منبع Elementor با JSON فارسی فعلی جور نیست (منبع عوض شده).', 'polymart-ai' );
+			$meta['source_hash_stale'] = true;
 		}
 
 		$codes = array_values( array_unique( $codes ) );

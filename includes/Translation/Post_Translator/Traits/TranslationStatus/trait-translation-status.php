@@ -140,6 +140,10 @@ trait Trait_Translation_Status {
 					|| self::elementor_job_has_remaining_payload( $post_id, $lang )
 					|| (
 						self::has_elementor_persian_content( $post_id )
+						&& ! self::is_elementor_translation_current( $post_id, $lang )
+					)
+					|| (
+						self::has_elementor_persian_content( $post_id )
 						&& ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang )
 					)
 				)
@@ -150,6 +154,7 @@ trait Trait_Translation_Status {
 			} elseif (
 				self::uses_elementor_builder( $post_id )
 				&& self::is_elementor_translation_finalized( $post_id, $lang )
+				&& self::is_elementor_translation_current( $post_id, $lang )
 				&& self::elementor_translation_is_storefront_ready( $post_id, $lang )
 				&& ! self::elementor_job_has_remaining_payload( $post_id, $lang )
 				&& ( ! $post instanceof \WP_Post || empty( self::collect_persian_fields( $post, $lang ) ) )

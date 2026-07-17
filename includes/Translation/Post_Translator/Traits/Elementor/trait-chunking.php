@@ -1491,14 +1491,16 @@ trait Trait_Chunking {
 		// "Accepted" force-finalize must NOT hide Persian leftovers — otherwise
 		// remaining_payload becomes empty while audit still says ناقص Elementor
 		// and the bulk job bounces to the next post forever.
+		// Require a real translation (not FA echo). For ar, !rejects alone is true for
+		// any Arabic-script string including unchanged Persian source.
 		if ( self::elementor_path_is_accepted( $path ) ) {
 			$mapped = isset( $map[ $path ] ) ? (string) $map[ $path ] : '';
 
-			if ( '' !== $mapped && ! self::elementor_rejects_translated_text( $mapped ) ) {
+			if ( '' !== $mapped && self::elementor_map_value_is_valid_translation( $path, $text, $mapped ) ) {
 				return true;
 			}
 
-			// Unusable / empty accepted → fall through to real completeness checks.
+			// Unusable / empty / source-echo accepted → fall through to real completeness checks.
 		}
 
 		if (
