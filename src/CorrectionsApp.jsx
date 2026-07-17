@@ -47,11 +47,12 @@ export default function CorrectionsApp() {
   const [find, setFind] = useState('');
   const [replace, setReplace] = useState('');
   const [mode, setMode] = useState('contains');
-  const [wordBoundary, setWordBoundary] = useState(true);
+  const [wordBoundary, setWordBoundary] = useState(false);
   const [scopes, setScopes] = useState(['ui_strings', 'products', 'elementor']);
   const [saveGlossary, setSaveGlossary] = useState(true);
   const [matches, setMatches] = useState([]);
   const [selected, setSelected] = useState({});
+  const [replaceOverrides, setReplaceOverrides] = useState({});
   const [truncated, setTruncated] = useState(false);
   const [cursor, setCursor] = useState({});
   const [previewing, setPreviewing] = useState(false);
@@ -62,8 +63,17 @@ export default function CorrectionsApp() {
   const [section, setSection] = useState('correct');
 
   const selectedMatches = useMemo(
-    () => matches.filter((m) => selected[m.id]),
-    [matches, selected]
+    () =>
+      matches
+        .filter((m) => selected[m.id])
+        .map((m) => ({
+          ...m,
+          replace:
+            typeof replaceOverrides[m.id] === 'string' && replaceOverrides[m.id].trim() !== ''
+              ? replaceOverrides[m.id]
+              : replace,
+        })),
+    [matches, selected, replaceOverrides, replace]
   );
 
   const loadGlossary = useCallback(async (lang) => {
@@ -107,12 +117,23 @@ export default function CorrectionsApp() {
     setSelected((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const selectAllMatches = (checked) => {
+	const selectAllMatches = (checked) => {
     const next = {};
     matches.forEach((m) => {
       next[m.id] = checked;
     });
     setSelected(next);
+  };
+
+  const matchReplaceValue = (matchId) => {
+    if (typeof replaceOverrides[matchId] === 'string') {
+      return replaceOverrides[matchId];
+    }
+    return replace;
+  };
+
+  const setMatchReplace = (matchId, value) => {
+    setReplaceOverrides((prev) => ({ ...prev, [matchId]: value }));
   };
 
   const runPreview = async (append = false) => {
@@ -143,10 +164,13 @@ export default function CorrectionsApp() {
 
       if (!append) {
         const nextSelected = {};
+        const nextOverrides = {};
         nextMatches.forEach((m) => {
           nextSelected[m.id] = true;
+          nextOverrides[m.id] = replace;
         });
         setSelected(nextSelected);
+        setReplaceOverrides(nextOverrides);
       } else {
         setSelected((prev) => {
           const next = { ...prev };
@@ -155,13 +179,24 @@ export default function CorrectionsApp() {
           });
           return next;
         });
+        setReplaceOverrides((prev) => {
+          const next = { ...prev };
+          nextMatches.forEach((m) => {
+            if (typeof next[m.id] !== 'string') {
+              next[m.id] = replace;
+            }
+          });
+          return next;
+        });
       }
 
       setNotice({
-        type: nextMatches.length ? 'success' : 'info',
+        type: nextMatches.length ? 'success' : data.truncated ? 'warning' : 'info',
         message: nextMatches.length
-          ? `${nextMatches.length} مورد پیدا شد${data.truncated ? ' (نتایج محدود — می‌توانید بیشتر بارگذاری کنید)' : ''}.`
-          : 'موردی یافت نشد. محدوده یا متن اشتباه را بررسی کنید.',
+          ? `${nextMatches.length} مورد پیدا شد${data.truncated ? ' (نتایج محدود — می‌توانید بیشتر بارگذاری کنید)' : ''}. متن جایگزین هر مورد را می‌توانید پایین کارت ویرایش کنید.`
+          : data.truncated
+            ? 'در این دسته چیزی نبود. «بارگذاری بیشتر» را بزنید یا عبارت کوتاه‌تری مثل «دیکور کی ان دی» را امتحان کنید.'
+            : 'موردی یافت نشد. برای placeholder جستجو، Elementor را تیک بزنید و حالت «شامل» را با بخشی از متن امتحان کنید.',
       });
     } catch (error) {
       setNotice({ type: 'error', message: errorMessage(error, 'پیش‌نمایش ناموفق بود.') });
@@ -511,8 +546,19 @@ export default function CorrectionsApp() {
                       </div>
                       <p className="mt-1 text-xs text-pmai-muted">{match.location}</p>
                       <p className="mt-2 rounded-md bg-gray-50 px-2.5 py-2 text-sm leading-relaxed" dir="auto">
-                        {match.snippet}
+                        {match.snippet || match.value}
                       </p>
+                      <label className="mt-3 block text-xs font-medium text-gray-700">
+                        متن جایگزین این مورد
+                        <textarea
+                          value={matchReplaceValue(match.id)}
+                          onChange={(e) => setMatchReplace(match.id, e.target.value)}
+                          rows={2}
+                          dir="auto"
+                          disabled={!selected[match.id]}
+                          className="mt-1 w-full rounded-lg border border-pmai-border px-2.5 py-2 text-sm focus:border-pmai-primary focus:outline-none focus:ring-1 focus:ring-pmai-primary disabled:bg-gray-50 disabled:opacity-60"
+                        />
+                      </label>
                     </div>
                   </li>
                 ))}

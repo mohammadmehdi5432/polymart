@@ -195,10 +195,14 @@ final class Correction_Job {
 				continue;
 			}
 
+			$replace = isset( $match['replace'] ) && is_string( $match['replace'] ) && '' !== $match['replace']
+				? (string) $match['replace']
+				: (string) $state['replace'];
+
 			$result = Correction_Applier::apply_match(
 				$match,
 				(string) $state['find'],
-				(string) $state['replace'],
+				$replace,
 				(string) $state['mode'],
 				! empty( $state['word_boundary'] )
 			);

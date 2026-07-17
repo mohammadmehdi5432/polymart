@@ -64,6 +64,136 @@ final class Correction_Text {
 	}
 
 	/**
+	 * Whether needle looks like Arabic/Persian script (needs PHP-side scan).
+	 *
+	 * @param string $text Text.
+	 * @return bool
+	 */
+	public static function has_arabic_script( $text ) {
+		return (bool) preg_match( '/[\x{0600}-\x{06FF}]/u', (string) $text );
+	}
+
+	/**
+	 * Fold Arabic/Persian lookalikes and cosmetic marks for comparison.
+	 *
+	 * @param string $text Text.
+	 * @return string
+	 */
+	public static function normalize( $text ) {
+		$text = (string) $text;
+
+		if ( '' === $text ) {
+			return '';
+		}
+
+		// Strip bidi / zero-width marks that break substring search.
+		$text = preg_replace( '/[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{FEFF}]/u', '', $text );
+		$text = str_replace( "\xC2\xA0", ' ', $text ); // NBSP
+
+		// Unify common FA/AR letter variants (ی/ي، ک/ك، الف، ة).
+		$map = array(
+			"\xD9\x8A" => "\xDB\x8C", // ي → ی
+			"\xD9\x89" => "\xDB\x8C", // ى → ی
+			"\xD9\x83" => "\xDA\xA9", // ك → ک
+			"\xD8\xA3" => "\xD8\xA7", // أ → ا
+			"\xD8\xA5" => "\xD8\xA7", // إ → ا
+			"\xD8\xA2" => "\xD8\xA7", // آ → ا
+			"\xD8\xA9" => "\xD9\x87", // ة → ه
+			"\xDB\x81" => "\xD9\x87", // ھ → ه
+		);
+
+		$text = strtr( $text, $map );
+
+		// Collapse whitespace.
+		$text = preg_replace( '/\s+/u', ' ', $text );
+
+		return is_string( $text ) ? trim( $text ) : '';
+	}
+
+	/**
+	 * SQL LIKE needles (raw + folded + flexible wildcards + JSON \u escapes).
+	 *
+	 * @param string $find Find string.
+	 * @return string[]
+	 */
+	public static function sql_like_needles( $find ) {
+		$find = is_string( $find ) ? $find : '';
+
+		if ( '' === $find ) {
+			return array();
+		}
+
+		$needles = array( $find );
+
+		$folded_fa = self::normalize( $find );
+		if ( '' !== $folded_fa && $folded_fa !== $find ) {
+			$needles[] = $folded_fa;
+		}
+
+		// Alternate Arabic yeh/kaf forms (inverse of normalize).
+		$alt = strtr(
+			$find,
+			array(
+				"\xDB\x8C" => "\xD9\x8A", // ی → ي
+				"\xDA\xA9" => "\xD9\x83", // ک → ك
+			)
+		);
+		if ( $alt !== $find ) {
+			$needles[] = $alt;
+		}
+
+		// Do NOT inject MySQL "_" wildcards here: $wpdb->esc_like() escapes them.
+
+		foreach ( array_values( $needles ) as $n ) {
+			$escaped = self::json_unicode_escape( $n );
+			if ( '' !== $escaped && $escaped !== $n ) {
+				$needles[] = $escaped;
+			}
+		}
+
+		$out = array();
+		foreach ( $needles as $n ) {
+			$n = (string) $n;
+			if ( '' !== $n ) {
+				$out[ $n ] = $n;
+			}
+		}
+
+		return array_values( $out );
+	}
+
+	/**
+	 * Escape a UTF-8 string as JSON \uXXXX sequences (Elementor sometimes stores this).
+	 *
+	 * @param string $text Text.
+	 * @return string
+	 */
+	public static function json_unicode_escape( $text ) {
+		$text = (string) $text;
+		$len  = self::utf8_strlen( $text );
+		$out  = '';
+
+		for ( $i = 0; $i < $len; $i++ ) {
+			$ch = self::utf8_substr( $text, $i, 1 );
+			$ord = self::utf8_ord( $ch );
+
+			if ( $ord < 0 ) {
+				$out .= $ch;
+				continue;
+			}
+
+			if ( $ord < 0x80 && ! in_array( $ch, array( '\\', '"' ), true ) ) {
+				$out .= $ch;
+				continue;
+			}
+
+			$out .= sprintf( '\\u%04x', $ord );
+		}
+
+		return $out;
+	}
+
+	/**
 	 * Whether haystack matches the needle under the given mode.
 	 *
 	 * @param string $haystack      Text to search.
@@ -80,20 +210,35 @@ final class Correction_Text {
 		$mode = 'contains' === $mode ? 'contains' : 'exact';
 
 		if ( 'exact' === $mode ) {
-			return $haystack === $needle;
+			if ( $haystack === $needle ) {
+				return true;
+			}
+
+			return self::normalize( $haystack ) === self::normalize( $needle );
 		}
 
 		if ( $word_boundary && self::is_mostly_latin( $needle ) ) {
-			$pattern = '/(?<![\p{L}\p{N}_])' . preg_quote( $needle, '/' ) . '(?![\p{L}\p{N}_])/u';
+			$pattern = '/(?<![\p{L}\p{N}_])' . preg_quote( $needle, '/' ) . '(?![\p{L}\p{N}_])/iu';
 
 			return (bool) preg_match( $pattern, $haystack );
 		}
 
-		return false !== mb_strpos( $haystack, $needle, 0, 'UTF-8' );
+		if ( false !== mb_strpos( $haystack, $needle, 0, 'UTF-8' ) ) {
+			return true;
+		}
+
+		$hay_n = self::normalize( $haystack );
+		$nee_n = self::normalize( $needle );
+
+		if ( '' === $nee_n ) {
+			return false;
+		}
+
+		return false !== mb_strpos( $hay_n, $nee_n, 0, 'UTF-8' );
 	}
 
 	/**
-	 * Replace needle in haystack.
+	 * Replace needle in haystack (supports FA/AR letter variants).
 	 *
 	 * @param string $haystack      Source.
 	 * @param string $needle        Find.
@@ -111,17 +256,33 @@ final class Correction_Text {
 		$mode        = 'contains' === $mode ? 'contains' : 'exact';
 
 		if ( 'exact' === $mode ) {
-			return $haystack === $needle ? $replacement : $haystack;
+			if ( $haystack === $needle || self::normalize( $haystack ) === self::normalize( $needle ) ) {
+				return $replacement;
+			}
+
+			return $haystack;
 		}
 
 		if ( $word_boundary && self::is_mostly_latin( $needle ) ) {
-			$pattern = '/(?<![\p{L}\p{N}_])' . preg_quote( $needle, '/' ) . '(?![\p{L}\p{N}_])/u';
+			$pattern = '/(?<![\p{L}\p{N}_])' . preg_quote( $needle, '/' ) . '(?![\p{L}\p{N}_])/iu';
 			$result  = preg_replace( $pattern, $replacement, $haystack );
 
 			return is_string( $result ) ? $result : $haystack;
 		}
 
-		return str_replace( $needle, $replacement, $haystack );
+		if ( false !== mb_strpos( $haystack, $needle, 0, 'UTF-8' ) ) {
+			return str_replace( $needle, $replacement, $haystack );
+		}
+
+		$pattern = self::flexible_needle_regex( $needle );
+
+		if ( '' === $pattern ) {
+			return $haystack;
+		}
+
+		$result = preg_replace( '/' . $pattern . '/u', $replacement, $haystack );
+
+		return is_string( $result ) ? $result : $haystack;
 	}
 
 	/**
@@ -142,18 +303,27 @@ final class Correction_Text {
 		}
 
 		$pos = '' !== $needle ? mb_strpos( $haystack, $needle, 0, 'UTF-8' ) : false;
+		$len = '' !== $needle ? self::utf8_strlen( $needle ) : 0;
+
+		if ( false === $pos && '' !== $needle ) {
+			$range = self::find_flexible_range( $haystack, $needle );
+			if ( is_array( $range ) ) {
+				$pos = $range[0];
+				$len = $range[1];
+			}
+		}
 
 		if ( false === $pos ) {
 			$plain = wp_strip_all_tags( $haystack );
-			$len   = self::utf8_strlen( $plain );
+			$plen  = self::utf8_strlen( $plain );
 
-			return $len > ( $radius * 2 )
+			return $plen > ( $radius * 2 )
 				? self::utf8_substr( $plain, 0, $radius * 2 ) . '…'
 				: $plain;
 		}
 
 		$start  = max( 0, $pos - $radius );
-		$length = self::utf8_strlen( $needle ) + ( $radius * 2 );
+		$length = $len + ( $radius * 2 );
 		$slice  = self::utf8_substr( $haystack, $start, $length );
 		$prefix = $start > 0 ? '…' : '';
 		$suffix = ( $start + $length ) < self::utf8_strlen( $haystack ) ? '…' : '';
@@ -180,12 +350,96 @@ final class Correction_Text {
 		}
 
 		if ( $word_boundary && self::is_mostly_latin( $needle ) ) {
-			$pattern = '/(?<![\p{L}\p{N}_])' . preg_quote( $needle, '/' ) . '(?![\p{L}\p{N}_])/u';
+			$pattern = '/(?<![\p{L}\p{N}_])' . preg_quote( $needle, '/' ) . '(?![\p{L}\p{N}_])/iu';
 
 			return (int) preg_match_all( $pattern, $haystack );
 		}
 
-		return substr_count( $haystack, $needle );
+		if ( false !== mb_strpos( $haystack, $needle, 0, 'UTF-8' ) ) {
+			return substr_count( $haystack, $needle );
+		}
+
+		$pattern = self::flexible_needle_regex( $needle );
+
+		if ( '' === $pattern ) {
+			return 1;
+		}
+
+		return (int) preg_match_all( '/' . $pattern . '/u', $haystack );
+	}
+
+	/**
+	 * Regex fragment matching needle with FA/AR letter flexibility.
+	 *
+	 * @param string $needle Needle.
+	 * @return string
+	 */
+	private static function flexible_needle_regex( $needle ) {
+		$needle = (string) $needle;
+		$len    = self::utf8_strlen( $needle );
+
+		if ( $len < 1 ) {
+			return '';
+		}
+
+		$parts = array();
+
+		for ( $i = 0; $i < $len; $i++ ) {
+			$ch = self::utf8_substr( $needle, $i, 1 );
+
+			if ( preg_match( '/\s/u', $ch ) ) {
+				$parts[] = '\s+';
+				continue;
+			}
+
+			if ( in_array( $ch, array( 'ی', 'ي', 'ى' ), true ) ) {
+				$parts[] = '[یيى]';
+				continue;
+			}
+
+			if ( in_array( $ch, array( 'ک', 'ك' ), true ) ) {
+				$parts[] = '[کك]';
+				continue;
+			}
+
+			if ( in_array( $ch, array( 'ا', 'أ', 'إ', 'آ' ), true ) ) {
+				$parts[] = '[اأإآ]';
+				continue;
+			}
+
+			if ( in_array( $ch, array( 'ه', 'ة', 'ھ' ), true ) ) {
+				$parts[] = '[هةھ]';
+				continue;
+			}
+
+			$parts[] = preg_quote( $ch, '/' );
+		}
+
+		return implode( '', $parts );
+	}
+
+	/**
+	 * Locate flexible match range in haystack (char offset + length).
+	 *
+	 * @param string $haystack Haystack.
+	 * @param string $needle   Needle.
+	 * @return array{0:int,1:int}|null
+	 */
+	private static function find_flexible_range( $haystack, $needle ) {
+		$pattern = self::flexible_needle_regex( $needle );
+
+		if ( '' === $pattern || ! preg_match( '/' . $pattern . '/u', $haystack, $m, PREG_OFFSET_CAPTURE ) ) {
+			return null;
+		}
+
+		$byte_pos = isset( $m[0][1] ) ? (int) $m[0][1] : 0;
+		$matched  = isset( $m[0][0] ) ? (string) $m[0][0] : '';
+
+		// Convert byte offset to UTF-8 char offset.
+		$prefix = substr( $haystack, 0, $byte_pos );
+		$pos    = self::utf8_strlen( $prefix );
+
+		return array( $pos, self::utf8_strlen( $matched ) );
 	}
 
 	/**
@@ -222,5 +476,22 @@ final class Correction_Text {
 		}
 
 		return (string) substr( (string) $text, $start, $length );
+	}
+
+	/**
+	 * @param string $char Single UTF-8 char.
+	 * @return int
+	 */
+	private static function utf8_ord( $char ) {
+		if ( function_exists( 'mb_ord' ) ) {
+			$ord = mb_ord( (string) $char, 'UTF-8' );
+
+			return false === $ord ? -1 : (int) $ord;
+		}
+
+		$char = (string) $char;
+		$u    = unpack( 'N', mb_convert_encoding( $char, 'UCS-4BE', 'UTF-8' ) );
+
+		return is_array( $u ) && isset( $u[1] ) ? (int) $u[1] : -1;
 	}
 }

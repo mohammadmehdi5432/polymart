@@ -244,19 +244,29 @@ final class Correction_Glossary {
 		);
 
 		foreach ( $exact as $entry ) {
-			if ( $text === (string) $entry['wrong'] ) {
-				return (string) $entry['preferred'];
-			}
+			$text = Correction_Text::replace(
+				$text,
+				(string) $entry['wrong'],
+				(string) $entry['preferred'],
+				'exact',
+				false
+			);
 		}
 
 		foreach ( $contains as $entry ) {
 			$wrong = (string) $entry['wrong'];
 
-			if ( '' === $wrong || false === mb_strpos( $text, $wrong, 0, 'UTF-8' ) ) {
+			if ( '' === $wrong ) {
 				continue;
 			}
 
-			$text = str_replace( $wrong, (string) $entry['preferred'], $text );
+			$text = Correction_Text::replace(
+				$text,
+				$wrong,
+				(string) $entry['preferred'],
+				'contains',
+				false
+			);
 		}
 
 		return $text;

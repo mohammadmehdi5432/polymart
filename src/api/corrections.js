@@ -1,7 +1,7 @@
 import { api } from './settings';
 
 export function previewCorrections(payload) {
-  return api.post('/corrections/preview', payload, { timeout: 120000 }).then((r) => r.data);
+  return api.post('/corrections/preview', payload, { timeout: 180000 }).then((r) => r.data);
 }
 
 export function applyCorrections(payload) {
