@@ -30,29 +30,56 @@ final class Correction_Applier {
 	 * @return array{ok:bool,replacements:int,message:string}|\WP_Error
 	 */
 	public static function apply_match( array $match, $find, $replace, $mode = 'exact', $word_boundary = false ) {
-		$scope = sanitize_key( (string) ( $match['scope'] ?? '' ) );
-		$valid = Correction_Text::validate_pair( $find, $replace, $mode, $word_boundary );
+		$scope         = sanitize_key( (string) ( $match['scope'] ?? '' ) );
+		$replace_whole = ! empty( $match['replace_whole'] );
+		$valid         = Correction_Text::validate_pair( $find, $replace, $mode, $word_boundary );
 
 		if ( is_wp_error( $valid ) ) {
 			return $valid;
 		}
 
 		if ( 'ui_strings' === $scope ) {
-			return self::apply_ui_match( $match, $find, $replace, $mode, $word_boundary );
+			return self::apply_ui_match( $match, $find, $replace, $mode, $word_boundary, $replace_whole );
 		}
 
 		if ( 'products' === $scope ) {
-			return self::apply_product_match( $match, $find, $replace, $mode, $word_boundary );
+			return self::apply_product_match( $match, $find, $replace, $mode, $word_boundary, $replace_whole );
 		}
 
 		if ( 'elementor' === $scope ) {
-			return self::apply_elementor_match( $match, $find, $replace, $mode, $word_boundary );
+			return self::apply_elementor_match( $match, $find, $replace, $mode, $word_boundary, $replace_whole );
 		}
 
 		return new \WP_Error(
 			'polymart_ai_correction_scope',
 			__( 'محدودهٔ ناشناخته برای اعمال تصحیح.', 'polymart-ai' )
 		);
+	}
+
+	/**
+	 * Compute new string from old.
+	 *
+	 * @param string $before         Current value.
+	 * @param string $find           Find.
+	 * @param string $replace        Replace / new full value.
+	 * @param string $mode           Mode.
+	 * @param bool   $word_boundary  Boundary.
+	 * @param bool   $replace_whole  Replace entire field.
+	 * @return string
+	 */
+	public static function compute_after( $before, $find, $replace, $mode, $word_boundary, $replace_whole ) {
+		$before  = is_string( $before ) ? $before : '';
+		$replace = is_string( $replace ) ? $replace : '';
+
+		if ( $replace_whole ) {
+			if ( ! Correction_Text::matches( $before, $find, $mode, $word_boundary ) ) {
+				return $before;
+			}
+
+			return $replace;
+		}
+
+		return Correction_Text::replace( $before, $find, $replace, $mode, $word_boundary );
 	}
 
 	/**
@@ -63,7 +90,7 @@ final class Correction_Applier {
 	 * @param bool                 $word_boundary Boundary.
 	 * @return array{ok:bool,replacements:int,message:string}|\WP_Error
 	 */
-	private static function apply_ui_match( array $match, $find, $replace, $mode, $word_boundary ) {
+	private static function apply_ui_match( array $match, $find, $replace, $mode, $word_boundary, $replace_whole = false ) {
 		$id   = (string) ( $match['id'] ?? '' );
 		$hash = (string) ( $match['hash'] ?? '' );
 		$lang = sanitize_key( (string) ( $match['lang'] ?? '' ) );
@@ -88,7 +115,7 @@ final class Correction_Applier {
 		}
 
 		if ( 'runtime' === $store ) {
-			return self::apply_runtime_cache( $lang, $hash, $find, $replace, $mode, $word_boundary );
+			return self::apply_runtime_cache( $lang, $hash, $find, $replace, $mode, $word_boundary, $replace_whole );
 		}
 
 		$bucket = get_option( UI_String_Registry::TRANSLATIONS_OPTION_PREFIX . $lang, array() );
@@ -101,13 +128,13 @@ final class Correction_Applier {
 		}
 
 		$before = $bucket['h'][ $hash ];
-		$after  = Correction_Text::replace( $before, $find, $replace, $mode, $word_boundary );
+		$after  = self::compute_after( $before, $find, $replace, $mode, $word_boundary, $replace_whole );
 
 		if ( $before === $after ) {
 			return array(
-				'ok'            => true,
-				'replacements'  => 0,
-				'message'       => __( 'تغییری لازم نبود.', 'polymart-ai' ),
+				'ok'           => true,
+				'replacements' => 0,
+				'message'      => __( 'تغییری لازم نبود.', 'polymart-ai' ),
 			);
 		}
 
@@ -129,7 +156,7 @@ final class Correction_Applier {
 
 		return array(
 			'ok'           => true,
-			'replacements' => Correction_Text::match_count( $before, $find, $mode, $word_boundary ),
+			'replacements' => $replace_whole ? 1 : Correction_Text::match_count( $before, $find, $mode, $word_boundary ),
 			'message'      => __( 'رشته UI به‌روز شد.', 'polymart-ai' ),
 		);
 	}
@@ -141,9 +168,10 @@ final class Correction_Applier {
 	 * @param string $replace Replace.
 	 * @param string $mode Mode.
 	 * @param bool   $word_boundary Boundary.
+	 * @param bool   $replace_whole Whole field.
 	 * @return array{ok:bool,replacements:int,message:string}|\WP_Error
 	 */
-	private static function apply_runtime_cache( $lang, $hash, $find, $replace, $mode, $word_boundary ) {
+	private static function apply_runtime_cache( $lang, $hash, $find, $replace, $mode, $word_boundary, $replace_whole = false ) {
 		$lang   = sanitize_key( (string) $lang );
 		$option = Runtime_String_Translator::CACHE_OPTION_PREFIX . $lang;
 		$bucket = get_option( $option, array() );
@@ -156,7 +184,7 @@ final class Correction_Applier {
 		}
 
 		$before = $bucket['h'][ $hash ];
-		$after  = Correction_Text::replace( $before, $find, $replace, $mode, $word_boundary );
+		$after  = self::compute_after( $before, $find, $replace, $mode, $word_boundary, $replace_whole );
 
 		if ( $before === $after ) {
 			return array(
@@ -171,7 +199,7 @@ final class Correction_Applier {
 
 		return array(
 			'ok'           => true,
-			'replacements' => Correction_Text::match_count( $before, $find, $mode, $word_boundary ),
+			'replacements' => $replace_whole ? 1 : Correction_Text::match_count( $before, $find, $mode, $word_boundary ),
 			'message'      => __( 'کش ران‌تایم به‌روز شد.', 'polymart-ai' ),
 		);
 	}
@@ -182,9 +210,10 @@ final class Correction_Applier {
 	 * @param string               $replace Replace.
 	 * @param string               $mode Mode.
 	 * @param bool                 $word_boundary Boundary.
+	 * @param bool                 $replace_whole Whole field.
 	 * @return array{ok:bool,replacements:int,message:string}|\WP_Error
 	 */
-	private static function apply_product_match( array $match, $find, $replace, $mode, $word_boundary ) {
+	private static function apply_product_match( array $match, $find, $replace, $mode, $word_boundary, $replace_whole = false ) {
 		$post_id  = absint( $match['post_id'] ?? 0 );
 		$meta_key = (string) ( $match['meta_key'] ?? '' );
 		$path     = isset( $match['path'] ) ? (string) $match['path'] : '';
@@ -209,9 +238,9 @@ final class Correction_Applier {
 			}
 
 			if ( '' !== $path ) {
-				list( $data, $count ) = self::replace_path_leaf( $data, $path, $find, $replace, $mode, $word_boundary );
+				list( $data, $count ) = self::replace_path_leaf( $data, $path, $find, $replace, $mode, $word_boundary, $replace_whole );
 			} else {
-				list( $data, $count ) = Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary );
+				list( $data, $count ) = Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary, $replace_whole );
 			}
 
 			if ( $count <= 0 ) {
@@ -239,7 +268,7 @@ final class Correction_Applier {
 			);
 		}
 
-		$after = Correction_Text::replace( $raw, $find, $replace, $mode, $word_boundary );
+		$after = self::compute_after( $raw, $find, $replace, $mode, $word_boundary, $replace_whole );
 
 		if ( $raw === $after ) {
 			return array(
@@ -269,7 +298,7 @@ final class Correction_Applier {
 
 		return array(
 			'ok'           => true,
-			'replacements' => Correction_Text::match_count( $raw, $find, $mode, $word_boundary ),
+			'replacements' => $replace_whole ? 1 : Correction_Text::match_count( $raw, $find, $mode, $word_boundary ),
 			'message'      => __( 'متای محصول/برگه به‌روز شد.', 'polymart-ai' ),
 		);
 	}
@@ -280,9 +309,10 @@ final class Correction_Applier {
 	 * @param string               $replace Replace.
 	 * @param string               $mode Mode.
 	 * @param bool                 $word_boundary Boundary.
+	 * @param bool                 $replace_whole Whole field.
 	 * @return array{ok:bool,replacements:int,message:string}|\WP_Error
 	 */
-	private static function apply_elementor_match( array $match, $find, $replace, $mode, $word_boundary ) {
+	private static function apply_elementor_match( array $match, $find, $replace, $mode, $word_boundary, $replace_whole = false ) {
 		$post_id  = absint( $match['post_id'] ?? 0 );
 		$meta_key = (string) ( $match['meta_key'] ?? '' );
 		$lang     = sanitize_key( (string) ( $match['lang'] ?? '' ) );
@@ -330,7 +360,7 @@ final class Correction_Applier {
 			);
 		}
 
-		list( $data, $count ) = Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary );
+		list( $data, $count ) = Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary, $replace_whole );
 
 		if ( $count <= 0 ) {
 			return array(
@@ -391,18 +421,19 @@ final class Correction_Applier {
 	 * @param string               $replace Replace.
 	 * @param string               $mode Mode.
 	 * @param bool                 $word_boundary Boundary.
+	 * @param bool                 $replace_whole Whole field.
 	 * @return array{0:array,1:int}
 	 */
-	private static function replace_path_leaf( array $data, $path, $find, $replace, $mode, $word_boundary ) {
+	private static function replace_path_leaf( array $data, $path, $find, $replace, $mode, $word_boundary, $replace_whole = false ) {
 		$parts = explode( '.', (string) $path );
 
 		if ( empty( $parts ) || ( 1 === count( $parts ) && 'value' === $parts[0] ) ) {
-			return Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary );
+			return Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary, $replace_whole );
 		}
 
-		$ref    =& $data;
-		$last   = array_pop( $parts );
-		$ok     = true;
+		$ref  =& $data;
+		$last = array_pop( $parts );
+		$ok   = true;
 
 		foreach ( $parts as $part ) {
 			if ( ! is_array( $ref ) || ! array_key_exists( $part, $ref ) ) {
@@ -414,14 +445,14 @@ final class Correction_Applier {
 		}
 
 		if ( ! $ok || ! is_array( $ref ) || ! array_key_exists( $last, $ref ) || ! is_string( $ref[ $last ] ) ) {
-			return Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary );
+			return Correction_Scanner::replace_array_leaves( $data, $find, $replace, $mode, $word_boundary, $replace_whole );
 		}
 
 		$before       = $ref[ $last ];
-		$ref[ $last ] = Correction_Text::replace( $before, $find, $replace, $mode, $word_boundary );
+		$ref[ $last ] = self::compute_after( $before, $find, $replace, $mode, $word_boundary, $replace_whole );
 		$count        = $before === $ref[ $last ]
 			? 0
-			: Correction_Text::match_count( $before, $find, $mode, $word_boundary );
+			: ( $replace_whole ? 1 : Correction_Text::match_count( $before, $find, $mode, $word_boundary ) );
 
 		return array( $data, $count );
 	}

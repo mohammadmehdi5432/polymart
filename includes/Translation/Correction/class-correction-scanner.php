@@ -629,9 +629,10 @@ final class Correction_Scanner {
 	 * @param string $replace       Replace.
 	 * @param string $mode          Mode.
 	 * @param bool   $word_boundary Boundary.
+	 * @param bool   $replace_whole Replace entire leaf value.
 	 * @return array{0:mixed,1:int} Node and replacement count.
 	 */
-	public static function replace_array_leaves( $node, $find, $replace, $mode, $word_boundary ) {
+	public static function replace_array_leaves( $node, $find, $replace, $mode, $word_boundary, $replace_whole = false ) {
 		$count = 0;
 
 		if ( is_string( $node ) ) {
@@ -640,8 +641,12 @@ final class Correction_Scanner {
 			}
 
 			$before = $node;
-			$after  = Correction_Text::replace( $node, $find, $replace, $mode, $word_boundary );
-			$count  = $before === $after ? 0 : max( 1, Correction_Text::match_count( $before, $find, $mode, $word_boundary ) );
+			$after  = $replace_whole
+				? (string) $replace
+				: Correction_Text::replace( $node, $find, $replace, $mode, $word_boundary );
+			$count  = $before === $after
+				? 0
+				: ( $replace_whole ? 1 : max( 1, Correction_Text::match_count( $before, $find, $mode, $word_boundary ) ) );
 
 			return array( $after, $count );
 		}
@@ -651,7 +656,7 @@ final class Correction_Scanner {
 		}
 
 		foreach ( $node as $key => $child ) {
-			list( $new_child, $child_count ) = self::replace_array_leaves( $child, $find, $replace, $mode, $word_boundary );
+			list( $new_child, $child_count ) = self::replace_array_leaves( $child, $find, $replace, $mode, $word_boundary, $replace_whole );
 			$node[ $key ] = $new_child;
 			$count       += $child_count;
 		}

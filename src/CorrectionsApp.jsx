@@ -42,17 +42,31 @@ function errorMessage(error, fallback) {
   return error?.response?.data?.message || error?.message || fallback;
 }
 
+/** Approximate after-preview for substring replace (server also normalizes FA/AR). */
+function previewAfter(value, findText, replaceText, replaceWhole) {
+  const before = value || '';
+  if (replaceWhole) {
+    return replaceText || '';
+  }
+  if (!findText || !before.includes(findText)) {
+    return before;
+  }
+  return before.split(findText).join(replaceText ?? '');
+}
+
 export default function CorrectionsApp() {
   const { langOptions, targetLang, setTargetLang, loading: langsLoading } = useTargetLanguages('ar');
   const [find, setFind] = useState('');
   const [replace, setReplace] = useState('');
   const [mode, setMode] = useState('contains');
   const [wordBoundary, setWordBoundary] = useState(false);
+  const [replaceWhole, setReplaceWhole] = useState(true);
   const [scopes, setScopes] = useState(['ui_strings', 'products', 'elementor']);
   const [saveGlossary, setSaveGlossary] = useState(true);
   const [matches, setMatches] = useState([]);
   const [selected, setSelected] = useState({});
   const [replaceOverrides, setReplaceOverrides] = useState({});
+  const [wholeOverrides, setWholeOverrides] = useState({});
   const [truncated, setTruncated] = useState(false);
   const [cursor, setCursor] = useState({});
   const [previewing, setPreviewing] = useState(false);
@@ -72,9 +86,14 @@ export default function CorrectionsApp() {
             typeof replaceOverrides[m.id] === 'string' && replaceOverrides[m.id].trim() !== ''
               ? replaceOverrides[m.id]
               : replace,
+          replace_whole:
+            typeof wholeOverrides[m.id] === 'boolean' ? wholeOverrides[m.id] : replaceWhole,
         })),
-    [matches, selected, replaceOverrides, replace]
+    [matches, selected, replaceOverrides, wholeOverrides, replace, replaceWhole]
   );
+
+  const matchIsWhole = (matchId) =>
+    typeof wholeOverrides[matchId] === 'boolean' ? wholeOverrides[matchId] : replaceWhole;
 
   const loadGlossary = useCallback(async (lang) => {
     try {
@@ -165,12 +184,16 @@ export default function CorrectionsApp() {
       if (!append) {
         const nextSelected = {};
         const nextOverrides = {};
+        const nextWhole = {};
         nextMatches.forEach((m) => {
           nextSelected[m.id] = true;
+          // Default: put full current value intent — use global replace as new full text.
           nextOverrides[m.id] = replace;
+          nextWhole[m.id] = replaceWhole;
         });
         setSelected(nextSelected);
         setReplaceOverrides(nextOverrides);
+        setWholeOverrides(nextWhole);
       } else {
         setSelected((prev) => {
           const next = { ...prev };
@@ -184,6 +207,15 @@ export default function CorrectionsApp() {
           nextMatches.forEach((m) => {
             if (typeof next[m.id] !== 'string') {
               next[m.id] = replace;
+            }
+          });
+          return next;
+        });
+        setWholeOverrides((prev) => {
+          const next = { ...prev };
+          nextMatches.forEach((m) => {
+            if (typeof next[m.id] !== 'boolean') {
+              next[m.id] = replaceWhole;
             }
           });
           return next;
@@ -396,6 +428,14 @@ export default function CorrectionsApp() {
               <label className="inline-flex items-center gap-2">
                 <input
                   type="checkbox"
+                  checked={replaceWhole}
+                  onChange={(e) => setReplaceWhole(e.target.checked)}
+                />
+                کل مقدار فیلد را با «متن صحیح» عوض کن (پیشنهادی)
+              </label>
+              <label className="inline-flex items-center gap-2">
+                <input
+                  type="checkbox"
                   checked={wordBoundary}
                   onChange={(e) => setWordBoundary(e.target.checked)}
                 />
@@ -410,6 +450,16 @@ export default function CorrectionsApp() {
                 ذخیره در واژه‌نامه (برای AI و استورفرانت)
               </label>
             </div>
+            {find.trim().length > 0 && find.trim().length < 8 && saveGlossary && (
+              <p className="mt-2 text-xs text-amber-700">
+                متن اشتباه خیلی کوتاه است؛ ذخیره در واژه‌نامه می‌تواند جاهای دیگر را خراب کند. بهتر است تیک واژه‌نامه را بردارید.
+              </p>
+            )}
+            {!replaceWhole && (
+              <p className="mt-2 text-xs text-amber-700">
+                بدون «کل مقدار فیلد»، فقط خودِ عبارت پیدا‌شده عوض می‌شود و بقیه متن می‌ماند.
+              </p>
+            )}
 
             <div className="mt-5 flex flex-wrap gap-2">
               <button
@@ -545,11 +595,43 @@ export default function CorrectionsApp() {
                         )}
                       </div>
                       <p className="mt-1 text-xs text-pmai-muted">{match.location}</p>
-                      <p className="mt-2 rounded-md bg-gray-50 px-2.5 py-2 text-sm leading-relaxed" dir="auto">
-                        {match.snippet || match.value}
-                      </p>
-                      <label className="mt-3 block text-xs font-medium text-gray-700">
-                        متن جایگزین این مورد
+                      <div className="mt-2 space-y-2 rounded-md border border-pmai-border bg-gray-50 px-2.5 py-2 text-sm">
+                        <div>
+                          <p className="text-[11px] font-medium text-pmai-muted">الان</p>
+                          <p className="leading-relaxed" dir="auto">
+                            {match.value || match.snippet}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[11px] font-medium text-emerald-700">بعد از اعمال</p>
+                          <p className="leading-relaxed text-emerald-900" dir="auto">
+                            {previewAfter(
+                              match.value || match.snippet,
+                              find,
+                              matchReplaceValue(match.id),
+                              matchIsWhole(match.id)
+                            )}
+                          </p>
+                        </div>
+                      </div>
+                      <label className="mt-3 inline-flex items-center gap-2 text-xs text-gray-700">
+                        <input
+                          type="checkbox"
+                          checked={matchIsWhole(match.id)}
+                          disabled={!selected[match.id]}
+                          onChange={(e) =>
+                            setWholeOverrides((prev) => ({
+                              ...prev,
+                              [match.id]: e.target.checked,
+                            }))
+                          }
+                        />
+                        کل این فیلد را عوض کن
+                      </label>
+                      <label className="mt-2 block text-xs font-medium text-gray-700">
+                        {matchIsWhole(match.id)
+                          ? 'متن نهایی این فیلد'
+                          : 'جایگزین فقط برای عبارت پیدا‌شده'}
                         <textarea
                           value={matchReplaceValue(match.id)}
                           onChange={(e) => setMatchReplace(match.id, e.target.value)}
