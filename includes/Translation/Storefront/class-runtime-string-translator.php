@@ -11,6 +11,7 @@ namespace PolymartAI\Translation\Storefront;
 
 use PolymartAI\Translation\AI\AI_Client;
 use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Correction\Correction_Glossary;
 use PolymartAI\Translation\Post_Translator;
 use PolymartAI\Translation\UI_String\UI_String_Registry;
 
@@ -223,7 +224,7 @@ final class Runtime_String_Translator {
 		$text = is_string( $text ) ? trim( $text ) : '';
 
 		if ( '' === $text || ! Persian_Detector::contains_persian( $text ) ) {
-			return $text;
+			return Correction_Glossary::apply_to_text( $text, sanitize_key( (string) $lang ) );
 		}
 
 		$lang = sanitize_key( (string) $lang );
@@ -239,14 +240,14 @@ final class Runtime_String_Translator {
 			$cached_hit = self::$request_cache[ $key ];
 
 			if ( is_string( $cached_hit ) && '' !== trim( $cached_hit ) ) {
-				return $cached_hit;
+				return Correction_Glossary::apply_to_text( $cached_hit, $lang );
 			}
 		}
 
 		if ( self::$options_locked ) {
 			self::$request_cache[ $key ] = $text;
 
-			return $text;
+			return Correction_Glossary::apply_to_text( $text, $lang );
 		}
 
 		$dictionary = self::get_seed_dictionary();
@@ -254,7 +255,7 @@ final class Runtime_String_Translator {
 		if ( isset( $dictionary[ $text ] ) && '' !== trim( (string) $dictionary[ $text ] ) ) {
 			self::$request_cache[ $key ] = (string) $dictionary[ $text ];
 
-			return self::$request_cache[ $key ];
+			return Correction_Glossary::apply_to_text( self::$request_cache[ $key ], $lang );
 		}
 
 		// Prefer bulk UI-string translations when the exact msgid was catalogued.
@@ -263,7 +264,7 @@ final class Runtime_String_Translator {
 		if ( null !== $from_registry ) {
 			self::$request_cache[ $key ] = $from_registry;
 
-			return $from_registry;
+			return Correction_Glossary::apply_to_text( $from_registry, $lang );
 		}
 
 		$cached = self::get_persistent_entry( $lang, $hash, $text );
@@ -271,7 +272,7 @@ final class Runtime_String_Translator {
 		if ( null !== $cached && '' !== trim( (string) $cached ) ) {
 			self::$request_cache[ $key ] = $cached;
 
-			return $cached;
+			return Correction_Glossary::apply_to_text( $cached, $lang );
 		}
 
 		if ( ! self::allows_runtime_ai() ) {
@@ -281,7 +282,7 @@ final class Runtime_String_Translator {
 			self::queue_pending( $lang, $text, $context );
 			self::$request_cache[ $key ] = $text;
 
-			return $text;
+			return Correction_Glossary::apply_to_text( $text, $lang );
 		}
 
 		$settings = Post_Translator::get_translation_settings();
@@ -289,7 +290,7 @@ final class Runtime_String_Translator {
 		if ( empty( $settings['api_key'] ) || empty( $settings['api_endpoint'] ) ) {
 			self::$request_cache[ $key ] = $text;
 
-			return $text;
+			return Correction_Glossary::apply_to_text( $text, $lang );
 		}
 
 		$api_key      = (string) $settings['api_key'];
@@ -316,7 +317,7 @@ final class Runtime_String_Translator {
 		if ( is_wp_error( $result ) || empty( $result[ $payload_key ] ) ) {
 			self::$request_cache[ $key ] = $text;
 
-			return $text;
+			return Correction_Glossary::apply_to_text( $text, $lang );
 		}
 
 		$translated = trim( (string) $result[ $payload_key ] );
@@ -324,13 +325,13 @@ final class Runtime_String_Translator {
 		if ( '' === $translated ) {
 			self::$request_cache[ $key ] = $text;
 
-			return $text;
+			return Correction_Glossary::apply_to_text( $text, $lang );
 		}
 
 		self::remember( $lang, $hash, $translated );
 		self::$request_cache[ $key ] = $translated;
 
-		return $translated;
+		return Correction_Glossary::apply_to_text( $translated, $lang );
 	}
 
 	/**
@@ -922,6 +923,7 @@ final class Runtime_String_Translator {
 		 * @param array<string, string> $dictionary Source => translated map.
 		 */
 		self::$seed_dictionary = apply_filters( 'polymart_ai_string_dictionary', $dynamic );
+		self::$seed_dictionary = Correction_Glossary::merge_into_dictionary( self::$seed_dictionary );
 
 		return self::$seed_dictionary;
 	}

@@ -980,6 +980,14 @@ final class AI_Client {
 			$system_rules[] = 'Some values contain tokens like __SHORTCODE_0__ — copy them exactly; never translate, rename, or remove these tokens.';
 		}
 
+		if ( class_exists( '\PolymartAI\Translation\Correction\Correction_Glossary' ) ) {
+			$glossary_hint = \PolymartAI\Translation\Correction\Correction_Glossary::format_for_ai_prompt( $target_lang );
+
+			if ( '' !== $glossary_hint ) {
+				$system_rules[] = $glossary_hint;
+			}
+		}
+
 		$system_prompt = implode( ' ', $system_rules );
 
 		$user_content = wp_json_encode(

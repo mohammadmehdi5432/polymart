@@ -7,6 +7,7 @@ import AutoTranslateApp from './AutoTranslateApp';
 import CurrencyApp from './CurrencyApp';
 import ReportApp from './ReportApp';
 import LogsApp from './LogsApp';
+import CorrectionsApp from './CorrectionsApp';
 import './index.css';
 
 const PAGE_COMPONENTS = {
@@ -15,6 +16,7 @@ const PAGE_COMPONENTS = {
   'auto-translate': AutoTranslateApp,
   currency: CurrencyApp,
   translations: TranslationsApp,
+  corrections: CorrectionsApp,
   report: ReportApp,
   logs: LogsApp,
 };

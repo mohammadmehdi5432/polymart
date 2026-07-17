@@ -159,14 +159,27 @@ trait Trait_Ai_Persistence {
 		$payload      = self::collect_persian_fields( $post, $lang );
 		$is_elementor = self::uses_elementor_builder( $post_id );
 
-		if ( empty( $payload ) && ! $is_elementor ) {
-			return new \WP_Error(
-				'polymart_ai_empty_source',
-				__( 'محتوای فارسی برای ترجمه یافت نشد.', 'polymart-ai' )
+		// collect_persian_fields( $post, $lang ) omits fields that already have a current
+		// translation. Empty payload here usually means "already done for this lang", not
+		// "this post has no Persian" — async re-saves were logging that as a hard error
+		// (e.g. product #54979 with title_ar already stored).
+		$nothing_left_for_lang = empty( $payload )
+			&& (
+				! $is_elementor
+				|| '' === self::collect_elementor_persian_plain_text( $post_id )
 			);
-		}
 
-		if ( empty( $payload ) && '' === self::collect_elementor_persian_plain_text( $post_id ) ) {
+		if ( $nothing_left_for_lang ) {
+			if ( self::post_has_persian_content( $post ) ) {
+				self::sync_translation_index_meta( $post_id, $lang );
+
+				return array(
+					'post'         => $post,
+					'translations' => array(),
+					'noop'         => true,
+				);
+			}
+
 			return new \WP_Error(
 				'polymart_ai_empty_source',
 				__( 'محتوای فارسی برای ترجمه یافت نشد.', 'polymart-ai' )

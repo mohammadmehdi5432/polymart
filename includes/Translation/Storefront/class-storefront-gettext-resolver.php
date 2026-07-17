@@ -9,6 +9,7 @@ namespace PolymartAI\Translation\Storefront;
 
 use PolymartAI\Language_Registry;
 use PolymartAI\Translation\AI\Persian_Detector;
+use PolymartAI\Translation\Correction\Correction_Glossary;
 use PolymartAI\Translation\UI_String\UI_String_Registry;
 
 
@@ -47,11 +48,14 @@ final class Storefront_Gettext_Resolver {
 		$stored = UI_String_Registry::lookup( $lang, $text, $context );
 
 		if ( null !== $stored ) {
-			return $stored;
+			return Correction_Glossary::apply_to_text( $stored, $lang );
 		}
 
 		if ( Persian_Detector::contains_persian( $text ) ) {
-			return Runtime_String_Translator::translate( $text, $lang, $cache_key );
+			return Correction_Glossary::apply_to_text(
+				Runtime_String_Translator::translate( $text, $lang, $cache_key ),
+				$lang
+			);
 		}
 
 		/*
@@ -61,10 +65,13 @@ final class Storefront_Gettext_Resolver {
 		 */
 		if ( Persian_Detector::contains_persian( $translation ) ) {
 			if ( 'en' === $lang ) {
-				return $text;
+				return Correction_Glossary::apply_to_text( $text, $lang );
 			}
 
-			return Runtime_String_Translator::translate( $translation, $lang, $cache_key );
+			return Correction_Glossary::apply_to_text(
+				Runtime_String_Translator::translate( $translation, $lang, $cache_key ),
+				$lang
+			);
 		}
 
 		/*
@@ -75,10 +82,10 @@ final class Storefront_Gettext_Resolver {
 			$runtime = Runtime_String_Translator::translate( $text, $lang, $cache_key );
 
 			if ( $runtime !== $text ) {
-				return $runtime;
+				return Correction_Glossary::apply_to_text( $runtime, $lang );
 			}
 		}
 
-		return $translation;
+		return Correction_Glossary::apply_to_text( $translation, $lang );
 	}
 }

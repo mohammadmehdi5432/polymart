@@ -1193,6 +1193,10 @@ final class Async_Translator {
 	private function process_async_language_translation( $post_id, $lang, array $language, \WP_Post $post ) {
 		$lang = sanitize_key( (string) $lang );
 
+		if ( ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+			return true;
+		}
+
 		if ( $this->should_use_elementor_slice_for_async( $post_id, $lang, $post ) ) {
 			return $this->process_async_language_via_slices( $post_id, $lang, $language );
 		}
@@ -1217,6 +1221,11 @@ final class Async_Translator {
 			);
 
 			return ! $this->should_retry_async_error( $result );
+		}
+
+		// Already fully translated for this language — nothing to persist.
+		if ( ! empty( $result['noop'] ) ) {
+			return $this->log_async_language_outcome( $post_id, $lang, $language );
 		}
 
 		$save_result = Post_Translator::save_ai_translations( $post_id, $result['translations'], $lang );

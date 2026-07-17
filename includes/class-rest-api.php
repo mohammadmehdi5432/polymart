@@ -11,6 +11,9 @@ use PolymartAI\Language_Registry;
 use PolymartAI\Frontend\Currency;
 use PolymartAI\Frontend\Currency_Price_Sync;
 use PolymartAI\Translation\AI\AI_Client;
+use PolymartAI\Translation\Correction\Correction_Glossary;
+use PolymartAI\Translation\Correction\Correction_Job;
+use PolymartAI\Translation\Correction\Correction_Scanner;
 use PolymartAI\Translation\Pipeline\Async_Translator;
 use PolymartAI\Translation\Post_Translator;
 use PolymartAI\Translation\Pipeline\Translation_Query;
@@ -394,6 +397,70 @@ final class REST_API {
 						'required'          => true,
 						'sanitize_callback' => array( $this, 'sanitize_sandbox_file_path_param' ),
 					),
+				),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/corrections/preview',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'preview_corrections' ),
+				'permission_callback' => array( $this, 'check_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/corrections/apply',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'apply_corrections' ),
+				'permission_callback' => array( $this, 'check_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/corrections/job',
+			array(
+				array(
+					'methods'             => \WP_REST_Server::READABLE,
+					'callback'            => array( $this, 'get_corrections_job' ),
+					'permission_callback' => array( $this, 'check_permissions' ),
+				),
+				array(
+					'methods'             => \WP_REST_Server::DELETABLE,
+					'callback'            => array( $this, 'clear_corrections_job' ),
+					'permission_callback' => array( $this, 'check_permissions' ),
+				),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/corrections/job/step',
+			array(
+				'methods'             => \WP_REST_Server::CREATABLE,
+				'callback'            => array( $this, 'step_corrections_job' ),
+				'permission_callback' => array( $this, 'check_permissions' ),
+			)
+		);
+
+		register_rest_route(
+			self::NAMESPACE,
+			'/corrections/glossary',
+			array(
+				array(
+					'methods'             => \WP_REST_Server::READABLE,
+					'callback'            => array( $this, 'get_corrections_glossary' ),
+					'permission_callback' => array( $this, 'check_permissions' ),
+				),
+				array(
+					'methods'             => \WP_REST_Server::EDITABLE,
+					'callback'            => array( $this, 'update_corrections_glossary' ),
+					'permission_callback' => array( $this, 'check_permissions' ),
 				),
 			)
 		);
@@ -2178,5 +2245,161 @@ final class REST_API {
 		}
 
 		Activity_Logger::log_report( $post_id, $lang, $title_source, $title_translated, $source );
+	}
+
+	/**
+	 * Preview correction matches.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function preview_corrections( $request ) {
+		$params = $request->get_json_params();
+
+		if ( ! is_array( $params ) ) {
+			$params = $request->get_params();
+		}
+
+		$result = Correction_Scanner::preview( is_array( $params ) ? $params : array() );
+
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Start a correction apply job.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function apply_corrections( $request ) {
+		$params = $request->get_json_params();
+
+		if ( ! is_array( $params ) ) {
+			$params = $request->get_params();
+		}
+
+		$result = Correction_Job::start( is_array( $params ) ? $params : array() );
+
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Get correction job status.
+	 *
+	 * @return \WP_REST_Response
+	 */
+	public function get_corrections_job() {
+		return rest_ensure_response( Correction_Job::get( true ) );
+	}
+
+	/**
+	 * Clear correction job.
+	 *
+	 * @return \WP_REST_Response
+	 */
+	public function clear_corrections_job() {
+		return rest_ensure_response( Correction_Job::clear() );
+	}
+
+	/**
+	 * Process one correction job step.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function step_corrections_job( $request ) {
+		$batch  = absint( $request->get_param( 'batch' ) );
+		$result = Correction_Job::step( $batch > 0 ? $batch : Correction_Job::DEFAULT_STEP );
+
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		return rest_ensure_response( $result );
+	}
+
+	/**
+	 * Get glossary.
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response
+	 */
+	public function get_corrections_glossary( $request ) {
+		$lang = sanitize_key( (string) $request->get_param( 'lang' ) );
+
+		if ( '' !== $lang ) {
+			return rest_ensure_response(
+				array(
+					'lang'    => $lang,
+					'entries' => Correction_Glossary::get_for_lang( $lang ),
+				)
+			);
+		}
+
+		return rest_ensure_response(
+			array(
+				'glossary' => Correction_Glossary::get_all(),
+			)
+		);
+	}
+
+	/**
+	 * Update glossary (full replace or single upsert/delete).
+	 *
+	 * @param \WP_REST_Request $request Request.
+	 * @return \WP_REST_Response|\WP_Error
+	 */
+	public function update_corrections_glossary( $request ) {
+		$params = $request->get_json_params();
+
+		if ( ! is_array( $params ) ) {
+			$params = $request->get_params();
+		}
+
+		$action = sanitize_key( (string) ( $params['action'] ?? 'save' ) );
+
+		if ( 'delete' === $action ) {
+			$lang  = sanitize_key( (string) ( $params['lang'] ?? '' ) );
+			$wrong = is_string( $params['wrong'] ?? null ) ? (string) $params['wrong'] : '';
+
+			return rest_ensure_response(
+				array(
+					'lang'    => $lang,
+					'entries' => Correction_Glossary::delete( $lang, $wrong ),
+				)
+			);
+		}
+
+		if ( 'upsert' === $action ) {
+			$lang      = sanitize_key( (string) ( $params['lang'] ?? '' ) );
+			$wrong     = is_string( $params['wrong'] ?? null ) ? (string) $params['wrong'] : '';
+			$preferred = is_string( $params['preferred'] ?? null ) ? (string) $params['preferred'] : '';
+			$match     = isset( $params['match'] ) && 'contains' === $params['match'] ? 'contains' : 'exact';
+
+			return rest_ensure_response(
+				array(
+					'lang'    => $lang,
+					'entries' => Correction_Glossary::upsert( $lang, $wrong, $preferred, $match ),
+				)
+			);
+		}
+
+		$glossary = isset( $params['glossary'] ) && is_array( $params['glossary'] )
+			? $params['glossary']
+			: $params;
+
+		return rest_ensure_response(
+			array(
+				'glossary' => Correction_Glossary::save_all( is_array( $glossary ) ? $glossary : array() ),
+			)
+		);
 	}
 }

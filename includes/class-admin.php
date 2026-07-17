@@ -95,6 +95,15 @@ final class Admin {
 			array( $this, 'render_translations_page' )
 		);
 
+		$this->page_hooks['corrections'] = add_submenu_page(
+			'polymart-ai',
+			__( 'تصحیح ترجمه', 'polymart-ai' ),
+			__( 'تصحیح ترجمه', 'polymart-ai' ),
+			REST_API::required_admin_capability(),
+			'polymart-ai-corrections',
+			array( $this, 'render_corrections_page' )
+		);
+
 		$this->page_hooks['report'] = add_submenu_page(
 			'polymart-ai',
 			__( 'گزارش ترجمه', 'polymart-ai' ),
@@ -142,6 +151,15 @@ final class Admin {
 	 */
 	public function render_translations_page() {
 		$this->render_admin_page( 'translations' );
+	}
+
+	/**
+	 * Render the translation corrections React mount point.
+	 *
+	 * @return void
+	 */
+	public function render_corrections_page() {
+		$this->render_admin_page( 'corrections' );
 	}
 
 	/**
