@@ -692,8 +692,10 @@ final class Universal_Translator {
 		}
 
 		$lang = Url_Router::get_current_language();
+		$post_type = get_post_type( $post_id );
+		$context   = in_array( $post_type, self::get_embedded_elementor_post_types(), true ) ? 'embedded' : 'page';
 
-		return Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
+		return Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang, $context );
 	}
 
 	/**
@@ -712,10 +714,8 @@ final class Universal_Translator {
 				return false;
 			}
 
-			if (
-				Layout_Guard::is_single_product_context()
-				&& in_array( $post_type, array( 'woodmart_layout', 'elementor_library' ), true )
-			) {
+			// Site footer/header must still bust FA element cache; only the product shell is exempt.
+			if ( Layout_Guard::is_single_product_shell_post( $post_id ) ) {
 				return false;
 			}
 
@@ -742,6 +742,10 @@ final class Universal_Translator {
 	 * @return bool
 	 */
 	private function post_has_servable_elementor_companion( $post_id ) {
+		$post_id   = (int) $post_id;
+		$post_type = get_post_type( $post_id );
+		$context   = in_array( $post_type, self::get_embedded_elementor_post_types(), true ) ? 'embedded' : 'page';
+
 		foreach ( Language_Registry::get_languages() as $language ) {
 			if ( ! empty( $language['is_default'] ) ) {
 				continue;
@@ -753,7 +757,7 @@ final class Universal_Translator {
 				continue;
 			}
 
-			if ( Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $code ) ) {
+			if ( Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $code, $context ) ) {
 				return true;
 			}
 		}
@@ -1113,11 +1117,8 @@ final class Universal_Translator {
 			return $value;
 		}
 
-		// Woodmart single-product shells must keep Persian layout documents untouched.
-		if (
-			Layout_Guard::is_single_product_context()
-			&& in_array( $post_type, array( 'woodmart_layout', 'elementor_library' ), true )
-		) {
+		// Only skip the Woodmart single-product shell layout — never the site footer/header.
+		if ( Layout_Guard::is_single_product_shell_post( $post_id ) ) {
 			return $value;
 		}
 
@@ -1140,7 +1141,7 @@ final class Universal_Translator {
 		try {
 			$lang = Url_Router::get_current_language();
 
-			if ( ! Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+			if ( ! Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang, 'embedded' ) ) {
 				$this->elementor_cache[ $post_id ] = self::ELEMENTOR_CACHE_UNCHANGED;
 
 				return $value;

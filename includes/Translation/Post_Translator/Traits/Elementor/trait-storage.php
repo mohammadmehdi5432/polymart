@@ -337,10 +337,16 @@ trait Trait_Storage {
 		return self::$stored_elementor_json_cache[ $key ];
 	}
 
-	public static function can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) {
+	public static function can_serve_stored_elementor_json_on_storefront( $post_id, $lang, $context = 'page' ) {
 		$post_id = absint( $post_id );
 		$lang    = sanitize_key( (string) $lang );
-		$key     = 'serve:' . $post_id . ':' . $lang;
+		$context = sanitize_key( (string) $context );
+
+		if ( '' === $context ) {
+			$context = 'page';
+		}
+
+		$key = 'serve:' . $context . ':' . $post_id . ':' . $lang;
 
 		if ( array_key_exists( $key, self::$elementor_storefront_serve_cache ) ) {
 			return self::$elementor_storefront_serve_cache[ $key ];
@@ -348,7 +354,30 @@ trait Trait_Storage {
 
 		// allow_progress_clean=true so harmless finalized progress markers are cleared.
 		$blockers = self::explain_elementor_storefront_serve_blockers( $post_id, $lang, true );
-		$can      = empty( $blockers['codes'] );
+		$codes    = isset( $blockers['codes'] ) && is_array( $blockers['codes'] ) ? $blockers['codes'] : array();
+
+		if ( 'embedded' === $context ) {
+			/*
+			 * Footer/header Theme Builder shells: prefer a partial/finalizing companion
+			 * over falling back to full Persian source + FA element cache. Hard failures
+			 * (missing/invalid/oversize/error) still block.
+			 */
+			$hard = array_intersect(
+				$codes,
+				array(
+					'invalid_args',
+					'commerce_product',
+					'missing_companion_json',
+					'invalid_companion_json',
+					'oversize_json',
+					'hard_error_meta',
+					'json_decode_failed',
+				)
+			);
+			$can = empty( $hard );
+		} else {
+			$can = empty( $codes );
+		}
 
 		self::$elementor_storefront_serve_cache[ $key ] = $can;
 

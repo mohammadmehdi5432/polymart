@@ -481,9 +481,11 @@ final class Product_Diagnostics {
 	}
 
 	/**
+	 * Resolve Woodmart single-product Elementor layout post ID (0 when unused).
+	 *
 	 * @return int
 	 */
-	private static function resolve_woodmart_single_product_layout_id() {
+	public static function resolve_woodmart_single_product_layout_id() {
 		if ( ! class_exists( '\XTS\Modules\Layouts\Main' ) ) {
 			return 0;
 		}

@@ -88,6 +88,24 @@ final class Layout_Guard {
 	}
 
 	/**
+	 * Whether this post is the Woodmart single-product shell layout (not site footer/header).
+	 *
+	 * @param int $post_id Post ID.
+	 * @return bool
+	 */
+	public static function is_single_product_shell_post( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 || ! self::is_single_product_context() ) {
+			return false;
+		}
+
+		$shell_id = Product_Diagnostics::resolve_woodmart_single_product_layout_id();
+
+		return $shell_id > 0 && $post_id === $shell_id;
+	}
+
+	/**
 	 * Whether PolyMartAI must not touch Elementor document metadata at all.
 	 *
 	 * @param int $object_id Post ID being read.

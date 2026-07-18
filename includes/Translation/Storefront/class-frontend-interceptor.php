@@ -735,7 +735,7 @@ final class Frontend_Interceptor {
 
 		$lang = $this->get_active_lang();
 
-		if ( Post_Translator::can_serve_stored_elementor_json_on_storefront( $block_id, $lang ) ) {
+		if ( Post_Translator::can_serve_stored_elementor_json_on_storefront( $block_id, $lang, 'embedded' ) ) {
 			// Elementor JSON swap handles rendering; fall back to runtime/hash for Persian leftovers.
 			if ( ! Persian_Detector::contains_persian( $content ) ) {
 				return $content;
