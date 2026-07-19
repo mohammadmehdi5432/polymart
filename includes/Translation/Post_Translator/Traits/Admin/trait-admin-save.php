@@ -155,6 +155,8 @@ trait Trait_Admin_Save {
 		if ( 'attachment_id' === $sanitize ) {
 			if ( $value > 0 && 'attachment' === get_post_type( $value ) ) {
 				update_post_meta( $post_id, $meta_key, $value );
+			} elseif ( 0 === $value ) {
+				delete_post_meta( $post_id, $meta_key );
 			}
 
 			return;
@@ -174,9 +176,11 @@ trait Trait_Admin_Save {
 	}
 
 	private function save_thumbnail_field( $post_id, $lang = 'en' ) {
-		$meta_key = self::get_thumbnail_meta_key( $lang );
+		$meta_key  = self::get_thumbnail_meta_key( $lang );
+		$form_key  = self::get_form_field_name( $meta_key );
 
-		if ( ! isset( $_POST[ $meta_key ] ) ) {
+		// Form fields omit the leading underscore (thumbnail_id_en, not _thumbnail_id_en).
+		if ( ! isset( $_POST[ $form_key ] ) && ! isset( $_POST[ $meta_key ] ) ) {
 			return;
 		}
 
