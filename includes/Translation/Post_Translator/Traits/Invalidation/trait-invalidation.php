@@ -56,7 +56,7 @@ trait Trait_Invalidation {
 			return;
 		}
 
-		self::invalidate_elementor_translations( $post_id );
+		self::invalidate_elementor_translations( $post_id, true );
 
 		$all_meta = get_post_meta( $post_id );
 

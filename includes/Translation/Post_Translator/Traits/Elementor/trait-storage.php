@@ -567,12 +567,25 @@ trait Trait_Storage {
 		update_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), $hash );
 	}
 
-	public static function invalidate_elementor_translations( $post_id ) {
+	/**
+	 * Mark Elementor language companions stale after source `_elementor_data` changes.
+	 *
+	 * Soft mode (default): keep `_elementor_data_{lang}` so /en|/ar keep serving the last
+	 * good translation while a re-translate is queued. Hard mode deletes companions
+	 * (explicit clear-all / force reset only).
+	 *
+	 * @param int  $post_id Post ID.
+	 * @param bool $hard    When true, delete companion JSON for every language.
+	 * @return void
+	 */
+	public static function invalidate_elementor_translations( $post_id, $hard = false ) {
 		$post_id = absint( $post_id );
 
 		if ( $post_id <= 0 ) {
 			return;
 		}
+
+		$hard = (bool) $hard;
 
 		foreach ( \PolymartAI\Language_Registry::get_translation_target_languages() as $language ) {
 			$lang = sanitize_key( (string) ( $language['code'] ?? '' ) );
@@ -581,14 +594,20 @@ trait Trait_Storage {
 				continue;
 			}
 
-			delete_post_meta( $post_id, self::get_elementor_meta_key( $lang ) );
+			if ( $hard ) {
+				delete_post_meta( $post_id, self::get_elementor_meta_key( $lang ) );
+				delete_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ) );
+			}
+
+			// Always drop finalize/hash so status becomes partial and a refresh can re-run.
 			delete_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ) );
 			delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
-			delete_post_meta( $post_id, self::get_elementor_accepted_paths_meta_key( $lang ) );
+			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
 		}
 
 		self::flush_translation_status_cache( $post_id );
+		self::reset_elementor_runtime_caches();
 	}
 
 	public static function uses_elementor_builder( $post_id ) {
