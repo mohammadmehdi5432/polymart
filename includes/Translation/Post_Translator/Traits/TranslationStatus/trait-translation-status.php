@@ -208,8 +208,6 @@ trait Trait_Translation_Status {
 		}
 
 		if ( 'woodmart_slide' === $post->post_type && get_post_thumbnail_id( $post_id ) ) {
-			self::ensure_translated_thumbnail_fallback( $post_id, $lang );
-
 			$fields[] = array(
 				'key'        => 'thumbnail',
 				'label'      => __( 'تصویر شاخص', 'polymart-ai' ),

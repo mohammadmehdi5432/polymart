@@ -407,9 +407,25 @@ final class Frontend_Interceptor {
 
 		try {
 			if ( '_thumbnail_id' === $meta_key ) {
+				$lang           = $this->get_active_lang();
+				$translated_key = Post_Translator::get_thumbnail_meta_key( $lang );
+
+				// Woodmart slides never fall back to the Persian featured image.
+				if ( 'woodmart_slide' === get_post_type( $object_id ) ) {
+					remove_filter( 'get_post_metadata', array( $this, 'filter_post_metadata' ), 10 );
+					$lang_id = (int) get_post_meta( $object_id, $translated_key, true );
+					add_filter( 'get_post_metadata', array( $this, 'filter_post_metadata' ), 10, 4 );
+
+					if ( $lang_id > 0 && 'attachment' === get_post_type( $lang_id ) ) {
+						return $single ? (string) $lang_id : array( (string) $lang_id );
+					}
+
+					return $single ? '' : array();
+				}
+
 				return $this->resolve_translated_meta_value(
 					$object_id,
-					Post_Translator::get_thumbnail_meta_key( $this->get_active_lang() ),
+					$translated_key,
 					$single,
 					$value
 				);
@@ -468,7 +484,16 @@ final class Frontend_Interceptor {
 
 		$translated_id = Post_Translator::get_translated_thumbnail_id( $post_id, $this->get_active_lang() );
 
-		return $translated_id > 0 ? $translated_id : $thumbnail_id;
+		if ( $translated_id > 0 ) {
+			return $translated_id;
+		}
+
+		// Woodmart slides: missing language banner must not fall back to Persian.
+		if ( 'woodmart_slide' === $post_type ) {
+			return false;
+		}
+
+		return $thumbnail_id;
 	}
 
 	/**

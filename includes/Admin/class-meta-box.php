@@ -102,7 +102,7 @@ final class Meta_Box {
 			<div class="polymart-ai-metabox__toolbar">
 				<p class="polymart-ai-metabox__intro">
 					<?php if ( $is_slide ) : ?>
-						<?php esc_html_e( 'برای هر زبان فعال، بنر جایگزین را انتخاب کنید. در آدرس‌های /en/ و /ar/ همان اسلاید با تصویر همان زبان نمایش داده می‌شود.', 'polymart-ai' ); ?>
+						<?php esc_html_e( 'برای هر زبان فعال، بنر جایگزین را انتخاب کنید. اگر برای زبانی تصویری نگذارید، آن اسلاید در /en یا /ar بدون تصویر (یا مخفی از اسلایدر) می‌ماند و تصویر فارسی جایگزین نمی‌شود.', 'polymart-ai' ); ?>
 					<?php else : ?>
 						<?php esc_html_e( 'ترجمه‌ها را دستی ویرایش کنید، با AI تولید کنید، یا همه زبان‌ها را یک‌جا دوباره ترجمه کنید.', 'polymart-ai' ); ?>
 					<?php endif; ?>

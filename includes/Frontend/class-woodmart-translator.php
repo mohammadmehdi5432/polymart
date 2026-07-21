@@ -58,6 +58,7 @@ final class Woodmart_Translator {
 		'popup_text',
 		'popup_html_block',
 		'header_banner_text',
+		'sticky_navigation_title',
 		'sticky_navigation_area',
 		'info_box_text',
 		'info_box_title',
@@ -97,6 +98,8 @@ final class Woodmart_Translator {
 	 * Constructor.
 	 */
 	public function __construct() {
+		// Woodmart theme applies `woodmart_option` inside woodmart_get_opt(); older aliases kept for safety.
+		add_filter( 'woodmart_option', array( $this, 'filter_woodmart_opt' ), 20, 2 );
 		add_filter( 'woodmart_get_opt', array( $this, 'filter_woodmart_opt' ), 20, 2 );
 		add_filter( 'xts_get_opt', array( $this, 'filter_woodmart_opt' ), 20, 2 );
 		add_filter( 'widget_title', array( $this, 'filter_widget_title' ), 20, 1 );

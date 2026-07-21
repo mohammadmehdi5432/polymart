@@ -356,11 +356,12 @@ trait Trait_Storage {
 		$blockers = self::explain_elementor_storefront_serve_blockers( $post_id, $lang, true );
 		$codes    = isset( $blockers['codes'] ) && is_array( $blockers['codes'] ) ? $blockers['codes'] : array();
 
-		if ( 'embedded' === $context ) {
+		if ( 'embedded' === $context || 'page' === $context ) {
 			/*
-			 * Footer/header Theme Builder shells: prefer a partial/finalizing companion
-			 * over falling back to full Persian source + FA element cache. Hard failures
-			 * (missing/invalid/oversize/error) still block.
+			 * Prefer a usable companion over falling back to full Persian source.
+			 * Soft issues (not_finalized / leftover Persian fields / progress markers)
+			 * must not blank the whole /en|/ar page when JSON exists.
+			 * Hard failures (missing/invalid/oversize/error) still block.
 			 */
 			$hard = array_intersect(
 				$codes,

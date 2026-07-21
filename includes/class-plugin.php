@@ -18,6 +18,7 @@ use PolymartAI\Frontend\Woodmart_Translator;
 use PolymartAI\Integration\Apd_Integration;
 use PolymartAI\Integration\Cpc_Integration;
 use PolymartAI\Integration\Customer_Portal_Integration;
+use PolymartAI\Integration\Elementor_Image_Translation;
 use PolymartAI\Integration\Jet_Checkout_Integration;
 use PolymartAI\Integration\Woodmart_Header_Integration;
 use PolymartAI\Integration\Knd_Integration;
@@ -212,6 +213,7 @@ final class Plugin {
 		Knd_Integration::init();
 		Kndpi_Integration::init();
 		Wve_Integration::init();
+		Elementor_Image_Translation::init();
 
 		if ( ! Admin_Request_Guard::should_isolate() ) {
 			add_action( 'init', array( Runtime_String_Translator::class, 'maybe_prune_on_boot' ), 1 );
