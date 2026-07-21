@@ -239,6 +239,166 @@ trait Trait_Storage {
 		return true;
 	}
 
+	/**
+	 * Fingerprint of Elementor whitelist strings only (ignores cosmetic JSON reshuffles).
+	 *
+	 * @param mixed $raw_or_data JSON string, decoded tree, or empty.
+	 * @return string md5 hex or empty string.
+	 */
+	public static function compute_elementor_content_fingerprint( $raw_or_data ) {
+		$data = null;
+
+		if ( is_array( $raw_or_data ) ) {
+			$data = $raw_or_data;
+		} elseif ( is_string( $raw_or_data ) && '' !== $raw_or_data ) {
+			$decoded = json_decode( $raw_or_data, true );
+
+			if ( is_array( $decoded ) ) {
+				$data = $decoded;
+			}
+		}
+
+		if ( ! is_array( $data ) ) {
+			return '';
+		}
+
+		$payload = self::collect_elementor_translation_payload( $data );
+
+		if ( empty( $payload ) ) {
+			return md5( '[]' );
+		}
+
+		ksort( $payload );
+
+		$normalized = array();
+
+		foreach ( $payload as $path => $text ) {
+			$normalized[ (string) $path ] = Text_Normalizer::normalize_translation_plaintext( (string) $text );
+		}
+
+		$json = wp_json_encode( $normalized );
+
+		return is_string( $json ) ? md5( $json ) : '';
+	}
+
+	/**
+	 * Whether Elementor source text that we translate actually changed.
+	 *
+	 * @param mixed $before Previous `_elementor_data` value.
+	 * @param mixed $after  New `_elementor_data` value.
+	 * @return bool
+	 */
+	public static function elementor_source_text_meaningfully_changed( $before, $after ) {
+		$before_fp = self::compute_elementor_content_fingerprint( $before );
+		$after_fp  = self::compute_elementor_content_fingerprint( $after );
+
+		if ( '' === $before_fp && '' === $after_fp ) {
+			return false;
+		}
+
+		if ( '' === $before_fp || '' === $after_fp ) {
+			return true;
+		}
+
+		return ! hash_equals( $before_fp, $after_fp );
+	}
+
+	/**
+	 * After a cosmetic `_elementor_data` rewrite, keep companions and refresh content hashes.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return void
+	 */
+	public static function refresh_elementor_hashes_after_cosmetic_source_change( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			return;
+		}
+
+		$content_fp = self::compute_elementor_source_hash( $post_id );
+
+		if ( '' === $content_fp ) {
+			return;
+		}
+
+		foreach ( \PolymartAI\Language_Registry::get_translation_target_languages() as $language ) {
+			$lang = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+			if ( '' === $lang ) {
+				continue;
+			}
+
+			$companion = get_post_meta( $post_id, self::get_elementor_meta_key( $lang ), true );
+			$finalized = get_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), true );
+			$has_json  = is_string( $companion ) && '' !== ltrim( $companion );
+			$is_final  = is_numeric( $finalized ) && absint( $finalized ) > 0;
+
+			if ( ! $has_json && ! $is_final ) {
+				continue;
+			}
+
+			update_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), $content_fp );
+		}
+
+		self::flush_translation_status_cache( $post_id );
+		self::reset_elementor_runtime_caches();
+	}
+
+	/**
+	 * Re-stamp Elementor hash/finalize when a clean companion already exists.
+	 *
+	 * Soft-invalidate used to clear hash after cosmetic JSON rewrites, which left
+	 * async cron thinking AI work was required even though translations were intact.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language.
+	 * @return bool True when healed and no AI call is needed.
+	 */
+	public static function maybe_heal_soft_stale_elementor_without_ai( $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || ! self::uses_elementor_builder( $post_id ) ) {
+			return false;
+		}
+
+		if ( self::is_commerce_product_post( $post_id ) && ! self::should_require_elementor_translation( $post_id ) ) {
+			return false;
+		}
+
+		if ( ! is_string( self::get_stored_elementor_json( $post_id, $lang ) ) ) {
+			return false;
+		}
+
+		if ( self::elementor_job_has_durable_partial_state( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$error = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ) );
+
+		if ( '' !== $error && ! self::is_elementor_progress_message( $error ) ) {
+			return false;
+		}
+
+		if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+			return false;
+		}
+
+		$content_fp = self::compute_elementor_source_hash( $post_id );
+
+		if ( '' === $content_fp ) {
+			return false;
+		}
+
+		update_post_meta( $post_id, self::get_elementor_source_hash_meta_key( $lang ), $content_fp );
+		self::mark_elementor_translation_finalized( $post_id, $lang );
+		delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
+		self::flush_translation_status_cache( $post_id );
+
+		return true;
+	}
+
 	public static function compute_elementor_source_hash( $post_id ) {
 		$post_id = absint( $post_id );
 
@@ -258,7 +418,14 @@ trait Trait_Storage {
 			return '';
 		}
 
-		self::$elementor_source_hash_cache[ $post_id ] = md5( $raw );
+		$fingerprint = self::compute_elementor_content_fingerprint( $raw );
+
+		// Undecodable / empty-payload edge: fall back to raw bytes so we still detect edits.
+		if ( '' === $fingerprint ) {
+			$fingerprint = md5( $raw );
+		}
+
+		self::$elementor_source_hash_cache[ $post_id ] = $fingerprint;
 
 		return self::$elementor_source_hash_cache[ $post_id ];
 	}
@@ -316,6 +483,17 @@ trait Trait_Storage {
 		}
 
 		$is_current = hash_equals( $stored_hash, $current_hash );
+
+		// Legacy installs stored md5( full `_elementor_data` ). Treat as current when
+		// raw bytes still match, even though we now fingerprint whitelist text only.
+		if ( ! $is_current ) {
+			$raw = get_post_meta( $post_id, '_elementor_data', true );
+
+			if ( is_string( $raw ) && '' !== $raw && hash_equals( $stored_hash, md5( $raw ) ) ) {
+				$is_current = true;
+			}
+		}
+
 		self::$elementor_current_cache[ $cache_key ] = $is_current;
 
 		return $is_current;
@@ -676,15 +854,22 @@ trait Trait_Storage {
 			return;
 		}
 
-		$new_raw  = is_string( $meta_value ) ? $meta_value : '';
-		$new_hash = '' !== $new_raw ? md5( $new_raw ) : '';
+		$new_raw = is_string( $meta_value ) ? $meta_value : ( is_array( $meta_value ) ? wp_json_encode( $meta_value ) : '' );
+		$new_raw = is_string( $new_raw ) ? $new_raw : '';
 
 		$had_capture = array_key_exists( $post_id, self::$elementor_data_prev_values );
 		$prev_raw    = $had_capture ? self::$elementor_data_prev_values[ $post_id ] : null;
 
 		unset( self::$elementor_data_prev_values[ $post_id ] );
 
-		$prev_hash = is_string( $prev_raw ) && '' !== $prev_raw ? md5( $prev_raw ) : '';
+		if ( is_array( $prev_raw ) ) {
+			$prev_raw = wp_json_encode( $prev_raw );
+		}
+
+		$prev_raw = is_string( $prev_raw ) ? $prev_raw : '';
+
+		$new_hash  = '' !== $new_raw ? md5( $new_raw ) : '';
+		$prev_hash = '' !== $prev_raw ? md5( $prev_raw ) : '';
 
 		if ( '' !== $new_hash && '' !== $prev_hash && hash_equals( $prev_hash, $new_hash ) ) {
 			return;
@@ -694,7 +879,16 @@ trait Trait_Storage {
 			return;
 		}
 
-		self::$elementor_source_hash_cache[ $post_id ] = $new_hash;
+		// Cosmetic Elementor rewrite (CSS ids, key order, empty settings) — keep translations.
+		if ( $had_capture && ! self::elementor_source_text_meaningfully_changed( $prev_raw, $new_raw ) ) {
+			unset( self::$elementor_source_hash_cache[ $post_id ] );
+			self::refresh_elementor_hashes_after_cosmetic_source_change( $post_id );
+
+			return;
+		}
+
+		$content_fp = self::compute_elementor_content_fingerprint( $new_raw );
+		self::$elementor_source_hash_cache[ $post_id ] = '' !== $content_fp ? $content_fp : $new_hash;
 		self::reset_elementor_runtime_caches();
 
 		self::invalidate_elementor_translations( $post_id );

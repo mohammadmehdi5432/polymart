@@ -267,7 +267,14 @@ final class Async_Translator {
 		$current_fp = Post_Translator::compute_product_variation_titles_fingerprint( $parent_id );
 		$stored_fp  = (string) get_post_meta( $parent_id, '_polymart_ai_variation_titles_fingerprint', true );
 
-		if ( '' !== $stored_fp && hash_equals( $stored_fp, $current_fp ) ) {
+		// First observation: seed fingerprint only. Empty meta used to always queue AI.
+		if ( '' === $stored_fp ) {
+			update_post_meta( $parent_id, '_polymart_ai_variation_titles_fingerprint', $current_fp );
+
+			return;
+		}
+
+		if ( hash_equals( $stored_fp, $current_fp ) ) {
 			return;
 		}
 
@@ -485,6 +492,13 @@ final class Async_Translator {
 			$post = get_post( absint( $post_id ) );
 
 			if ( ! $post instanceof \WP_Post || $this->should_skip_request( $post_id, $post ) ) {
+				return $check;
+			}
+
+			// Cosmetic Elementor JSON churn must not burn AI tokens.
+			if ( ! Post_Translator::elementor_source_text_meaningfully_changed( $prev_value, $meta_value ) ) {
+				Post_Translator::refresh_elementor_hashes_after_cosmetic_source_change( $post_id );
+
 				return $check;
 			}
 
@@ -1197,6 +1211,13 @@ final class Async_Translator {
 			return true;
 		}
 
+		// Soft-stale Elementor companions: restamp without burning AI tokens.
+		if ( Post_Translator::maybe_heal_soft_stale_elementor_without_ai( $post_id, $lang ) ) {
+			if ( ! Post_Translator::post_needs_translation_work( $post_id, $lang ) ) {
+				return $this->log_async_language_outcome( $post_id, $lang, $language );
+			}
+		}
+
 		if ( $this->should_use_elementor_slice_for_async( $post_id, $lang, $post ) ) {
 			return $this->process_async_language_via_slices( $post_id, $lang, $language );
 		}
@@ -1344,6 +1365,11 @@ final class Async_Translator {
 	 * @return bool
 	 */
 	private function should_retry_async_error( \WP_Error $error ) {
+		// Quota / auth / billing must stop — retries only burn more failed calls.
+		if ( Activity_Logger::is_critical_api_error( $error ) ) {
+			return false;
+		}
+
 		$retry_codes = array(
 			'polymart_ai_elementor_partial',
 			'polymart_ai_elementor_no_translations',
