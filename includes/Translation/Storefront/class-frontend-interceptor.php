@@ -282,21 +282,32 @@ final class Frontend_Interceptor {
 
 		self::$filtering_posts = true;
 
-		foreach ( $posts as $index => $post ) {
+		$lang     = $this->get_active_lang();
+		$filtered = array();
+
+		foreach ( $posts as $post ) {
 			if ( ! $post instanceof \WP_Post ) {
 				continue;
 			}
 
 			if ( Layout_Guard::should_preserve_post_data( $post ) ) {
+				$filtered[] = $post;
 				continue;
 			}
 
-			$posts[ $index ] = $this->apply_translation_to_post_object( $post );
+			// Woodmart slider: omit slides with no banner for this language (no blank slide).
+			if ( 'woodmart_slide' === $post->post_type ) {
+				if ( Post_Translator::get_translated_thumbnail_id( $post->ID, $lang ) <= 0 ) {
+					continue;
+				}
+			}
+
+			$filtered[] = $this->apply_translation_to_post_object( $post );
 		}
 
 		self::$filtering_posts = false;
 
-		return $posts;
+		return $filtered;
 	}
 
 	/**
