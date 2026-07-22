@@ -579,11 +579,14 @@ trait Trait_Queue_Run {
 				self::finalize_job_if_queue_exhausted( $job, $lang );
 				self::sync_job_remaining( $job, $lang );
 
-				if ( 'running' === ( $job['status'] ?? '' ) && (int) ( $job['needs_work'] ?? $job['remaining'] ?? 0 ) > 0 ) {
-					$job['status']       = 'paused';
-					$job['pause_reason'] = 'pick_stalled';
-					$job['last_error']   = __( 'صف ترجمه گیر کرد — مورد فعلی را رد کنید یا «ادامه» / شروع مجدد بزنید.', 'polymart-ai' );
-					self::set_job_last_step( $job, 0, 'failed', $job['last_error'] );
+				// Picker empty: never show a fake stall when there is no next post.
+				if ( 'running' === ( $job['status'] ?? '' ) ) {
+					$job['status']       = 'completed';
+					$job['pause_reason'] = null;
+					$job['stalled_ids']  = array();
+					$job['remaining']    = 0;
+					$job['needs_work']   = 0;
+					$job['last_error']   = null;
 				}
 
 				self::save_job( $job );
@@ -1156,10 +1159,22 @@ trait Trait_Queue_Run {
 				return;
 			}
 
-			$job['status']       = 'paused';
-			$job['pause_reason'] = 'stalled';
-			$job['stalled_ids']  = $stalled_ids;
-			$job['last_error']   = self::format_stalled_job_error( $lang, $stalled_ids );
+			/*
+			 * Job counter/index still says remaining > 0, but nothing is actionable
+			 * (stale index, exhausted stubborn leftovers, etc.). Treat as successful
+			 * completion — do NOT pause with the fake "0 ناقص / cms_block" error.
+			 */
+			$issues              = Translation_Query::collect_storefront_translation_issues( $lang, 5 );
+			$job['status']       = 'completed';
+			$job['pause_reason'] = null;
+			$job['stalled_ids']  = array();
+			$job['remaining']    = 0;
+			$job['needs_work']   = 0;
+			$job['last_error']   = null;
+
+			if ( ! empty( $issues ) ) {
+				self::log( 'info', self::format_no_queue_diagnostic( $lang, $issues ) );
+			}
 
 			return;
 		}

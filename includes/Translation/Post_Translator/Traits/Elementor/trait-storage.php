@@ -782,6 +782,7 @@ trait Trait_Storage {
 			delete_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ) );
 			delete_post_meta( $post_id, self::get_elementor_progress_meta_key( $lang ) );
 			delete_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang );
+			self::clear_elementor_stubborn_exhausted( $post_id, $lang );
 		}
 
 		self::flush_translation_status_cache( $post_id );
@@ -895,13 +896,36 @@ trait Trait_Storage {
 	}
 
 	public static function stored_elementor_translation_has_persian( $post_id, $lang ) {
-		return '' !== self::collect_stored_elementor_persian_plain_text( $post_id, $lang );
+		return '' !== self::collect_stored_elementor_persian_plain_text( $post_id, $lang, false );
 	}
 
-	public static function collect_stored_elementor_persian_plain_text( $post_id, $lang ) {
-		$post_id = absint( $post_id );
-		$lang    = sanitize_key( (string) $lang );
-		$key     = $post_id . ':' . $lang;
+	/**
+	 * Whether the EN/AR companion still contains Persian that the storefront would show.
+	 *
+	 * Unlike {@see stored_elementor_translation_has_persian()}, this includes force-accepted
+	 * stubborn paths — those leftovers still render as FA on /en|/ar.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Target language.
+	 * @return bool
+	 */
+	public static function stored_elementor_translation_has_visible_persian( $post_id, $lang ) {
+		return '' !== self::collect_stored_elementor_persian_plain_text( $post_id, $lang, true );
+	}
+
+	/**
+	 * Collect non-acceptable strings from the stored Elementor companion.
+	 *
+	 * @param int    $post_id          Post ID.
+	 * @param string $lang             Target language.
+	 * @param bool   $include_accepted When false, skip force-accepted paths (job loop control).
+	 * @return string
+	 */
+	public static function collect_stored_elementor_persian_plain_text( $post_id, $lang, $include_accepted = false ) {
+		$post_id          = absint( $post_id );
+		$lang             = sanitize_key( (string) $lang );
+		$include_accepted = (bool) $include_accepted;
+		$key              = $post_id . ':' . $lang . ':' . ( $include_accepted ? '1' : '0' );
 
 		if ( array_key_exists( $key, self::$stored_elementor_persian_cache ) ) {
 			return self::$stored_elementor_persian_cache[ $key ];
@@ -931,13 +955,16 @@ trait Trait_Storage {
 
 		$payload = self::collect_elementor_translation_payload( $data );
 
-		// Force-accepted fallback paths (partial __segN + source gaps) are intentional leftovers.
-		// Counting them as "still Persian" caused infinite force→reopen loops (#21870).
-		$accepted = self::get_elementor_accepted_paths( $post_id, $lang );
+		// Force-accepted fallback paths (partial __segN + source gaps) are intentional for
+		// job-loop control — excluding them from the strict check avoids infinite reopen
+		// (#21870). The visible/storefront check must still count them.
+		if ( ! $include_accepted ) {
+			$accepted = self::get_elementor_accepted_paths( $post_id, $lang );
 
-		if ( ! empty( $accepted ) ) {
-			foreach ( $accepted as $accepted_path ) {
-				unset( $payload[ (string) $accepted_path ] );
+			if ( ! empty( $accepted ) ) {
+				foreach ( $accepted as $accepted_path ) {
+					unset( $payload[ (string) $accepted_path ] );
+				}
 			}
 		}
 
@@ -951,7 +978,6 @@ trait Trait_Storage {
 			}
 
 			// Language-aware: Arabic storefront JSON uses the same Unicode block as FA.
-			// Rejecting "contains_persian" here made every Arabic page look unfinished.
 			if ( ! Persian_Detector::is_acceptable_translation_for_language( $text, $lang ) ) {
 				$persian_bits[] = $text;
 			}
@@ -960,6 +986,45 @@ trait Trait_Storage {
 		self::$stored_elementor_persian_cache[ $key ] = implode( "\n\n", array_unique( $persian_bits ) );
 
 		return self::$stored_elementor_persian_cache[ $key ];
+	}
+
+	/**
+	 * Meta key: Elementor stubborn leftovers were force-accepted; auto-queue should not loop.
+	 *
+	 * @param string $lang Language code.
+	 * @return string
+	 */
+	public static function get_elementor_stubborn_exhausted_meta_key( $lang ) {
+		return '_polymart_ai_elementor_stubborn_exhausted_' . sanitize_key( (string) $lang );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language.
+	 * @return bool
+	 */
+	public static function is_elementor_stubborn_exhausted( $post_id, $lang ) {
+		$raw = get_post_meta( absint( $post_id ), self::get_elementor_stubborn_exhausted_meta_key( $lang ), true );
+
+		return is_numeric( $raw ) && absint( $raw ) > 0;
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language.
+	 * @return void
+	 */
+	public static function mark_elementor_stubborn_exhausted( $post_id, $lang ) {
+		update_post_meta( absint( $post_id ), self::get_elementor_stubborn_exhausted_meta_key( $lang ), time() );
+	}
+
+	/**
+	 * @param int    $post_id Post ID.
+	 * @param string $lang    Language.
+	 * @return void
+	 */
+	public static function clear_elementor_stubborn_exhausted( $post_id, $lang ) {
+		delete_post_meta( absint( $post_id ), self::get_elementor_stubborn_exhausted_meta_key( $lang ) );
 	}
 
 	private static function allows_elementor_audit_decode() {
@@ -1003,7 +1068,12 @@ trait Trait_Storage {
 			return true;
 		}
 
-		return self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang );
+		if ( ! self::can_serve_stored_elementor_json_on_storefront( $post_id, $lang ) ) {
+			return false;
+		}
+
+		// Soft-serve may swap an incomplete companion; treat visible FA leftovers as not ready.
+		return ! self::stored_elementor_translation_has_visible_persian( $post_id, $lang );
 	}
 
 	private static function has_stored_elementor_translation( $post_id, $lang ) {

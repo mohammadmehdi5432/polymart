@@ -1711,7 +1711,7 @@ trait Trait_Job_Slice {
 					return true;
 				}
 
-				if ( self::stored_elementor_translation_has_persian( $post_id, $lang ) ) {
+				if ( self::stored_elementor_translation_has_visible_persian( $post_id, $lang ) ) {
 					return true;
 				}
 
@@ -1839,6 +1839,19 @@ trait Trait_Job_Slice {
 				self::should_require_elementor_translation( $post_id )
 				&& self::has_elementor_persian_content( $post_id )
 				&& ( ! $is_finalized || ! $is_current )
+			) {
+				return true;
+			}
+
+			// Finalized companion that still shows FA on storefront (incl. force-accepted gaps).
+			// Exhausted stubborn leftovers stay partial in UI but skip auto-queue token burn.
+			if (
+				self::should_require_elementor_translation( $post_id )
+				&& self::has_elementor_persian_content( $post_id )
+				&& $is_finalized
+				&& $is_current
+				&& self::stored_elementor_translation_has_visible_persian( $post_id, $lang )
+				&& ! self::is_elementor_stubborn_exhausted( $post_id, $lang )
 			) {
 				return true;
 			}

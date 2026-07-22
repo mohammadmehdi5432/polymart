@@ -638,7 +638,8 @@ trait Trait_Job_Gap_Fill {
 		self::clear_job_partial_state( $post_id, $lang, true );
 		self::flush_translation_status_cache( $post_id );
 
-		$still_persian = self::stored_elementor_translation_has_persian( $post_id, $lang );
+		$still_persian   = self::stored_elementor_translation_has_persian( $post_id, $lang );
+		$visible_persian = self::stored_elementor_translation_has_visible_persian( $post_id, $lang );
 
 		if ( $still_persian ) {
 			$reopens = absint( $state['elementor_force_persian_reopens'] ?? 0 ) + 1;
@@ -694,7 +695,15 @@ trait Trait_Job_Gap_Fill {
 					update_post_meta( $post_id, self::get_elementor_finalized_meta_key( $lang ), time() );
 					update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
 					update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
-					update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+
+					// Accepted FA leftovers still render on storefront — never stamp "translated".
+					if ( self::stored_elementor_translation_has_visible_persian( $post_id, $lang ) ) {
+						self::mark_elementor_stubborn_exhausted( $post_id, $lang );
+						update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'partial' );
+					} else {
+						self::clear_elementor_stubborn_exhausted( $post_id, $lang );
+						update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+					}
 
 					\PolymartAI\Activity_Logger::log(
 						'warning',
@@ -770,7 +779,14 @@ trait Trait_Job_Gap_Fill {
 
 		update_post_meta( $post_id, '_polymart_ai_translated_at_' . $lang, time() );
 		update_post_meta( $post_id, '_polymart_ai_translated_at', time() );
-		update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+
+		if ( $visible_persian ) {
+			self::mark_elementor_stubborn_exhausted( $post_id, $lang );
+			update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'partial' );
+		} else {
+			self::clear_elementor_stubborn_exhausted( $post_id, $lang );
+			update_post_meta( $post_id, self::get_status_index_meta_key( $lang ), 'translated' );
+		}
 
 		return array(
 			'done'           => true,

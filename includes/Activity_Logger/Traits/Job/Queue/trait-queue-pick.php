@@ -639,7 +639,7 @@ trait Trait_Queue_Pick {
 		}
 
 		return __(
-			'مورد ترجمه‌نشده‌ای در index یافت نشد. اگر صفحه اصلی/فوتر/بلوک HTML هنوز فارسی است، احتمالاً متن در ویجت هدر وودمارت (خارج از پست) است — تب «رشته‌های UI» را اسکن کنید، یا صفحه/بلوک cms_block را در ویرایشگر باز کنید.',
+			'مورد ترجمه‌نشده‌ای در صف index نیست. اگر صفحه اصلی/فوتر هنوز فارسی است: تب «رشته‌های UI» را اسکن کنید، یا بلوک HTML (cms_block) / صفحه را در ویرایشگر باز کنید و «ترجمه و تکمیل» بزنید.',
 			'polymart-ai'
 		);
 	}
@@ -647,11 +647,24 @@ trait Trait_Queue_Pick {
 	private static function format_stalled_job_error( $lang, array $remaining_ids, $template = '' ) {
 		$lang          = sanitize_key( (string) $lang );
 		$remaining_ids = array_values( array_filter( array_map( 'absint', $remaining_ids ) ) );
-		$details       = array();
+
+		// Empty ID list is not a stall — callers should complete the job. Keep a calm tip.
+		if ( empty( $remaining_ids ) ) {
+			$live_count = Translation_Query::count_untranslated_persian_posts( $lang );
+			$issues     = Translation_Query::collect_storefront_translation_issues( $lang, 5 );
+
+			if ( $live_count <= 0 && empty( $issues ) ) {
+				return __( 'صف خالی است؛ مورد قابل اجرای دیگری برای ترجمه خودکار نیست.', 'polymart-ai' );
+			}
+
+			return self::format_no_queue_diagnostic( $lang, $issues );
+		}
+
+		$details = array();
 
 		foreach ( array_slice( $remaining_ids, 0, 5 ) as $post_id ) {
-			$gaps    = Post_Translator::get_translation_gaps( $post_id, $lang );
-			$parts   = array();
+			$gaps  = Post_Translator::get_translation_gaps( $post_id, $lang );
+			$parts = array();
 
 			foreach ( $gaps['fields'] ?? array() as $field ) {
 				if ( empty( $field['translated'] ) ) {
@@ -684,7 +697,7 @@ trait Trait_Queue_Pick {
 
 		$summary = implode( ' | ', $details );
 
-		if ( '' === trim( $summary ) && ! empty( $remaining_ids ) ) {
+		if ( '' === trim( $summary ) ) {
 			foreach ( array_slice( $remaining_ids, 0, 5 ) as $post_id ) {
 				$details[] = sprintf(
 					'#%1$d: %2$s',
@@ -704,32 +717,12 @@ trait Trait_Queue_Pick {
 		}
 
 		if ( '' === trim( $summary ) ) {
-			$issues = Translation_Query::collect_storefront_translation_issues( $lang, 5 );
-
-			foreach ( $issues as $issue ) {
-				$details[] = sprintf(
-					'#%1$d: %2$s — %3$s',
-					(int) ( $issue['post_id'] ?? 0 ),
-					(string) ( $issue['title'] ?? '' ),
-					(string) ( $issue['reason'] ?? '' )
-				);
-			}
-
-			$summary = implode( ' | ', $details );
+			$summary = self::format_no_queue_diagnostic( $lang );
 		}
-
-		if ( '' === trim( $summary ) ) {
-			$summary = __( 'هیچ مورد قابل اجرا در صف پیدا نشد. صفحه اصلی، بلوک HTML (cms_block) یا ویجت هدر را در ویرایشگر باز کنید و دوباره «شروع» بزنید.', 'polymart-ai' );
-		}
-
-		$total_incomplete = max(
-			count( $remaining_ids ),
-			Translation_Query::count_untranslated_persian_posts( $lang )
-		);
 
 		return sprintf(
 			$template,
-			$total_incomplete,
+			count( $remaining_ids ),
 			$summary
 		);
 	}

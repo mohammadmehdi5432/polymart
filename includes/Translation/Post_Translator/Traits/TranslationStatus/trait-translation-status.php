@@ -135,7 +135,7 @@ trait Trait_Translation_Status {
 			} elseif (
 				self::uses_elementor_builder( $post_id )
 				&& (
-					self::stored_elementor_translation_has_persian( $post_id, $lang )
+					self::stored_elementor_translation_has_visible_persian( $post_id, $lang )
 					|| self::storefront_would_show_persian_source( $post_id, $lang )
 					|| self::elementor_job_has_remaining_payload( $post_id, $lang )
 					|| (
