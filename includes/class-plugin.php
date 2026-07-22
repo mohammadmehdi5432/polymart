@@ -244,15 +244,24 @@ final class Plugin {
 		);
 		Comment_Translator::register_lifecycle_hooks();
 
+		/*
+		 * Boot on `init` (not only `wp`): Elementor often reads `_elementor_data`
+		 * during `wp` / CSS print. Waiting until `wp` left /en/ serving Persian
+		 * source even when `_elementor_data_en` was clean and finalized.
+		 *
+		 * admin-ajax.php never fires `wp` either — same early boot covers AJAX
+		 * fragments. `wp` remains a fallback for any path that skipped `init`.
+		 */
+		if ( ! is_admin() || wp_doing_ajax() ) {
+			add_action( 'init', array( $this, 'maybe_boot_storefront_translators' ), 20 );
+		}
+
 		add_action( 'wp', array( $this, 'maybe_boot_storefront_translators' ), 0 );
 
-		/*
-		 * admin-ajax.php never fires `wp`, so storefront translators would not exist
-		 * for AJAX-rendered content (variation payloads, cart fragments, widgets).
-		 * Boot them on init instead; each module decides via its own should_intercept.
-		 */
-		if ( wp_doing_ajax() ) {
-			add_action( 'init', array( $this, 'maybe_boot_storefront_translators' ), 20 );
+		// Translated storefront: register the Elementor companion swap immediately
+		// (plugins_loaded) so Theme Builder / CSS never cache FA `_elementor_data`.
+		if ( ( ! is_admin() || wp_doing_ajax() ) && Url_Router::is_translated_request() ) {
+			$this->maybe_boot_storefront_translators();
 		}
 
 		if ( is_admin() ) {
@@ -265,10 +274,11 @@ final class Plugin {
 	}
 
 	/**
-	 * Boot storefront translation modules after the main query is ready.
+	 * Boot storefront translation modules (idempotent).
 	 *
-	 * Per-module bypass constants (POLYMART_AI_BYPASS_*) allow selective
-	 * isolation on single product pages. Nuclear bypass skips every module.
+	 * Prefer `init` so Elementor meta swap is registered before `wp`. Per-module
+	 * bypass constants (POLYMART_AI_BYPASS_*) allow selective isolation on single
+	 * product pages. Nuclear bypass skips every module.
 	 *
 	 * @return void
 	 */
@@ -280,27 +290,27 @@ final class Plugin {
 		$this->storefront_translators_booted = true;
 		Product_Diagnostics::log_boot_decision();
 
-		if ( ! Product_Diagnostics::should_skip_module( 'frontend_interceptor' ) ) {
+		if ( null === $this->frontend_interceptor && ! Product_Diagnostics::should_skip_module( 'frontend_interceptor' ) ) {
 			$this->frontend_interceptor = new Frontend_Interceptor();
 		}
 
-		if ( ! Product_Diagnostics::should_skip_module( 'universal' ) ) {
+		if ( null === $this->universal_translator && ! Product_Diagnostics::should_skip_module( 'universal' ) ) {
 			$this->universal_translator = new Universal_Translator();
 		}
 
-		if ( ! Product_Diagnostics::should_skip_module( 'woocommerce' ) ) {
+		if ( null === $this->woocommerce_translator && ! Product_Diagnostics::should_skip_module( 'woocommerce' ) ) {
 			$this->woocommerce_translator = new WooCommerce_Translator();
 		}
 
-		if ( ! Product_Diagnostics::should_skip_module( 'woodmart' ) ) {
+		if ( null === $this->woodmart_translator && ! Product_Diagnostics::should_skip_module( 'woodmart' ) ) {
 			$this->woodmart_translator = new Woodmart_Translator();
 		}
 
-		if ( ! Product_Diagnostics::should_skip_module( 'option' ) ) {
+		if ( null === $this->option_translator && ! Product_Diagnostics::should_skip_module( 'option' ) ) {
 			$this->option_translator = new Option_Translator();
 		}
 
-		if ( ! Product_Diagnostics::should_skip_module( 'comment' ) ) {
+		if ( null === $this->comment_translator && ! Product_Diagnostics::should_skip_module( 'comment' ) ) {
 			$this->comment_translator = new Comment_Translator();
 		}
 	}

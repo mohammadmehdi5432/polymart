@@ -131,10 +131,17 @@ final class Universal_Translator {
 		add_filter( 'gettext_with_context', array( $this, 'filter_gettext_with_context' ), 20, 4 );
 		add_filter( 'ngettext', array( $this, 'filter_ngettext' ), 20, 5 );
 
-		// Register BEFORE template_redirect — Elementor often reads `_elementor_data`
-		// during `wp` / CSS print, so waiting until template_redirect left /en/ on Persian source.
-		add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_swap_early' ), 20 );
-		add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_cache_guard' ), 20 );
+		// Elementor often reads `_elementor_data` during `wp` / CSS print.
+		// This class may be constructed on `init` (after plugins_loaded) or earlier;
+		// never rely on a deferred plugins_loaded hook that already fired.
+		if ( did_action( 'plugins_loaded' ) ) {
+			$this->maybe_register_elementor_cache_guard();
+			$this->maybe_register_elementor_swap_early();
+		} else {
+			add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_swap_early' ), 20 );
+			add_action( 'plugins_loaded', array( $this, 'maybe_register_elementor_cache_guard' ), 20 );
+		}
+
 		add_action( 'wp', array( $this, 'maybe_register_elementor_metadata_filter' ), 0 );
 		add_action( 'template_redirect', array( $this, 'maybe_register_elementor_metadata_filter' ), 1 );
 		add_action( 'template_redirect', array( $this, 'maybe_register_embedded_elementor_filter' ), 1 );
@@ -158,7 +165,7 @@ final class Universal_Translator {
 			add_filter( 'acf/format_value', array( $this, 'filter_acf_value' ), 20, 3 );
 		}
 
-		// Also try immediately — language is bootstrapped from URI in Url_Router::__construct.
+		// Immediate attempt for non-admin — URI language is ready in Url_Router.
 		if ( ! is_admin() ) {
 			$this->maybe_register_elementor_cache_guard();
 			$this->maybe_register_elementor_swap_early();
@@ -1059,10 +1066,14 @@ final class Universal_Translator {
 			}
 		}
 
+		$label = ( $serving && 'hit' === $cached ) ? 'Serving' : 'Elementor status';
+
 		printf(
-			"\n<!-- Polymart AI: Serving %s for Post ID %d | filter=%s embedded=%s cache=%s pin=%s singular=%s front=%s embeds=%s -->\n",
+			"\n<!-- Polymart AI: %s %s for Post ID %d | can_serve=%s filter=%s embedded=%s cache=%s pin=%s singular=%s front=%s embeds=%s -->\n",
+			esc_html( $label ),
 			esc_html( strtoupper( $lang ) ),
 			(int) $post_id,
+			$serving ? '1' : '0',
 			esc_html( $filter ),
 			esc_html( $embedded ),
 			esc_html( $cached ),
@@ -1084,6 +1095,8 @@ final class Universal_Translator {
 				"<!-- Polymart AI: NOT serving Elementor companion | codes=%s -->\n",
 				esc_html( $codes )
 			);
+		} elseif ( 'miss' === $cached ) {
+			echo "<!-- Polymart AI: can_serve but cache=miss — companion was not read (late boot or wrong pin) -->\n";
 		}
 	}
 
