@@ -1006,22 +1006,72 @@ trait Trait_Job_Gap_Fill {
 			);
 		}
 
-		$preview_tree     = self::apply_elementor_translation_payload( $source_data, $map );
-		$preview_persian  = self::collect_elementor_translation_payload( $preview_tree );
+		self::bind_elementor_accepted_paths_context( $post_id, $lang );
 
-		if ( ! empty( $preview_persian ) ) {
+		$preview_leftovers = self::collect_elementor_preview_language_leftovers( $source_data, $map, $lang );
+
+		if ( ! empty( $preview_leftovers ) ) {
 			return array(
 				'code'    => 'stored_persian',
 				'message' => sprintf(
 					/* translators: 1: post ID, 2: remaining Persian field count */
 					__( 'Elementor — #%1$d: %2$d فیلد هنوز فارسی در JSON نهایی دارد — نهایی‌سازی متوقف شد.', 'polymart-ai' ),
 					$post_id,
-					count( $preview_persian )
+					count( $preview_leftovers )
 				),
 			);
 		}
 
 		return null;
+	}
+
+	/**
+	 * Fields in the mapped Elementor tree that are still unacceptable for $lang.
+	 *
+	 * Critical for Arabic: collect_elementor_translation_payload() uses the shared
+	 * Arabic/Persian Unicode block, so valid Arabic copy would look like "leftover FA"
+	 * and block finalization forever. Compare against source / language rules instead.
+	 *
+	 * @param array<int|string, mixed> $source_data Source Elementor tree.
+	 * @param array<string, string>    $map         Translation map.
+	 * @param string                   $lang        Target language.
+	 * @return array<string, string> Path => applied text.
+	 */
+	private static function collect_elementor_preview_language_leftovers( array $source_data, array $map, $lang ) {
+		$lang           = sanitize_key( (string) $lang );
+		$source_payload = self::collect_elementor_translation_payload( $source_data );
+		$preview_tree   = self::apply_elementor_translation_payload( $source_data, $map );
+		$preview_hits   = self::collect_elementor_translation_payload( $preview_tree );
+		$leftovers      = array();
+
+		foreach ( $preview_hits as $path => $applied ) {
+			$path    = (string) $path;
+			$applied = (string) $applied;
+
+			if ( self::elementor_path_is_accepted( $path ) ) {
+				continue;
+			}
+
+			$source_text = (string) ( $source_payload[ $path ] ?? '' );
+
+			if ( 'ar' === $lang ) {
+				// Shared Unicode block with FA — only unchanged source is a real leftover.
+				if (
+					'' !== $source_text
+					&& self::normalize_translation_plaintext( $applied ) === self::normalize_translation_plaintext( $source_text )
+				) {
+					$leftovers[ $path ] = $applied;
+				}
+
+				continue;
+			}
+
+			if ( ! Persian_Detector::is_acceptable_translation_for_language( $applied, $lang ) ) {
+				$leftovers[ $path ] = $applied;
+			}
+		}
+
+		return $leftovers;
 	}
 
 	private static function respond_elementor_blocked_finalize( $post_id, $lang, array $source_data, array $map, array &$state, $done_count, $total_chunks, array $blocker ) {
