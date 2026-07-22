@@ -117,6 +117,13 @@ final class Universal_Translator {
 	private static $elementor_cache_bust_registered = false;
 
 	/**
+	 * Whether Element Cache TTL disable + builder_content_data overrides are registered.
+	 *
+	 * @var bool
+	 */
+	private static $elementor_render_overrides_registered = false;
+
+	/**
 	 * Post IDs whose polluted `_elementor_element_cache` row was deleted this request.
 	 *
 	 * @var array<int, true>
@@ -169,6 +176,7 @@ final class Universal_Translator {
 		if ( ! is_admin() ) {
 			$this->maybe_register_elementor_cache_guard();
 			$this->maybe_register_elementor_swap_early();
+			$this->maybe_register_elementor_render_overrides();
 		}
 	}
 
@@ -203,6 +211,128 @@ final class Universal_Translator {
 		$this->pin_early_storefront_main_post();
 		// Footer/header Theme Builder templates read meta during render — same early window as homepage.
 		$this->maybe_register_embedded_elementor_filter();
+		$this->maybe_register_elementor_render_overrides();
+	}
+
+	/**
+	 * Force companion JSON into Elementor's render path and disable Element Cache on /en|/ar.
+	 *
+	 * Meta swap alone is not enough: when Element Cache is on, `Document::print_elements()`
+	 * serves pre-rendered FA HTML from `_elementor_element_cache` and ignores swapped JSON.
+	 *
+	 * @return void
+	 */
+	public function maybe_register_elementor_render_overrides() {
+		if ( self::$elementor_render_overrides_registered || ! Url_Router::is_translated_request() || is_admin() ) {
+			return;
+		}
+
+		self::$elementor_render_overrides_registered = true;
+
+		// Bypass Elementor's element-cache branch entirely on translated URLs.
+		add_filter( 'pre_option_elementor_element_cache_ttl', array( $this, 'disable_elementor_element_cache_ttl' ), 5 );
+
+		// Last-mile: replace decoded elements with companion before HTML is printed.
+		add_filter( 'elementor/frontend/builder_content_data', array( $this, 'filter_builder_content_data' ), 5, 2 );
+		add_filter( 'elementor/document/load/data', array( $this, 'filter_document_load_data' ), 5, 2 );
+	}
+
+	/**
+	 * Disable Elementor Element Cache TTL on translated storefront requests.
+	 *
+	 * @param mixed $pre Short-circuit value for get_option.
+	 * @return mixed
+	 */
+	public function disable_elementor_element_cache_ttl( $pre ) {
+		if ( ! Url_Router::is_translated_request() ) {
+			return $pre;
+		}
+
+		return 'disable';
+	}
+
+	/**
+	 * Replace frontend builder data with stored companion JSON when available.
+	 *
+	 * @param array<int|string, mixed> $data    Elements data.
+	 * @param int                      $post_id Post ID.
+	 * @return array<int|string, mixed>
+	 */
+	public function filter_builder_content_data( $data, $post_id ) {
+		$swapped = $this->resolve_companion_elements_data( (int) $post_id );
+
+		return null !== $swapped ? $swapped : $data;
+	}
+
+	/**
+	 * Replace document load data with companion JSON (CSS / secondary reads).
+	 *
+	 * @param array<int|string, mixed>     $data     Elements data.
+	 * @param \Elementor\Core\Base\Document $document Document.
+	 * @return array<int|string, mixed>
+	 */
+	public function filter_document_load_data( $data, $document ) {
+		$post_id = 0;
+
+		if ( is_object( $document ) && method_exists( $document, 'get_main_id' ) ) {
+			$post_id = (int) $document->get_main_id();
+		} elseif ( is_object( $document ) && method_exists( $document, 'get_post' ) ) {
+			$post = $document->get_post();
+			$post_id = ( $post instanceof \WP_Post ) ? (int) $post->ID : 0;
+		}
+
+		$swapped = $this->resolve_companion_elements_data( $post_id );
+
+		return null !== $swapped ? $swapped : $data;
+	}
+
+	/**
+	 * Decode companion `_elementor_data_{lang}` for a post when it is safe to serve.
+	 *
+	 * @param int $post_id Post ID.
+	 * @return array<int|string, mixed>|null
+	 */
+	private function resolve_companion_elements_data( $post_id ) {
+		$post_id = (int) $post_id;
+
+		if ( $post_id <= 0 || ! Url_Router::is_translated_request() ) {
+			return null;
+		}
+
+		if ( Layout_Guard::is_single_product_shell_post( $post_id ) ) {
+			return null;
+		}
+
+		$lang      = Url_Router::get_current_language();
+		$post_type = get_post_type( $post_id );
+		$embedded  = in_array( $post_type, self::get_embedded_elementor_post_types(), true );
+		$context   = $embedded ? 'embedded' : 'page';
+
+		if ( ! $embedded && Layout_Guard::should_preserve_elementor_metadata( $post_id ) ) {
+			return null;
+		}
+
+		if ( ! Post_Translator::can_serve_stored_elementor_json_on_storefront( $post_id, $lang, $context ) ) {
+			return null;
+		}
+
+		$stored = Post_Translator::get_stored_elementor_json( $post_id, $lang );
+
+		if ( ! is_string( $stored ) || '' === $stored ) {
+			return null;
+		}
+
+		$decoded = json_decode( $stored, true );
+
+		if ( ! is_array( $decoded ) ) {
+			return null;
+		}
+
+		// Keep meta-swap cache warm for debug comment + avoid duplicate DB reads.
+		$this->elementor_cache[ $post_id ] = $stored;
+		$this->purge_stale_elementor_element_cache( $post_id );
+
+		return $decoded;
 	}
 
 	/**
@@ -253,6 +383,7 @@ final class Universal_Translator {
 		$this->register_elementor_swap_filters();
 		$this->maybe_register_elementor_cache_guard();
 		$this->maybe_register_embedded_elementor_filter();
+		$this->maybe_register_elementor_render_overrides();
 	}
 
 	/**
@@ -1095,9 +1226,10 @@ final class Universal_Translator {
 		}
 
 		$label = ( $serving && 'hit' === $cached ) ? 'Serving' : 'Elementor status';
+		$ecache = self::$elementor_render_overrides_registered ? 'off' : 'default';
 
 		printf(
-			"\n<!-- Polymart AI: %s %s for Post ID %d | can_serve=%s filter=%s embedded=%s cache=%s pin=%s singular=%s front=%s embeds=%s -->\n",
+			"\n<!-- Polymart AI: %s %s for Post ID %d | can_serve=%s filter=%s embedded=%s cache=%s ecache=%s pin=%s singular=%s front=%s embeds=%s -->\n",
 			esc_html( $label ),
 			esc_html( strtoupper( $lang ) ),
 			(int) $post_id,
@@ -1105,6 +1237,7 @@ final class Universal_Translator {
 			esc_html( $filter ),
 			esc_html( $embedded ),
 			esc_html( $cached ),
+			esc_html( $ecache ),
 			esc_html( $main_pin ),
 			is_singular() ? '1' : '0',
 			is_front_page() ? '1' : '0',
