@@ -9,6 +9,7 @@ namespace PolymartAI\Translation\Pipeline;
 
 use PolymartAI\Language_Registry;
 use PolymartAI\Frontend\Storefront_Script_Guard;
+use PolymartAI\Integration\Elementor_Image_Translation;
 use PolymartAI\Routing\Url_Router;
 
 use PolymartAI\Translation\AI\Persian_Detector;
@@ -326,6 +327,15 @@ final class Universal_Translator {
 
 		if ( ! is_array( $decoded ) ) {
 			return null;
+		}
+
+		// Companion inject bypasses get_post_metadata image rewrite — promote here.
+		if ( class_exists( Elementor_Image_Translation::class ) ) {
+			$decoded = Elementor_Image_Translation::localize_elements_data( $decoded, $post_id, $lang );
+			$reencoded = wp_json_encode( $decoded, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+			if ( is_string( $reencoded ) && '' !== $reencoded ) {
+				$stored = $reencoded;
+			}
 		}
 
 		// Keep meta-swap cache warm for debug comment + avoid duplicate DB reads.

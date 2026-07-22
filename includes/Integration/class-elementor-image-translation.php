@@ -305,9 +305,9 @@ final class Elementor_Image_Translation {
 			return is_string( $json ) ? $json : '';
 		}
 
-		remove_filter( 'get_post_metadata', array( __CLASS__, 'filter_elementor_data_images' ), 20 );
-		$source_raw = get_post_meta( $post_id, '_elementor_data', true );
-		add_filter( 'get_post_metadata', array( __CLASS__, 'filter_elementor_data_images' ), 20, 4 );
+		// Read FA source from DB — get_post_meta( _elementor_data ) would return the
+		// companion while Universal_Translator swap is active.
+		$source_raw = self::read_raw_elementor_data_meta( $post_id );
 
 		if ( ! is_string( $source_raw ) || false === strpos( $source_raw, '"' . $key . '"' ) ) {
 			return $json;
@@ -336,6 +336,92 @@ final class Elementor_Image_Translation {
 		$encoded = wp_json_encode( $target, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
 
 		return is_string( $encoded ) && '' !== $encoded ? $encoded : $json;
+	}
+
+	/**
+	 * Read unfiltered FA `_elementor_data` (bypasses companion swap filters).
+	 *
+	 * @param int $post_id Post ID.
+	 * @return string|null
+	 */
+	private static function read_raw_elementor_data_meta( $post_id ) {
+		$post_id = absint( $post_id );
+
+		if ( $post_id <= 0 ) {
+			return null;
+		}
+
+		global $wpdb;
+
+		$row = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s LIMIT 1",
+				$post_id,
+				'_elementor_data'
+			)
+		);
+
+		if ( ! is_string( $row ) || '' === $row ) {
+			return null;
+		}
+
+		$row = maybe_unserialize( $row );
+
+		if ( ! is_string( $row ) ) {
+			return null;
+		}
+
+		return wp_unslash( $row );
+	}
+
+	/**
+	 * Localize Image widgets on decoded Elementor elements for a storefront language.
+	 *
+	 * Used when companion JSON is injected via builder_content_data (bypasses the
+	 * get_post_metadata image rewrite). Merges polymart_image_{lang} from FA source
+	 * when missing, then promotes into settings.image.
+	 *
+	 * @param array<int|string, mixed> $data    Elements tree.
+	 * @param int                      $post_id Post ID.
+	 * @param string                   $lang    Language code.
+	 * @return array<int|string, mixed>
+	 */
+	public static function localize_elements_data( array $data, $post_id, $lang ) {
+		$post_id = absint( $post_id );
+		$lang    = sanitize_key( (string) $lang );
+
+		if ( $post_id <= 0 || '' === $lang || Language_Registry::get_default_language_code() === $lang ) {
+			return $data;
+		}
+
+		$json = wp_json_encode( $data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+
+		if ( ! is_string( $json ) || '' === $json ) {
+			return $data;
+		}
+
+		$needle = '"' . self::get_setting_key( $lang ) . '"';
+
+		if ( false === strpos( $json, $needle ) ) {
+			$json = self::merge_language_images_from_source( $json, $post_id, $lang );
+		}
+
+		if ( false === strpos( $json, '"' . self::SETTING_PREFIX ) ) {
+			return $data;
+		}
+
+		$rewritten = self::apply_language_images_to_json( $json, $lang );
+
+		if ( ! is_string( $rewritten ) || $rewritten === $json ) {
+			// Still try promote when merge added keys but encode equality edge-case.
+			$decoded_after_merge = json_decode( $json, true );
+
+			return is_array( $decoded_after_merge ) ? $decoded_after_merge : $data;
+		}
+
+		$decoded = json_decode( $rewritten, true );
+
+		return is_array( $decoded ) ? $decoded : $data;
 	}
 
 	/**
