@@ -58,6 +58,7 @@ final class Woodmart_Translator {
 		'popup_text',
 		'popup_html_block',
 		'header_banner_text',
+		'header_banner_shortcode',
 		'sticky_navigation_title',
 		'sticky_navigation_area',
 		'info_box_text',
