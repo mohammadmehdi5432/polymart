@@ -56,9 +56,7 @@ trait Trait_Translation_Status {
 			return false;
 		}
 
-		if ( 'woodmart_slide' === $post->post_type && get_post_thumbnail_id( $post->ID ) ) {
-			return true;
-		}
+		// Featured / slide banner images are manual media — never count as AI text work.
 
 		if ( ! empty( self::collect_persian_fields( $post ) ) ) {
 			return true;
@@ -207,15 +205,8 @@ trait Trait_Translation_Status {
 			);
 		}
 
-		if ( 'woodmart_slide' === $post->post_type && get_post_thumbnail_id( $post_id ) ) {
-			$fields[] = array(
-				'key'        => 'thumbnail',
-				'label'      => __( 'تصویر شاخص', 'polymart-ai' ),
-				'meta_key'   => self::get_thumbnail_meta_key( $lang ),
-				'has_source' => true,
-				'translated' => self::get_translated_thumbnail_id( $post_id, $lang ) > 0,
-			);
-		}
+		// Slide/product banners (_thumbnail_id_{lang}) are set manually in the meta box —
+		// never require them for auto-translate completion or queue progress.
 
 		$title_source = Persian_Detector::only_persian_value( $post->post_title );
 
