@@ -246,19 +246,28 @@ function polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang ) {
 	$en_bytes      = strlen( (string) get_post_meta( $post_id, $elementor_key, true ) );
 	$partial_raw   = get_post_meta( $post_id, '_polymart_ai_job_partial_' . $lang, true );
 	$partial_bytes = is_string( $partial_raw ) ? strlen( $partial_raw ) : ( is_array( $partial_raw ) ? strlen( (string) wp_json_encode( $partial_raw ) ) : 0 );
+	$why           = polymart_ai_queue_diag_why_storefront_persian( $post_id, $lang );
+
+	$view_lang = class_exists( '\PolymartAI\Language_Registry' )
+		? (string) \PolymartAI\Language_Registry::get_language_home_url( $lang )
+		: '';
 
 	return array(
-		'post_id'     => $post_id,
-		'title'       => get_the_title( $post_id ),
-		'post_type'   => $post->post_type,
-		'post_status' => $post->post_status,
-		'edit_url'    => get_edit_post_link( $post_id, 'raw' ),
-		'view_url_fa' => get_permalink( $post_id ),
-		'index_status'=> (string) get_post_meta( $post_id, $status_key, true ),
-		'persian_flag'=> (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::PERSIAN_CONTENT_FLAG_META, true ),
+		'post_id'        => $post_id,
+		'title'          => get_the_title( $post_id ),
+		'post_type'      => $post->post_type,
+		'post_status'    => $post->post_status,
+		'edit_url'       => get_edit_post_link( $post_id, 'raw' ),
+		'view_url_fa'    => get_permalink( $post_id ),
+		'view_url_' . $lang => $view_lang,
+		'index_status'   => (string) get_post_meta( $post_id, $status_key, true ),
+		'live_status'    => isset( $why['live_status'] ) ? $why['live_status'] : null,
+		'needs_work'     => isset( $why['needs_work'] ) ? $why['needs_work'] : null,
+		'persian_flag'   => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::PERSIAN_CONTENT_FLAG_META, true ),
 		'uses_elementor' => \PolymartAI\Translation\Post_Translator::uses_elementor_builder( $post_id ),
-		'light'       => true,
-		'meta'        => array(
+		'light'          => true,
+		'why_persian'    => $why,
+		'meta'           => array(
 			'_elementor_edit_mode'                              => (string) get_post_meta( $post_id, '_elementor_edit_mode', true ),
 			'_elementor_data_bytes'                             => $source_bytes,
 			$elementor_key . '_bytes'                           => $en_bytes,
@@ -279,42 +288,186 @@ function polymart_ai_queue_diag_post_snapshot_light( $post_id, $lang ) {
 			'title_' . $lang                                    => (string) get_post_meta( $post_id, \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ), true ),
 			'title_meta_key_' . $lang                           => \PolymartAI\Translation\Post_Translator::get_meta_key( 'title', $lang ),
 		),
-		'can_serve_light' => ( static function () use ( $post_id, $lang, $en_bytes ) {
-			$finalized_raw = (string) get_post_meta( $post_id, '_polymart_ai_elementor_finalized_' . $lang, true );
-			$error         = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_error_' . $lang, true ) );
-			$progress      = trim( (string) get_post_meta( $post_id, '_polymart_ai_elementor_progress_' . $lang, true ) );
-			$hash_current  = method_exists( '\PolymartAI\Translation\Post_Translator', 'is_elementor_translation_current' )
-				? (bool) \PolymartAI\Translation\Post_Translator::is_elementor_translation_current( $post_id, $lang )
-				: null;
-			$codes         = array();
-
-			if ( $en_bytes <= 2 ) {
-				$codes[] = 'missing_companion_json';
-			}
-
-			if ( '' === $finalized_raw || ! is_numeric( $finalized_raw ) ) {
-				$codes[] = 'not_finalized';
-			}
-
-			if ( '' !== $error ) {
-				$codes[] = 'hard_error_meta';
-			}
-
-			if ( '' !== $progress ) {
-				$codes[] = 'progress_meta_present';
-			}
-
-			return array(
-				'ok'                => empty( $codes ),
-				'codes'             => $codes,
-				'hash_current'      => $hash_current,
-				'source_hash_stale' => ( false === $hash_current ),
-				'finalized'         => ( '' !== $finalized_raw && is_numeric( $finalized_raw ) ),
-				'stored_bytes'      => $en_bytes,
-				'note'              => 'Cheap meta gate only — use full=1 for has_persian / elementor_scan.',
-			);
-		} )(),
+		'can_serve_light' => array(
+			'ok'                => empty( $why['serve_hard_codes'] ?? array() ),
+			'codes'             => array_values( (array) ( $why['serve_hard_codes'] ?? array() ) ),
+			'hash_current'      => $why['hash_current'] ?? null,
+			'source_hash_stale' => empty( $why['hash_current'] ),
+			'finalized'         => ! empty( $why['finalized'] ),
+			'stored_bytes'      => $en_bytes,
+			'note'              => 'Includes companion Persian audit (why_persian). Use full=1 for elementor_scan / AS events.',
+		),
 	);
+}
+
+/**
+ * Explain why /en|/ar may still look Persian even when index says translated.
+ *
+ * Bounded admin-only decode of the language companion — safe for homepage-sized JSON.
+ *
+ * @param int    $post_id Post ID.
+ * @param string $lang    Language code.
+ * @return array<string, mixed>
+ */
+function polymart_ai_queue_diag_why_storefront_persian( $post_id, $lang ) {
+	$post_id = absint( $post_id );
+	$lang    = sanitize_key( (string) $lang );
+	$out     = array(
+		'verdict'                    => 'unknown',
+		'explanation'                => '',
+		'can_serve'                  => null,
+		'serve_hard_codes'           => array(),
+		'serve_soft_codes'           => array(),
+		'finalized'                  => false,
+		'hash_current'               => null,
+		'companion_bytes'            => 0,
+		'source_bytes'               => 0,
+		'bytes_ratio'                => null,
+		'stored_persian_strict'      => null,
+		'stored_persian_visible'     => null,
+		'persian_field_count'        => 0,
+		'persian_samples'            => array(),
+		'accepted_paths_count'       => 0,
+		'stubborn_exhausted'         => null,
+		'storefront_ready'           => null,
+		'storefront_would_show_fa'   => null,
+		'live_status'                => null,
+		'needs_work'                 => null,
+		'actionable_for_job'         => null,
+		'check_html_comment'         => 'View Source on /' . $lang . '/ — look for «Polymart AI: Serving ' . strtoupper( $lang ) . '» vs «NOT serving».',
+		'errors'                     => array(),
+	);
+
+	if ( $post_id <= 0 || '' === $lang ) {
+		$out['verdict']     = 'invalid_args';
+		$out['explanation'] = 'post_id/lang invalid';
+
+		return $out;
+	}
+
+	$pt = '\PolymartAI\Translation\Post_Translator';
+
+	try {
+		$elementor_key = method_exists( $pt, 'get_elementor_meta_key' )
+			? $pt::get_elementor_meta_key( $lang )
+			: '_elementor_data_' . $lang;
+
+		$out['source_bytes']    = strlen( (string) get_post_meta( $post_id, '_elementor_data', true ) );
+		$out['companion_bytes'] = strlen( (string) get_post_meta( $post_id, $elementor_key, true ) );
+
+		if ( $out['source_bytes'] > 0 ) {
+			$out['bytes_ratio'] = round( $out['companion_bytes'] / $out['source_bytes'], 3 );
+		}
+
+		$finalized_raw     = (string) get_post_meta( $post_id, '_polymart_ai_elementor_finalized_' . $lang, true );
+		$out['finalized']  = ( '' !== $finalized_raw && is_numeric( $finalized_raw ) );
+		$out['hash_current'] = method_exists( $pt, 'is_elementor_translation_current' )
+			? (bool) $pt::is_elementor_translation_current( $post_id, $lang )
+			: null;
+
+		if ( method_exists( $pt, 'is_elementor_stubborn_exhausted' ) ) {
+			$out['stubborn_exhausted'] = (bool) $pt::is_elementor_stubborn_exhausted( $post_id, $lang );
+		}
+
+		if ( method_exists( $pt, 'get_elementor_accepted_paths' ) ) {
+			$out['accepted_paths_count'] = count( (array) $pt::get_elementor_accepted_paths( $post_id, $lang ) );
+		}
+
+		$serve = array( 'ok' => null, 'codes' => array() );
+
+		if ( method_exists( $pt, 'explain_elementor_storefront_serve_blockers' ) ) {
+			$serve = (array) $pt::explain_elementor_storefront_serve_blockers( $post_id, $lang, false );
+		} elseif ( method_exists( $pt, 'can_serve_stored_elementor_json_on_storefront' ) ) {
+			$serve['ok'] = (bool) $pt::can_serve_stored_elementor_json_on_storefront( $post_id, $lang, 'page' );
+		}
+
+		$codes = isset( $serve['codes'] ) && is_array( $serve['codes'] ) ? array_values( $serve['codes'] ) : array();
+		$hard  = array_values(
+			array_intersect(
+				$codes,
+				array(
+					'invalid_args',
+					'commerce_product',
+					'missing_companion_json',
+					'invalid_companion_json',
+					'oversize_json',
+					'hard_error_meta',
+					'json_decode_failed',
+				)
+			)
+		);
+		$out['serve_hard_codes'] = $hard;
+		$out['serve_soft_codes'] = array_values( array_diff( $codes, $hard ) );
+		$out['can_serve']        = empty( $hard ) && $out['companion_bytes'] > 2;
+
+		if ( method_exists( $pt, 'stored_elementor_translation_has_persian' ) ) {
+			$out['stored_persian_strict'] = (bool) $pt::stored_elementor_translation_has_persian( $post_id, $lang );
+		}
+
+		if ( method_exists( $pt, 'stored_elementor_translation_has_visible_persian' ) ) {
+			$out['stored_persian_visible'] = (bool) $pt::stored_elementor_translation_has_visible_persian( $post_id, $lang );
+		} elseif ( method_exists( $pt, 'collect_stored_elementor_persian_plain_text' ) ) {
+			$plain = (string) $pt::collect_stored_elementor_persian_plain_text( $post_id, $lang, true );
+			$out['stored_persian_visible'] = '' !== trim( $plain );
+		}
+
+		if ( method_exists( $pt, 'collect_stored_elementor_persian_plain_text' ) ) {
+			$plain = (string) $pt::collect_stored_elementor_persian_plain_text( $post_id, $lang, true );
+			$bits  = array_values( array_filter( array_map( 'trim', preg_split( '/\n\n+/', $plain ) ?: array() ) ) );
+			$out['persian_field_count'] = count( $bits );
+
+			foreach ( array_slice( $bits, 0, 8 ) as $bit ) {
+				$out['persian_samples'][] = function_exists( 'mb_substr' )
+					? mb_substr( $bit, 0, 100, 'UTF-8' )
+					: substr( $bit, 0, 100 );
+			}
+		}
+
+		if ( method_exists( $pt, 'elementor_translation_is_storefront_ready' ) ) {
+			$out['storefront_ready'] = (bool) $pt::elementor_translation_is_storefront_ready( $post_id, $lang );
+		}
+
+		if ( method_exists( $pt, 'storefront_would_show_persian_source' ) ) {
+			$out['storefront_would_show_fa'] = (bool) $pt::storefront_would_show_persian_source( $post_id, $lang );
+		}
+
+		$out['live_status'] = method_exists( $pt, 'get_translation_status' )
+			? (string) $pt::get_translation_status( $post_id, $lang )
+			: null;
+		$out['needs_work'] = method_exists( $pt, 'post_needs_translation_work' )
+			? (bool) $pt::post_needs_translation_work( $post_id, $lang )
+			: null;
+		$out['actionable_for_job'] = method_exists( $pt, 'post_is_actionable_for_job' )
+			? (bool) $pt::post_is_actionable_for_job( $post_id, $lang )
+			: null;
+
+		if ( $out['companion_bytes'] <= 2 ) {
+			$out['verdict']     = 'missing_companion';
+			$out['explanation'] = 'JSON زبان مقصد خالی است — فروشگاه مجبور است فارسی را نشان دهد.';
+		} elseif ( ! empty( $hard ) ) {
+			$out['verdict']     = 'serve_blocked';
+			$out['explanation'] = 'Companion هست ولی سرو بلاک شده: ' . implode( ', ', $hard );
+		} elseif ( ! empty( $out['stored_persian_visible'] ) ) {
+			$out['verdict']     = 'serving_companion_with_persian_leftovers';
+			$out['explanation'] = sprintf(
+				'Companion سرو می‌شود ولی هنوز حدود %d فیلد فارسی/غیرقابل‌قبول داخل JSON زبان مقصد است (نسبت حجم EN/FA=٪s). صف ممکن است translated بگوید چون فیلدهای force-accept شده از تشخیص قبلی حذف می‌شدند.',
+				(int) $out['persian_field_count'],
+				null !== $out['bytes_ratio'] ? (string) $out['bytes_ratio'] : '?'
+			);
+		} elseif ( ! empty( $out['storefront_would_show_fa'] ) ) {
+			$out['verdict']     = 'other_fa_sources';
+			$out['explanation'] = 'Companion Elementor تمیز به نظر می‌رسد؛ فارسی احتمالاً از cms_block / هدر وودمارت / رشته‌های UI می‌آید.';
+		} else {
+			$out['verdict']     = 'looks_clean';
+			$out['explanation'] = 'از نظر متا/companion مشکلی دیده نشد. اگر هنوز فارسی است: کش صفحه/CDN را پاک کن و View Source را برای Serving چک کن.';
+		}
+	} catch ( \Throwable $e ) {
+		$out['errors'][]    = $e->getMessage();
+		$out['verdict']     = 'audit_error';
+		$out['explanation'] = $e->getMessage();
+	}
+
+	return $out;
 }
 
 function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
@@ -367,6 +520,8 @@ function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
 	} catch ( \Throwable $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
 	}
 
+	$why = polymart_ai_queue_diag_why_storefront_persian( $post_id, $lang );
+
 	return array(
 		'post_id'              => $post_id,
 		'title'                => get_the_title( $post_id ),
@@ -387,6 +542,7 @@ function polymart_ai_queue_diag_post_snapshot( $post_id, $lang ) {
 		'elementor_scan'       => $scan,
 		'elementor_storefront_ready' => $ready,
 		'stored_elementor_persian' => $stored_persian,
+		'why_persian'          => $why,
 		'needs_elementor_job'  => \PolymartAI\Translation\Post_Translator::post_needs_elementor_job_work( $post_id, $lang ),
 		'gap_reason'           => \PolymartAI\Translation\Post_Translator::describe_translation_gap( $post_id, $lang ),
 		'gaps_missing'         => array_values( array_map( 'strval', (array) ( \PolymartAI\Translation\Post_Translator::get_translation_gaps( $post_id, $lang )['missing'] ?? array() ) ) ),
@@ -807,6 +963,23 @@ function polymart_ai_queue_diag_build_recommendations( array $report ) {
 	$scan     = (array) ( $report['elementor_scan'] ?? array() );
 	$stubborn = (array) ( $report['stubborn_details'] ?? array() );
 	$lock     = (array) ( $report['lock'] ?? array() );
+	$why      = (array) ( $report['why_persian'] ?? ( $report['snapshot']['why_persian'] ?? array() ) );
+	$verdict  = (string) ( $why['verdict'] ?? '' );
+
+	if ( 'serving_companion_with_persian_leftovers' === $verdict ) {
+		$hints[] = sprintf(
+			'علت فارسی بودن /en: companion سرو می‌شود ولی ~%d فیلد فارسی داخل JSON زبان مقصد مانده. روی پست Shift+«ترجمه و تکمیل» بزن یا در «اصلاح ترجمه» همان نمونه‌ها را عوض کن.',
+			(int) ( $why['persian_field_count'] ?? 0 )
+		);
+	} elseif ( 'missing_companion' === $verdict ) {
+		$hints[] = 'JSON زبان مقصد خالی است — Shift+ترجمه و تکمیل برای ساخت مجدد companion.';
+	} elseif ( 'serve_blocked' === $verdict ) {
+		$hints[] = 'سرو companion بلاک است: ' . implode( ', ', (array) ( $why['serve_hard_codes'] ?? array() ) );
+	} elseif ( 'other_fa_sources' === $verdict ) {
+		$hints[] = 'Elementor تمیز است؛ فارسی احتمالاً از cms_block / هدر وودمارت / رشته‌های UI است — تب UI strings را اسکن کن.';
+	} elseif ( 'looks_clean' === $verdict ) {
+		$hints[] = 'متا تمیز است — کش/CDN را پاک کن و View Source را برای Serving EN چک کن.';
+	}
 
 	if ( ! empty( $job['pinned_on_post'] ) && 'running' === (string) ( $job['status'] ?? '' ) ) {
 		$hints[] = 'این پست الان روی ترجمه خودکار قفل است — اگر بیش از ۵ دقیقه پیشرفت نکرد، خروجی JSON را بفرست.';
@@ -848,7 +1021,7 @@ function polymart_ai_queue_diag_build_recommendations( array $report ) {
 	}
 
 	if ( empty( $hints ) ) {
-		$hints[] = 'اگر هنوز گیر کرده، JSON زیر را کپی کن و بفرست.';
+		$hints[] = 'اگر هنوز گیر کرده، JSON زیر را کپی کن و بفرست (بخش why_persian مهم است).';
 	}
 
 	return $hints;
@@ -996,6 +1169,9 @@ function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
 	}
 
 	$scan = is_array( $snapshot['elementor_scan'] ?? null ) ? $snapshot['elementor_scan'] : null;
+	$why  = is_array( $snapshot['why_persian'] ?? null )
+		? $snapshot['why_persian']
+		: polymart_ai_queue_diag_why_storefront_persian( $post_id, $lang );
 
 	$report = array(
 		'post_id'                 => $post_id,
@@ -1004,6 +1180,7 @@ function polymart_ai_queue_diag_troubleshoot_snapshot( $post_id, $lang ) {
 		'post_type'               => (string) ( $snapshot['post_type'] ?? '' ),
 		'edit_url'                => (string) ( $snapshot['edit_url'] ?? '' ),
 		'snapshot'                => $snapshot,
+		'why_persian'             => $why,
 		'elementor_scan'          => $scan,
 		'stubborn_details'        => \PolymartAI\Translation\Post_Translator::get_elementor_stubborn_field_diagnostics( $post_id, $lang ),
 		'job_partial_state'       => polymart_ai_queue_diag_summarize_partial_state( $state ),
@@ -1409,10 +1586,28 @@ function polymart_ai_render_troubleshoot_page() {
 			$stubborn = (array) ( $report['stubborn_details'] ?? array() );
 			$bulk     = (array) ( $report['bulk_job'] ?? array() );
 			$lock     = (array) ( $report['lock'] ?? array() );
+			$why      = (array) ( $report['why_persian'] ?? ( $report['snapshot']['why_persian'] ?? array() ) );
 			?>
 			<h2>#<?php echo esc_html( (string) $post_id ); ?> — <?php echo esc_html( (string) ( $report['title'] ?? '' ) ); ?></h2>
+			<?php if ( ! empty( $why['verdict'] ) ) : ?>
+				<div class="notice notice-warning inline" style="max-width:900px;">
+					<p>
+						<strong>چرا فارسی؟</strong>
+						<code><?php echo esc_html( (string) $why['verdict'] ); ?></code>
+						— <?php echo esc_html( (string) ( $why['explanation'] ?? '' ) ); ?>
+					</p>
+					<?php if ( ! empty( $why['persian_samples'] ) ) : ?>
+						<p style="margin:8px 0 0;"><strong>نمونه فیلدهای فارسی در JSON زبان مقصد:</strong></p>
+						<ul>
+							<?php foreach ( array_slice( (array) $why['persian_samples'], 0, 5 ) as $sample ) : ?>
+								<li><code><?php echo esc_html( (string) $sample ); ?></code></li>
+							<?php endforeach; ?>
+						</ul>
+					<?php endif; ?>
+				</div>
+			<?php endif; ?>
 			<?php if ( ! empty( $report['light'] ) ) : ?>
-				<div class="notice notice-info inline"><p>گزارش سبک (بدون decode کامل Elementor). برای گزارش کامل تیک «گزارش کامل» را بزن — روی پست‌های خیلی بزرگ ممکن است ۵۰۳ بدهد.</p></div>
+				<div class="notice notice-info inline"><p>گزارش سبک + ممیزی companion (why_persian). برای AS events / scan سنگین تیک «گزارش کامل» را بزن.</p></div>
 			<?php endif; ?>
 			<p>
 				نوع: <code><?php echo esc_html( (string) ( $report['post_type'] ?? '' ) ); ?></code>
@@ -1424,7 +1619,16 @@ function polymart_ai_render_troubleshoot_page() {
 			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;max-width:1100px;margin-bottom:20px;">
 				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
 					<strong>وضعیت زنده</strong><br />
-					<code><?php echo esc_html( polymart_ai_queue_diag_str( $report['snapshot']['live_status'] ?? '' ) ); ?></code>
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $report['snapshot']['live_status'] ?? ( $why['live_status'] ?? '' ) ) ); ?></code>
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>فارسی visible در companion</strong><br />
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $why['stored_persian_visible'] ?? '' ) ); ?></code>
+					(<?php echo esc_html( (string) (int) ( $why['persian_field_count'] ?? 0 ) ); ?> فیلد)
+				</div>
+				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
+					<strong>نسبت حجم EN/FA</strong><br />
+					<code><?php echo esc_html( polymart_ai_queue_diag_str( $why['bytes_ratio'] ?? '' ) ); ?></code>
 				</div>
 				<div style="background:#fff;border:1px solid #ccd0d4;padding:12px;border-radius:4px;">
 					<strong>پیشرفت Elementor</strong><br />
