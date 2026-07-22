@@ -823,7 +823,7 @@ trait Trait_Storage {
 	}
 
 	public function capture_elementor_data_prev_value( $check, $post_id, $meta_key, $meta_value, $prev_value ) {
-		unset( $check, $meta_value );
+		unset( $meta_value );
 
 		if ( '_elementor_data' !== $meta_key ) {
 			return $check;

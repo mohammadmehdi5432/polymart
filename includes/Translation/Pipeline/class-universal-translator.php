@@ -878,6 +878,8 @@ final class Universal_Translator {
 	/**
 	 * Resolve homepage post ID from URI before WP_Query (e.g. /en/ static front page).
 	 *
+	 * Safe to call during plugins_loaded — must not touch $wp_query before it exists.
+	 *
 	 * @return int
 	 */
 	private function resolve_early_storefront_post_id() {
@@ -885,7 +887,7 @@ final class Universal_Translator {
 			return (int) $this->elementor_main_post_id;
 		}
 
-		$queried = get_queried_object_id();
+		$queried = $this->safe_queried_object_id();
 
 		if ( $queried > 0 ) {
 			return $queried;
@@ -910,6 +912,21 @@ final class Universal_Translator {
 		}
 
 		return 0;
+	}
+
+	/**
+	 * Queried object ID when the main query exists; otherwise 0.
+	 *
+	 * @return int
+	 */
+	private function safe_queried_object_id() {
+		global $wp_query;
+
+		if ( ! $wp_query instanceof \WP_Query ) {
+			return 0;
+		}
+
+		return (int) $wp_query->get_queried_object_id();
 	}
 
 	/**
@@ -973,9 +990,9 @@ final class Universal_Translator {
 	 * @return int
 	 */
 	private function resolve_storefront_main_post_id() {
-		$post_id = get_queried_object_id();
+		$post_id = $this->safe_queried_object_id();
 
-		if ( $post_id <= 0 && ( is_front_page() || $this->is_default_language_home_request() || $this->is_translated_home_request() ) ) {
+		if ( $post_id <= 0 && ( $this->safe_is_front_page() || $this->is_default_language_home_request() || $this->is_translated_home_request() ) ) {
 			$post_id = absint( get_option( 'page_on_front' ) );
 		}
 
@@ -984,6 +1001,17 @@ final class Universal_Translator {
 		}
 
 		return (int) $post_id;
+	}
+
+	/**
+	 * is_front_page() only after the main query is available.
+	 *
+	 * @return bool
+	 */
+	private function safe_is_front_page() {
+		global $wp_query;
+
+		return $wp_query instanceof \WP_Query && is_front_page();
 	}
 
 	/**
