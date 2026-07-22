@@ -161,10 +161,16 @@ final class Frontend_Interceptor {
 	 * @return string
 	 */
 	private function resolve_queried_document_title() {
-		$post_id = get_queried_object_id();
+		global $wp_query;
 
-		if ( $post_id <= 0 && is_front_page() ) {
-			$post_id = absint( get_option( 'page_on_front' ) );
+		$post_id = 0;
+
+		if ( $wp_query instanceof \WP_Query ) {
+			$post_id = (int) $wp_query->get_queried_object_id();
+
+			if ( $post_id <= 0 && is_front_page() ) {
+				$post_id = absint( get_option( 'page_on_front' ) );
+			}
 		}
 
 		if ( $post_id <= 0 || Layout_Guard::should_preserve_post_data( $post_id ) ) {
@@ -855,12 +861,6 @@ final class Frontend_Interceptor {
 			return $this->intercept_cache;
 		}
 
-		// admin-ajax requests never fire `wp`; language is resolved from the referer.
-		if ( ! did_action( 'wp' ) && ! wp_doing_ajax() ) {
-			$this->intercept_cache = false;
-			return false;
-		}
-
 		if ( ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || wp_doing_cron() ) {
 			$this->intercept_cache = false;
 			return false;
@@ -871,6 +871,12 @@ final class Frontend_Interceptor {
 			return false;
 		}
 
+		/*
+		 * Language is bootstrapped from the request URI in Url_Router before
+		 * storefront modules boot. Never memoize "false" just because `wp` has
+		 * not fired yet — early get_post_meta/option reads during plugins_loaded
+		 * would disable title/content swap for the entire /en/ request.
+		 */
 		$this->intercept_cache = Url_Router::is_translated_request();
 
 		return $this->intercept_cache;

@@ -1566,16 +1566,12 @@ final class Universal_Translator {
 			return $this->translate_cache;
 		}
 
-		if ( ! did_action( 'wp' ) ) {
-			$this->translate_cache = false;
-			return false;
-		}
-
 		if ( is_admin() && ! wp_doing_ajax() ) {
 			$this->translate_cache = false;
 			return false;
 		}
 
+		// Same as Frontend_Interceptor: URI language is known before `wp`.
 		$this->translate_cache = Url_Router::is_translated_request();
 
 		return $this->translate_cache;
