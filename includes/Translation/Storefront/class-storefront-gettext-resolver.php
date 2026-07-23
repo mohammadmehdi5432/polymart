@@ -62,10 +62,21 @@ final class Storefront_Gettext_Resolver {
 		 * WooCommerce/Woodmart msgids are English while fa_IR .mo may supply a Persian
 		 * $translation. English URLs should show the msgid; other languages translate
 		 * from that Persian string when present.
+		 *
+		 * Arabic .mo output also matches contains_persian() (shared Unicode block).
+		 * Trust clean Arabic storefront strings — do not burn tokens re-translating ar→ar.
 		 */
 		if ( Persian_Detector::contains_persian( $translation ) ) {
 			if ( 'en' === $lang ) {
 				return Correction_Glossary::apply_to_text( $text, $lang );
+			}
+
+			if (
+				'ar' === $lang
+				&& Persian_Detector::contains_arabic_script( $translation )
+				&& ! Persian_Detector::contains_persian_specific_characters( $translation )
+			) {
+				return Correction_Glossary::apply_to_text( $translation, $lang );
 			}
 
 			return Correction_Glossary::apply_to_text(

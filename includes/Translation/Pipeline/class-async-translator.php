@@ -39,6 +39,21 @@ final class Async_Translator {
 	const FIRST_PUBLISH_STATUSES = array( 'draft', 'auto-draft', 'pending', 'future' );
 
 	/**
+	 * Transient prefix for async retry / no-progress counters (per post).
+	 */
+	const ASYNC_RETRY_TRANSIENT_PREFIX = 'polymart_ai_async_retry_';
+
+	/**
+	 * Hard ceiling for incomplete async follow-up cron ticks per post.
+	 */
+	const ASYNC_RETRY_MAX = 8;
+
+	/**
+	 * Stop sooner when consecutive ticks make no measurable progress.
+	 */
+	const ASYNC_NO_PROGRESS_MAX = 3;
+
+	/**
 	 * Guard against re-entrancy while persisting AI translations.
 	 *
 	 * @var bool
@@ -380,6 +395,23 @@ final class Async_Translator {
 
 		if ( $forget_legacy && isset( self::$term_edit_snapshots[ $term_id ] ) ) {
 			$previous = self::$term_edit_snapshots[ $term_id ];
+
+			// Noisy term saves (count, parent, etc.) must not wipe + re-AI translations.
+			$name_changed = Post_Translator::field_source_text_meaningfully_changed(
+				(string) ( $previous['name'] ?? '' ),
+				(string) $term->name
+			);
+			$desc_changed = Post_Translator::field_source_text_meaningfully_changed(
+				(string) ( $previous['description'] ?? '' ),
+				(string) $term->description
+			);
+
+			if ( ! $name_changed && ! $desc_changed ) {
+				unset( self::$term_edit_snapshots[ $term_id ] );
+
+				return;
+			}
+
 			Runtime_String_Translator::invalidate_term_runtime_cache(
 				$term_id,
 				$previous['name'] ?? '',
@@ -707,6 +739,7 @@ final class Async_Translator {
 
 		self::$is_translating = true;
 		$needs_retry          = false;
+		$progress_before      = $this->build_async_progress_fingerprint( $post_id, $languages );
 
 		try {
 			foreach ( $languages as $language ) {
@@ -722,7 +755,12 @@ final class Async_Translator {
 			}
 
 			if ( $needs_retry ) {
-				$this->schedule_async_translation_retry( $post_id );
+				$progress_after = $this->build_async_progress_fingerprint( $post_id, $languages );
+				$made_progress  = ( $progress_before !== $progress_after );
+
+				$this->schedule_async_translation_retry( $post_id, 120, $made_progress );
+			} else {
+				$this->clear_async_retry_state( $post_id );
 			}
 		} catch ( \Throwable $exception ) {
 			Activity_Logger::log(
@@ -891,6 +929,9 @@ final class Async_Translator {
 		if ( ! $post_id || self::$is_translating ) {
 			return;
 		}
+
+		// Fresh content change — reset burn guards so the post gets a new retry budget.
+		$this->clear_async_retry_state( $post_id );
 
 		// Bulk auto-translate owns the queue — defer async work until it finishes.
 		if ( \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
@@ -1174,16 +1215,57 @@ final class Async_Translator {
 	/**
 	 * Schedule a follow-up async cron tick when translation is partial or recoverable.
 	 *
-	 * @param int $post_id       Post ID.
-	 * @param int $delay_seconds Delay before retry.
+	 * Caps retries so incomplete Arabic/Elementor work cannot burn API tokens forever.
+	 *
+	 * @param int  $post_id       Post ID.
+	 * @param int  $delay_seconds Delay before retry.
+	 * @param bool $made_progress Whether this tick changed the progress fingerprint.
 	 * @return void
 	 */
-	private function schedule_async_translation_retry( $post_id, $delay_seconds = 120 ) {
+	private function schedule_async_translation_retry( $post_id, $delay_seconds = 120, $made_progress = true ) {
 		$post_id = absint( $post_id );
 
 		if ( $post_id <= 0 || \PolymartAI\Activity_Logger::is_bulk_job_running() ) {
 			return;
 		}
+
+		$state = $this->get_async_retry_state( $post_id );
+		$state['retries'] = absint( $state['retries'] ?? 0 ) + 1;
+
+		if ( ! $made_progress ) {
+			$state['no_progress'] = absint( $state['no_progress'] ?? 0 ) + 1;
+		} else {
+			$state['no_progress'] = 0;
+		}
+
+		$retries     = (int) $state['retries'];
+		$no_progress = (int) $state['no_progress'];
+		$hit_ceiling = $retries >= self::ASYNC_RETRY_MAX || $no_progress >= self::ASYNC_NO_PROGRESS_MAX;
+
+		if ( $hit_ceiling ) {
+			$this->set_async_retry_state( $post_id, $state );
+
+			Activity_Logger::log(
+				'warning',
+				sprintf(
+					/* translators: 1: post ID, 2: retry count, 3: no-progress count */
+					__( 'ترجمه پس‌زمینه مورد #%1$d متوقف شد تا توکن مصرف نشود (ریتری: %2$d، بدون پیشرفت: %3$d). پس از ویرایش مجدد محتوا دوباره تلاش می‌شود.', 'polymart-ai' ),
+					$post_id,
+					$retries,
+					$no_progress
+				),
+				array(
+					'post_id'     => $post_id,
+					'source'      => 'async',
+					'retries'     => $retries,
+					'no_progress' => $no_progress,
+				)
+			);
+
+			return;
+		}
+
+		$this->set_async_retry_state( $post_id, $state );
 
 		if ( ! wp_next_scheduled( self::CRON_HOOK, array( $post_id ) ) ) {
 			wp_schedule_single_event(
@@ -1193,6 +1275,72 @@ final class Async_Translator {
 			);
 			self::maybe_spawn_cron();
 		}
+	}
+
+	/**
+	 * Compact fingerprint of per-language "needs work" flags for progress detection.
+	 *
+	 * @param int   $post_id   Post ID.
+	 * @param array $languages Target language rows.
+	 * @return string
+	 */
+	private function build_async_progress_fingerprint( $post_id, array $languages ) {
+		$post_id = absint( $post_id );
+		$parts   = array();
+
+		foreach ( $languages as $language ) {
+			$lang = sanitize_key( (string) ( $language['code'] ?? '' ) );
+
+			if ( '' === $lang ) {
+				continue;
+			}
+
+			$parts[] = $lang . ':' . ( Post_Translator::post_needs_translation_work( $post_id, $lang ) ? '1' : '0' );
+		}
+
+		return implode( '|', $parts );
+	}
+
+	/**
+	 * @param int $post_id Post ID.
+	 * @return string
+	 */
+	private function get_async_retry_transient_key( $post_id ) {
+		return self::ASYNC_RETRY_TRANSIENT_PREFIX . absint( $post_id );
+	}
+
+	/**
+	 * @param int $post_id Post ID.
+	 * @return array{retries?: int, no_progress?: int}
+	 */
+	private function get_async_retry_state( $post_id ) {
+		$raw = get_transient( $this->get_async_retry_transient_key( $post_id ) );
+
+		return is_array( $raw ) ? $raw : array();
+	}
+
+	/**
+	 * @param int   $post_id Post ID.
+	 * @param array $state   Counter payload.
+	 * @return void
+	 */
+	private function set_async_retry_state( $post_id, array $state ) {
+		set_transient(
+			$this->get_async_retry_transient_key( $post_id ),
+			array(
+				'retries'     => absint( $state['retries'] ?? 0 ),
+				'no_progress' => absint( $state['no_progress'] ?? 0 ),
+			),
+			DAY_IN_SECONDS
+		);
+	}
+
+	/**
+	 * @param int $post_id Post ID.
+	 * @return void
+	 */
+	private function clear_async_retry_state( $post_id ) {
+		delete_transient( $this->get_async_retry_transient_key( $post_id ) );
 	}
 
 	/**

@@ -233,6 +233,15 @@ final class Runtime_String_Translator {
 			$lang = 'en';
 		}
 
+		// Already Arabic (no پ/چ/ژ/گ) targeting Arabic — skip AI / pending queue.
+		if (
+			'ar' === $lang
+			&& Persian_Detector::contains_arabic_script( $text )
+			&& ! Persian_Detector::contains_persian_specific_characters( $text )
+		) {
+			return Correction_Glossary::apply_to_text( $text, $lang );
+		}
+
 		$hash = self::cache_hash( $text, $context );
 		$key  = $lang . ':' . $hash;
 
@@ -671,6 +680,17 @@ final class Runtime_String_Translator {
 			}
 
 			$lang = (string) $entry['lang'];
+			$text = (string) $entry['text'];
+
+			// Drop Arabic→Arabic leftovers queued before the script short-circuit.
+			if (
+				'ar' === sanitize_key( $lang )
+				&& Persian_Detector::contains_arabic_script( $text )
+				&& ! Persian_Detector::contains_persian_specific_characters( $text )
+			) {
+				unset( $queue[ $key ] );
+				continue;
+			}
 
 			if ( ! isset( $batches[ $lang ] ) ) {
 				$batches[ $lang ] = array();
